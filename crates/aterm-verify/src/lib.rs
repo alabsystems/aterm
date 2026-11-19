@@ -68,6 +68,9 @@ pub mod findings;
 pub mod fmt;
 pub mod git_paths;
 pub mod git_provider;
+/// The join: a run posts its start and end to the aterm instance that hosts it, which answers
+/// with the session the run belongs to, placed by the posting process's lineage.
+pub mod hosting;
 pub mod input_content;
 pub mod ladder;
 pub mod launch_agent;
@@ -3871,6 +3874,18 @@ fn write_survivor_report(
         let event = ctx.record_event(&format!("verify-event: {event}\n"));
         let _ = log.write_all(event.as_bytes());
     }
+    if report.kin.stages > 0 {
+        let k = report.kin;
+        let event = event_log::event_value(
+            event_log::EventKind::KinLeft,
+            aterm_json::json!({
+                "stages": k.stages, "reads": k.reads, "wall_us": k.wall_us,
+                "max_us": k.max_us, "booked": k.booked, "ended": k.ended,
+            }),
+        );
+        let event = ctx.record_event(&format!("verify-event: {event}\n"));
+        let _ = log.write_all(event.as_bytes());
+    }
     for line in report.lines {
         let _ = writeln!(log, "verify: {line}");
         writeln!(out, "verify: {line}")?;
@@ -4472,6 +4487,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let (_leases, lease_said) = hold_toolchain(&env, &tools, &root);
     #[cfg(unix)]
     exec::group::kill_on_interrupt();
+    // The pass's start and end, posted to the instance that hosts it (`hosting`): best effort
+    // within the post's bound, and nothing where no aterm hosts it.
+    let host = runs::ToInstance::from_env();
+    let hosted = hosting::Pass::start(&host, hosting::VERIFY);
     let runs_dir = aterm_uds::control_socket_dir()
         .map(|d| runs::records_dir(&d, aterm_uds::process::pid_namespace().as_deref()));
     if let (Some(dir), Some(boot)) = (&runs_dir, aterm_uds::process::boot_id()) {
@@ -4484,7 +4503,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             &mut |line| {
                 eprintln!("verify: {line}");
             },
-            &runs::ToInstance::from_env(),
+            &host,
         );
     }
     #[cfg(target_os = "macos")]
@@ -4553,7 +4572,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let mut ctx = match runs_dir
         .as_deref()
         .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
-        .map(|record| record.telling(Box::new(runs::ToInstance::from_env())))
+        .map(|record| record.telling(Box::new(host.clone())))
     {
         Some(record) => ctx.with_runs(record),
         None => ctx,
@@ -4702,6 +4721,8 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             }
         }
     }
+    // Before `end_run`, which dies of an interrupt the handler took.
+    hosted.end(Some(code));
     end_run(&ctx, &scratch, log.as_ref().map(|log| log.path.as_path()));
     code
 }

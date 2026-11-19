@@ -49,6 +49,7 @@ fn golden_v1() -> Vec<Record> {
             parents: vec![parent],
             authored_ms: 1_700_000_000_000 + sequence,
             body,
+            statement: None,
         }
         .sign(&[1; 32], [1; 16])
         .unwrap();
@@ -196,7 +197,7 @@ fn vault_checkpoint_v1_records_are_byte_for_byte_unchanged() {
     assert_eq!(hex(&put.wire_bytes().unwrap()), GOLDEN_PUT);
     #[cfg(unix)]
     assert_eq!(hex(put.frame().unwrap()), GOLDEN_PUT[..2 * (359 - 48 - 64)]);
-    // No version-1 record of the checkpoint kind exists: a draft refuses to sign one.
+    // No version-1 record of the checkpoint kind exists: a draft of one signs version 2.
     let checkpoint = Draft {
         network: *records[0].id(),
         sequence: 1,
@@ -204,8 +205,12 @@ fn vault_checkpoint_v1_records_are_byte_for_byte_unchanged() {
         parents: vec![*records[0].id()],
         authored_ms: 1,
         body: checkpoint_body(vec![*records[0].id()]),
+        statement: None,
     };
-    assert!(checkpoint.sign(&[1; 32], [1; 16]).is_err());
+    assert_eq!(
+        checkpoint.sign(&[1; 32], [1; 16]).unwrap().version(),
+        VERSION_TWO
+    );
 }
 
 fn checkpoint_body(heads: Vec<RecordId>) -> Body {
@@ -659,6 +664,7 @@ fn vault_checkpoint_a_checkpoint_is_a_keyed_membership_record_within_its_bound()
             state,
             dropped: [0x66; 32],
         },
+        statement: None,
     };
     let sign = |draft: Draft| draft.sign_two(&[1; 32], [1; 16], None);
     let largest = sign(draft(ids(MAX_CHECKPOINT_HEADS, 0x30), [0x55; 32])).unwrap();

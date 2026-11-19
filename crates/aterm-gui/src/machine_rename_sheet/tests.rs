@@ -16,6 +16,7 @@ fn read(name: &str, word: &str) -> Held {
         nick: word.to_owned(),
         word: word.to_owned(),
         read: true,
+        chosen_nick: true,
         waits: false,
     }
 }
@@ -93,7 +94,7 @@ fn invalid_pastes_keep_the_draft_without_copying_it_into_the_error() {
 }
 
 #[test]
-fn an_automatic_display_name_can_be_saved_in_lowercase() {
+fn explicitly_selecting_a_drawn_name_can_make_it_chosen() {
     let (_root, preview) = preview();
     let held = Held::of_read(&preview);
     let lower = preview.name().nick.as_str();
@@ -105,6 +106,24 @@ fn an_automatic_display_name_can_be_saved_in_lowercase() {
             &held
         ),
         Ok(nick(lower))
+    );
+}
+
+#[test]
+fn a_saved_nickname_keeps_its_display_while_a_new_word_boundary_is_an_edit() {
+    let held = read("m85", "Blue Heron");
+    for spelling in ["blue heron", "BlueHeron", " blue-HERON "] {
+        let draft = typed(spelling);
+        assert_eq!(rename_to(&left("85"), &draft, &held), Ok(RenameTo::Keep));
+        let mut field = held.nickname_field(draft);
+        assert_eq!(field.text(), spelling);
+        assert_eq!(field.typed(), None);
+        assert!(field.follow("Dog"));
+        assert_eq!(field.text(), "Dog");
+    }
+    assert_eq!(
+        rename_to(&left("85"), &typed("blueheron"), &held),
+        Ok(nick("blueheron"))
     );
 }
 

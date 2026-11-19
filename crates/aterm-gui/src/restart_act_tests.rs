@@ -632,6 +632,7 @@ fn a_codex_with_no_validated_copy_is_not_offered_the_act() {
             version: None,
             run: aterm_agent::harness::relaunch::AgentRun::Codex(
                 aterm_agent::harness::relaunch::CodexRun {
+                    selected_default: false,
                     home: home.join(".codex"),
                     home_env: None,
                     self_claimed: None,
@@ -1056,4 +1057,111 @@ fn a_moves_rest_read_waits_no_longer_than_account_rest() {
         assert_eq!(rest_read().1, Duration::from_millis(3), "CONTROL");
     }
     assert_eq!(rest_read().1, wait, "CONTROL: the guard dropped");
+}
+
+/// REVIEW OF HX-15m: A STOPPED CLAIMANT IS TOLD NO MEMORY RESTART, AND ITS WATCH WAITS WHILE IT
+/// STAYS STOPPED (HX-15: the watchdog leaves a stopped tab alone; HX-15e: a stopped claimant is
+/// never ended for an act of aterm's own). A contract 4 claim holding `relaunch` whose claimant
+/// the kernel reports stopped (`SIGSTOP`, as a person pausing it does): the memory ceiling's
+/// restart answers `wait:stopped` and writes no `restart` row, and the watch of a memory
+/// restart, as of a beat restart, is held back past its bound by the stopped claimant. Running
+/// again, the claimant is told (`relaunched:scoped-memory`, one row) and its watch holds back
+/// nothing.
+/// NEGATIVE HALF: before the fix the stopped claimant was told, and its memory restart's watch
+/// held back nothing, so past the bound it was sent `SIGTERM` and then the `SIGKILL` that ends a
+/// stopped process. A restart a person asked (`cause=asked`) is still not held back by it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stopped_claimant_is_told_no_memory_restart_and_its_watch_waits() {
+    use aterm_agent::harness::contract::{Scope, UNIVERSAL};
+    let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
+        "/bin/sleep",
+    )))
+    .expect("the sleep stand-in");
+    let sleep_s = sleep.to_string_lossy().into_owned();
+    let defaults = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
+    let mut child = aterm_uds::spawnfd::command(&sleep)
+        .arg("600")
+        .spawn()
+        .expect("spawn the claimant");
+    drop(defaults);
+    let pid = child.id();
+    let wait = |what: &str, probe: &dyn Fn() -> bool| {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            probe().then_some(())
+        });
+    };
+    wait("the claimant runs from the stand-in", &|| {
+        atpkg::caller_shell::process_args(pid).is_some_and(|a| a.argv.first() == Some(&sleep_s))
+    });
+    let ctx = crate::session_store::test_handle_on(7429, -1).ctx;
+    let mut scoped = crate::harness_claim::Scoped {
+        proven: crate::harness_claim::Proven {
+            pid,
+            start: restart_stamp::kernel_start(pid).expect("its kernel start"),
+        },
+        ..crate::session_timeline::scoped_input_tests::scoped(&[Scope::Relaunch])
+    };
+    scoped.claim.contract = UNIVERSAL;
+    crate::session_timeline::claim_supervisor_scoped(
+        &ctx,
+        &format!("grok-alab@{pid}"),
+        Some(129),
+        scoped,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the harness's claim");
+    let rows = || {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .view_copy(None, 0)
+            .rows()
+            .iter()
+            .filter(|row| row.kind == RESTART_EVENT)
+            .count()
+    };
+    let bound = |cause| Bound {
+        cause,
+        obey: Duration::ZERO,
+        quiet: Duration::ZERO,
+    };
+
+    // SAFETY: our own unreaped child, so its pid has not been reused.
+    assert_eq!(unsafe { libc::kill(child_pid(pid), libc::SIGSTOP) }, 0);
+    wait("the kernel reports it stopped", &|| {
+        crate::input_stall::claimant_stopped(pid) == Some(true)
+    });
+    assert_eq!(memory_restart(&ctx), MEMORY_STOPPED);
+    assert_eq!(rows(), 0, "a stopped claimant is told nothing");
+    for cause in [Cause::Memory, Cause::Beat] {
+        assert_eq!(
+            held_back(&ctx, pid, bound(cause)),
+            Some("its claimant is stopped"),
+            "{cause:?}: the watch's SIGTERM waits while it stays stopped"
+        );
+    }
+    assert_eq!(
+        held_back(&ctx, pid, bound(Cause::Asked)),
+        None,
+        "a restart a person asked is not held back by it"
+    );
+
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(child_pid(pid), libc::SIGCONT) }, 0);
+    wait("the kernel reports it running", &|| {
+        crate::input_stall::claimant_stopped(pid) == Some(false)
+    });
+    assert_eq!(held_back(&ctx, pid, bound(Cause::Memory)), None);
+    assert_eq!(memory_restart(&ctx), MEMORY_TOLD, "running, it is told");
+    assert_eq!(rows(), 1);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `pid` as `kill` takes it.
+#[cfg(target_os = "macos")]
+fn child_pid(pid: u32) -> libc::pid_t {
+    libc::pid_t::try_from(pid).expect("a pid")
 }

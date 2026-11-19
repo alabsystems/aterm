@@ -32,7 +32,7 @@ use alab_policy::vocab::{Phase, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 25, "0.25");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 26, "0.26");
 
 /// The usage limit is spent: the server's quota words 2.3.3's patterns matched, and its code
 /// (lowercase).

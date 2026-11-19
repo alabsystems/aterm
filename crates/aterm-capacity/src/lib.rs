@@ -165,8 +165,8 @@ mod epoch_controller_tests;
 mod retained_cohort_tests;
 
 pub use admit::{
-    Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, Polled, QuietStart, Relief, Reserve,
-    Short, Shortfall, Spared, Waiter, admit, admit_relieved, admit_until, admit_with,
+    Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, PollStopped, Polled, QuietStart, Relief,
+    Reserve, Short, Shortfall, Spared, Waiter, admit, admit_relieved, admit_until, admit_with,
     covered_memory, covering, covering_command, covering_disk, gib, heavy_queue, never, reserved,
     span, spared, tree_roots,
 };

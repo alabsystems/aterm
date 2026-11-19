@@ -3826,6 +3826,7 @@ pub(crate) const NATIVE_SWEEP: Duration = Duration::from_secs(1);
 /// Per-session status classifier table enforcing observation intervals and scheduling wakes.
 #[derive(Debug)]
 pub(crate) struct StatusObserver {
+    pub(crate) adoption_watches: crate::codex_adoption::Watches,
     badge: bool,
     sessions: ScheduledStatuses,
     census_initialized: bool,
@@ -3927,6 +3928,7 @@ impl StatusObserver {
             sessions: ScheduledStatuses::new(policy, min_interval),
             census_initialized: false,
             swept_pool_epoch: 0,
+            adoption_watches: Default::default(),
             native_swept: None,
             unclassified: Vec::new(),
             agent_seq: 0,
@@ -4911,6 +4913,7 @@ impl StatusObserver {
         self.programs.retire(session);
         crate::claude_footer::stop_session(session, None);
         self.footer_asked.remove(&session);
+        self.adoption_watches.retire(session);
         crate::codex_rollout_tap::retire_session(session);
         crate::kimi_record::forget(session);
         self.sessions.remove(&session);
@@ -5232,6 +5235,23 @@ impl crate::App {
             self.session_status.slog_wakes.note(id, wake);
             self.session_status.note_build_wait(id, build_waiting);
             let group_changed = previous_group.is_some();
+            // A contract 4 claim the release below drops is the watchdog's to end, where its
+            // claimant exited (`harness_watchdog::released_gone`).
+            #[cfg(unix)]
+            let universal = group_changed
+                .then(|| {
+                    let meta = session.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+                    meta.live_claim(crate::metrics::now_us()).and_then(|claim| {
+                        claim
+                            .scoped
+                            .clone()
+                            .filter(|scoped| {
+                                scoped.claim.contract == aterm_agent::harness::contract::UNIVERSAL
+                            })
+                            .map(|scoped| (claim.holder.clone(), scoped))
+                    })
+                })
+                .flatten();
             if group_changed
                 && crate::session_timeline::publish_release_proven_if_gone(
                     &session.ctx,
@@ -5241,6 +5261,10 @@ impl crate::App {
                 .published()
             {
                 claims_cleared.push(id);
+                #[cfg(unix)]
+                if let Some((holder, scoped)) = universal {
+                    crate::harness_watchdog::released_gone(&session.ctx, &holder, scoped);
+                }
             }
             let turn_begun = program_report.turns != self.session_status.program_turns(id);
             let program_state_moved = self.session_status.observe_program_state(

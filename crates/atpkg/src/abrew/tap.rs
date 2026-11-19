@@ -1371,6 +1371,12 @@ fn cask_interpolate_depth(
         }
     };
     let value = |expr: &str| -> Option<String> {
+        // A quoted conditional string whose predicate
+        // the formula evaluator models (its literal
+        // may itself interpolate version chains).
+        if super::formula::version_conditional_string_syntax(expr) {
+            return super::formula::cask_version_token(version, expr);
+        }
         // `"-#{version.csv.second}" if version.csv.second`:
         // a quoted string (itself interpolated) kept
         // only when the condition chain is present.
@@ -1697,6 +1703,9 @@ fn line_opens_block(t: &str) -> bool {
         && (t.ends_with(" do")
             || t.contains(" do |")
             || t.starts_with("if ")
+            // An assignment-if expression (`v = if …`)
+            // opens a block its `end` closes.
+            || t.contains(" = if ")
             || t.starts_with("unless ")
             || t.starts_with("while ")
             || t.starts_with("until ")
@@ -2169,10 +2178,39 @@ fn regex_literal(s: &str) -> Option<(String, String, &str)> {
     let mut depth = 1usize;
     let mut escaped = false;
     // A `/` delimiter does not close inside a
-    // character class (`/[^/]+/`).
+    // character class (`/[^/]+/`) or an
+    // interpolation (`#{arch.gsub(/[._-]/, "…")}`).
     let mut in_class = false;
     let mut class_fresh = false;
+    let mut interp = 0usize;
+    let mut interp_quote: Option<char> = None;
+    let mut prev = '\0';
     for (i, c) in rest.char_indices() {
+        if interp > 0 {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && interp_quote.is_some() {
+                escaped = true;
+            } else if let Some(q) = interp_quote {
+                if c == q {
+                    interp_quote = None;
+                }
+            } else if c == '"' || c == '\'' {
+                interp_quote = Some(c);
+            } else if c == '{' {
+                interp += 1;
+            } else if c == '}' {
+                interp -= 1;
+            }
+            prev = c;
+            continue;
+        }
+        if c == '{' && prev == '#' && !in_class {
+            interp = 1;
+            prev = c;
+            continue;
+        }
+        prev = c;
         if escaped {
             escaped = false;
             class_fresh = false;
@@ -2617,6 +2655,127 @@ fn conditional_value(kind: &str, kwargs: &[(String, String)]) -> Option<String> 
 /// interpolate, resolved for this host:
 /// `<ident> = on_*_conditional …` assignments plus
 /// the `arch`/`os` stanzas (as `arch`/`os`).
+/// Regexp-valued cask locals declared before the
+/// livecheck block: `<ident> = /…/flags` (possibly
+/// spanning lines) or `<ident> = on_system_conditional(
+/// macos: /…/flags, linux: /…/flags)` (the macOS arm).
+/// `value.gsub(/<single character class>/, "repl")`
+/// for cask locals: replace every character in the
+/// class (ranges and negation supported).
+fn gsub_char_class(value: &str, pat: &str, repl: &str) -> Option<String> {
+    let inner = pat.strip_prefix('[')?.strip_suffix(']')?;
+    let (negated, inner) = match inner.strip_prefix('^') {
+        Some(r) => (true, r),
+        None => (false, inner),
+    };
+    let mut set: Vec<char> = Vec::new();
+    let chars: Vec<char> = inner.chars().collect();
+    let mut i = 0usize;
+    let read = |chars: &[char], i: &mut usize| -> Option<char> {
+        let c = *chars.get(*i)?;
+        *i += 1;
+        if c == '\\' {
+            let e = *chars.get(*i)?;
+            *i += 1;
+            Some(match e {
+                'n' => '\n',
+                't' => '\t',
+                other => other,
+            })
+        } else {
+            Some(c)
+        }
+    };
+    while i < chars.len() {
+        let lo = read(&chars, &mut i)?;
+        if chars.get(i) == Some(&'-') && i + 1 < chars.len() {
+            i += 1;
+            let hi = read(&chars, &mut i)?;
+            if lo > hi {
+                return None;
+            }
+            set.extend(lo..=hi);
+        } else {
+            set.push(lo);
+        }
+    }
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if set.contains(&c) != negated {
+            out.push_str(repl);
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn cask_regex_locals(lines: &[&str]) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        i += 1;
+        let Some((name, rhs)) = t.split_once(" = ") else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let rhs = rhs.trim();
+        // Gather the (possibly multi-line) RHS until a
+        // regex literal parses out of it.
+        let gathered = |start: &str, i: &mut usize| -> String {
+            let mut joined = start.to_string();
+            let mut n = 0usize;
+            while regex_literal(&joined).is_none() && *i < lines.len() && n < 24 {
+                joined.push('\n');
+                joined.push_str(lines[*i]);
+                *i += 1;
+                n += 1;
+            }
+            joined
+        };
+        if rhs.starts_with('/') || rhs.starts_with('%') {
+            let joined = gathered(rhs, &mut i);
+            if let Some((pat, flags, _)) = regex_literal(&joined) {
+                out.retain(|(n, _, _)| n != name);
+                out.push((name.to_string(), pat, flags));
+            }
+        } else if rhs.starts_with("on_system_conditional") {
+            // Gather only to the call's paren balance
+            // (a paren-less call ends at the line end).
+            let mut joined = rhs.to_string();
+            let depth = |s: &str| -> i64 {
+                s.chars()
+                    .map(|c| match c {
+                        '(' => 1,
+                        ')' => -1,
+                        _ => 0,
+                    })
+                    .sum()
+            };
+            let mut n = 0usize;
+            while depth(&joined) > 0 && i < lines.len() && n < 24 {
+                joined.push('\n');
+                joined.push_str(lines[i]);
+                i += 1;
+                n += 1;
+            }
+            let joined = joined;
+            if let Some(pos) = joined.find("macos:") {
+                let after = joined[pos + "macos:".len()..].trim_start();
+                if let Some((pat, flags, _)) = regex_literal(after) {
+                    out.retain(|(n, _, _)| n != name);
+                    out.push((name.to_string(), pat, flags));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn cask_livecheck_locals(lines: &[&str]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let set = |name: &str, value: String, out: &mut Vec<(String, String)>| {
@@ -2647,6 +2806,26 @@ fn cask_livecheck_locals(lines: &[&str]) -> Vec<(String, String)> {
                 && let Some(v) = conditional_value(kind, &kwargs)
             {
                 set(stanza, v, &mut out);
+            }
+        }
+        // The default `language` block's trailing
+        // string is the `#{language}` value the API
+        // renders (firefox@nightly's "en-US").
+        if t.starts_with("language ") && t.contains("default: true") && t.ends_with(" do") {
+            let mut value: Option<String> = None;
+            for next in lines.iter().skip(line_idx + 1) {
+                let n = next.trim();
+                if n == "end" {
+                    break;
+                }
+                if let Some((v, tail)) = quoted_token(n)
+                    && tail.trim().is_empty()
+                {
+                    value = Some(v);
+                }
+            }
+            if let Some(v) = value {
+                set("language", v, &mut out);
             }
         }
         // `<ident> = "…"` plain strings (kept raw; any
@@ -2725,6 +2904,7 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
     let all: Vec<&str> = text.lines().collect();
     let open_idx = all.iter().position(|l| livecheck_block_open(l))?;
     let locals = cask_livecheck_locals(&all[..open_idx]);
+    let cask_regex_locals = cask_regex_locals(&all[..open_idx]);
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -2744,6 +2924,18 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
         }
         if let Some((_, v)) = locals.iter().find(|(n, _)| n == token) {
             return Some(Some(v.clone()));
+        }
+        // A cask local with a single-class gsub
+        // (`#{arch.gsub(/[._-]/, "[._-]")}`).
+        if let Some((base, args)) = token.split_once(".gsub(")
+            && let Some((_, v)) = locals.iter().find(|(n, _)| n == base)
+            && let Some((pat, _flags, rest)) = regex_literal(args.trim())
+            && let Some(rest) = rest.trim().strip_prefix(',')
+            && let Some((repl, tail)) = quoted_token(rest.trim())
+            && tail.trim() == ")"
+            && let Some(out) = gsub_char_class(v, &pat, &repl)
+        {
+            return Some(Some(out));
         }
         // A cask local with a case transform
         // (`#{arch.downcase}`).
@@ -2851,7 +3043,13 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                         }
                         "extract_plist" => spec.plist_block = parse_plist_shape(params, lines),
                         "page_match" | "sourceforge" | "gnome" => {
-                            spec.page_block = parse_page_shape(params, lines)
+                            spec.page_block = parse_page_shape(params, lines).or_else(|| {
+                                let subst: Vec<String> = lines
+                                    .iter()
+                                    .map(|l| substitute_local_tokens(l, &locals))
+                                    .collect();
+                                parse_page_shape(params, &subst)
+                            })
                         }
                         "github_releases" => {
                             let subst: Vec<String> = lines
@@ -3058,6 +3256,35 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                     }
                 }
             } else if let Some(rest) = t.strip_prefix("regex(") {
+                // `regex(<ident>)`: a Regexp-valued cask
+                // local (bambu-studio@beta).
+                if rest
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                {
+                    let (ident, tail) = rest.split_once(')')?;
+                    let ident = ident.trim();
+                    if !tail.trim().is_empty()
+                        || ident.is_empty()
+                        || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        return None;
+                    }
+                    let Some((_, pat, flags)) =
+                        cask_regex_locals.iter().find(|(n, _, _)| n == ident)
+                    else {
+                        return None;
+                    };
+                    let pattern = substitute(pat)?.replace(
+                        "#{Regexp.escape(version.major_minor)}",
+                        super::formula::MAJOR_MINOR_SENTINEL,
+                    );
+                    spec.regex = Some(pattern);
+                    spec.regex_flags = flags.clone();
+                    continue;
+                }
                 // A regex literal may span lines (the
                 // `x`-mode alternation in neo4j); join
                 // following body lines until it closes.
@@ -3066,8 +3293,15 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                 // oracle's `Regexp#inspect` prints it).
                 let mut joined = rest.to_string();
                 let (pattern, flags, tail) = loop {
-                    if let Some(parsed) = regex_literal(&joined) {
-                        break (parsed.0, parsed.1, parsed.2.to_string());
+                    if let Some(parsed) = regex_literal(joined.trim_start()) {
+                        // Complete when the tail is the
+                        // call's close (an argument comma
+                        // may precede it on its own line).
+                        let t = strip_trailing_comment(parsed.2).trim();
+                        let t = t.strip_prefix(',').unwrap_or(t).trim();
+                        if t == ")" {
+                            break (parsed.0, parsed.1, ")".to_string());
+                        }
                     }
                     body.get(idx)?;
                     let next = all[open_idx + 1 + idx];
@@ -5454,6 +5688,348 @@ fn parse_json_nested_first(
     })
 }
 
+/// "<list> = <dig>&.filter_map { |i| i["k"] }&.uniq
+/// <v> = list.max_by { Version.new } next unless v
+/// <page> = page_content("url")[:content] next if
+/// page.blank? <d> = page[regex, N] next unless d
+/// \"#{v},#{d}\"" (eclipse-ide).
+fn parse_json_list_max_hop(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    use super::formula::{JsonHopPart, JsonShape};
+    let (list_name, rest) = assign_parts(joined.trim())?;
+    let (path, tail) = jt_dig(rest.trim(), root, cask_locals)?;
+    if path.is_empty() {
+        return None;
+    }
+    let tail = tail
+        .trim()
+        .strip_prefix("&.filter_map")
+        .or_else(|| tail.trim().strip_prefix(".filter_map"))?
+        .trim();
+    let tail = tail.strip_prefix('{')?.trim().strip_prefix('|')?;
+    let (ivar, tail) = tail.split_once('|')?;
+    let ivar = ivar.trim();
+    let tail = tail.trim().strip_prefix(ivar)?;
+    let (key, tail) = json_bracket_key(tail.trim())?;
+    let tail = tail.trim().strip_prefix('}')?.trim();
+    let tail = tail.strip_prefix("&.uniq").unwrap_or(tail).trim();
+    let (v_name, rest) = assign_parts(tail)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("{list_name}.max_by"))?
+        .trim();
+    let rest = rest.strip_prefix('{')?.trim().strip_prefix('|')?;
+    let (x, rest) = rest.split_once('|')?;
+    let x = x.trim();
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("Version.new({x})"))?
+        .trim()
+        .strip_prefix('}')?
+        .trim();
+    let rest = rest.strip_prefix(&format!("next unless {v_name}"))?.trim();
+    let (page_name, rest) = assign_parts(rest)?;
+    let rest = rest
+        .trim()
+        .strip_prefix("Homebrew::Livecheck::Strategy.page_content(")?
+        .trim();
+    let (url, rest) = quoted_token(rest)?;
+    let rest = rest.trim().strip_prefix(',').unwrap_or(rest.trim()).trim();
+    let rest = rest.strip_prefix(")[:content]")?.trim();
+    let rest = rest
+        .strip_prefix(&format!("next if {page_name}.blank?"))?
+        .trim();
+    let (date_name, rest) = assign_parts(rest)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("{page_name}[regex,"))?
+        .trim();
+    let (cap_s, rest) = rest.split_once(']')?;
+    let cap: usize = cap_s.trim().parse().ok()?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("next unless {date_name}"))?
+        .trim();
+    let (body_str, tail) = quoted_token(rest)?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let mut parts: Vec<JsonHopPart> = Vec::new();
+    let mut rest = body_str.as_str();
+    while let Some(i) = rest.find("#{") {
+        if i > 0 {
+            parts.push(JsonHopPart::Lit(ruby_unescape_dq(&rest[..i])));
+        }
+        let j = rest[i + 2..].find('}')?;
+        let token = rest[i + 2..i + 2 + j].trim();
+        parts.push(if token == v_name {
+            JsonHopPart::Max
+        } else if token == date_name {
+            JsonHopPart::Date
+        } else {
+            return None;
+        });
+        rest = &rest[i + 2 + j + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(JsonHopPart::Lit(ruby_unescape_dq(rest)));
+    }
+    Some(JsonShape::ListMaxPageHop {
+        path,
+        key,
+        url,
+        cap,
+        parts,
+    })
+}
+
+/// "<s> = <dig> next if s.blank? <j> =
+/// Json.parse_json(s) <m> = j<dig>&.match(regex)
+/// next if m.blank? <render>" (kdocs).
+fn parse_json_dig_parse_match(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    use super::formula::JsonShape;
+    let (s_name, rest) = assign_parts(joined.trim())?;
+    let (outer, tail) = jt_dig(rest.trim(), root, cask_locals)?;
+    if outer.is_empty() {
+        return None;
+    }
+    let rest = tail
+        .trim()
+        .strip_prefix(&format!("next if {s_name}.blank?"))?
+        .trim();
+    let (j_name, rest) = assign_parts(rest)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!(
+            "Homebrew::Livecheck::Strategy::Json.parse_json({s_name})"
+        ))?
+        .trim();
+    let (mv, rest) = assign_parts(rest)?;
+    let (inner, tail) = jt_dig(rest.trim(), &j_name, cask_locals)?;
+    if inner.is_empty() {
+        return None;
+    }
+    let rest = tail
+        .trim()
+        .strip_prefix("&.match(regex)")
+        .or_else(|| tail.trim().strip_prefix(".match(regex)"))?
+        .trim();
+    let rest = rest
+        .strip_prefix(&format!("next if {mv}.blank?"))
+        .or_else(|| rest.strip_prefix(&format!("next unless {mv}")))?;
+    let mut locals: Vec<super::formula::JsonLocal> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let render = jt_render(
+        rest.trim(),
+        &j_name,
+        &j_name,
+        &mv,
+        &mut locals,
+        &mut names,
+        cask_locals,
+    )?;
+    if !locals.is_empty() {
+        return None;
+    }
+    Some(JsonShape::DigParseMatch {
+        outer,
+        inner,
+        render: Box::new(render),
+    })
+}
+
+/// `<v> = json["K"] next if v.blank? <c> =
+/// page_content("pre#{v}post") next if
+/// c[:content].blank? <j> = parse_json(c[:content])
+/// <b> = j.dig(...)&.[](regex, N) next if b.blank?
+/// "<template over v and b>"` (firefox@nightly).
+fn parse_json_key_hop_dig_match(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    use super::formula::{JsonHopPart, JsonShape};
+    let _ = cask_locals;
+    let (v_name, rest) = assign_parts(joined.trim())?;
+    let rest = rest.trim().strip_prefix(root)?.trim_start();
+    let rest = rest.strip_prefix('[')?;
+    let (key, rest) = quoted_token(rest.trim())?;
+    let rest = rest.trim().strip_prefix(']')?.trim();
+    let rest = rest
+        .strip_prefix(&format!("next if {v_name}.blank?"))
+        .or_else(|| rest.strip_prefix(&format!("next unless {v_name}")))?
+        .trim();
+    let (c_name, rest) = assign_parts(rest)?;
+    let rest = rest
+        .trim()
+        .strip_prefix("Homebrew::Livecheck::Strategy.page_content(")?
+        .trim();
+    let (url, rest) = quoted_token(rest)?;
+    let rest = rest.trim().strip_prefix(')')?.trim();
+    let (url_pre, url_post) = url.split_once(&format!("#{{{v_name}}}"))?;
+    if url_post.contains("#{") {
+        return None;
+    }
+    let url_pre = ruby_unescape_dq(url_pre);
+    let url_post = ruby_unescape_dq(url_post);
+    let rest = rest
+        .strip_prefix(&format!("next if {c_name}[:content].blank?"))?
+        .trim();
+    let (j_name, rest) = assign_parts(rest)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!(
+            "Homebrew::Livecheck::Strategy::Json.parse_json({c_name}[:content])"
+        ))?
+        .trim();
+    let (b_name, rest) = assign_parts(rest)?;
+    let (path, tail) = jt_dig(rest.trim(), &j_name, &[])?;
+    if path.is_empty() {
+        return None;
+    }
+    let tail = tail.trim();
+    let tail = tail
+        .strip_prefix("&.[](regex,")
+        .or_else(|| tail.strip_prefix(".[](regex,"))?;
+    let (cap_s, tail) = tail.split_once(')')?;
+    let cap: usize = cap_s.trim().parse().ok()?;
+    let rest = tail
+        .trim()
+        .strip_prefix(&format!("next if {b_name}.blank?"))?
+        .trim();
+    let (tmpl, tail) = quoted_token(rest)?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let mut parts: Vec<JsonHopPart> = Vec::new();
+    let mut rest_t = tmpl.as_str();
+    while let Some(i) = rest_t.find("#{") {
+        if i > 0 {
+            parts.push(JsonHopPart::Lit(ruby_unescape_dq(&rest_t[..i])));
+        }
+        let j = rest_t[i + 2..].find('}')?;
+        let token = rest_t[i + 2..i + 2 + j].trim();
+        parts.push(if token == v_name {
+            JsonHopPart::Key
+        } else if token == b_name {
+            JsonHopPart::Fetched
+        } else {
+            return None;
+        });
+        rest_t = &rest_t[i + 2 + j + 1..];
+    }
+    if !rest_t.is_empty() {
+        parts.push(JsonHopPart::Lit(ruby_unescape_dq(rest_t)));
+    }
+    Some(JsonShape::KeyHopDigMatch {
+        key,
+        url_pre,
+        url_post,
+        path,
+        cap,
+        parts,
+    })
+}
+
+/// minecraft-server: current-version gate, then a
+/// links-document dig for the first typed match.
+fn parse_json_key_current_gate(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    use super::formula::JsonShape;
+    let _ = cask_locals;
+    let (v_name, rest) = assign_parts(joined.trim())?;
+    let rest = rest.trim().strip_prefix(root)?.trim_start();
+    let rest = rest.strip_prefix('[')?;
+    let (key, rest) = quoted_token(rest.trim())?;
+    let rest = rest.trim().strip_prefix(']')?.trim();
+    let rest = rest
+        .strip_prefix(&format!("next unless {v_name} "))?
+        .trim()
+        .strip_prefix(&format!("next version if {v_name} == version.csv.first "))?
+        .trim();
+    let (c_name, rest) = assign_parts(rest)?;
+    let rest = rest
+        .trim()
+        .strip_prefix("Homebrew::Livecheck::Strategy.page_content(")?
+        .trim();
+    let (url, rest) = quoted_token(rest)?;
+    if url.contains("#{") {
+        return None;
+    }
+    let rest = rest.trim();
+    let rest = rest.strip_prefix(',').map_or(rest, str::trim);
+    let rest = rest.strip_prefix(")[:content] ")?.trim();
+    let rest = rest
+        .strip_prefix(&format!("next {v_name} if {c_name}.blank? "))?
+        .trim();
+    let (j_name, rest) = assign_parts(rest)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!(
+            "Homebrew::Livecheck::Strategy::Json.parse_json({c_name})"
+        ))?
+        .trim();
+    let (h_name, rest) = assign_parts(rest)?;
+    let rest = rest.trim().strip_prefix("nil ")?.trim();
+    let (path, tail) = jt_dig(rest, &j_name, &[])?;
+    if path.is_empty() {
+        return None;
+    }
+    let tail = tail.trim().strip_prefix("&.each do |")?;
+    let (link, rest) = tail.split_once('|')?;
+    let link = link.trim();
+    if link.is_empty() || !link.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = rest.trim().strip_prefix(&format!("next if {link}["))?;
+    let (type_key, rest) = quoted_token(rest.trim())?;
+    let rest = rest.trim().strip_prefix("] != ")?.trim();
+    let (type_val, rest) = quoted_token(rest)?;
+    let (m_name, rest) = rest.trim().split_once(" = ")?;
+    let m_name = m_name.trim();
+    if m_name.is_empty()
+        || !m_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let rest = rest.trim().strip_prefix(&format!("{link}["))?;
+    let (url_key, rest) = quoted_token(rest.trim())?;
+    let rest = rest
+        .trim()
+        .strip_prefix("]&.match(regex) ")?
+        .trim()
+        .strip_prefix(&format!("next if {m_name}.blank? "))?
+        .trim()
+        .strip_prefix(&format!("{h_name} = {m_name}["))?;
+    let (cap_s, rest) = rest.split_once(']')?;
+    let cap: usize = cap_s.trim().parse().ok()?;
+    let rest = rest.trim().strip_prefix("break end ")?.trim();
+    if rest != format!("{h_name} ? \"#{{{v_name}}},#{{{h_name}}}\" : {v_name}") {
+        return None;
+    }
+    Some(JsonShape::KeyCurrentGateDigMatch {
+        key,
+        url: ruby_unescape_dq(&url),
+        path,
+        type_key,
+        type_val,
+        url_key,
+        cap,
+    })
+}
+
 fn parse_json_shape(
     params: &str,
     lines: &[String],
@@ -5474,6 +6050,10 @@ fn parse_json_shape(
     }
     if has_regex {
         for shape in [
+            parse_json_dig_parse_match(body, &root, cask_locals),
+            parse_json_list_max_hop(body, &root, cask_locals),
+            parse_json_key_hop_dig_match(body, &root, cask_locals),
+            parse_json_key_current_gate(body, &root, cask_locals),
             parse_json_multi_match(&root, lines, cask_locals),
             parse_json_dig_match(body, &root, cask_locals),
             parse_json_entries_first(body, &root, cask_locals),
@@ -7621,6 +8201,69 @@ fn scan_regex_arg(cur: &str) -> Option<(Option<(String, String)>, &str)> {
 /// (gnu-getopt, texlive, singular) to data. See
 /// `DirWalk` for the shape; anything off-template
 /// stays block-only.
+/// qt-creator's lazy walk: try each scanned
+/// directory (in scan order) until one's own scan
+/// is non-empty, the directory URL formed by
+/// `url.sub(needle, template)`.
+fn parse_dirwalk_lazy_shape(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::{DirBlank, DirWalk, PageShape};
+    let stmts = block_statements(lines);
+    if stmts.len() != 7 {
+        return None;
+    }
+    let mvar = stmts[0]
+        .strip_prefix(&format!("{root}.scan(regex).lazy.map do |"))?
+        .strip_suffix('|')?
+        .trim()
+        .to_string();
+    let (pvar, rhs) = stmts[1].split_once(" = ")?;
+    let pvar = pvar.trim();
+    let arg = rhs
+        .trim()
+        .strip_prefix("Homebrew::Livecheck::Strategy.page_content(")?
+        .strip_suffix(')')?
+        .trim();
+    let arg = arg.strip_prefix("url.sub(")?.strip_suffix(')')?;
+    let (needle, rest) = quoted_token(arg.trim_start())?;
+    let (template, tail) = quoted_token(rest.trim().strip_prefix(',')?.trim())?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let slot = format!("#{{{mvar}[0]}}");
+    let (pre, post) = template.split_once(&slot)?;
+    if pre.contains("#{") || post.contains("#{") {
+        return None;
+    }
+    if stmts[2] != format!("next if {pvar}[:content].blank?") {
+        return None;
+    }
+    let (vers, rhs) = stmts[3].split_once(" = ")?;
+    let vers = vers.trim();
+    if rhs.trim() != format!("{pvar}[:content].scan(regex).map(&:first)") {
+        return None;
+    }
+    if stmts[4] != format!("next if {vers}.blank?")
+        || stmts[5].trim() != vers
+        || stmts[6].trim() != "end.compact_blank.first"
+    {
+        return None;
+    }
+    Some(PageShape::DirWalk(Box::new(DirWalk {
+        stage1_regex: None,
+        stage1_tr: None,
+        reject_patch_ge: None,
+        last_two: false,
+        scan_order: true,
+        url_sub: Some((needle, pre.to_string(), post.to_string())),
+        dir_pre: String::new(),
+        dir_tr: None,
+        dir_post: String::new(),
+        stage2_regex: None,
+        blank: DirBlank::NextCandidate,
+        empty_scan_stage1: false,
+    })))
+}
+
 fn parse_dirwalk_shape(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
     use super::formula::{DirBlank, DirWalk, PageShape};
     let stmts = block_statements(lines);
@@ -7723,6 +8366,8 @@ fn parse_dirwalk_shape(root: &str, lines: &[String]) -> Option<super::formula::P
         stage1_tr,
         reject_patch_ge,
         last_two: false,
+        scan_order: false,
+        url_sub: None,
         dir_pre: String::new(),
         dir_tr: None,
         dir_post: String::new(),
@@ -8140,10 +8785,31 @@ fn parse_page_shape(params: &str, lines: &[String]) -> Option<super::formula::Pa
     if let Some(shape) = parse_page_two_match(&root, lines) {
         return Some(PageBlock { shape });
     }
+    if let Some(shape) = parse_dirwalk_lazy_shape(&root, lines) {
+        return Some(PageBlock { shape });
+    }
     if let Some(shape) = parse_dirwalk_shape(&root, lines) {
         return Some(PageBlock { shape });
     }
     if let Some(shape) = parse_first_date_shape(&root, lines) {
+        return Some(PageBlock { shape });
+    }
+    if let Some(shape) = parse_page_json_dig_match(&root, lines) {
+        return Some(PageBlock { shape });
+    }
+    if let Some(shape) = parse_page_scanmax_optcap(&root, lines) {
+        return Some(PageBlock { shape });
+    }
+    if let Some(shape) = parse_page_scan_strip_match(&root, lines) {
+        return Some(PageBlock { shape });
+    }
+    if let Some(shape) = parse_page_scan_dotted_max(&root, lines) {
+        return Some(PageBlock { shape });
+    }
+    if let Some(shape) = parse_page_scan_time_max_throttle(&root, lines) {
+        return Some(PageBlock { shape });
+    }
+    if let Some(shape) = parse_page_header_hop(&root, lines) {
         return Some(PageBlock { shape });
     }
     if let Some(shape) = parse_hopscan_shape(&root, lines) {
@@ -8437,6 +9103,20 @@ fn hop_pick<'a>(
 ) -> Option<(Option<Pair>, super::formula::HopPick, &'a str)> {
     use super::formula::HopPick;
     let after = rhs.trim().strip_prefix(root)?;
+    if let Some(rest) = after.strip_prefix(".match(") {
+        let (pat, flags, rest) = regex_literal(rest.trim())?;
+        let rest = rest.trim().strip_prefix(')')?;
+        return Some((Some((pat, flags)), HopPick::MatchFirst, rest));
+    }
+    if let Some(rest) = after.strip_prefix(".scan(regex).flatten.max_by") {
+        let rest = rest.trim_start();
+        let (block, rest) = take_bracketed(rest, '{', '}')?;
+        let (vvar, vinner) = json_map_parts(block)?;
+        if vinner.trim() != format!("Version.new({vvar})") {
+            return None;
+        }
+        return Some((None, HopPick::ScanMax, rest));
+    }
     if let Some(rest) = after.strip_prefix(".scan(regex)&.flatten&.last") {
         return Some((None, HopPick::ScanLast, rest));
     }
@@ -8446,6 +9126,34 @@ fn hop_pick<'a>(
     let inner = after.strip_prefix(".scan(")?;
     let (pat, flags, rest) = regex_literal(inner)?;
     let rest = rest.trim().strip_prefix(')')?.trim();
+    if let Some(r) = rest.strip_prefix(".flatten") {
+        let r = r.trim().strip_prefix(".uniq")?.trim();
+        if let Some(r) = r.strip_prefix(".max")
+            && !r.starts_with("_by")
+            && r.chars().next().is_none_or(|c| c == ' ')
+        {
+            return Some((Some((pat, flags)), HopPick::ScanLexMax, r));
+        }
+        let r = r.strip_prefix(".sort_by")?.trim_start();
+        let (block, r) = take_bracketed(r, '{', '}')?;
+        let (vvar, vinner) = json_map_parts(block)?;
+        if vinner.trim() != format!("Version.new({vvar})") {
+            return None;
+        }
+        return Some((Some((pat, flags)), HopPick::ScanMax, r));
+    }
+    if let Some(r) = rest.strip_prefix(".max_by") {
+        let r = r.trim_start();
+        let (block, r) = take_bracketed(r, '{', '}')?;
+        let (mvar, minner) = json_map_parts(block)?;
+        let inner = minner
+            .trim()
+            .strip_prefix("Version.new(")?
+            .strip_suffix(')')?;
+        let k = page_cap_index(&mvar, inner.trim())?;
+        let r = r.trim().strip_prefix("&.first")?;
+        return Some((Some((pat, flags)), HopPick::ScanMaxKey(k), r));
+    }
     let rest = rest.strip_prefix(".map")?.trim_start();
     let (block, rest) = take_bracketed(rest, '{', '}')?;
     let (mvar, minner) = json_map_parts(block)?;
@@ -8469,29 +9177,66 @@ fn hop_pick<'a>(
 fn hop_target(var: &str, arg: &str) -> Option<super::formula::HopTarget> {
     use super::formula::HopTarget;
     let arg = arg.trim().strip_suffix(',').unwrap_or(arg.trim()).trim();
+    let slot = format!("#{{{var}}}");
+    // Remaining interpolations must be `version`
+    // chains (substituted at plan time).
+    let only_version_tokens = |s: &str| -> bool {
+        let mut rest = s;
+        while let Some(i) = rest.find("#{") {
+            let Some(j) = rest[i + 2..].find('}') else {
+                return false;
+            };
+            if !super::formula::version_chain_syntax(rest[i + 2..i + 2 + j].trim()) {
+                return false;
+            }
+            rest = &rest[i + 2 + j + 1..];
+        }
+        true
+    };
+    let split_slot = |template: &str| -> Option<(String, String)> {
+        let (pre, post) = template.split_once(&slot)?;
+        if !only_version_tokens(pre) || !only_version_tokens(post) {
+            return None;
+        }
+        Some((pre.to_string(), post.to_string()))
+    };
     if let Some(join) = arg.strip_prefix("URI.join(") {
-        let (target, rest) = if let Some(r) = join.strip_prefix("@url") {
-            (HopTarget::JoinSelf, r)
+        let (base, rest) = if let Some(r) = join.strip_prefix("@url") {
+            (None, r)
         } else if let Some((lit, r)) = quoted_token(join) {
-            (HopTarget::JoinLiteral(lit), r)
+            (Some(lit), r)
         } else {
             return None;
         };
         let rest = rest.trim().strip_prefix(',')?.trim();
+        // A quoted template argument joins after
+        // substitution; a bare var joins as itself.
+        if let Some((template, r)) = quoted_token(rest) {
+            let (pre, post) = split_slot(&template)?;
+            let r = r.trim().strip_prefix(')')?;
+            let r = r.strip_prefix(".to_s").unwrap_or(r);
+            return r
+                .trim()
+                .is_empty()
+                .then_some(HopTarget::JoinTemplate { base, pre, post });
+        }
         let rest = rest.strip_prefix(var)?.trim().strip_prefix(')')?;
         let rest = rest.strip_prefix(".to_s").unwrap_or(rest);
+        let target = match base {
+            Some(lit) => HopTarget::JoinLiteral(lit),
+            None => HopTarget::JoinSelf,
+        };
         return rest.trim().is_empty().then_some(target);
     }
     let (template, tail) = quoted_token(arg)?;
     if !tail.trim().is_empty() {
         return None;
     }
-    let slot = format!("#{{{var}}}");
-    let (pre, post) = template.split_once(&slot)?;
-    if pre.contains("#{") || post.contains("#{") {
-        return None;
-    }
-    Some(HopTarget::Template(pre.to_string(), post.to_string()))
+    // `#{url}` is the livecheck URL itself: mark it
+    // with a sentinel the evaluator expands.
+    let template = template.replace("#{url}", "\u{2}");
+    let (pre, post) = split_slot(&template)?;
+    Some(HopTarget::Template(pre, post))
 }
 
 /// The second fetch's blank guard at the start of
@@ -8520,35 +9265,665 @@ fn hop_content_guard<'a>(wvar: &str, took_content: bool, s: &'a str) -> Option<(
     (rhs == format!("{wvar}[:content]")).then_some((cvar, &inner[close + ").blank?".len()..]))
 }
 
-/// The final scan of a hop body: all captures, or
-/// only the last (`&.flatten&.last`).
-fn hop_final(content_root: &str, stmt: &str) -> Option<bool> {
-    let rest = stmt
-        .trim()
-        .strip_prefix(content_root)?
-        .strip_prefix(".scan(regex)")?;
+/// The final scan of a hop body: all captures,
+/// only the last (`&.flatten&.last`), or a
+/// per-match render (parts over scan captures).
+/// Returns (last_only, scan parts).
+fn hop_final(
+    content_root: &str,
+    stmt: &str,
+) -> Option<(bool, Option<Vec<super::formula::PagePart>>)> {
+    use super::formula::PagePart;
+    let rest = stmt.trim().strip_prefix(content_root)?;
+    let rest = rest
+        .strip_prefix("&.scan(regex)")
+        .or_else(|| rest.strip_prefix(".scan(regex)"))?;
     let rest = rest.trim();
     if rest == "&.flatten&.last" {
-        return Some(true);
+        return Some((true, None));
     }
-    if rest == ".map(&:first)" {
-        return Some(false);
+    if rest == ".map(&:first)" || rest == "&.map(&:first)" {
+        return Some((false, None));
     }
     let mrest = strip_map_open(rest)?;
     let (var, inner) = json_map_parts(mrest)?;
     let inner = inner.trim();
-    (inner == format!("{var}[0]") || inner == format!("{var}.first")).then_some(false)
+    if inner == format!("{var}[0]") || inner == format!("{var}.first") {
+        return Some((false, None));
+    }
+    if inner.starts_with('"') {
+        let (body_str, tail) = quoted_token(inner)?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        return Some((false, Some(page_template_parts(&body_str, &var)?)));
+    }
+    let r = inner.strip_prefix(&format!("{var}["))?;
+    let close = r.find(']')?;
+    let n: usize = r[..close].parse().ok()?;
+    let part = page_cap_part(n, r[close + 1..].trim())?;
+    let _ = PagePart::Lit(String::new());
+    Some((false, Some(vec![part])))
 }
 
-/// The second-fetch ("hop") bodies (kytea,
-/// libxsd-frontend, gnutls, dovecot): pick a value
-/// from page one, fetch the page it names, scan
-/// that with the block regex. Parsed as a cursor
-/// over the space-joined body (statement joining
-/// miscounts parens around regex character classes
-/// holding a lone quote).
-fn parse_hopscan_shape(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
-    use super::formula::{HopScan, PageShape};
+/// The final single-match render of a hop body:
+/// `<mv> = <content>.match(regex)`, a blank guard,
+/// and a template over the captures and hop value.
+fn hop_final_match(
+    content_root: &str,
+    hop_var: &str,
+    stmt: &str,
+) -> Option<Vec<super::formula::HopFinalPart>> {
+    use super::formula::HopFinalPart;
+    let (mv, rest) = assign_parts(stmt.trim())?;
+    let rest = rest
+        .trim()
+        .strip_prefix(content_root)?
+        .strip_prefix(".match(regex)")?
+        .trim();
+    let rest = rest
+        .strip_prefix(&format!("next if {mv}.blank?"))
+        .or_else(|| rest.strip_prefix(&format!("next unless {mv}")))?
+        .trim();
+    let (body_str, tail) = quoted_token(rest)?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let mut parts: Vec<HopFinalPart> = Vec::new();
+    let mut rest = body_str.as_str();
+    while let Some(i) = rest.find("#{") {
+        if i > 0 {
+            parts.push(HopFinalPart::Lit(ruby_unescape_dq(&rest[..i])));
+        }
+        let j = rest[i + 2..].find('}')?;
+        let token = rest[i + 2..i + 2 + j].trim();
+        if token == hop_var {
+            parts.push(HopFinalPart::Hop);
+        } else if let Some(r) = token.strip_prefix(&format!("{mv}[")) {
+            let (n, t) = r.split_once(']')?;
+            if !t.trim().is_empty() {
+                return None;
+            }
+            parts.push(HopFinalPart::Cap(n.trim().parse().ok()?));
+        } else {
+            return None;
+        }
+        rest = &rest[i + 2 + j + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(HopFinalPart::Lit(ruby_unescape_dq(rest)));
+    }
+    Some(parts)
+}
+
+/// Render parts for a header-hop final: captures of
+/// `mv`, a literal-capture local (as capture 1),
+/// and the hop value.
+fn header_hop_parts(
+    body_str: &str,
+    mv: &str,
+    cap_var: Option<&str>,
+    hop_var: &str,
+) -> Option<Vec<super::formula::HopFinalPart>> {
+    use super::formula::HopFinalPart;
+    let mut parts: Vec<HopFinalPart> = Vec::new();
+    let mut rest = body_str;
+    while let Some(i) = rest.find("#{") {
+        if i > 0 {
+            parts.push(HopFinalPart::Lit(ruby_unescape_dq(&rest[..i])));
+        }
+        let j = rest[i + 2..].find('}')?;
+        let token = rest[i + 2..i + 2 + j].trim();
+        if token == hop_var {
+            parts.push(HopFinalPart::Hop);
+        } else if Some(token) == cap_var {
+            parts.push(HopFinalPart::Cap(1));
+        } else if let Some(r) = token.strip_prefix(&format!("{mv}[")) {
+            let (n, t) = r.split_once(']')?;
+            if !t.trim().is_empty() {
+                return None;
+            }
+            parts.push(HopFinalPart::Cap(n.trim().parse().ok()?));
+        } else {
+            return None;
+        }
+        rest = &rest[i + 2 + j + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(HopFinalPart::Lit(ruby_unescape_dq(rest)));
+    }
+    Some(parts)
+}
+
+/// Pick a value, fetch the named URL's headers
+/// (`page_headers`), and render from a header
+/// match — merged (grafx, linqpad) or per response
+/// set (platinum-notes).
+/// Parts over one match variable's captures for a
+/// page template (`#{match[1]},#{match[2]}`).
+fn match_template_parts(body_str: &str, mv: &str) -> Option<Vec<super::formula::HopFinalPart>> {
+    use super::formula::HopFinalPart;
+    let mut parts: Vec<HopFinalPart> = Vec::new();
+    let mut rest = body_str;
+    while let Some(i) = rest.find("#{") {
+        if i > 0 {
+            parts.push(HopFinalPart::Lit(ruby_unescape_dq(&rest[..i])));
+        }
+        let j = rest[i + 2..].find('}')?;
+        let token = rest[i + 2..i + 2 + j].trim();
+        let r = token.strip_prefix(&format!("{mv}["))?;
+        let (n, t) = r.split_once(']')?;
+        if !t.trim().is_empty() {
+            return None;
+        }
+        parts.push(HopFinalPart::Cap(n.trim().parse().ok()?));
+        rest = &rest[i + 2 + j + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(HopFinalPart::Lit(ruby_unescape_dq(rest)));
+    }
+    Some(parts)
+}
+
+/// A literal-regex page capture parsed as JSON,
+/// dug, and matched against the block regex
+/// (popo's JSONP wrapper).
+fn parse_page_json_dig_match(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::PageShape;
+    let body = lines
+        .iter()
+        .map(|l| strip_trailing_comment(l.trim()).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ident = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    let mut rest = body.trim();
+    let mut lit: Option<(String, String)> = None;
+    let mut jr_name: Option<String> = None;
+    // Optional `<jr> = /lit/flags` pre-statement.
+    if let Some((v, rhs)) = rest.split_once(" = ")
+        && let Ok(v) = ident(v).ok_or(())
+        && let Some((pat, flags, tail)) = regex_literal(rhs.trim())
+    {
+        lit = Some((pat, flags));
+        jr_name = Some(v);
+        rest = tail.trim();
+    }
+    let (mv, rhs) = rest.split_once(" = ")?;
+    let mv = ident(mv)?;
+    let rhs = rhs.trim();
+    // First capture: `page.match(<jr>|/lit/)` (cap
+    // index read at the parse_json call) or
+    // `page[/lit/, N]` (the string itself).
+    let (cap, rest, bracket): (usize, &str, bool) =
+        if let Some(r) = rhs.strip_prefix(&format!("{root}.match(")) {
+            let r = r.trim();
+            let (l, t) = if r.starts_with('/') || r.starts_with('%') {
+                let (pat, flags, tail) = regex_literal(r)?;
+                let tail = tail.trim().strip_prefix(')')?;
+                ((pat, flags), tail)
+            } else {
+                let (name, tail) = r.split_once(')')?;
+                if Some(name.trim()) != jr_name.as_deref() {
+                    return None;
+                }
+                (lit.clone()?, tail)
+            };
+            lit = Some(l);
+            (usize::MAX, t, false)
+        } else if let Some(r) = rhs.strip_prefix(&format!("{root}[")) {
+            let (pat, flags, t) = regex_literal(r.trim())?;
+            let t = t.trim().strip_prefix(',')?.trim();
+            let (n, t) = t.split_once(']')?;
+            lit = Some((pat, flags));
+            (n.trim().parse().ok()?, t, true)
+        } else {
+            return None;
+        };
+    let lit = lit?;
+    let rest = rest.trim();
+    let rest = rest
+        .strip_prefix(&format!("next if {mv}.blank?"))
+        .or_else(|| rest.strip_prefix(&format!("next unless {mv}")))?
+        .trim();
+    let (j_name, rhs) = rest.split_once(" = ")?;
+    let j_name = ident(j_name)?;
+    let inner = rhs
+        .trim()
+        .strip_prefix("Homebrew::Livecheck::Strategy::Json.parse_json(")?
+        .trim();
+    let (cap, rest) = if bracket {
+        let rest = inner.strip_prefix(&mv)?.strip_prefix(')')?;
+        (cap, rest)
+    } else {
+        let (arg, rest) = inner.split_once(')')?;
+        let c = page_cap_index(&mv, arg.trim())?;
+        (c, rest)
+    };
+    // Nested-map tail (lg-onscreen-control):
+    // `<j>.dig(...)&.map do |_, files| files.map do
+    // |file| match = file["f"]&.match(regex) next if
+    // match.blank? [|| (x = file["g"]).blank?] "…"
+    // end end&.flatten`.
+    if let Some(shape) = parse_page_json_nested_tail(rest.trim(), &j_name, &lit, cap) {
+        return Some(shape);
+    }
+    let (m2, rhs) = rest.trim().split_once(" = ")?;
+    let m2 = ident(m2)?;
+    let (path, tail) = jt_dig(rhs.trim(), &j_name, &[])?;
+    // An interpolated key (`"#{arch}Url"`) parses
+    // only on the substituted-lines retry.
+    if path.is_empty()
+        || path
+            .iter()
+            .any(|k| matches!(k, super::formula::JsonKey::Key(s) if s.contains("#{")))
+    {
+        return None;
+    }
+    let rest = tail
+        .trim()
+        .strip_prefix("&.match(regex)")
+        .or_else(|| tail.trim().strip_prefix(".match(regex)"))?
+        .trim();
+    let rest = rest
+        .strip_prefix(&format!("next if {m2}.blank?"))
+        .or_else(|| rest.strip_prefix(&format!("next unless {m2}")))?
+        .trim();
+    let (body_str, tail) = quoted_token(rest)?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let parts = match_template_parts(&body_str, &m2)?;
+    Some(PageShape::MatchJsonDigMatch {
+        lit,
+        cap,
+        path,
+        parts,
+    })
+}
+
+/// The lg-onscreen-control nested-map tail after
+/// `parse_json(...)`: dig to a hash of file lists,
+/// match each file's field, render.
+fn parse_page_json_nested_tail(
+    rest: &str,
+    j_name: &str,
+    lit: &(String, String),
+    cap: usize,
+) -> Option<super::formula::PageShape> {
+    use super::formula::{HopFinalPart, PageShape};
+    let (path, tail) = jt_dig(rest, j_name, &[])?;
+    if path.is_empty()
+        || path
+            .iter()
+            .any(|k| matches!(k, super::formula::JsonKey::Key(s) if s.contains("#{")))
+    {
+        return None;
+    }
+    let tail = tail.trim();
+    let tail = tail
+        .strip_prefix("&.map do |")
+        .or_else(|| tail.strip_prefix(".map do |"))?;
+    let (params, tail) = tail.split_once('|')?;
+    let params: Vec<&str> = params.split(',').map(str::trim).collect();
+    if params.len() != 2 || params.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let files_var = params[1];
+    let tail = tail.trim();
+    let tail = tail
+        .strip_prefix(&format!("{files_var}.map do |"))
+        .or_else(|| tail.strip_prefix(&format!("{files_var}&.map do |")))?;
+    let (file_var, tail) = tail.split_once('|')?;
+    let file_var = file_var.trim();
+    if file_var.is_empty()
+        || !file_var
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let (m_name, tail) = tail.trim().split_once(" = ")?;
+    let m_name = m_name.trim();
+    if m_name.is_empty()
+        || !m_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let tail = tail.trim().strip_prefix(&format!("{file_var}["))?;
+    let (field, tail) = quoted_token(tail.trim())?;
+    let tail = tail.trim().strip_prefix("]&.match(regex)")?;
+    let tail = tail
+        .trim()
+        .strip_prefix(&format!("next if {m_name}.blank?"))?
+        .trim();
+    let (extra, extra_var, tail) = if let Some(t) = tail.strip_prefix("|| (") {
+        let (ev, t) = t.split_once(" = ")?;
+        let ev = ev.trim();
+        if ev.is_empty() || !ev.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let t = t.trim().strip_prefix(&format!("{file_var}["))?;
+        let (f2, t) = quoted_token(t.trim())?;
+        let t = t.trim().strip_prefix("]).blank?")?;
+        (Some(f2), Some(ev.to_string()), t.trim())
+    } else {
+        (None, None, tail)
+    };
+    let (tmpl, tail) = quoted_token(tail)?;
+    if !matches!(
+        tail.trim(),
+        "end end&.flatten" | "end end.flatten" | "end end"
+    ) {
+        return None;
+    }
+    // Template parts: `#{m[n]}` captures, an
+    // optional `#{extra}` (the Hop part), literals.
+    let mut parts: Vec<HopFinalPart> = Vec::new();
+    let mut rest_t = tmpl.as_str();
+    while let Some(i) = rest_t.find("#{") {
+        if i > 0 {
+            parts.push(HopFinalPart::Lit(rest_t[..i].to_string()));
+        }
+        let tok = &rest_t[i + 2..];
+        let j = tok.find('}')?;
+        let token = tok[..j].trim();
+        if let Some(idx) = token
+            .strip_prefix(&format!("{m_name}["))
+            .and_then(|t| t.strip_suffix(']'))
+        {
+            parts.push(HopFinalPart::Cap(idx.trim().parse().ok()?));
+        } else if extra_var.as_deref() == Some(token) {
+            parts.push(HopFinalPart::Hop);
+        } else {
+            return None;
+        }
+        rest_t = &tok[j + 1..];
+    }
+    if !rest_t.is_empty() {
+        parts.push(HopFinalPart::Lit(rest_t.to_string()));
+    }
+    Some(PageShape::MatchJsonNestedMap {
+        lit: lit.clone(),
+        cap,
+        path,
+        field,
+        extra,
+        parts,
+    })
+}
+
+/// ripx: scan sections, repeatedly gsub-strip tags
+/// from each capture until stable, then read the
+/// block regex capture from the cleaned text.
+fn parse_page_scan_strip_match(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::PageShape;
+    let body = lines
+        .iter()
+        .map(|l| strip_trailing_comment(l.trim()).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ident = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    let rest = body.strip_prefix(&format!("{root}.scan("))?;
+    let (pat, flags, tail) = regex_literal(rest.trim())?;
+    let tail = tail.trim().strip_prefix(").map do |")?;
+    let (var, rest) = tail.split_once('|')?;
+    let var = ident(var)?;
+    let (t, rest) = rest.trim().split_once(" = ")?;
+    let t = ident(t)?;
+    let rest = rest.trim().strip_prefix(&format!("{var}["))?;
+    let (idx, rest) = rest.split_once(']')?;
+    let idx: usize = idx.trim().parse().ok()?;
+    let (p, rest) = rest.trim().split_once(" = nil ")?;
+    let p = ident(p)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("while {t} != {p} "))?
+        .trim();
+    let rest = rest
+        .strip_prefix(&format!("{p} = {t} "))?
+        .trim()
+        .strip_prefix(&format!("{t} = {t}.gsub("))?;
+    let (spat, sflags, tail) = regex_literal(rest.trim())?;
+    let tail = tail.trim().strip_prefix(',')?.trim();
+    let (repl, tail) = quoted_token(tail)?;
+    if repl.contains("#{") || repl.contains('\\') {
+        return None;
+    }
+    let rest = tail
+        .trim()
+        .strip_prefix(") end ")?
+        .trim()
+        .strip_prefix(&format!("{t}[regex, "))?
+        .trim();
+    let (cap, tail) = rest.split_once(']')?;
+    let cap: usize = cap.trim().parse().ok()?;
+    if tail.trim() != "end" {
+        return None;
+    }
+    Some(PageShape::ScanStripMatch {
+        pat,
+        flags,
+        idx,
+        strip: (spat, sflags),
+        repl,
+        cap,
+    })
+}
+
+/// font-kikai: lexical scan maximum, with a
+/// dotless-to-dotted remap through a second scan.
+fn parse_page_scan_dotted_max(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::PageShape;
+    let body = lines
+        .iter()
+        .map(|l| strip_trailing_comment(l.trim()).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ident = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    let (ver, rest) = body.split_once(" = ")?;
+    let ver = ident(ver)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("{root}.scan(regex).map {{ |"))?;
+    let (m1, rest) = rest.split_once('|')?;
+    let m1 = ident(m1)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("{m1}[0] }}.max "))?
+        .trim()
+        .strip_prefix(&format!("next {ver} if {ver}.include?(\".\") "))?
+        .trim();
+    let (dotted, rest) = rest.split_once(" = nil ")?;
+    let dotted = ident(dotted)?;
+    let rest = rest.trim().strip_prefix(&format!("{root}.scan("))?;
+    let (pat, flags, tail) = regex_literal(rest.trim())?;
+    let tail = tail.trim().strip_prefix(").each do |")?;
+    let (m2, rest) = tail.split_once('|')?;
+    let m2 = ident(m2)?;
+    let (dotless, rest) = rest.trim().split_once(" = ")?;
+    let dotless = ident(dotless)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("DSL::Version.new({m2}[0]).no_dots "))?
+        .trim()
+        .strip_prefix(&format!("if {ver} == {dotless} "))?
+        .trim()
+        .strip_prefix(&format!("{dotted} = {m2}[0] break end end "))?
+        .trim();
+    if rest != dotted {
+        return None;
+    }
+    Some(PageShape::ScanDottedMax { lit: (pat, flags) })
+}
+
+/// bettertouchtool@alpha: newest by listing time,
+/// throttled against the current build.
+fn parse_page_scan_time_max_throttle(
+    root: &str,
+    lines: &[String],
+) -> Option<super::formula::PageShape> {
+    use super::formula::PageShape;
+    let body = lines
+        .iter()
+        .map(|l| strip_trailing_comment(l.trim()).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ident = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    let pair = |s: &str| -> Option<(String, String)> {
+        let (a, b) = s.split_once(',')?;
+        Some((ident(a)?, ident(b)?))
+    };
+    let (lhs, rest) = body.split_once(" = version.csv ")?;
+    let (cv, cb) = pair(lhs)?;
+    let (lhs, rest) = rest.trim().split_once(" = ")?;
+    let (v, b) = pair(lhs)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("{root}.scan(regex).max_by {{ |"))?;
+    let (m, rest) = rest.split_once('|')?;
+    let m = ident(m)?;
+    let rest = rest.trim().strip_prefix(&format!("Time.parse({m}["))?;
+    let (time_idx, rest) = rest.split_once("]) }&.first&.split(")?;
+    let time_idx: usize = time_idx.trim().parse().ok()?;
+    let (sep, rest) = quoted_token(rest.trim())?;
+    let rest = rest.trim().strip_prefix(", 2) ")?.trim();
+    let rest = rest.strip_prefix(&format!("if {b} && {cb}.to_i + "))?;
+    let (step, rest) = rest.split_once(&format!(" > {b}.to_i "))?;
+    let step: i64 = step.trim().parse().ok()?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("{v} = {cv} {b} = {cb} end "))?
+        .trim();
+    if rest != format!("\"#{{{v}}},#{{{b}}}\"") {
+        return None;
+    }
+    Some(PageShape::ScanTimeMaxThrottle {
+        time_idx,
+        sep,
+        step,
+    })
+}
+
+/// The scan maximum as a Version plus an optional
+/// literal capture suffix (hy-rpe2's path date).
+fn parse_page_scanmax_optcap(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::PageShape;
+    let body = lines
+        .iter()
+        .map(|l| strip_trailing_comment(l.trim()).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ident = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    let (v, rest) = body.trim().split_once(" = ")?;
+    let v = ident(v)?;
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("{root}.scan(regex)"))?
+        .trim()
+        .strip_prefix(".map")?
+        .trim_start();
+    let (block, rest) = take_bracketed(rest, '{', '}')?;
+    let (mvar, minner) = json_map_parts(block)?;
+    if minner.trim() != format!("{mvar}[0]") {
+        return None;
+    }
+    let rest = rest.trim().strip_prefix(".max_by")?.trim_start();
+    let (block, rest) = take_bracketed(rest, '{', '}')?;
+    let (xvar, xinner) = json_map_parts(block)?;
+    if xinner.trim() != format!("Version.new({xvar})") {
+        return None;
+    }
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("next unless {v}"))
+        .or_else(|| rest.trim().strip_prefix(&format!("next if {v}.blank?")))?
+        .trim();
+    let (d, rhs) = rest.split_once(" = ")?;
+    let d = ident(d)?;
+    let rhs = rhs.trim().strip_prefix(&format!("{root}["))?;
+    let (pat, flags, t) = regex_literal(rhs.trim())?;
+    let t = t.trim().strip_prefix(',')?.trim();
+    let (cap_s, rest) = t.split_once(']')?;
+    let cap: usize = cap_s.trim().parse().ok()?;
+    let rest = rest.trim().strip_prefix(&format!("{d} ?"))?.trim();
+    let (body_str, tail) = quoted_token(rest)?;
+    let tail = tail.trim().strip_prefix(':')?.trim();
+    if tail != v {
+        return None;
+    }
+    // Template must be `#{v}<sep>#{d}` with an
+    // optional tr on the date.
+    let after_v = body_str.strip_prefix(&format!("#{{{v}}}"))?;
+    let Some(i) = after_v.find("#{") else {
+        return None;
+    };
+    let sep = ruby_unescape_dq(&after_v[..i]);
+    let token_full = &after_v[i + 2..];
+    let j = token_full.find('}')?;
+    if !token_full[j + 1..].is_empty() {
+        return None;
+    }
+    let token = token_full[..j].trim();
+    let tr = if token == d {
+        None
+    } else if let Some(args) = token.strip_prefix(&format!("{d}.tr(")) {
+        let (from, t) = quoted_token(args.trim_start())?;
+        let (to, t) = quoted_token(t.trim().strip_prefix(',')?.trim())?;
+        if t.trim() != ")" || from.contains('\\') || to.contains('\\') {
+            return None;
+        }
+        Some((from, to))
+    } else {
+        return None;
+    };
+    Some(PageShape::ScanMaxOptCap {
+        pat,
+        flags,
+        cap,
+        sep,
+        tr,
+    })
+}
+
+fn parse_page_header_hop(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::{HeaderHop, HopFinalPart, PageShape};
     let body = lines
         .iter()
         .map(|l| strip_trailing_comment(l.trim()).trim())
@@ -8560,6 +9935,267 @@ fn parse_hopscan_shape(root: &str, lines: &[String]) -> Option<super::formula::P
     let rest = rest.trim();
     let rest = rest
         .strip_prefix(&format!("next unless {var}"))
+        .or_else(|| rest.strip_prefix(&format!("next if {var}.blank?")))?
+        .trim();
+    // Optional chained second pick (mixed-in-key):
+    // fetch a page named by the first pick, bracket
+    // a new value out of it; downstream reads the
+    // new value as the hop value.
+    let mut mid: Option<super::formula::MidHop> = None;
+    let mut var = var;
+    let mut rest = rest;
+    if let Some(parsed) = (|| -> Option<(super::formula::MidHop, String, &str)> {
+        let (dp, r) = assign_parts(rest)?;
+        let r = r
+            .trim()
+            .strip_prefix("Homebrew::Livecheck::Strategy.page_content(")?
+            .trim();
+        let (tmpl, r) = quoted_token(r)?;
+        let r = r.trim();
+        let r = r.strip_prefix(',').map_or(r, str::trim);
+        let r = r.strip_prefix(')')?.trim();
+        let (pre, post) = tmpl.split_once(&format!("#{{{var}}}"))?;
+        let only_version = |s: &str| -> bool {
+            let mut rest_s = s;
+            while let Some(i) = rest_s.find("#{") {
+                let Some(j) = rest_s[i + 2..].find('}') else {
+                    return false;
+                };
+                if !super::formula::version_chain_syntax(rest_s[i + 2..i + 2 + j].trim()) {
+                    return false;
+                }
+                rest_s = &rest_s[i + 2 + j + 1..];
+            }
+            true
+        };
+        if !only_version(pre) || !only_version(post) {
+            return None;
+        }
+        let r = r.strip_prefix("next if (")?.trim();
+        let (dpc, r) = assign_parts(r)?;
+        let r = r
+            .trim()
+            .strip_prefix(&format!("{dp}[:content]).blank?"))?
+            .trim();
+        let (var2, r) = assign_parts(r)?;
+        let r = r.trim().strip_prefix(&format!("{dpc}["))?;
+        let (pat, flags, t) = regex_literal(r.trim())?;
+        let t = t.trim().strip_prefix(',')?.trim();
+        let (cap_s, t) = t.split_once(']')?;
+        let cap: usize = cap_s.trim().parse().ok()?;
+        let t = t
+            .trim()
+            .strip_prefix(&format!("next if {var2}.blank?"))
+            .or_else(|| t.trim().strip_prefix(&format!("next unless {var2}")))?
+            .trim();
+        Some((
+            super::formula::MidHop {
+                url_pre: pre.to_string(),
+                url_post: post.to_string(),
+                lit: (pat, flags),
+                cap,
+            },
+            var2,
+            t,
+        ))
+    })() {
+        mid = Some(parsed.0);
+        var = parsed.1;
+        rest = parsed.2;
+    }
+    // Per-set form: `page_headers(arg)&.map do |h| … end`.
+    if let Some(r) = rest.strip_prefix("Homebrew::Livecheck::Strategy.page_headers") {
+        let (parens, rest) = take_bracketed(r.trim_start(), '(', ')')?;
+        let target = hop_target(&var, &parens[1..parens.len() - 1])?;
+        let rest = rest.trim().strip_prefix("&.map do |")?;
+        let (hvar, rest) = rest.split_once('|')?;
+        let hvar = hvar.trim();
+        let (mv, rest) = assign_parts(rest.trim())?;
+        let rest = rest.trim().strip_prefix('(')?;
+        let (h1, rest) = header_name(&rest, hvar)?;
+        let rest = rest.trim().strip_prefix("||")?.trim();
+        let (h2, rest) = header_name(rest, hvar)?;
+        let rest = rest
+            .trim()
+            .strip_prefix(')')?
+            .strip_prefix("&.match(regex)")?
+            .trim();
+        let rest = rest
+            .strip_prefix(&format!("next if {mv}.blank?"))
+            .or_else(|| rest.strip_prefix(&format!("next unless {mv}")))?
+            .trim();
+        let (body_str, tail) = quoted_token(rest)?;
+        if tail.trim() != "end" {
+            return None;
+        }
+        let parts = header_hop_parts(&body_str, &mv, None, &var)?;
+        return Some(PageShape::HeaderHop(Box::new(HeaderHop {
+            hop_re,
+            pick,
+            target,
+            header: h1,
+            fallback: Some(h2),
+            per_set: true,
+            lit_cap: None,
+            parts,
+            mid,
+        })));
+    }
+    let (hvar, rest) = assign_parts(rest)?;
+    let rest = rest
+        .trim()
+        .strip_prefix("Homebrew::Livecheck::Strategy.page_headers")?
+        .trim_start();
+    let (parens, rest) = take_bracketed(rest, '(', ')')?;
+    let target = hop_target(&var, &parens[1..parens.len() - 1])?;
+    let rest = rest.trim().strip_prefix(".reduce(&:merge)")?.trim();
+    let (mv, rest) = assign_parts(rest)?;
+    let (header, rest) = header_name(rest.trim(), &hvar)?;
+    let rest = rest.trim();
+    let (lit_cap, cap_var, rest): (Option<(String, String)>, Option<&str>, &str) =
+        if let Some(r) = rest.strip_prefix("&.match(regex)") {
+            (None, None, r)
+        } else if let Some(r) = rest
+            .strip_prefix("&.[](")
+            .or_else(|| rest.strip_prefix(".[]("))
+        {
+            let (pat, flags, t) = regex_literal(r.trim())?;
+            let t = t.trim().strip_prefix(", 1)")?;
+            (Some((pat, flags)), Some(mv.as_str()), t)
+        } else {
+            return None;
+        };
+    // In the literal-capture form `mv` is the capture
+    // local itself; the guard names it either way.
+    let rest = rest.trim();
+    let rest = rest
+        .strip_prefix(&format!("next if {mv}.blank?"))
+        .or_else(|| rest.strip_prefix(&format!("next unless {mv}")))?
+        .trim();
+    let parts = if let Some(r) = rest.strip_prefix(&format!("{mv}[")) {
+        let (n, t) = r.split_once(']')?;
+        if !t.trim().is_empty() || cap_var.is_some() {
+            return None;
+        }
+        vec![HopFinalPart::Cap(n.trim().parse().ok()?)]
+    } else {
+        let (body_str, tail) = quoted_token(rest)?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        header_hop_parts(&body_str, &mv, cap_var, &var)?
+    };
+    Some(PageShape::HeaderHop(Box::new(HeaderHop {
+        hop_re,
+        pick,
+        target,
+        header,
+        fallback: None,
+        per_set: false,
+        lit_cap,
+        parts,
+        mid,
+    })))
+}
+
+/// A `headers["name"]` read: the lowercase name and
+/// the rest.
+fn header_name<'a>(s: &'a str, hvar: &str) -> Option<(String, &'a str)> {
+    let rest = s.strip_prefix(hvar)?.strip_prefix('[')?;
+    let (name, rest) = quoted_token(rest.trim_start())?;
+    let rest = rest.trim().strip_prefix(']')?;
+    Some((name.to_lowercase(), rest))
+}
+
+/// The second-fetch ("hop") bodies (kytea,
+/// libxsd-frontend, gnutls, dovecot): pick a value
+/// from page one, fetch the page it names, scan
+/// that with the block regex. Parsed as a cursor
+/// over the space-joined body (statement joining
+/// miscounts parens around regex character classes
+/// holding a lone quote).
+/// The two-assignment section pick (java@beta):
+/// `<sec> = page[/section/]`, a guard, then
+/// `<v> = <sec>.scan(/lit/).flatten.uniq
+/// .map { Version.new }.max`.
+fn hopscan_section_prelude(
+    body: &str,
+    root: &str,
+) -> Option<(
+    String,
+    Option<(String, String)>,
+    super::formula::HopPick,
+    String,
+)> {
+    use super::formula::HopPick;
+    let (sec, rest) = assign_parts(body.trim())?;
+    let rest = rest.trim().strip_prefix(&format!("{root}["))?;
+    let (spat, sflags, rest) = regex_literal(rest.trim())?;
+    let rest = rest.trim().strip_prefix(']')?.trim();
+    let rest = rest
+        .strip_prefix(&format!("next unless {sec}"))
+        .or_else(|| rest.strip_prefix(&format!("next if {sec}.blank?")))?
+        .trim();
+    let (var, rest) = assign_parts(rest)?;
+    let rest = rest.trim().strip_prefix(&format!("{sec}.scan("))?.trim();
+    let (pat, flags, rest) = regex_literal(rest)?;
+    let rest = rest.trim().strip_prefix(')')?.trim();
+    let rest = rest.strip_prefix(".flatten")?.trim();
+    let rest = rest.strip_prefix(".uniq")?.trim();
+    let rest = rest.strip_prefix(".map")?.trim_start();
+    let (block, rest) = take_bracketed(rest, '{', '}')?;
+    let (x, xinner) = json_map_parts(block)?;
+    if xinner.trim() != format!("Version.new({x})") {
+        return None;
+    }
+    let rest = rest.trim().strip_prefix(".max")?;
+    if rest.starts_with("_by") {
+        return None;
+    }
+    Some((
+        var.to_string(),
+        Some((pat, flags)),
+        HopPick::SectionScanMax {
+            section: (spat, sflags),
+        },
+        rest.to_string(),
+    ))
+}
+
+fn parse_hopscan_shape(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::{HopScan, PageShape};
+    let body = lines
+        .iter()
+        .map(|l| strip_trailing_comment(l.trim()).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (var, hop_re, pick, rest_owned);
+    let rest = if let Some((v, hre, pk, r)) = hopscan_section_prelude(&body, root) {
+        var = v;
+        hop_re = hre;
+        pick = pk;
+        rest_owned = r;
+        rest_owned.as_str()
+    } else {
+        let (v, r) = assign_parts(body.trim())?;
+        let (hre, pk, r) = hop_pick(root, r)?;
+        var = v;
+        hop_re = hre;
+        pick = pk;
+        r
+    };
+    // `<var2> = <var>.last` after a sort_by pick.
+    let (var, rest) = match assign_parts(rest.trim()) {
+        Some((v2, rhs)) if rhs.trim().starts_with(&format!("{var}.last")) => {
+            let after = rhs.trim().strip_prefix(&format!("{var}.last"))?;
+            (v2, after)
+        }
+        _ => (var, rest),
+    };
+    let rest = rest.trim();
+    let rest = rest
+        .strip_prefix(&format!("next unless {var}"))
         .or_else(|| rest.strip_prefix(&format!("next if {var}.blank?")))?;
     let (wvar, rest) = assign_parts(rest.trim())?;
     let rest = rest
@@ -8567,18 +10203,51 @@ fn parse_hopscan_shape(root: &str, lines: &[String]) -> Option<super::formula::P
         .strip_prefix("Homebrew::Livecheck::Strategy.page_content")?
         .trim_start();
     let (parens, rest) = take_bracketed(rest, '(', ')')?;
-    let target = hop_target(&var, &parens[1..parens.len() - 1])?;
+    let slot_var = if matches!(pick, super::formula::HopPick::MatchFirst) {
+        format!("{var}[1]")
+    } else {
+        var.clone()
+    };
+    let target = hop_target(&slot_var, &parens[1..parens.len() - 1])?;
     let (rest, took_content) = match rest.trim().strip_prefix("[:content]") {
         Some(r) => (r, true),
         None => (rest, false),
     };
-    let (content_root, rest) = hop_content_guard(&wvar, took_content, rest)?;
-    let last_only = hop_final(&content_root, rest)?;
+    let (content_root, rest) = match hop_content_guard(&wvar, took_content, rest) {
+        Some(pair) => pair,
+        // No guard: the final scan reads `w[:content]`
+        // directly (safe-navigated).
+        None if !took_content => (format!("{wvar}[:content]"), rest),
+        None => return None,
+    };
+    let (last_only, final_match, final_scan) = match hop_final(&content_root, rest) {
+        Some((last, parts)) => (last, None, parts),
+        None => match hop_final_match(&content_root, &var, rest) {
+            Some(parts) => (false, Some(parts), None),
+            None => {
+                // Bare bracket capture final:
+                // `<content>[regex, N]` (keychron).
+                let r = rest
+                    .trim()
+                    .strip_prefix(&content_root)?
+                    .strip_prefix("[regex,")?
+                    .strip_suffix(']')?;
+                let n: usize = r.trim().parse().ok()?;
+                (
+                    false,
+                    Some(vec![super::formula::HopFinalPart::Cap(n)]),
+                    None,
+                )
+            }
+        },
+    };
     Some(PageShape::HopScan(Box::new(HopScan {
         hop_re,
         pick,
         target,
         last_only,
+        final_match,
+        final_scan,
     })))
 }
 
@@ -10158,6 +11827,33 @@ fn ghrel_then(
             els: else_parts,
         });
     }
+    // The same equality ternary without parens
+    // (bambu-studio@beta).
+    if let Some((a, rest)) = expr.split_once(" == ")
+        && let Some((b, rest)) = rest.split_once(" ? ")
+        && let Some(a) = ghrel_operand(a, mvar, local, rel, tag_alias)
+        && let Some(b) = ghrel_operand(b, mvar, local, rel, tag_alias)
+    {
+        let (then_parts, els) = if rest.starts_with('"') {
+            let (_, tail) = quoted_token(rest)?;
+            let used = rest.len() - tail.len();
+            let els = tail.trim().strip_prefix(':')?.trim();
+            (
+                ghrel_parts(&rest[..used], mvar, local, rel, tag_alias)?,
+                els,
+            )
+        } else {
+            let (then, els) = rest.split_once(" : ")?;
+            (ghrel_parts(then, mvar, local, rel, tag_alias)?, els)
+        };
+        let else_parts = ghrel_parts(els, mvar, local, rel, tag_alias)?;
+        return Some(GhRelThen::EqElse {
+            a,
+            b,
+            then: then_parts,
+            els: else_parts,
+        });
+    }
     // `match[n] ? X : Y` (Ruby truthiness fork).
     if let Some(mv) = mvar
         && let Some(r) = expr.strip_prefix(&format!("{mv}["))
@@ -10186,6 +11882,113 @@ fn ghrel_then(
     )?))
 }
 
+/// The `each` + `break` first-match form (turtl):
+/// `version = nil`, nested each loops with a
+/// value-if assignment, breaks, and the version.
+fn ghrel_each_first(stmts: &[String], root: &str) -> Option<super::formula::GhRelBlock> {
+    use super::formula::{GhRelBlock, GhRelOp, GhRelSource, GhRelThen};
+    if stmts.len() != 16 {
+        return None;
+    }
+    let ident = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    let (ver, rhs) = stmts[0].split_once(" = ")?;
+    let ver = ident(ver)?;
+    if rhs.trim() != "nil" {
+        return None;
+    }
+    let rel = ident(
+        stmts[1]
+            .trim()
+            .strip_prefix(&format!("{root}.each do |"))?
+            .strip_suffix('|')?,
+    )?;
+    let (skip_draft, skip_prerelease) = match stmts[2]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .as_str()
+    {
+        s if s == format!("next if {rel}[\"draft\"] || {rel}[\"prerelease\"]") => (true, true),
+        s if s == format!("next if {rel}[\"draft\"]") => (true, false),
+        s if s == format!("next if {rel}[\"prerelease\"]") => (false, true),
+        _ => return None,
+    };
+    let asset = ident(
+        stmts[3]
+            .trim()
+            .strip_prefix(&format!("{rel}[\"assets\"]&.each do |"))
+            .or_else(|| {
+                stmts[3]
+                    .trim()
+                    .strip_prefix(&format!("{rel}[\"assets\"].each do |"))
+            })?
+            .strip_suffix('|')?,
+    )?;
+    let (mv, rhs) = stmts[4].split_once(" = ")?;
+    let mv = ident(mv)?;
+    if rhs.trim() != format!("{asset}[\"browser_download_url\"]&.match(regex)") {
+        return None;
+    }
+    if stmts[5].trim() != format!("next if {mv}.blank?") {
+        return None;
+    }
+    let (v2, rhs) = stmts[6].split_once(" = ")?;
+    if ident(v2)? != ver {
+        return None;
+    }
+    let cond = rhs.trim().strip_prefix("if ")?;
+    let (b_side, ne) = cond.split_once(" && ")?;
+    let b_op = ghrel_operand(b_side, Some(&mv), None, &rel, None)?;
+    let (a_side, b2_side) = ne.split_once(" != ")?;
+    let a_op = ghrel_operand(a_side, Some(&mv), None, &rel, None)?;
+    let b2_op = ghrel_operand(b2_side, Some(&mv), None, &rel, None)?;
+    if b_op != b2_op {
+        return None;
+    }
+    let then = ghrel_parts(&stmts[7], Some(&mv), None, &rel, None)?;
+    if stmts[8].trim() != "else" {
+        return None;
+    }
+    let els = ghrel_parts(&stmts[9], Some(&mv), None, &rel, None)?;
+    if stmts[10].trim() != "end"
+        || stmts[11].trim() != "break"
+        || stmts[12].trim() != "end"
+        || stmts[13].trim() != format!("break if {ver}")
+        || stmts[14].trim() != "end"
+        || stmts[15].trim() != ver
+    {
+        return None;
+    }
+    Some(GhRelBlock {
+        skip_draft,
+        skip_prerelease,
+        require_prerelease: false,
+        tag_ne: None,
+        tag_prefix: None,
+        asset_any: None,
+        name_skip: None,
+        pre_capture: None,
+        source: GhRelSource::AssetDownloadUrl,
+        then: GhRelThen::CapNeElse {
+            a: a_op,
+            b: b_op,
+            then,
+            els,
+        },
+        fallback_tag: None,
+        blank_emit_local: false,
+        limit: None,
+        own_guards: Vec::new(),
+        first_only: true,
+    })
+}
+
 fn parse_ghrel_shape(
     params: &str,
     lines: &[String],
@@ -10201,6 +12004,9 @@ fn parse_ghrel_shape(
         .map(|l| strip_trailing_comment(l.trim()).trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+    if let Some(blk) = ghrel_each_first(&stmts, &root) {
+        return Some(blk);
+    }
     // Guard lines compare with whitespace runs
     // collapsed (the tap writes `draft"]  ||` too).
     let squash = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -10680,6 +12486,7 @@ fn parse_ghrel_shape(
             if (tail.len() == 2 && tail[0] == "end" && flat_tail.contains(&tail[1]))
                 || (outer_flat && tail == ["end", "end"])
                 || (outer_flat && tail.len() == 2 && tail[0] == "end" && tail[1] == "end.compact")
+                || (outer_flat && tail == ["end.compact", "end"])
             {
                 true
             } else if asset_filter
@@ -10721,6 +12528,7 @@ fn parse_ghrel_shape(
     let then_ok = match &then {
         GhRelThen::Template(parts) => parts_ok(parts),
         GhRelThen::EqElse { then, els, .. } => parts_ok(then) && parts_ok(els),
+        GhRelThen::CapNeElse { then, els, .. } => parts_ok(then) && parts_ok(els),
         GhRelThen::TruthyElse { then, els, .. } => parts_ok(then) && parts_ok(els),
         _ => true,
     };
@@ -10742,6 +12550,7 @@ fn parse_ghrel_shape(
         blank_emit_local,
         limit,
         own_guards,
+        first_only: false,
     })
 }
 

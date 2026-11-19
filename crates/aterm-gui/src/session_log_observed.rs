@@ -724,6 +724,10 @@ impl SessionLog {
     /// mark the bucket delayed neither opens its box after the edge that ends its turn nor drags
     /// that turn's close to the flush; person
     /// reconciliation keeps the flush clock `at`. Nothing moves unless `run` is a codex's.
+    ///
+    /// A box of a kind the record stream feeds (an `ask` applied under `approvals` or
+    /// `questions`, HX-15i1) opens nothing: the tracker leaves that kind to the stream's own
+    /// `ask` step ([`aterm_slog::TurnTracker::set_stream_steps`]).
     fn claim_box(&mut self, run: Node, report: ClaimedReport, event_at: Stamp, at: Stamp) {
         if self.codex_run() != Some(run) {
             return;
@@ -1532,14 +1536,38 @@ impl SessionLog {
         );
     }
 
-    /// The timeline's word on which built-in writers the record stream stands down.
+    /// The timeline's word on which built-in writers the record stream stands down. The open
+    /// agent run's turn tracker is told whether the stream feeds turns now, and a run that opens
+    /// later is told as it opens. The `tool` and `subagent` steps the stream left open are no
+    /// longer its own once it stops feeding their kind: a later claimant's record of the same
+    /// `id` is matched against nothing of an earlier one's (D8), and those steps end with their
+    /// turn or run.
+    ///
+    /// The tracker is told which of the screen's approval, question and wall steps the stream
+    /// feeds (HX-15i1): their readers, and a codex run's claimed box ([`Self::claim_box`]), open
+    /// none of those. An `ask` or `wall` step the stream left open when it stops feeding that
+    /// kind ends there ([`Self::end_stream_asks`]): no later record of its claim can close it.
     pub(crate) fn set_stream_down(&mut self, down: super::StreamDown) {
         self.stream_down = down;
+        self.stream_steps.retain(|(kind, ..)| match kind {
+            Kind::Tool => down.tool,
+            Kind::Subagent => down.subagent,
+            _ => false,
+        });
+        let at = self.now();
+        self.end_stream_asks(down, at);
+        let Self { log, agent, .. } = self;
+        if let Some(a) = agent.as_mut() {
+            a.tracker.set_stream_turns(down.turn, at);
+            if a.tracker.stream_steps() != down.screen_steps() {
+                a.tracker.set_stream_steps(log, down.screen_steps(), at);
+            }
+        }
     }
 
     /// The agent run a stream row is written on: the open agent run, else none (the deepest
     /// open node, else the session).
-    fn stream_run(&self) -> Option<Node> {
+    pub(super) fn stream_run(&self) -> Option<Node> {
         self.agent
             .as_ref()
             .map(|a| a.node)

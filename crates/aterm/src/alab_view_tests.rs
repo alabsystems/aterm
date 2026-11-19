@@ -760,7 +760,7 @@ fn a_bound_registry_name_creates_the_same_local_mirror_the_cli_and_menu_read() {
         )
         .unwrap();
         assert_eq!(origin, Origin::Registry);
-        assert_eq!(name.title(), "m86 MissBunny");
+        assert_eq!(name.title(), "m86 Miss Bunny");
         assert_eq!(
             (name.class, name.since, name.rev, name.migration),
             (Class::Seeded, IMPLIED_SINCE, 0, None)

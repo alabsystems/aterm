@@ -1083,6 +1083,72 @@ fn a_notice_closed_by_the_turn_end_is_the_turns_wall() {
     );
 }
 
+/// A BLOCKED PATH'S LOGIN NOTICE ENDS ITS TURN ON THE API'S OUTAGE (plan package UB-05): Claude
+/// Code writes a 403 named by its status alone (or by a page's title) as its
+/// `authentication_failed` notice under its sign-in remedy (`Please run /login · API Error: 403
+/// Forbidden`), the policy and the tab's published word answer that wall as the API's outage
+/// (`turn_end::answered_wall`, `wall:api-error`), and so does the fold: the turn's wall is the
+/// outage (`EndWall`, `notice_read`'s `wall`), and its end confirms the screen's API error, so
+/// the session log never retracts the wall the tab published nor names the turn a lost login. It
+/// still confirms a screen's login wall, which the harness's own `confirm_wall` judges on the
+/// reader's raw kind.
+/// CONTROL: `Login expired · Please run /login` stays the login wall, and refutes an API error.
+/// NEGATIVE CONTROL (2026-11-18, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `notice_of_value` keeping the transcript's raw wall, the 403's turn ends on `Auth` and
+/// its end refutes the screen's API error.
+#[test]
+fn a_blocked_paths_login_notice_ends_its_turn_on_the_api_outage() {
+    let outage = WallKind::ApiError {
+        code: Some(403),
+        retryable: true,
+        cause: alab_policy::vocab::ApiCause::Server,
+    };
+    let screen_api = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: alab_policy::vocab::ApiCause::Server,
+    };
+    for (text, wall, api) in [
+        (
+            "Please run /login · API Error: 403 Forbidden",
+            outage,
+            Judge::Confirm,
+        ),
+        (
+            "Please run /login · API Error: Error 403 - Forbidden",
+            outage,
+            Judge::Confirm,
+        ),
+        (
+            "Login expired · Please run /login",
+            WallKind::Auth,
+            Judge::Refute,
+        ),
+    ] {
+        let row = notice(10, text, "authentication_failed");
+        assert_eq!(notice_read(&row).and_then(|n| n.wall), Some(wall), "{text}");
+        let mut f = Fed::new();
+        f.push(&prompt("v1", 0, "go")).push(&row);
+        let end = f.fold.end();
+        assert_eq!(judge_wall(screen_api, &end, 0), api, "{text}");
+        assert_eq!(
+            judge_wall(WallKind::Auth, &end, 0),
+            Judge::Confirm,
+            "{text}"
+        );
+        let _ = f.events();
+        f.push(&turn_end(20, 10));
+        let evs = f.events();
+        assert!(
+            matches!(
+                evs[..],
+                [StepEvent::TurnEnd { .. }, StepEvent::EndWall { kind }] if kind == wall
+            ),
+            "{text}: {evs:?}"
+        );
+    }
+}
+
 /// Each discriminant of the wrong shape latches the fold off once and queues nothing more from the path.
 #[test]
 fn a_wrong_shaped_discriminant_latches_the_fold_off() {
@@ -1662,8 +1728,36 @@ fn class_of(e: &Entry) -> EndClass {
     }
 }
 
+/// The harness's wall of `end`'s closed turn (`transcript_wall`) as its policy answers it
+/// (`turn_end::answered_wall`): the fold's [`End::wall`].
+fn answered(end: &TranscriptEnd) -> Option<WallKind> {
+    let wall = transcript_wall(end);
+    match &end.last {
+        Entry::Notice { text, .. } => {
+            wall.map(|k| crate::supervise::policy::turn_end::answered_wall(k, text))
+        }
+        _ => wall,
+    }
+}
+
+/// Whether `end` confirms a screen wall of `screen` by the harness's rule (`confirms`) or by the
+/// class of the wall the policy answers its notice as ([`answered`]): the fold's
+/// [`End::confirms`].
+fn answered_confirms(screen: WallKind, end: &TranscriptEnd) -> bool {
+    let notice = TranscriptEnd {
+        closed: true,
+        ..end.clone()
+    };
+    confirms(screen, end)
+        || answered(&notice).is_some_and(|a| {
+            Some(a) != transcript_wall(&notice)
+                && wall_confirm::class(a) == wall_confirm::class(screen)
+        })
+}
+
 /// After every line of every `supervise/fixtures` transcript and corpus row, the fold's end
-/// agrees with `transcript_ends_on` and `confirms`, or is opaque and the judge waits.
+/// agrees with `transcript_ends_on` and `confirms`, each notice's wall as the policy answers it
+/// ([`answered`], [`answered_confirms`]), or is opaque and the judge waits.
 #[test]
 fn the_end_agrees_with_the_harness_on_every_fixture_and_corpus_row() {
     let corpus: String = super::super::transcript::corpus_tests::ROWS
@@ -1704,21 +1798,30 @@ fn the_end_agrees_with_the_harness_on_every_fixture_and_corpus_row() {
             assert_eq!(mine.last, class_of(&theirs.last), "{}", at());
             assert_eq!(mine.closed, theirs.closed, "{}", at());
             assert_eq!(mine.at_ms.map(|m| (m / 1000) as i64), theirs.at, "{}", at());
-            assert_eq!(mine.wall(), transcript_wall(&theirs), "{}", at());
+            assert_eq!(mine.wall(), answered(&theirs), "{}", at());
             assert_eq!(mine.lagging(), theirs.lagging(), "{}", at());
             for &k in SCREENS {
                 if k == WallKind::Memory {
                     continue;
                 }
-                assert_eq!(mine.confirms(k), confirms(k, &theirs), "{} for {k:?}", at());
+                assert_eq!(
+                    mine.confirms(k),
+                    answered_confirms(k, &theirs),
+                    "{} for {k:?}",
+                    at()
+                );
                 match judge_wall(k, &mine, 0) {
                     Judge::Confirm => {
                         confirmed += 1;
-                        assert!(confirms(k, &theirs), "{}", at());
+                        assert!(answered_confirms(k, &theirs), "{}", at());
                     }
                     Judge::Refute => {
                         refuted += 1;
-                        assert!(!confirms(k, &theirs) && !theirs.lagging(), "{}", at());
+                        assert!(
+                            !answered_confirms(k, &theirs) && !theirs.lagging(),
+                            "{}",
+                            at()
+                        );
                     }
                     Judge::Wait => {}
                 }

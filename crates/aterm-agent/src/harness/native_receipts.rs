@@ -32,6 +32,11 @@ use std::time::{Duration, Instant};
 mod account;
 #[path = "native_receipts_recipients.rs"]
 mod recipients;
+#[cfg(unix)]
+#[path = "native_retained_receipts.rs"]
+mod retained;
+#[cfg(unix)]
+pub use retained::RetainedExecution;
 #[path = "native_recipient_reservation.rs"]
 mod reservation;
 pub use reservation::{RecipientReservation, reserve_recipient_operation};
@@ -110,7 +115,12 @@ impl Key {
         let text = Request::prepare(prepare.clone())
             .encode()
             .ok_or_else(invalid)?;
-        Ok(self.digest(b"prepare\0", text.as_bytes()))
+        Ok(self.prepare_words(&text))
+    }
+
+    /// [`Self::prepare`] of the preparation whose canonical encoding is `text`.
+    fn prepare_words(&self, text: &str) -> Digest {
+        self.digest(b"prepare\0", text.as_bytes())
     }
 
     fn capability(&self, binding: &Binding) -> Digest {
@@ -791,19 +801,25 @@ fn record_event_at(
 }
 
 fn valid_pair(prepare: &Prepare, binding: &Binding) -> bool {
-    prepare.id == binding.id
-        && matches!(prepare.plan, NativePlan::Restart { .. })
-        && Request::prepare(prepare.clone()).encode().is_some()
-        && Request::Query(binding.clone()).encode().is_some()
+    paired_words(prepare, binding).is_some()
+}
+
+/// The canonical encoding of `prepare` where it pairs with `binding` ([`valid_pair`]): a receipt
+/// digests the words its check encoded, never a second encoding of them.
+fn paired_words(prepare: &Prepare, binding: &Binding) -> Option<String> {
+    if prepare.id != binding.id || !matches!(prepare.plan, NativePlan::Restart { .. }) {
+        return None;
+    }
+    let words = Request::prepare(prepare.clone()).encode()?;
+    Request::Query(binding.clone()).encode()?;
+    Some(words)
 }
 
 fn receipt(key: &Key, prepare: &Prepare, binding: &Binding) -> io::Result<Receipt> {
-    if !valid_pair(prepare, binding) {
-        return Err(invalid());
-    }
+    let words = paired_words(prepare, binding).ok_or_else(invalid)?;
     Ok(Receipt {
         operation: key.operation(&prepare.id),
-        prepare: key.prepare(prepare)?,
+        prepare: key.prepare_words(&words),
         capability: key.capability(binding),
     })
 }

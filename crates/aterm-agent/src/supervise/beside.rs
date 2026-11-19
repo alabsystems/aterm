@@ -119,6 +119,101 @@ impl<C: Ctl> Session<'_, C> {
             .map_err(Fail::Hard)
     }
 
+    /// THE MEMORY CEILING BESIDE A CONTRACT 4 CLAIM HOLDING `relaunch` (HX-15m, D19: the
+    /// watchdog serves every contract 4 claim, a Codex tab's too, whose worker only watches).
+    /// Where the host says such a claimant takes the tab's memory restart
+    /// ([`IdleHost::scoped_restart`] of `Restart::Memory`), the restart is the host's
+    /// ([`IdleHost::restart`], which tells that harness `restart cause=memory`), never the
+    /// server's `restart` verb: asked at the agent's idle point as the screen reads it, on that
+    /// unchanged screen, once per agent process, and, while the host defers it (a hand on the
+    /// tab, a stopped claimant, another restart watched), asked again on the restart back-off.
+    /// Whether the host's restart is the tab's memory remedy; where it is not, the self-claim's
+    /// ([`Self::beside_memory_remedy`]) stands, unchanged.
+    pub(super) fn beside_scoped_memory(
+        &mut self,
+        over: Option<super::super::memory::MemoryOver>,
+        seen: &Turn,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
+        let now = self.fx.mono();
+        self.beside_scoped_memory_at(over, seen, now, opts, review)
+    }
+
+    /// [`Self::beside_scoped_memory`] at the loop's monotonic `now`.
+    pub(super) fn beside_scoped_memory_at(
+        &mut self,
+        over: Option<super::super::memory::MemoryOver>,
+        seen: &Turn,
+        now: Instant,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
+        use super::super::policy::turn_end::{Restart, RestartAsk};
+        let Some(host) = self.stall_host.clone() else {
+            return Ok(false);
+        };
+        if !host.scoped_restart(&Restart::Memory) {
+            self.beside_memory_retry = None;
+            return Ok(false);
+        }
+        // The self-claim remedy's observation does not carry over to the claim's.
+        self.beside_idle_at = None;
+        let Some(over) = over.filter(super::super::memory::MemoryOver::acts) else {
+            self.beside_memory_ended = None;
+            self.beside_memory_retry = None;
+            return Ok(true);
+        };
+        let Some(leader) = host.agent_pid() else {
+            return Ok(true);
+        };
+        let seq = seen.screen.seq;
+        if self.beside_memory_ended == Some(leader)
+            || !review.unattended()
+            || !opts.policy.relaunch
+            || self.stalled.is_some()
+            || !matches!(seen.phase, Phase::Idle | Phase::Limited { .. })
+            || self.beside_memory_retry.is_some_and(|(_, at)| now < at)
+            || self.screen()?.seq != seq
+        {
+            return Ok(true);
+        }
+        let ask = RestartAsk::of(&Restart::Memory, self.now_unix());
+        let Some(answer) = host.restart(&Restart::Memory, &ask) else {
+            return Ok(true);
+        };
+        let step = answer.step;
+        if super::turn_end_loop::defers(&step) {
+            let waits = self.beside_memory_retry.map_or(0, |(waits, _)| waits);
+            let pause = alab_policy::ladder::Ladder(&self.turn_end.timing.restart_backoff)
+                .step(usize::try_from(waits).unwrap_or(usize::MAX));
+            self.beside_memory_retry = Some((waits.saturating_add(1), now + pause));
+            if super::turn_end_loop::restart_note_due(waits) {
+                review.note(&format!(
+                    "WAITING seq={seq} until={} restart:memory waits: {step}",
+                    self.stamp_in(now + pause)
+                ));
+            }
+            return Ok(true);
+        }
+        self.beside_memory_retry = None;
+        self.beside_memory_ended = Some(leader);
+        let made = matches!(
+            step.split_once(':').map_or(step.as_str(), |(head, _)| head),
+            "adopted" | "relaunched" | "continued" | "done"
+        );
+        self.memory_refused = !made;
+        review
+            .say(&format!(
+                "{} seq={seq} memory footprint_mb={} ceiling_mb={} reply={step}",
+                if made { "RESTARTED" } else { "RESTART-REFUSED" },
+                over.footprint_mib,
+                over.ceiling_mib,
+            ))
+            .map_err(Fail::Hard)?;
+        Ok(true)
+    }
+
     /// The memory ceiling's restart withheld from an unconfirmed agent: ended for `leader` and
     /// refused, as a server's lasting refusal is, so it is said once,
     /// `RESTART-REFUSED … reply=(<why>)`.

@@ -5887,7 +5887,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         Err(_) => Err(()),
     };
     // `targeted`: whether `CARGO_TARGET_DIR` names the world's target, under HOME.
-    let produce =
+    let observe_response =
         |world: &World, cwd: &Path, targeted: bool, more: &[(&str, String)], args: &[String]| {
             let env = |name: &str| {
                 (targeted && name == "CARGO_TARGET_DIR")
@@ -5907,7 +5907,11 @@ fn the_front_judges_each_word_where_targo_reads_it() {
                 read_manifest: &read,
                 writable: &|_| Some(true),
             };
-            let verdict = observe_for_producer(args, Tool::Targo, &world.home, &machine, true).ok();
+            observe_for_producer(args, Tool::Targo, &world.home, &machine, true)
+        };
+    let produce =
+        |world: &World, cwd: &Path, targeted: bool, more: &[(&str, String)], args: &[String]| {
+            let verdict = observe_response(world, cwd, targeted, more, args).ok();
             (verdict, roots(&world.home).len())
         };
     let config = |dir: &Path, name: &str, text: &str| {
@@ -7557,7 +7561,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
     // spelling HOME, `@O` a folder outside it, and the verdict.
     let typed = "miri run --target-dir @H/t";
     let alias = ("CARGO_ALIAS_XB", "-C ../a -C ../b build");
-    for (more, line, judged) in [
+    let cases = [
         (vec![("TMPDIR", "@H/tmp")], typed, (None, 0)),
         (
             vec![("TMPDIR", "@H/tmp"), ("MIRI_SYSROOT", "/private/tmp/s")],
@@ -7577,12 +7581,6 @@ fn the_front_judges_each_word_where_targo_reads_it() {
             typed,
             (None, 0),
         ),
-        (vec![("TMPDIR", "@H/tmp")], "miri setup", (None, 0)),
-        (
-            vec![("MIRI_SYSROOT", "@H/sysroot")],
-            "miri setup",
-            (None, 0),
-        ),
         (vec![("MIRI_SYSROOT", "@H")], "miri setup", (None, 0)),
         // A sysroot outside HOME is clear, unless its `lib` or `lib/rustlib`, which setup
         // makes and renames its result into, is a link into HOME.
@@ -7593,11 +7591,6 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         ),
         (
             vec![("MIRI_SYSROOT", "@O/lib-link")],
-            "miri setup",
-            (None, 0),
-        ),
-        (
-            vec![("MIRI_SYSROOT", "@O/rustlib-link")],
             "miri setup",
             (None, 0),
         ),
@@ -7682,7 +7675,23 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         // An alias this reader cannot tell may run `miri` on a call that consents.
         (vec![("TMPDIR", "@H/tmp"), alias], "xb", (None, 0)),
         (vec![alias], "xb", (Some(false), 0)),
-    ] {
+    ];
+    let setup_refusals = [
+        ("TMPDIR", "@H/tmp", "TMPDIR"),
+        ("MIRI_SYSROOT", "@H/sysroot", "MIRI_SYSROOT"),
+        (
+            "MIRI_SYSROOT",
+            "@O/rustlib-link",
+            "MIRI_SYSROOT/lib/rustlib",
+        ),
+    ];
+    let cases = cases
+        .into_iter()
+        .map(|(vars, line, judged)| (vars, line, judged, None));
+    let setup_refusals = setup_refusals
+        .into_iter()
+        .map(|(var, path, cause)| (vec![(var, path)], "miri setup", (None, 0), Some(cause)));
+    for (more, line, judged, cause) in cases.chain(setup_refusals) {
         let world = World::new();
         let home = world.home.display().to_string();
         let outside = world.home.parent().unwrap().join("outside");
@@ -7714,8 +7723,16 @@ fn the_front_judges_each_word_where_targo_reads_it() {
             .split(' ')
             .map(str::to_owned)
             .collect();
+        let response = observe_response(&world, &world.owner, false, &more, &args);
+        if let Some(cause) = cause {
+            let why = response.as_ref().unwrap_err().to_string();
+            assert!(
+                why.split_whitespace().any(|word| word == cause) && why.contains("protects"),
+                "{why}"
+            );
+        }
         assert_eq!(
-            produce(&world, &world.owner, false, &more, &args),
+            (response.ok(), roots(&world.home).len()),
             judged,
             "{more:?} {line}"
         );

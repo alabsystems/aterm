@@ -31,6 +31,8 @@ pub mod grant;
 #[cfg(unix)]
 mod peers;
 #[cfg(unix)]
+mod scope;
+#[cfg(unix)]
 mod server;
 #[cfg(unix)]
 mod store;
@@ -42,6 +44,8 @@ mod install_refused;
 
 #[cfg(target_os = "macos")]
 pub use direct::provide_direct;
+#[cfg(unix)]
+pub use scope::Duties;
 #[cfg(unix)]
 pub use server::{Opts, keep_log, serve};
 

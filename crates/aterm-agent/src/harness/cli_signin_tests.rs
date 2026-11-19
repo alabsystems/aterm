@@ -2366,6 +2366,26 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
             .is_some_and(|binding| binding.check_stop.is_some()),
         "the account's check is on record"
     );
+    let account = store
+        .load(env.now)
+        .unwrap()
+        .0
+        .accounts
+        .remove("kimi-one")
+        .unwrap_or_default();
+    assert!(
+        account
+            .unreached
+            .as_ref()
+            .is_some_and(|obs| obs.witness.starts_with("sign-in-bot-check@")),
+        "the account's path observation beside its check (plan package UB-05): {:?}",
+        account.unreached
+    );
+    assert!(
+        account.login.struck.is_none(),
+        "no strike on its login: {:?}",
+        account.login
+    );
     // With nobody at this terminal, the row the check stopped is not signed in again, on any
     // clock: the run names the person's step and changes nothing.
     let failed = SignInHost::new(Script::Ends(login_drive::Outcome::Failed), &home);

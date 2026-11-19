@@ -1547,13 +1547,26 @@ pub(super) fn clone_all(
     }
     queue.extend(unborn.iter().map(Acquire::Unborn));
     let lanes = queue.len().min(LANES);
+    let clones = queue
+        .iter()
+        .any(|acquire| matches!(acquire, Acquire::Clone(..)));
     let queue = std::sync::Mutex::new(queue);
     let results = std::sync::Mutex::new(Vec::new());
     let stopped = std::sync::atomic::AtomicBool::new(false);
     let current = || guard.map_or(Ok(()), |guard| (guard.current)());
+    // Each clone published in the console account's home leaves Spotlight's index now, not at
+    // the next pass's `sync.spotlight`: one asker of the root LAN broker beside the lanes, whose
+    // pace can wait a minute, so no lane waits on it.
+    let made = crate::init_spotlight::MadeFolders::new();
     std::thread::scope(|scope| {
+        let starting = made.maker();
+        if clones {
+            scope.spawn(|| made.ask_while_made(sys));
+        }
         for _ in 0..lanes {
+            let maker = made.maker();
             scope.spawn(|| {
+                let _maker = maker;
                 loop {
                     if stopped.load(std::sync::atomic::Ordering::Relaxed) {
                         return;
@@ -1630,6 +1643,9 @@ pub(super) fn clone_all(
                                 ..
                             })
                         );
+                        if published {
+                            made.made(sys, &folder);
+                        }
                         // Published with its staging left behind, whatever its dependencies do.
                         let staging_left = matches!(
                             parent,
@@ -1672,6 +1688,7 @@ pub(super) fn clone_all(
                 }
             });
         }
+        drop(starting);
     });
     let mut results = results
         .into_inner()
@@ -2051,7 +2068,7 @@ fn clone_one_with(
     // Publishing is not repeated safely, so it holds the update boundary (init-on-by-default
     // design §6.7). A wait there for an update's handoff, up to minutes, checks `current` again
     // before the rename, as every step of a guarded clone does.
-    let _boundary = sys.update_boundary().hold(
+    let boundary = sys.update_boundary().hold(
         aterm_types::update_boundary::GuardedItem::ClonePublishRename,
         &current,
     )?;
@@ -2089,6 +2106,7 @@ fn clone_one_with(
             Ok(None)
         }
     })();
+    drop(boundary);
     Ok(ClonePlacement { placed, completion })
 }
 

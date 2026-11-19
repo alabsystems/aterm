@@ -781,6 +781,7 @@ impl aterm_types::macos_setup::spotlight_scope::Reads for RecordFiles {
             dir: false,
             symlink: false,
             id: None,
+            mode: 0o644,
         })
     }
 

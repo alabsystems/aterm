@@ -503,6 +503,9 @@ fn retained_diagnostic(report: &str) -> bool {
                 | "withdraw-frontend"
                 | "resource-native-copy-and-external-change"
                 | "resource-replay-without-clipboard-redelivery"
+                | "native-transport-original-file"
+                | "exec-with-original-image-custody"
+                | "native-transport-kernel-rights-verified"
         );
     }
     let Some((stage, kind)) = report
@@ -546,6 +549,59 @@ fn retained_diagnostic(report: &str) -> bool {
             | "Unsupported"
             | "Other"
     )
+}
+
+#[derive(Default)]
+struct RetainedStages {
+    resource_copy: bool,
+    resource_replay: bool,
+    original_file: bool,
+    exec_custody: bool,
+    new_generation: bool,
+    original_rights: bool,
+}
+impl RetainedStages {
+    fn observe(&mut self, report: &str, replacement: bool, resources: bool) -> Result<bool, Fail> {
+        self.resource_copy |=
+            report == "Retained qualification: phase=resource-native-copy-and-external-change";
+        self.resource_replay |=
+            report == "Retained qualification: phase=resource-replay-without-clipboard-redelivery";
+        self.original_file |=
+            report == "Retained qualification: phase=native-transport-original-file";
+        self.exec_custody |=
+            report == "Retained qualification: phase=exec-with-original-image-custody";
+        self.new_generation |= report == "Retained qualification: phase=after-frontend-exec";
+        self.original_rights |=
+            report == "Retained qualification: phase=native-transport-kernel-rights-verified";
+        let startup = report
+            == "PASS retained SDK startup, physical attachment and actual configuration response";
+        let transport = report
+            == "PASS retained Native transport replacement, E1 image custody and premature App denial";
+        if !startup && !transport {
+            return Ok(false);
+        }
+        if replacement != transport {
+            return Err(Fail::die(
+                "retained SDK PASS belongs to a different qualification route",
+            ));
+        }
+        if resources && !(self.resource_copy && self.resource_replay) {
+            return Err(Fail::die(
+                "retained App resource qualification phases missing",
+            ));
+        }
+        if replacement
+            && !(self.original_file
+                && self.exec_custody
+                && self.new_generation
+                && self.original_rights)
+        {
+            return Err(Fail::die(
+                "retained Native transport physical qualification phases missing",
+            ));
+        }
+        Ok(true)
+    }
 }
 
 fn wait_host(host: &mut Child) -> Result<(), Fail> {
@@ -823,8 +879,7 @@ pub fn cmd(args: &[String]) -> Res {
                 .write_all(b"RUN retained\n")
                 .map_err(|_| Fail::die("retained SDK start barrier failed"))?;
             let until = Instant::now() + Duration::from_secs(120);
-            let mut resource_copy = false;
-            let mut resource_replay = false;
+            let mut stages = RetainedStages::default();
             loop {
                 let fd = output.as_raw_fd();
                 let bytes = match line(&mut output, fd, SDK_REPLY_LIMIT) {
@@ -840,23 +895,12 @@ pub fn cmd(args: &[String]) -> Res {
                 let report = std::str::from_utf8(&bytes)
                     .map_err(|_| Fail::die("invalid retained SDK output"))?
                     .trim_end_matches('\r');
-                resource_copy |= report
-                    == "Retained qualification: phase=resource-native-copy-and-external-change";
-                resource_replay |= report
-                    == "Retained qualification: phase=resource-replay-without-clipboard-redelivery";
                 // Export only these fixed phase labels, never arbitrary SDK,
                 // configuration, credential or terminal output.
                 if retained_diagnostic(report) {
                     eprintln!("{report}");
                 }
-                if report
-                    == "PASS retained SDK startup, physical attachment and actual configuration response"
-                {
-                    if resources && !(resource_copy && resource_replay) {
-                        return Err(Fail::die(
-                            "retained App resource qualification phases missing",
-                        ));
-                    }
+                if stages.observe(report, replacement.is_some(), resources)? {
                     break;
                 }
                 if Instant::now() >= until {
@@ -932,7 +976,11 @@ pub fn cmd(args: &[String]) -> Res {
         println!("WORLD isolated_source_proof={}", kept.display());
     }
     result?;
-    if retained {
+    if retained && replacement.is_some() {
+        println!(
+            "PASS joined foreground Native transport replacement with original backend; no whole-App or production activation qualification"
+        );
+    } else if retained {
         println!(
             "PASS joined foreground retained SDK/native service; synthetic issuer only, no work preservation or production activation"
         );

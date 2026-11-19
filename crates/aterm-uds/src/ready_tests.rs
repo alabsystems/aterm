@@ -1,6 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#[test]
+fn an_indefinite_wait_keeps_waiting_across_an_empty_kernel_poll() {
+    use std::os::fd::AsFd as _;
+
+    let (reader, _writer) = crate::pipe().unwrap();
+    let mut fds = [super::read_pollfd(reader.as_fd())];
+    let rosetta = cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && crate::process::translator().as_deref() == Some("Rosetta");
+    let mut calls = 0;
+    let ready = super::poll_set_with(&mut fds, super::Wait::Forever, |fds, timeout| {
+        calls += 1;
+        if rosetta {
+            assert!(
+                (1..60_000).contains(&timeout),
+                "Rosetta must regain control"
+            );
+        } else {
+            assert_eq!(timeout, -1, "a native idle listener sleeps until its event");
+        }
+        assert_eq!(fds[0].revents, 0);
+        match calls {
+            1 => 0,
+            2 => {
+                fds[0].revents = libc::POLLIN;
+                1
+            }
+            _ => panic!("lost readiness"),
+        }
+    })
+    .unwrap();
+    assert!(ready);
+    assert_eq!(calls, 2);
+}
+
 /// A doorbell polls ready from its first ring until its clear, and rings again after it: many
 /// rings take one clear, and a clear of an unrung doorbell takes nothing. Nothing is timed:
 /// each poll asks once.

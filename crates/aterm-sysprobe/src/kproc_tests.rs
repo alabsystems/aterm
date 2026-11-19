@@ -511,6 +511,106 @@ mod gated {
     }
 }
 
+/// The table's read through its sizing ([`super::imp::table_sized`]) over a stand-in kernel.
+#[cfg(target_os = "macos")]
+mod sized {
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::AtomicUsize;
+
+    use super::super::imp::table_sized;
+    use crate::jobs::darwin::KINFO_SIZE;
+
+    /// A stand-in `KERN_PROC_ALL`: a size answer is the table's bytes and xnu's slack of five
+    /// records, and a read into a buffer too small for the table writes the records that fit and
+    /// answers `ENOMEM`, as xnu's `sysctl_prochandle` does.
+    struct Kernel {
+        table: RefCell<Vec<u8>>,
+        sizes: Cell<usize>,
+        reads: Cell<usize>,
+    }
+
+    impl Kernel {
+        fn holding(records: usize) -> Self {
+            Self {
+                table: RefCell::new(table(records)),
+                sizes: Cell::new(0),
+                reads: Cell::new(0),
+            }
+        }
+
+        fn size(&self) -> Option<usize> {
+            self.sizes.set(self.sizes.get() + 1);
+            Some(self.table.borrow().len() + 5 * KINFO_SIZE)
+        }
+
+        fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            let table = self.table.borrow();
+            if table.len() > buf.len() {
+                let fit = buf.len() / KINFO_SIZE * KINFO_SIZE;
+                buf[..fit].copy_from_slice(&table[..fit]);
+                return Err(std::io::Error::from_raw_os_error(libc::ENOMEM));
+            }
+            buf[..table.len()].copy_from_slice(&table);
+            Ok(table.len())
+        }
+
+        /// The sizes asked and the reads made since the last take.
+        fn take(&self) -> (usize, usize) {
+            (self.sizes.take(), self.reads.take())
+        }
+    }
+
+    /// `records` records, each byte naming its record and offset, so a read of the wrong table
+    /// or a short one is told apart.
+    fn table(records: usize) -> Vec<u8> {
+        (0..records * KINFO_SIZE)
+            .map(|i| ((i / KINFO_SIZE) as u8) ^ ((i % 251) as u8))
+            .collect()
+    }
+
+    /// A TABLE OF A KNOWN SIZE IS READ IN ONE SYSCTL: the first read asks the size and reads
+    /// once; every later read asks no size and reads once while the table fits the last read's
+    /// bytes and their slack (unchanged, grown a little, shrunk); a table that outgrew them is
+    /// refused (`ENOMEM`) and read again at its asked size, three `sysctl`s where a read sized
+    /// first makes two. Every answer is the whole table the
+    /// stand-in held at that read, as a read sized by its own size answer gives. A size the
+    /// kernel does not answer, before any whole read, is no table.
+    /// NEGATIVE CONTROL: a read that asks the size before every read (the sizing before this
+    /// cut) asks one at each of the later reads here.
+    #[test]
+    fn a_table_of_a_known_size_is_read_with_no_size_asked() {
+        let last = AtomicUsize::new(0);
+        let kernel = Kernel::holding(700);
+        let read = || table_sized(&last, || kernel.size(), |buf| kernel.read(buf));
+        assert_eq!(read(), Some(table(700)));
+        assert_eq!(kernel.take(), (1, 1), "the first read asks the size");
+        assert_eq!(read(), Some(table(700)));
+        assert_eq!(kernel.take(), (0, 1), "an unchanged table: no size asked");
+        *kernel.table.borrow_mut() = table(760);
+        assert_eq!(read(), Some(table(760)));
+        assert_eq!(
+            kernel.take(),
+            (0, 1),
+            "grown within the slack: no size asked"
+        );
+        *kernel.table.borrow_mut() = table(1_000);
+        assert_eq!(read(), Some(table(1_000)));
+        assert_eq!(
+            kernel.take(),
+            (1, 2),
+            "outgrown: refused, then read at its asked size"
+        );
+        *kernel.table.borrow_mut() = table(300);
+        assert_eq!(read(), Some(table(300)));
+        assert_eq!(kernel.take(), (0, 1), "shrunk: no size asked");
+
+        let never = AtomicUsize::new(0);
+        assert_eq!(table_sized(&never, || None, |buf| kernel.read(buf)), None);
+        assert_eq!(kernel.take(), (0, 0), "no size answer, no read");
+    }
+}
+
 /// LS-15: A NAME NOT READ IS NO NAME. Where the kernel reads a process's arguments and its
 /// `KERN_PROCARGS2` read fails (a loaded host, a process mid-exec), `ps` prints the placeholder
 /// `(comm)`: [`crate::kproc::comm_read`] answers none there, so no caller takes `(aterm)` for a

@@ -1485,6 +1485,70 @@ fn the_github_rows_read_the_rate_book_under_the_state_root() {
     );
 }
 
+/// The survey's `vault_log` row says what the Mac's last format-2 vault log pass did, read
+/// from the journal record the pass keeps beside its records, and crosses the fleet read whole;
+/// a Mac that keeps no record sends no row, and neither does one that keeps a record but runs
+/// no pass (its build reads no format 2 or its mark names none, `log_pass::last`'s gate): the
+/// record states a pass this build never ran. Unix only: no Windows member stores a format
+/// mark, so none runs the pass or sends the row.
+/// NEGATIVE CONTROL (observed): with `from_survey_reply` not taking `vault_log ` lines, the
+/// parsed rows lose it and `assert_eq!(parsed.operation_lines, facts.operation_lines)` fails.
+#[cfg(unix)]
+#[test]
+fn the_vault_log_row_says_what_the_last_log_pass_did() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let rows = |facts: &SwarmSurveyFacts| -> Vec<String> {
+        facts
+            .operation_lines
+            .iter()
+            .filter(|line| line.starts_with("vault_log "))
+            .cloned()
+            .collect()
+    };
+    let facts = SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1);
+    assert_eq!(rows(&facts), Vec::<String>::new(), "no record, no row");
+    let paths = aterm_secrets::client::Paths::for_home(&home);
+    std::fs::create_dir_all(paths.dir.parent().unwrap()).unwrap();
+    aterm_uds::private_file::create_private_dir(&paths.dir).unwrap();
+    aterm_uds::private_file::write_private(
+        &paths.dir,
+        aterm_secrets::client::LOG_PASS_FILE,
+        b"aterm-secrets log pass 1\nat 1900000000000\nshed 2\nshared -\npruned -\n",
+    )
+    .unwrap();
+    let facts = SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1);
+    assert_eq!(
+        rows(&facts),
+        Vec::<String>::new(),
+        "a record on a Mac that runs no pass, no row"
+    );
+    // The Mac runs the pass: its build reads format 2 and its mark names format 2.
+    aterm_secrets::client::test_reads_format_two(&paths);
+    aterm_secrets::fsx::write_atomic(
+        &paths.records_file().with_extension("format"),
+        b"aterm-secrets records format 2\n",
+        0o600,
+    )
+    .unwrap();
+    let facts = SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1);
+    assert_eq!(
+        rows(&facts),
+        vec!["vault_log at=1900000000000 shed=2 shared=- pruned=-".to_owned()]
+    );
+    let wire = facts.to_survey_reply(
+        1,
+        None,
+        0,
+        1,
+        (aterm_types::fleet_access::FleetAccess::ReadOnly, false),
+    );
+    let parsed = SwarmSurveyFacts::from_survey_reply(&wire).unwrap();
+    assert_eq!(parsed.operation_lines, facts.operation_lines);
+}
+
 /// A Mac's moves of the last seven days, proved and tried, and the newest proved however old.
 #[test]
 fn moves_count_the_last_seven_days_and_keep_the_newest_proved() {

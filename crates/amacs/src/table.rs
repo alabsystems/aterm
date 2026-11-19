@@ -60,12 +60,14 @@ impl Delimiter {
 /// Why a text is not scanned as a grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TooLarge {
-    /// The text is longer than [`MAX_TABLE_BYTES`].
+    /// The text exceeds the scan's byte limit.
     Bytes(usize),
     /// The text holds more than [`MAX_TABLE_RECORDS`] records.
     Records,
     /// A record holds more than [`MAX_TABLE_COLUMNS`] cells.
     Columns,
+    /// The rectangular table exceeds the caller's cell budget.
+    Cells,
 }
 
 impl TooLarge {
@@ -81,6 +83,7 @@ impl TooLarge {
             Self::Records => format!(
                 "Opened as text: the grid reads up to {MAX_TABLE_RECORDS} rows, and this file has more"
             ),
+            Self::Cells => "The table exceeds the cell limit".to_owned(),
             Self::Columns => format!(
                 "Opened as text: the grid reads up to {MAX_TABLE_COLUMNS} columns, and a row of this file has more"
             ),
@@ -180,7 +183,48 @@ impl Table {
     /// than [`MAX_TABLE_RECORDS`] records or a record of more than
     /// [`MAX_TABLE_COLUMNS`] cells.
     pub fn scan(text: &str, delimiter: Delimiter) -> Result<Self, TooLarge> {
-        if text.len() > MAX_TABLE_BYTES {
+        Self::scan_bounded(
+            text,
+            delimiter,
+            MAX_TABLE_BYTES,
+            MAX_TABLE_RECORDS,
+            MAX_TABLE_COLUMNS,
+            usize::MAX,
+        )
+    }
+
+    /// Scan a rectangular interchange file with its own byte and cell budgets. The ordinary
+    /// editor's limits still apply to [`Self::scan`]. Missing trailing cells in short rows
+    /// count toward the rectangle, just as they do when comparing it with a table.
+    ///
+    /// # Errors
+    /// [`TooLarge::Bytes`] when the text exceeds `max_bytes`, [`TooLarge::Cells`] when the
+    /// number of records times the widest record exceeds `max_cells`.
+    pub fn scan_rectangular(
+        text: &str,
+        delimiter: Delimiter,
+        max_bytes: usize,
+        max_cells: usize,
+    ) -> Result<Self, TooLarge> {
+        Self::scan_bounded(
+            text,
+            delimiter,
+            max_bytes,
+            usize::MAX,
+            usize::MAX,
+            max_cells,
+        )
+    }
+
+    fn scan_bounded(
+        text: &str,
+        delimiter: Delimiter,
+        max_bytes: usize,
+        max_records: usize,
+        max_columns: usize,
+        max_cells: usize,
+    ) -> Result<Self, TooLarge> {
+        if text.len() > max_bytes {
             return Err(TooLarge::Bytes(text.len()));
         }
         let bytes = text.as_bytes();
@@ -192,11 +236,18 @@ impl Table {
         let mut columns = 0;
         let mut pos = 0;
         loop {
+            let available_width = max_cells / (records.len() + 1);
+            if columns > available_width {
+                return Err(TooLarge::Cells);
+            }
             let record_start = pos;
             let mut cells = Vec::new();
             loop {
-                if cells.len() >= MAX_TABLE_COLUMNS {
+                if cells.len() >= max_columns {
                     return Err(TooLarge::Columns);
+                }
+                if cells.len() >= available_width {
+                    return Err(TooLarge::Cells);
                 }
                 let start = pos;
                 if bytes.get(pos) == Some(&b'"') {
@@ -278,7 +329,7 @@ impl Table {
                 cells,
                 terminator: raw_end..pos,
             });
-            if records.len() > MAX_TABLE_RECORDS {
+            if records.len() > max_records {
                 return Err(TooLarge::Records);
             }
             if pos >= len {

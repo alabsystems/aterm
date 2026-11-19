@@ -197,7 +197,6 @@ impl<'a> Register<'a> {
 
     /// Op `k`'s class: two ops of one class write the same thing. Classes are numbered by
     /// their first op, in the register's order.
-    #[cfg(any(unix, windows))] // read by the unix-only signing of a put's class (`entries.rs`)
     pub(super) fn class_of(&self, k: usize) -> usize {
         self.class[k]
     }

@@ -523,48 +523,44 @@ pub struct StatePlatform {
     pub local_app_data: Option<PathBuf>,
 }
 
-/// The pure half of [`state_dir`].
+/// The pure half of [`state_dir`]: [`resolve_state_dir_for`] the host
+/// ([`crate::world::Platform::HOST`]); on a host that is none of its platforms, only an absolute
+/// override names a root.
 #[must_use]
 pub fn resolve_state_dir(
     override_root: Option<PathBuf>,
     platform: StatePlatform,
 ) -> Option<PathBuf> {
+    match crate::world::Platform::HOST {
+        Some(host) => resolve_state_dir_for(host, override_root, platform),
+        None => override_root.filter(|root| root.is_absolute()),
+    }
+}
+
+/// Aterm's state root on `on` from these inputs, from any host: an override when it is absolute;
+/// else on macOS the folder under HOME, on another Unix an absolute `XDG_STATE_HOME`'s `aterm`
+/// or else the folder under HOME, and on Windows an absolute `%LOCALAPPDATA%`'s `aterm`. The
+/// folder under HOME is [`crate::world::state_home_on`]'s, the one a scratch world's marker
+/// names, written once in a `std`-only file that code linking no crate mounts too.
+#[must_use]
+pub fn resolve_state_dir_for(
+    on: crate::world::Platform,
+    override_root: Option<PathBuf>,
+    platform: StatePlatform,
+) -> Option<PathBuf> {
+    use crate::world::{Platform, state_home_on};
     if let Some(root) = override_root {
         // Relative is refused, not resolved: a state root that depends on the
         // cwd is no root at all.
         return root.is_absolute().then_some(root);
     }
-    // On Unix the folder under HOME is `crate::world::state_home`'s, the one a scratch world's
-    // marker names, written once in a `std`-only file that code linking no crate mounts too.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (&platform.xdg_state_home, &platform.local_app_data);
-        platform
-            .home
-            .and_then(|home| crate::world::state_home(&home))
-    }
-    #[cfg(windows)]
-    {
-        let _ = (&platform.home, &platform.xdg_state_home);
-        platform
-            .local_app_data
-            .filter(|root| root.is_absolute())
+    let absolute = |root: Option<PathBuf>| root.filter(|root| root.is_absolute());
+    match on {
+        Platform::MacOs => platform.home.map(|home| state_home_on(on, &home)),
+        Platform::Xdg => absolute(platform.xdg_state_home)
             .map(|root| root.join("aterm"))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = &platform.local_app_data;
-        if let Some(root) = platform.xdg_state_home.filter(|root| root.is_absolute()) {
-            return Some(root.join("aterm"));
-        }
-        platform
-            .home
-            .and_then(|home| crate::world::state_home(&home))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = platform;
-        None
+            .or_else(|| platform.home.map(|home| state_home_on(on, &home))),
+        Platform::Windows => absolute(platform.local_app_data).map(|root| root.join("aterm")),
     }
 }
 

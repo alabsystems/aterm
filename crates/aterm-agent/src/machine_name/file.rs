@@ -199,13 +199,10 @@ impl MachineName {
         title_of(self.num, &self.display_nick())
     }
 
-    /// The chosen display spelling, or the title-cased default noun.
+    /// The nickname's display spelling, including for a name saved by an older build.
     #[must_use]
     pub fn display_nick(&self) -> String {
-        match self.nick_class {
-            NickClass::Chosen => self.nick.as_str().to_owned(),
-            NickClass::Auto => self.nick.display(),
-        }
+        self.nick.display()
     }
 
     /// The file's text.

@@ -98,6 +98,13 @@ struct Mac {
     status: RefCell<Result<Vec<u8>, String>>,
     listed: RefCell<Vec<PathBuf>>,
     looked: RefCell<Vec<PathBuf>>,
+    /// What [`Reads::mount_points`] answers.
+    mounts: RefCell<Option<BTreeSet<PathBuf>>>,
+    /// What [`Reads::broker_left`] answers: this account's record of the folders the broker
+    /// left as they are.
+    left: RefCell<Option<Vec<u8>>>,
+    /// What [`Reads::now`] answers: no clock unless a test sets one.
+    clock: RefCell<Option<u64>>,
 }
 
 const FOLDER: Entry = Entry {
@@ -105,17 +112,32 @@ const FOLDER: Entry = Entry {
     dir: true,
     symlink: false,
     id: None,
+    mode: 0o750,
 };
 
-/// A folder on the data volume with inode `ino`.
+/// A folder of alice's on the data volume.
+const MINE: Entry = Entry {
+    id: Some((VOLUME, 3000)),
+    ..FOLDER
+};
+
+/// A folder of root's on the data volume with inode `ino`, that only root may write.
 const fn on_volume(ino: u64) -> Entry {
     Entry {
         uid: 0,
         dir: true,
         symlink: false,
         id: Some((VOLUME, ino)),
+        mode: 0o755,
     }
 }
+
+/// Alice's home: her own folder on the data volume, with no sticky bit.
+const HOME: Entry = Entry {
+    uid: 501,
+    mode: 0o750,
+    ..on_volume(1000)
+};
 
 impl Mac {
     /// Alice (501) at the console of a Mac whose data volume is indexed.
@@ -135,6 +157,7 @@ impl Mac {
     ///   `/usr/local` is the volume's `usr/local` ([`FIRMLINKED`]), its `/usr/libexec/cups`
     ///   another folder than the volume's.
     /// - /Users//Shared is a folder on the volume.
+    /// - The mount table names `/` alone, and alice has no record of folders the broker left.
     fn alice() -> Self {
         let mac = Self {
             macos: true,
@@ -146,9 +169,19 @@ impl Mac {
             status: RefCell::new(Ok(ENABLED.as_bytes().to_vec())),
             listed: RefCell::default(),
             looked: RefCell::default(),
+            mounts: RefCell::new(Some(BTreeSet::from([PathBuf::from("/")]))),
+            left: RefCell::default(),
+            clock: RefCell::default(),
         };
         mac.put(CONSOLE, file_of(501));
-        mac.put(ALICE, on_volume(1000));
+        mac.put(
+            "/",
+            Entry {
+                uid: 0,
+                ..on_volume(1)
+            },
+        );
+        mac.put(ALICE, HOME);
         for name in [
             "Documents",
             "Desktop",
@@ -159,7 +192,7 @@ impl Mac {
             ".cargo",
             "Cache.noindex",
         ] {
-            mac.put(&format!("{ALICE}/{name}"), FOLDER);
+            mac.put(&format!("{ALICE}/{name}"), MINE);
         }
         mac.put(&format!("{ALICE}/Linked"), link());
         mac.put(&format!("{ALICE}/notes.txt"), file_of(501));
@@ -280,6 +313,7 @@ fn file_of(uid: u32) -> Entry {
         dir: false,
         symlink: false,
         id: None,
+        mode: 0o644,
     }
 }
 
@@ -356,10 +390,44 @@ impl Reads for Mac {
     fn volume_status(&self) -> Result<Vec<u8>, String> {
         self.status.borrow().clone()
     }
+
+    fn home_of(&self, uid: u32) -> Option<PathBuf> {
+        (uid == self.euid).then(|| self.home.clone()).flatten()
+    }
+
+    fn mount_points(&self) -> Option<BTreeSet<PathBuf>> {
+        self.mounts.borrow().clone()
+    }
+
+    fn broker_left(&self) -> Option<Vec<u8>> {
+        self.left.borrow().clone()
+    }
+
+    fn now(&self) -> Option<u64> {
+        *self.clock.borrow()
+    }
 }
 
 fn paths(names: &[&str]) -> BTreeSet<PathBuf> {
     names.iter().map(PathBuf::from).collect()
+}
+
+/// Alice's own folders at `names`, under her home.
+fn home_paths(names: &[&str]) -> BTreeSet<PathBuf> {
+    names
+        .iter()
+        .map(|name| Path::new(ALICE).join(name))
+        .collect()
+}
+
+/// A receipt naming every folder of [`ALL`] beyond alice's home's top level: a home whose owed
+/// folders are all ones the broker takes.
+fn beyond_the_home_receipt() -> Vec<u8> {
+    beyond_the_home()
+        .iter()
+        .map(|path| format!("{}\n", path.display()))
+        .collect::<String>()
+        .into_bytes()
 }
 
 /// [`ALL`] less the folders main's home-only receipt ([`HOME_ONLY`]) names.
@@ -998,6 +1066,508 @@ fn completed_scope_needs_an_explicit_extension() {
         !automatic_owed(&mac),
         "an untrusted receipt never admits a password ask"
     );
+}
+
+/// The broker's reading is the console account's own home by the broker's rules: a folder the
+/// password route failed to exclude is still the broker's to try, and no home is read for root
+/// or for an account other than the console's.
+/// NEGATIVE CONTROL: reading the refusal as `owed` does leaves the refused folders unowed.
+#[test]
+fn the_brokers_reading_is_the_console_home_by_the_receipt_alone() {
+    let mac = Mac::alice();
+    mac.file(REFUSED, 0, HOME_ONLY);
+    assert_eq!(
+        broker_owed(&mac),
+        Some(Ok(home_paths(&["Developer", "Downloads"])))
+    );
+    let root = Mac {
+        euid: 0,
+        ..Mac::alice()
+    };
+    assert_eq!(broker_owed(&root), None);
+    let away = Mac::alice();
+    away.put(CONSOLE, file_of(502));
+    assert_eq!(broker_owed(&away), None);
+}
+
+/// The broker is asked only where it would take a folder, and the home is read again after its
+/// answer: what it excluded with none left is done, with some left more; a busy broker and an
+/// unserved request are ones the clock may finish; a refusal, a Spotlight left as it is and an
+/// exclusion of none still owed are definite, and a failed edit fails; each answer comes with
+/// the folders it was asked for.
+/// NEGATIVE CONTROLS: asking where nothing is owed records an ask on a scoped home; reading the
+/// answer without reading the home again calls a partial exclusion done; an unchanged answer
+/// read as a transient one asks again for folders the broker left.
+#[cfg(unix)]
+#[test]
+fn the_broker_is_asked_only_where_a_folder_is_owed_and_read_again() {
+    use aterm_uds::lan::ScopeAnswer;
+    use std::cell::Cell;
+    let mac = Mac::alice();
+    mac.file(RECEIPT, 0, HOME_ONLY);
+    let asked = Cell::new(0);
+    let counted = |answer: ScopeAnswer| {
+        asked.set(asked.get() + 1);
+        answer
+    };
+    assert_eq!(
+        exclude_owed(&mac, &|| counted(ScopeAnswer::Excluded(1))),
+        (Pass::Nothing, BTreeSet::new())
+    );
+    assert_eq!(asked.get(), 0, "a scoped home asks nothing");
+
+    mac.put(&format!("{ALICE}/trust"), MINE);
+    mac.put(&format!("{ALICE}/ty"), MINE);
+    let one_of_two = || {
+        mac.file(
+            RECEIPT,
+            0,
+            b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/trust\n",
+        );
+        counted(ScopeAnswer::Excluded(1))
+    };
+    assert_eq!(
+        exclude_owed(&mac, &one_of_two),
+        (Pass::More(1), home_paths(&["trust", "ty"]))
+    );
+    let the_rest = || {
+        mac.file(
+            RECEIPT,
+            0,
+            b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/trust\n\
+              /Users//alice/ty\n",
+        );
+        counted(ScopeAnswer::Excluded(1))
+    };
+    assert_eq!(
+        exclude_owed(&mac, &the_rest),
+        (Pass::Done(1), home_paths(&["ty"]))
+    );
+    assert_eq!(asked.get(), 2);
+
+    mac.put(&format!("{ALICE}/Scratch"), MINE);
+    assert!(matches!(
+        exclude_owed(&mac, &|| ScopeAnswer::Excluded(0)).0,
+        Pass::Left(why) if why.contains("none")
+    ));
+    for (answer, pass) in [
+        (ScopeAnswer::Busy, Pass::Busy),
+        (
+            ScopeAnswer::Unserved("restarting".into()),
+            Pass::Unavailable("restarting".into()),
+        ),
+        (
+            ScopeAnswer::Refused("not the console's".into()),
+            Pass::Left("not the console's".into()),
+        ),
+        (
+            ScopeAnswer::Unchanged("its last edit failed".into()),
+            Pass::Left("its last edit failed".into()),
+        ),
+        (
+            ScopeAnswer::Failed("the edit failed".into()),
+            Pass::Failed("the edit failed".into()),
+        ),
+    ] {
+        assert_eq!(
+            exclude_owed(&mac, &|| answer.clone()),
+            (pass, home_paths(&["Scratch"]))
+        );
+    }
+}
+
+/// Folders this account's record says the broker left as they are are not asked for again, and
+/// owe the password a home they leave never scoped, so a Mac whose broker cannot serve the step
+/// asks the password once; a folder made since is a new ask of every folder owed, and the
+/// password then waits for its answer. Alice's receipt names every folder beyond her home's top
+/// level, so the broker would take every folder owed.
+/// NEGATIVE CONTROL: a reading that leaves out the record asks the broker again for the same
+/// folders, and owes the password nothing.
+#[cfg(unix)]
+#[test]
+fn folders_the_broker_left_are_not_asked_again_and_owe_the_password() {
+    let mac = Mac::alice();
+    mac.file(RECEIPT, 0, &beyond_the_home_receipt());
+    *mac.left.borrow_mut() =
+        Some(broker_left_text(&home_paths(&["Developer", "Downloads"]), 1_000).into_bytes());
+    assert_eq!(
+        broker_would_take(&mac),
+        Some(Err(Leave::Stands(LEFT.to_owned())))
+    );
+    assert_eq!(
+        exclude_owed(&mac, &|| panic!("a left plan asks no broker")),
+        (Pass::Nothing, BTreeSet::new())
+    );
+    assert!(automatic_owed_beside(&mac, || true));
+    mac.put(&format!("{ALICE}/trust"), MINE);
+    assert_eq!(
+        broker_would_take(&mac),
+        Some(Ok(home_paths(&["Developer", "Downloads", "trust"])))
+    );
+    assert!(!automatic_owed_beside(&mac, || true));
+}
+
+/// A home setup's password never scoped is owed the password unless a broker of this build
+/// serves this Mac and would take every folder the ask owes. The broker takes only the home's
+/// own top-level folders, so a home whose scope owes folders in ~/Library or at the data
+/// volume's top level (alice's, never scoped) is owed the password with the broker serving; one
+/// whose owed folders are all at the top level (her receipt names every folder beyond it) is
+/// not, unless the broker refuses the home (a sticky home, a `/Users` others may write) or
+/// leaves Spotlight as it is for a cause that stands (a listing past its bound). The broker's
+/// reading is read only where the scope is owed.
+/// NEGATIVE CONTROLS: counting a broker that would take some folder as taking the home leaves
+/// alice's never-scoped home owed nothing; counting every serving broker as taking it leaves the
+/// refused and the bounded homes owed nothing.
+#[test]
+fn a_home_the_broker_would_not_take_is_still_owed_the_password() {
+    use std::cell::Cell;
+    let asked = Cell::new(0);
+    let serves = |answer: bool| {
+        let asked = &asked;
+        move || {
+            asked.set(asked.get() + 1);
+            answer
+        }
+    };
+    let never = Mac::alice();
+    assert!(automatic_owed_beside(&never, serves(false)));
+    assert!(automatic_owed_beside(&never, serves(true)));
+    let at_top = || {
+        let mac = Mac::alice();
+        mac.file(RECEIPT, 0, &beyond_the_home_receipt());
+        mac
+    };
+    let mac = at_top();
+    assert!(automatic_owed_beside(&mac, serves(false)));
+    assert!(!automatic_owed_beside(&mac, serves(true)));
+    let sticky = at_top();
+    sticky.put(
+        ALICE,
+        Entry {
+            mode: 0o1750,
+            ..HOME
+        },
+    );
+    assert!(automatic_owed_beside(&sticky, serves(true)));
+    let shared = at_top();
+    shared.put(
+        "/Users",
+        Entry {
+            mode: 0o775,
+            ..on_volume(12)
+        },
+    );
+    assert!(automatic_owed_beside(&shared, serves(true)));
+    let crowded = at_top();
+    for at in 0..LISTING_MAX {
+        crowded.put(&format!("{ALICE}/.dot-{at}"), file_of(501));
+    }
+    assert!(automatic_owed_beside(&crowded, serves(true)));
+    assert_eq!(asked.get(), 7);
+    let scoped = Mac::alice();
+    scoped.file(RECEIPT, 0, &full());
+    assert!(!automatic_owed_beside(&scoped, serves(true)));
+    assert_eq!(asked.get(), 7, "a home owed nothing reads no broker");
+}
+
+/// The broker takes only the console account's own top-level home folders the scope leaves out,
+/// by the scope's own rule ([`wanted`] at the home's top level): of alice's, Developer and
+/// Downloads, never Documents, Desktop, Applications or Library, a dot-folder, a `*.noindex`
+/// folder, a link, a file or a folder on another device; and nothing in ~/Library, at the data
+/// volume's top level, in /Users//Shared or behind a firmlink, which are the password route's. Its
+/// reading lists the home alone, and a folder whose device numbers are unread is not taken. A
+/// home the password never scoped plans those two folders.
+/// NEGATIVE CONTROLS: a reading that takes the scope's whole `wanted` takes ~/Library's and the
+/// volume's folders; one that keeps no name of the home takes Documents, Desktop, Applications
+/// and Library; one held to the scope's own device rule takes the folder whose numbers are
+/// unread.
+#[test]
+fn the_broker_takes_only_the_homes_own_top_level_folders_the_scope_leaves_out() {
+    let mac = Mac::alice();
+    // Its numbers unread, a folder is no proof of the home's device, though the scope names it.
+    mac.put(&format!("{ALICE}/Unread"), FOLDER);
+    let read = broker_home_reading(&mac, 501).unwrap();
+    assert_eq!(read.home, PathBuf::from(ALICE));
+    assert_eq!(read.wanted, home_paths(&["Developer", "Downloads"]));
+    assert_eq!(*mac.listed.borrow(), [PathBuf::from(ALICE)]);
+    assert!(
+        wanted(&mac, Path::new(ALICE))
+            .unwrap()
+            .contains(Path::new("/Users//alice/Unread"))
+    );
+    assert_eq!(
+        broker_plan(&mac, 501),
+        Ok(home_paths(&["Developer", "Downloads"]))
+    );
+    // Main's home-only receipt names both: the broker owes this home nothing, while the
+    // password route still owes it the rest of the scope.
+    mac.file(RECEIPT, 0, HOME_ONLY);
+    assert_eq!(broker_plan(&mac, 501), Ok(BTreeSet::new()));
+    assert!(matches!(
+        state(&mac, Path::new(ALICE)),
+        Ok(State::Indexed { asks: true, .. })
+    ));
+}
+
+/// The broker scopes a home only on the data volume, whose configuration governs no other
+/// volume's index: a home whose numbers say another device, whose numbers are unread, or that
+/// lies inside a filesystem mounted below the root, is refused, and none of them is listed.
+/// NEGATIVE CONTROL: a broker that reads the device rule as the password route's (unread
+/// numbers are on the volume) lists the home whose numbers are unread.
+#[test]
+fn the_broker_refuses_a_home_off_the_data_volume() {
+    let other = Mac::alice();
+    other.put(
+        ALICE,
+        Entry {
+            id: Some((OTHER, 7)),
+            ..HOME
+        },
+    );
+    let unread = Mac::alice();
+    unread.put(ALICE, Entry { id: None, ..HOME });
+    let inside = Mac::alice();
+    inside
+        .mounts
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .insert(PathBuf::from("/Users"));
+    for mac in [other, unread, inside] {
+        assert!(matches!(
+            broker_home_reading(&mac, 501),
+            Err(Leave::Refused(why)) if why.contains("data volume")
+        ));
+        assert!(mac.listed.borrow().is_empty(), "{:?}", mac.listed.borrow());
+    }
+}
+
+/// While the data volume is not indexed (the person paused indexing from the page, or it is off
+/// for any other cause) the broker plans nothing and reads no home, and nothing asks it: a pause
+/// is never undone or worked around by an exclusion, as on the password route.
+/// NEGATIVE CONTROL: a plan that reads a volume not indexed as indexed plans alice's folders.
+#[cfg(unix)]
+#[test]
+fn a_volume_not_indexed_plans_nothing_and_asks_nothing() {
+    let mac = Mac::alice();
+    mac.prints(Ok("/System/Volumes/Data:\n\tIndexing disabled.\n"));
+    assert_eq!(broker_plan(&mac, 501), Ok(BTreeSet::new()));
+    assert!(mac.listed.borrow().is_empty(), "{:?}", mac.listed.borrow());
+    assert_eq!(broker_would_take(&mac), Some(Ok(BTreeSet::new())));
+    assert_eq!(
+        exclude_owed(&mac, &|| panic!("a volume not indexed asks no broker")),
+        (Pass::Nothing, BTreeSet::new())
+    );
+    assert!(!automatic_owed_beside(&mac, || panic!("nothing is owed")));
+}
+
+/// Root reads its own receipt strictly: one past its bound is an error to the reading and to
+/// the root step, never none, so no write of root's drops the other homes' lines; a receipt
+/// that is not root's own file, or none, reads as none, which root's next write replaces.
+/// NEGATIVE CONTROL: root reading a receipt it cannot read as none calls the over-bound one
+/// empty.
+#[test]
+fn root_reads_its_own_receipt_strictly_and_anothers_as_none() {
+    let root = Mac {
+        euid: 0,
+        ..Mac::alice()
+    };
+    assert_eq!(listed_as_root(&root, RECEIPT), Ok(BTreeSet::new()));
+    root.file(RECEIPT, 501, HOME_ONLY);
+    assert_eq!(listed_as_root(&root, RECEIPT), Ok(BTreeSet::new()));
+    root.file(RECEIPT, 0, HOME_ONLY);
+    assert_eq!(
+        listed_as_root(&root, RECEIPT),
+        Ok(home_paths(&["Developer", "Downloads"]))
+    );
+    root.file(RECEIPT, 0, &vec![b'/'; RECEIPT_MAX + 1]);
+    assert!(listed_as_root(&root, RECEIPT).is_err());
+    assert!(state(&root, Path::new(ALICE)).is_err());
+}
+
+/// The broker reads no folder another filesystem is mounted on: such a top-level folder is left
+/// out unread, a home that is a mount of its own is refused, and a mount table that could not
+/// be read whole leaves the home unread.
+/// NEGATIVE CONTROL: a listing kept whole, or a home not checked against the table, reads the
+/// mounted folder or the mounted home.
+#[test]
+fn the_broker_reads_no_folder_a_filesystem_is_mounted_on() {
+    let mac = Mac::alice();
+    let mounted = PathBuf::from(format!("{ALICE}/Developer"));
+    mac.mounts
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .insert(mounted.clone());
+    // Any read of the mounted folder's metadata would reach into its filesystem.
+    mac.put(&format!("{ALICE}/Developer"), Entry { uid: 0, ..MINE });
+    let read = broker_home_reading(&mac, 501).unwrap();
+    assert_eq!(read.wanted, home_paths(&["Downloads"]));
+    assert!(
+        !mac.looked.borrow().contains(&mounted),
+        "{:?}",
+        mac.looked.borrow()
+    );
+
+    let home = Mac::alice();
+    home.mounts
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .insert(PathBuf::from(ALICE));
+    assert!(matches!(
+        broker_home_reading(&home, 501),
+        Err(Leave::Refused(why)) if why.contains("filesystem of its own")
+    ));
+    assert!(!home.looked.borrow().contains(&PathBuf::from(ALICE)));
+
+    let unread = Mac::alice();
+    *unread.mounts.borrow_mut() = None;
+    assert!(matches!(
+        broker_home_reading(&unread, 501),
+        Err(Leave::Unread(_))
+    ));
+}
+
+/// A home keeps at most [`HOME_BYTES`] of the receipt: a folder whose line would pass its share
+/// is left out while one that fits is taken, and a home whose share no owed folder fits stands;
+/// another home's lines are not this home's share.
+/// NEGATIVE CONTROL: a plan bounded by lines alone takes the long name past the share.
+#[test]
+fn a_home_is_bounded_by_its_share_of_the_receipt_bytes() {
+    let mac = Mac::alice();
+    let mut receipt = String::from_utf8(HOME_ONLY.to_vec()).unwrap();
+    let mut at = 0;
+    while HOME_BYTES - receipt.len() > 154 {
+        receipt.push_str(&format!("{ALICE}/{at:0>40}\n"));
+        at += 1;
+    }
+    // One line more leaves 30 bytes of alice's share: room for `short`'s line, not `long`'s.
+    let filler = HOME_BYTES - 30 - receipt.len() - ALICE.len() - 2;
+    receipt.push_str(&format!("{ALICE}/{}\n", "f".repeat(filler)));
+    assert_eq!(receipt.len(), HOME_BYTES - 30);
+    for at in 0..200 {
+        receipt.push_str(&format!("/Users//bob/{at:0>60}\n"));
+    }
+    mac.file(RECEIPT, 0, receipt.as_bytes());
+    let long = "l".repeat(60);
+    mac.put(&format!("{ALICE}/{long}"), MINE);
+    mac.put(&format!("{ALICE}/short"), MINE);
+    assert_eq!(broker_plan(&mac, 501), Ok(home_paths(&["short"])));
+    mac.file(RECEIPT, 0, format!("{receipt}{ALICE}/short\n").as_bytes());
+    assert!(matches!(
+        broker_plan(&mac, 501),
+        Err(Leave::Stands(why)) if why.contains("share")
+    ));
+}
+
+/// The broker's own lines of the receipt ([`BROKERED`]) stay within [`BROKER_MAX`]: the rest of
+/// its bound is always the password route's, so the lines that route owes a home's ~/Library
+/// and the data volume's top level still fit however many homes the broker served first. A
+/// folder whose line fits under that half is taken; one whose line would pass it stands, though
+/// the whole bound has room. Only the record's lines the receipt names count, so lines a receipt
+/// lost take none of the half.
+/// NEGATIVE CONTROLS: a half bounded by the whole receipt's lines plans nothing here; one that
+/// counts the record whole, its lines the receipt lacks among them, stands at the first fill.
+#[test]
+fn the_broker_leaves_the_password_route_its_half_of_the_receipt() {
+    let mac = Mac::alice();
+    let folder = format!("{ALICE}/a-folder-of-alices");
+    let line = folder.len() + 1;
+    // The broker's own lines of other homes, to `short` bytes short of its half, in the receipt
+    // and in its record, which also names lines the receipt lost; the password route's
+    // (alice's) lines beside them in the receipt.
+    let broker_short_of_half_by = |short: usize| {
+        let mut own = String::new();
+        let mut at = 0;
+        while BROKER_MAX - short - own.len() > 1100 {
+            own.push_str(&format!("/Users//bob/{at:04}-{}\n", "b".repeat(1000)));
+            at += 1;
+        }
+        let room = BROKER_MAX - short - own.len();
+        own.push_str(&format!("/{}\n", "p".repeat(room - 2)));
+        assert_eq!(own.len(), BROKER_MAX - short);
+        let receipt = format!("{}{own}", String::from_utf8(HOME_ONLY.to_vec()).unwrap());
+        mac.file(RECEIPT, 0, receipt.as_bytes());
+        let lost = format!("/Users//dave/{}\n", "d".repeat(8000));
+        mac.file(BROKERED, 0, format!("{own}{lost}").as_bytes());
+    };
+    mac.put(&folder, MINE);
+    broker_short_of_half_by(line);
+    assert_eq!(
+        broker_plan(&mac, 501),
+        Ok(home_paths(&["a-folder-of-alices"]))
+    );
+    broker_short_of_half_by(line - 1);
+    const { assert!(BROKER_MAX + 1 < RECEIPT_MAX) };
+    assert!(matches!(
+        broker_plan(&mac, 501),
+        Err(Leave::Stands(why)) if why.contains("password route")
+    ));
+}
+
+/// The password route's lines, however many, take none of the broker's half: with more than
+/// half the receipt's bound of them and no line the broker recorded as its own, a folder the
+/// broker takes is planned.
+/// NEGATIVE CONTROL: a half that bounds the whole receipt leaves the folder out.
+#[test]
+fn the_password_routes_lines_past_half_leave_the_broker_its_own_half() {
+    let mac = Mac::alice();
+    mac.put(&format!("{ALICE}/a-folder-of-alices"), MINE);
+    let mut receipt = String::from_utf8(HOME_ONLY.to_vec()).unwrap();
+    let mut at = 0;
+    while receipt.len() < 150 * 1024 {
+        receipt.push_str(&format!(
+            "/Users//bob/Library/{at:04}-{}\n",
+            "b".repeat(1000)
+        ));
+        at += 1;
+    }
+    const { assert!(150 * 1024 > BROKER_MAX) };
+    mac.file(RECEIPT, 0, receipt.as_bytes());
+    assert_eq!(
+        broker_plan(&mac, 501),
+        Ok(home_paths(&["a-folder-of-alices"]))
+    );
+}
+
+/// This account's record of the folders the broker left stands a day for `sync.spotlight`'s ask
+/// ([`broker_would_ask`]) and at any age for the automatic ask ([`broker_would_take`]): dated
+/// within the last [`LEFT_KEPT`] it asks nothing; a day on, undated, or dated after the clock's
+/// time it asks again, while the automatic ask still reads the folders left, so the password
+/// stays owed until the broker excludes them. A reader with no clock keeps it at any age.
+/// NEGATIVE CONTROLS: a record honoured at any age by the ask asks nothing a day on; the
+/// automatic ask reading it by its age owes the password nothing a day on.
+#[cfg(unix)]
+#[test]
+fn a_left_record_stands_a_day_for_the_ask_and_any_age_for_the_password() {
+    let mac = Mac::alice();
+    mac.file(RECEIPT, 0, &beyond_the_home_receipt());
+    let owed = home_paths(&["Developer", "Downloads"]);
+    let left = Err(Leave::Stands(LEFT.to_owned()));
+    let day = LEFT_KEPT.as_secs();
+    *mac.left.borrow_mut() = Some(broker_left_text(&owed, 1_000).into_bytes());
+    assert_eq!(broker_would_ask(&mac), Some(left.clone()), "no clock");
+    for (now, stands) in [
+        (1_000, true),
+        (1_000 + day - 1, true),
+        (1_000 + day, false),
+        (999, false),
+    ] {
+        *mac.clock.borrow_mut() = Some(now);
+        let asks = if stands {
+            left.clone()
+        } else {
+            Ok(owed.clone())
+        };
+        assert_eq!(broker_would_ask(&mac), Some(asks), "{now}");
+        assert_eq!(broker_would_take(&mac), Some(left.clone()), "{now}");
+        assert!(automatic_owed_beside(&mac, || true), "{now}");
+    }
+    *mac.left.borrow_mut() = Some(b"/Users//alice/Developer\n/Users//alice/Downloads\n".to_vec());
+    *mac.clock.borrow_mut() = Some(1_000);
+    assert_eq!(broker_would_ask(&mac), Some(Ok(owed)), "undated");
+    assert_eq!(broker_would_take(&mac), Some(left));
 }
 
 /// A FOLDER KEPT OUT FROM THE PAGE LIES STRICTLY INSIDE DOCUMENTS, DESKTOP OR A SYNCED DRIVE,

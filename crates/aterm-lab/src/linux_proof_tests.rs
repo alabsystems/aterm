@@ -528,6 +528,16 @@ fn a_build_error_is_named_and_a_clean_run_counts() {
     let r = test_verdict("t", &out);
     assert_eq!(r.verdict, Verdict::Fail);
     assert!(r.detail.contains("E0425"), "{}", r.detail);
+    let stalled = Out {
+        code: Some(124),
+        text: format!("{STAGED}\ntest pending ... \nrow-watch: fixture snapshot\n"),
+        ..out
+    };
+    let r = test_verdict("t", &stalled);
+    assert_eq!(r.verdict, Verdict::Fail);
+    assert!(r.detail.contains("spawnfd::staged"));
+    assert!(r.detail.contains("test pending ..."));
+    assert_eq!(r.detail.matches("fixture snapshot").count(), 1);
     let clean = Out {
         code: Some(0),
         text: "     Running tests/a.rs (t/debug/deps/a-0123)\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured\n".into(),

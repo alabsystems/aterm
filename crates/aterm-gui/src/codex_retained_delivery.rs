@@ -30,6 +30,9 @@ pub(super) struct FrontendDelivery {
 }
 
 impl FrontendDelivery {
+    pub(super) fn received(&self) -> bool {
+        self.phase == Phase::Received
+    }
     pub(super) fn new(callback: CtlStream, endpoint: CtlStream) -> Result<Self, Error> {
         let nonce = aterm_uds::rand::hex_token::<16>().map_err(|_| Error::Unavailable)?;
         let mut header = [0; HEADER_BYTES];

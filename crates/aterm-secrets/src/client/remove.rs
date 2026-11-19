@@ -2464,7 +2464,7 @@ fn said_of(error: &Error) -> NodePassSaid {
 /// What tells one records file's contents from another's: every writer renames a new file over it
 /// or appends to it ([`fsx::FileStamp`]). `None` with no readable file.
 #[cfg(unix)]
-fn records_stamp(paths: &Paths) -> Option<fsx::FileStamp> {
+pub(super) fn records_stamp(paths: &Paths) -> Option<fsx::FileStamp> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(paths.records_data_file().ok()?).ok()?;
     let ns = |secs: i64, nsec: i64| i128::from(secs) * 1_000_000_000 + i128::from(nsec);

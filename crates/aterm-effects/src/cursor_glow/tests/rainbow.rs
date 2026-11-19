@@ -299,144 +299,135 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
     let mut worst_margin = f32::INFINITY;
     let mut worst_at = String::new();
     let mut brightest_field = 0.0f32;
-    for (raw, c) in [
-        ("tall", tall_rainbow_cfg()),
-        ("underline", underline_rainbow_cfg()),
-    ] {
-        for gap_ms in [18u64, 28, 45, 90] {
-            let (glow, over_engine, at) =
-                typed_burst(&c, g, row, 5..col + 1, Duration::from_millis(gap_ms));
-            for step in 0..=6u32 {
-                let field = step as f32 / 6.0;
-                for &e in &[0.35f32, 0.6, 1.0] {
-                    for &flare in &[false, true] {
-                        let mut caret = CursorRainbow::default();
-                        let mut over = over_engine.clone();
-                        let caret_cfg = RainbowConfig {
-                            light: crate::cursor_glow::Light::OFF,
-                            enabled: true,
-                            intensity: 1.0,
-                            blinking: flare,
-                            base: Some(0x0050_FA7B),
-                            head_rgb: None,
-                            paint: None,
-                            ground: None,
-                            flare_at: None,
-                        };
-                        let mut caret_tick =
-                            |blink: bool, when: Instant, out: &mut Vec<GlowQuad>| {
-                                caret
-                                    .tick_with_family_phase(
-                                        Some((row, col)),
-                                        when,
-                                        e,
-                                        glow.rainbow_phase(),
-                                        field,
-                                        blink,
-                                        true,
-                                        g,
-                                        &caret_cfg,
-                                        out,
-                                    )
-                                    .fill
-                                    .expect("enabled block fill")
-                            };
-                        let mark = over.len();
-                        let fill = if flare {
-                            caret_tick(false, at, &mut over);
-                            over.truncate(mark);
-                            caret_tick(true, at, &mut over);
-                            over.truncate(mark);
-                            caret_tick(true, at + Duration::from_millis(70), &mut over)
+    let c = tall_rainbow_cfg();
+    for gap_ms in [18u64, 28, 45, 90] {
+        let (glow, over_engine, at) =
+            typed_burst(&c, g, row, 5..col + 1, Duration::from_millis(gap_ms));
+        for step in 0..=6u32 {
+            let field = step as f32 / 6.0;
+            for &e in &[0.35f32, 0.6, 1.0] {
+                for &flare in &[false, true] {
+                    let mut caret = CursorRainbow::default();
+                    let mut over = over_engine.clone();
+                    let caret_cfg = RainbowConfig {
+                        light: crate::cursor_glow::Light::OFF,
+                        enabled: true,
+                        intensity: 1.0,
+                        blinking: flare,
+                        base: Some(0x0050_FA7B),
+                        head_rgb: None,
+                        paint: None,
+                        ground: None,
+                        flare_at: None,
+                    };
+                    let mut caret_tick = |blink: bool, when: Instant, out: &mut Vec<GlowQuad>| {
+                        caret
+                            .tick_with_family_phase(
+                                Some((row, col)),
+                                when,
+                                e,
+                                glow.rainbow_phase(),
+                                field,
+                                blink,
+                                true,
+                                g,
+                                &caret_cfg,
+                                out,
+                            )
+                            .fill
+                            .expect("enabled block fill")
+                    };
+                    let mark = over.len();
+                    let fill = if flare {
+                        caret_tick(false, at, &mut over);
+                        over.truncate(mark);
+                        caret_tick(true, at, &mut over);
+                        over.truncate(mark);
+                        caret_tick(true, at + Duration::from_millis(70), &mut over)
+                    } else {
+                        caret_tick(false, at, &mut over)
+                    };
+                    let rim_level = over[mark..]
+                        .iter()
+                        .map(|q| {
+                            ((q.color >> 16) & 0xff)
+                                .max((q.color >> 8) & 0xff)
+                                .max(q.color & 0xff)
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    let visible_floor = if flare { 16 } else { 4 };
+                    assert!(
+                        rim_level >= visible_floor,
+                        "NON-VACUOUS: {} vanished (peak level {rim_level})",
+                        if flare {
+                            "the flare arm"
                         } else {
-                            caret_tick(false, at, &mut over)
-                        };
-                        let rim_level = over[mark..]
-                            .iter()
-                            .map(|q| {
-                                ((q.color >> 16) & 0xff)
-                                    .max((q.color >> 8) & 0xff)
-                                    .max(q.color & 0xff)
-                            })
-                            .max()
-                            .unwrap_or(0);
-                        let visible_floor = if flare { 16 } else { 4 };
-                        assert!(
-                            rim_level >= visible_floor,
-                            "NON-VACUOUS: {} vanished (peak level {rim_level})",
-                            if flare {
-                                "the flare arm"
-                            } else {
-                                "the ordinary rim"
-                            }
-                        );
+                            "the ordinary rim"
+                        }
+                    );
 
-                        let mut f = Glass::new(g, c.theme_bg);
-                        f.add_quads(glow.under_quads());
-                        f.add_quads(&over);
-                        f.add_halos(glow.halos());
-                        f.stamp_caret(row, col, fill);
+                    let mut f = Glass::new(g, c.theme_bg);
+                    f.add_quads(glow.under_quads());
+                    f.add_quads(&over);
+                    f.add_halos(glow.halos());
+                    f.stamp_caret(row, col, fill);
 
-                        let (cx0, cy0, cx1, cy1) = f.cell_rect(row, col);
-                        let in_cell =
-                            |y: i32, x: i32| (cy0..cy1).contains(&y) && (cx0..cx1).contains(&x);
-                        let rail_px = (crate::rainbow_kitty::ribbon::RAIL_REACH_MAX_CH
-                            * g.ch as f32)
-                            .ceil() as i32;
-                        let in_glyph_rows =
-                            |y: i32| (y - i32::from(g.origin_y)).rem_euclid(g.ch as i32) >= rail_px;
-                        let mut best = (f32::NEG_INFINITY, 0i32, 0i32, 0u32);
-                        let mut best_outside = (f32::NEG_INFINITY, 0i32, 0i32, 0u32);
-                        for y in 0..g.win_h as i32 {
-                            if !in_glyph_rows(y) {
-                                continue;
+                    let (cx0, cy0, cx1, cy1) = f.cell_rect(row, col);
+                    let in_cell =
+                        |y: i32, x: i32| (cy0..cy1).contains(&y) && (cx0..cx1).contains(&x);
+                    let rail_px = (crate::rainbow_kitty::ribbon::RAIL_REACH_MAX_CH * g.ch as f32)
+                        .ceil() as i32;
+                    let in_glyph_rows =
+                        |y: i32| (y - i32::from(g.origin_y)).rem_euclid(g.ch as i32) >= rail_px;
+                    let mut best = (f32::NEG_INFINITY, 0i32, 0i32, 0u32);
+                    let mut best_outside = (f32::NEG_INFINITY, 0i32, 0i32, 0u32);
+                    for y in 0..g.win_h as i32 {
+                        if !in_glyph_rows(y) {
+                            continue;
+                        }
+                        for x in 0..g.win_w as i32 {
+                            let colr = f.at(y, x);
+                            let l = light(colr);
+                            if l > best.0 {
+                                best = (l, y, x, colr);
                             }
-                            for x in 0..g.win_w as i32 {
-                                let colr = f.at(y, x);
-                                let l = light(colr);
-                                if l > best.0 {
-                                    best = (l, y, x, colr);
+                            if !in_cell(y, x) {
+                                if l > best_outside.0 {
+                                    best_outside = (l, y, x, colr);
                                 }
-                                if !in_cell(y, x) {
-                                    if l > best_outside.0 {
-                                        best_outside = (l, y, x, colr);
-                                    }
-                                    let (r, gg, b) =
-                                        ((colr >> 16) & 0xff, (colr >> 8) & 0xff, colr & 0xff);
-                                    if r.min(gg).min(b) > 40 {
-                                        brightest_field = brightest_field.max(l);
-                                    }
+                                let (r, gg, b) =
+                                    ((colr >> 16) & 0xff, (colr >> 8) & 0xff, colr & 0xff);
+                                if r.min(gg).min(b) > 40 {
+                                    brightest_field = brightest_field.max(l);
                                 }
                             }
                         }
-                        assert!(
-                            in_cell(best.1, best.2),
-                            "the brightest pixel of the frame is at ({}, {}) — \
-                             #{:06X}, luminance {:.0} — while the cursor cell \
-                             peaks at {:.0}. {raw}, gap {gap_ms} ms, field \
-                             {field}, energy {e}, flare {flare}",
-                            best.1,
-                            best.2,
-                            best.3,
-                            best.0,
-                            (cy0..cy1)
-                                .flat_map(|y| (cx0..cx1).map(move |x| (y, x)))
-                                .map(|(y, x)| light(f.at(y, x)))
-                                .fold(0.0f32, f32::max)
-                        );
-                        if best.0 - best_outside.0 < worst_margin {
-                            worst_margin = best.0 - best_outside.0;
-                            worst_at = format!(
-                                "({}, {}) #{:06X} L{:.0} vs caret L{:.0} — {raw} gap                                      {gap_ms} field {field} energy {e} flare {flare}",
-                                best_outside.1,
-                                best_outside.2,
-                                best_outside.3,
-                                best_outside.0,
-                                best.0
-                            );
-                        }
-                        checked += 1;
                     }
+                    assert!(
+                        in_cell(best.1, best.2),
+                        "the brightest pixel of the frame is at ({}, {}) — \
+                         #{:06X}, luminance {:.0} — while the cursor cell \
+                         peaks at {:.0}; gap {gap_ms} ms, field {field}, \
+                         energy {e}, flare {flare}",
+                        best.1,
+                        best.2,
+                        best.3,
+                        best.0,
+                        (cy0..cy1)
+                            .flat_map(|y| (cx0..cx1).map(move |x| (y, x)))
+                            .map(|(y, x)| light(f.at(y, x)))
+                            .fold(0.0f32, f32::max)
+                    );
+                    if best.0 - best_outside.0 < worst_margin {
+                        worst_margin = best.0 - best_outside.0;
+                        worst_at = format!(
+                            "({}, {}) #{:06X} L{:.0} vs caret L{:.0} — gap {gap_ms} field \
+                             {field} energy {e} flare {flare}",
+                            best_outside.1, best_outside.2, best_outside.3, best_outside.0, best.0
+                        );
+                    }
+                    checked += 1;
                 }
             }
         }

@@ -11,6 +11,10 @@ description = "aterm's system-awareness model: what the machine, aterm and each 
 [dependencies]
 # Shared plain values; native readers never depend on this statistics model.
 aterm-process-facts = { workspace = true }
+# The workspace's one hasher for the kernel's integer ids (`explain::IdMap`, FxHash) and the
+# stable FNV-1a/64 that `sys::delta` fingerprints lines with. Workspace crate; its one
+# dependency, astream-wire, has none and no platform code.
+aterm-hash.workspace = true
 
 [dev-dependencies]
 # The Tier-1 conformance of the stuck verdict
@@ -19,9 +23,6 @@ aterm-process-facts = { workspace = true }
 # (tests/conformance_explain.rs) replays each against its model.
 aterm-models-misc.workspace = true
 aterm-spec.workspace = true
-# `sys::delta::fnv` is spelled out; its test holds it to the workspace's FNV-1a
-# without adding the hash implementation to the model's normal dependencies.
-aterm-hash.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,153 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Workspace disallowed methods and types. Sanctioned call sites annotate the
+# single statement or item with `#[expect(clippy::disallowed_methods, reason = "…")]`
+# (or `disallowed_types`), never an entire module or function.
+#
+# A crate that keeps its own clippy.toml lints by that file alone (clippy reads only the
+# nearest), so that file repeats these rows word for word: every row of std and core, and
+# every row of a crate it names or depends on. Census guard `clippy-mirror` fails a file
+# that leaves one out.
+#
+# Policy summary:
+# * **Flock release**: `flock` locks an open file description across `fork` /
+#   `posix_spawn`; take locks only through guards that call `File::unlock`
+#   (`LOCK_UN`) before closing (`HeldAdvisoryLock`, `lock::Flock`, `FileLock`).
+# * **Fsync tier**: `File::sync_all` / `sync_data` issue `F_FULLFSYNC` on Apple
+#   targets; use `aterm-durable` (`durable` vs `ordered` `F_BARRIERFSYNC`). A
+#   plain flush is `aterm_durable::primitive::fsync` (any descriptor), never
+#   `libc::fsync` / `fdatasync`: astream-sys counts and times only its own calls
+#   (`flush_tally`, `flush_times`), and calls `fsync` through its own FFI, never
+#   libc's, so no sanctioned site of these rows exists.
+# * **Confined shell**: spawn shells and open PTYs via `aterm-pty`, never raw
+#   `forkpty`/`openpty`/`execvp`.
+# * **No core-dump abort**: use `aterm_uds::process::kill_self_now()` (`SIGKILL`)
+#   instead of `abort()` / `raise()` so macOS does not raise crash-report dialogs.
+# * **Child processes**: construct children with `aterm_uds::spawnfd::command`
+#   (closing non-stdio descriptors and setting Windows console flags), never
+#   bare `std::process::Command::new` or direct `creation_flags`.
+# * **Kept-out pipes**: make a pipe with `aterm_uds::pipe`, which makes both ends
+#   close-on-exec and marks them `FD_CLOFORK` under the spawn lock (`aterm_uds::kept_out`). A
+#   `libc::pipe` end has neither flag, `pipe2` sets close-on-exec alone, and Apple's std pipe is
+#   flagged only after `pipe(2)`: a fork or spawn on another thread copies the end, and its
+#   reader waits for an EOF that never comes (aterm-gui's handoff_progress read `EAGAIN` where
+#   it expected EOF, its write end held by a sibling test's child). A deliberate bare pipe (a
+#   capability probe that needs one unmarked) says why on its one statement.
+# * **Accepted socket mode**: accept TCP and Unix-domain connections through
+#   `aterm_uds::accept`, with both its wait and its stream mode stated. BSD inherits
+#   `O_NONBLOCK` from a listener while Linux does not, so a raw accepted stream has
+#   platform- and listener-dependent read semantics.
+# * **The exec gate**: on macOS an `execve` waits, with no way to end the wait, for every other
+#   thread of its process, and a `kern.proc` read waits the same way on any process in exec, so
+#   a process that replaces itself over its own read never finishes.
+#   Replace the process through `aterm_uds::spawnfd`'s `exec`, which closes
+#   `aterm_sysprobe::exec_gate` first and refuses where it does not close. An exec in a forked
+#   child has one thread and says so on its one statement.
+# * **Checked Objective-C sends**: use `aterm_objc::checked_msg` rather than
+#   unchecked `aterm_objc::msg`.
+# * **Window & event loop doors**: build event loops via
+#   `driver_event_loop_builder`, launch windows via `crates/aterm`'s
+#   `run_window`, and restrict macOS TCC prompts to the approved setup revision's
+#   steps and the owner's own presses.
+# * **Stable spellings**: the foreign cells (`verify cells`) build with stock
+#   stable Rust, where `Option::map_or_default` and `Result::map_or_default` are
+#   unstable; spell `.map(..).unwrap_or_default()`.
+# * **A wait that wakes**: a thread that waits for another's progress sleeps on its wake (a
+#   `Condvar`, a channel, aterm-gui's registered `pause_for_handover`, or a bounded sleep slice
+#   where std has no timed wait), never on `std::thread::yield_now`: on macOS a yield while other
+#   work is runnable sets the thread aside for a whole 10 ms scheduling quantum. A test's poll
+#   pauses with `aterm_uds::deadline::poll_yield`; any other yield says why it waits for nobody.
+#   The row sees only a yield spelled in this workspace: std's channels yield inside themselves
+#   (`sync::mpmc::utils::Backoff::spin_heavy`) when a receive meets a send part-way through its
+#   slot, so a thread that must not lose a quantum receives from a queue that never waits on a
+#   sender (aterm-window's `macos-proxy-queue`), each such receive audited where it is.
+# * **A granted pool**: size a thread pool with `aterm_cores::available_parallelism`, never
+#   `std::thread::available_parallelism`: it is std's answer bounded by the cores aterm-verify
+#   grants a test binary (`ATERM_TEST_CORES`), so a test's pool, and an `aterm` a test boots,
+#   stays within what its binary is charged (ATERM-KI-1103-3). With nothing granted it is
+#   std's answer exactly. A reading of the machine itself (not a pool) says so on its statement.
+# * **Strict Ed25519**: ring's verifier takes a small-order key (the identity's
+#   one signature verifies every message); verify Ed25519 with
+#   `astream_aead::signature::verify`, which refuses it. ring's
+#   `UnparsedPublicKey` stays for another algorithm (ECDSA, RSA), for the static
+#   bootstrap verifier and for aterm-secrets' test oracle (`ed25519::ring_takes`,
+#   which shows a refused forgery is one ring alone takes), each on its one statement.
+# * **One owner act**: an owner's word to a shared file's outbox (a write, a requeue, a drop)
+#   needs an `aterm_file::OwnerAct`, and only an explicit verb of `aterm file`, an `aterm goals`
+#   claim or done of a package named on its command line, or a rename of this Mac asked for by
+#   name, makes one (docs/DESIGN-shared-files-2026-11-11.md §5, "In Rust"). Harness and observer
+#   code states its own Mac's row (`File::state_mine`). Each sanctioned call names its verb on
+#   its one statement: `OwnerAct::verb` in aterm-db's `file::write::run` and in aterm-file's
+#   `outbox drop`; `file::write::verb`, the wrapper every write verb runs through, in `aterm
+#   file`'s own entry (`file::command::main_entry`), in `file::rename`, the one door a rename
+#   of this Mac asked for by name takes, and in `file::yield_held`, the one door its held name
+#   write gives way to the registry's value through; and `file::write::set_seen`, the same
+#   wrapper for a `set` at the snapshot revision its caller read, in `aterm goals`' claim and
+#   done (`lab::tracker::command`); aterm-agent's `machine_name::registry`
+#   alone runs both (`aterm name nick|set|undo`, Rename This Mac…). `owner_act_for_test` is for tests
+#   only, each crate's one helper. The publisher's verbs (`File::claim`, `mark_done`, `dequeue`) settle
+#   or remove a queued intent, so only aterm-db's `file::publish` calls them.
+disallowed-methods = [
+  { path = "std::net::TcpListener::accept", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)" },
+  { path = "std::net::TcpListener::incoming", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)" },
+  { path = "std::os::unix::net::UnixListener::accept", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)", allow-invalid = true },
+  { path = "std::os::unix::net::UnixListener::incoming", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)", allow-invalid = true },
+  { path = "libc::pipe", reason = "make a pipe with aterm_uds::pipe, which keeps both ends out of every child it is not handed to (clippy.toml: kept-out pipes)" },
+  { path = "libc::pipe2", reason = "make a pipe with aterm_uds::pipe, which keeps both ends out of every child it is not handed to (clippy.toml: kept-out pipes)", allow-invalid = true },
+  { path = "std::io::pipe", reason = "make a pipe with aterm_uds::pipe, which keeps both ends out of every child it is not handed to (clippy.toml: kept-out pipes)" },
+  { path = "std::fs::File::lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "libc::fsync", reason = "flush through aterm-durable (aterm_durable::primitive::fsync for a plain flush), which astream-sys counts in flush_tally and times in flush_times (clippy.toml: a chosen flush)" },
+  { path = "libc::fdatasync", reason = "flush through aterm-durable (aterm_durable::durable_data, or primitive::fsync for a plain flush), which astream-sys counts in flush_tally and times in flush_times (clippy.toml: a chosen flush)", allow-invalid = true },
+  { path = "libc::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "libc::forkpty", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "libc::openpty", reason = "openpty leaves both ends inheritable and loses XNU's ptmx allocation race (EREDRIVEOPEN): use aterm_pty::open_pty_pair (clippy.toml: the confined shell)", allow-invalid = true },
+  { path = "libc::execvp", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "std::os::unix::process::CommandExt::exec", reason = "replace the process through aterm_uds::spawnfd's exec, which closes the exec gate first (clippy.toml: the exec gate)", allow-invalid = true },
+  { path = "libc::execv", reason = "replace the process through aterm_uds::spawnfd's exec, which closes the exec gate first; a forked child's exec says so (clippy.toml: the exec gate)", allow-invalid = true },
+  { path = "libc::execve", reason = "replace the process through aterm_uds::spawnfd's exec, which closes the exec gate first; a forked child's exec says so (clippy.toml: the exec gate)", allow-invalid = true },
+  { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::raise", reason = "a raised core signal writes a crash report: die by SIGKILL (clippy.toml: no core-dump death)" },
+  { path = "std::os::windows::process::CommandExt::creation_flags", reason = "set a child's console with aterm_uds::spawn (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::System::Threading::CreateProcessA", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::UI::Shell::ShellExecuteExW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "aterm_objc::msg", reason = "use checked_msg: the debug-build send checks the prototype against the runtime (clippy.toml: a checked send)" },
+  { path = "aterm_window::event_loop::EventLoop::new", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "aterm_window::event_loop::EventLoop::builder", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "aterm_window::event_loop::EventLoop::with_user_event", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "aterm_gui::main_entry", reason = "open a window through the front door's run_window, which knows which image is running (clippy.toml: one window door)" },
+  { path = "aterm_gui::main_entry_with_first_run", reason = "open a window through the front door's run_window, which owns the startup profile and knows which image is running (clippy.toml: one window door)" },
+  { path = "aterm_gui::main_entry_with_network", reason = "open a window through the front door's run_window, which owns startup and the off-thread network observation sources" },
+  { path = "aterm_gui::App::hand_fda_to_owner", reason = "only the launch check hands Full Disk Access over, as a step of the approved setup revision (clippy.toml: the approved plan is the standing yes; steps run only while System State is frontmost)" },
+  { path = "aterm_gui::App::fda_page_opened_by_owner", reason = "only the owner's own press opens the Full Disk Access page unasked (clippy.toml: the approved plan is the standing yes; steps run only while System State is frontmost)" },
+  { path = "aterm_gui::App::tick_launch_warmup", reason = "only the event loop's tick runs the launch warm-up, the approved revision's last step (clippy.toml: the approved plan is the standing yes; steps run only while System State is frontmost)" },
+  { path = "aterm_gui::devtools_helper::Lane::queue_fda", reason = "only the Full Disk Access hand-over queues one, and a new access revision's re-arm of the window's own, judged whole at its moment (clippy.toml: the approved plan is the standing yes; steps run only while System State is frontmost)" },
+  { path = "aterm_gui::App::open_fda_page", reason = "only the Full Disk Access hand-over opens the page, after admit_fda, so no door passes a Not now, an unstable build or the ten-minute gap (clippy.toml: the approved plan is the standing yes; steps run only while System State is frontmost)" },
+  { path = "core::option::Option::map_or_default", reason = "spell it .map(..).unwrap_or_default(): it is unstable on the stable Rust the foreign cells build with (clippy.toml: stable spellings)" },
+  { path = "core::result::Result::map_or_default", reason = "spell it .map(..).unwrap_or_default(): it is unstable on the stable Rust the foreign cells build with (clippy.toml: stable spellings)" },
+  { path = "std::thread::yield_now", reason = "wait on a wake: a Condvar, a channel, pause_for_handover or a bounded sleep slice; a test's poll pauses with aterm_uds::deadline::poll_yield (clippy.toml: a wait that wakes)" },
+  { path = "std::thread::available_parallelism", reason = "size a pool with aterm_cores::available_parallelism, bounded by the cores verify grants a test (clippy.toml: a granted pool)" },
+  { path = "ring::signature::UnparsedPublicKey::new", reason = "verify Ed25519 with astream_aead::signature::verify, which refuses small-order keys (clippy.toml: strict Ed25519)" },
+  { path = "aterm_file::outbox::OwnerAct::verb", reason = "only an explicit `aterm file` verb, or `aterm goals` claim or done, makes an owner act; harness and observer code states its own row with File::state_mine (clippy.toml: one owner act)" },
+  { path = "aterm_file::outbox::owner_act_for_test", reason = "tests only, through each crate's one test helper; harness and observer code states its own row with File::state_mine (clippy.toml: one owner act)", allow-invalid = true },
+  { path = "aterm_db::file::write::verb", reason = "only `aterm file`'s own entry, `file::rename` and `file::yield_held` run a write verb: the verb makes an owner act (clippy.toml: one owner act)" },
+  { path = "aterm_db::file::write::set_seen", reason = "only `aterm goals`' claim and done write a package's row at the snapshot revision they read it: the verb makes an owner act (clippy.toml: one owner act)" },
+  { path = "aterm_db::file::rename", reason = "only a rename of this Mac asked for by name (`aterm name nick|set|undo`, Rename This Mac…) writes its registry row's nickname and number: it makes an owner act (clippy.toml: one owner act)", allow-invalid = true },
+  { path = "aterm_db::file::yield_held", reason = "only the naming code gives way with this Mac's held name write, dropping it for the registry's value: it makes an owner act (clippy.toml: one owner act)", allow-invalid = true },
+  { path = "aterm_file::file::File::claim", reason = "only aterm-db's publisher claims a queued intent, to sign it or hold it (clippy.toml: one owner act)", allow-invalid = true },
+  { path = "aterm_file::file::File::mark_done", reason = "only aterm-db's publisher marks an intent a record carries (clippy.toml: one owner act)", allow-invalid = true },
+  { path = "aterm_file::file::File::dequeue", reason = "only aterm-db's publisher takes a marked or held intent out of the outbox (clippy.toml: one owner act)", allow-invalid = true },
+]
+disallowed-types = [
+  { path = "std::process::Command", reason = "build children with aterm_uds::spawnfd::command, which hands them stdio and nothing else (clippy.toml: one child constructor)" },
+]

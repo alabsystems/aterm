@@ -49,6 +49,13 @@ pub(in crate::harness) fn rejected_snapshot(
     )
 }
 
+/// The file in `home` that records the issuer's refusal of its `region` login's refresh grant,
+/// which [`rejected_snapshot`] reads, for a reader that stamps it to know the refusal may read
+/// otherwise; its contents are never looked at for that.
+pub(in crate::harness) fn rejection_file(home: &Path, region: Region) -> PathBuf {
+    rejection::path(home, region)
+}
+
 #[path = "cli_shared_kimi_lock.rs"]
 pub(super) mod native_lock;
 

@@ -289,6 +289,7 @@ fn probe(log: &Log, by: Mac, parents: Vec<RecordId>, body: Body) -> Record {
         parents,
         authored_ms: 7,
         body,
+        statement: None,
     }
     .sign(&by.seed(), by.incarnation())
     .unwrap()
@@ -476,6 +477,7 @@ impl Live {
             parents,
             authored_ms: 1_000,
             body,
+            statement: None,
         }
         .sign(&mac.seed(), mac.incarnation())
         .unwrap();

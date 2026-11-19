@@ -41,22 +41,14 @@ impl Mac {
     fn incarnation(self) -> [u8; 16] {
         [self.0; 16]
     }
-    fn identity(self) -> age::Identity {
-        age::Identity::from_secret_bytes([self.0 ^ 0x55; 32])
+    fn identity(self) -> &'static age::Identity {
+        checkpoint::tests::tag_identity(self.0)
     }
     fn request(self) -> Request {
-        Request::create(
-            [2; 16],
-            [3; 32],
-            [self.0; 16],
-            self.incarnation(),
-            &self.identity(),
-            &self.seed(),
-        )
-        .unwrap()
+        checkpoint::tests::tag_request(self.0).clone()
     }
     fn id(self) -> MemberId {
-        self.request().binding().actor()
+        checkpoint::tests::tag_request(self.0).binding().actor()
     }
     fn entrant(self, label: &str) -> Entrant {
         Entrant {
@@ -1881,6 +1873,7 @@ fn a_removed_mac_admit_carrying_a_members_node_key_does_not_poison_it() {
                         entrant,
                         evidence: Evidence::Manual,
                     },
+                    statement: None,
                 }
                 .sign(&X.seed(), X.incarnation())
                 .unwrap();
@@ -1896,6 +1889,7 @@ fn a_removed_mac_admit_carrying_a_members_node_key_does_not_poison_it() {
                         member: P.id(),
                         cutoff: admit_p_id,
                     },
+                    statement: None,
                 }
                 .sign(&X.seed(), X.incarnation())
                 .unwrap();
@@ -1914,6 +1908,7 @@ fn a_removed_mac_admit_carrying_a_members_node_key_does_not_poison_it() {
                         entrant,
                         evidence: Evidence::Manual,
                     },
+                    statement: None,
                 }
                 .sign(&X.seed(), X.incarnation())
                 .unwrap();
@@ -1934,6 +1929,7 @@ fn a_removed_mac_admit_carrying_a_members_node_key_does_not_poison_it() {
                         parents: vec![*let_in.id()],
                         authored_ms: 9,
                         body,
+                        statement: None,
                     }
                     .sign(&X.seed(), X.incarnation())
                     .unwrap()
@@ -2555,7 +2551,7 @@ fn island_log(state: &aterm_spec::interp::State, island: char) -> Log {
 /// `T` is there, whether `epoch` is newest or winning in `[everyone]`, and 0.
 fn keyed_outputs(log: &Log, reader: Mac, epoch: &RecordId) -> [i64; 4] {
     let opened = log
-        .open_audience_entries(&reader.identity())
+        .open_audience_entries(reader.identity())
         .unwrap()
         .expect("Y reads");
     let everyone = opened.by_audience.get(&crate::text::Audience::Everyone);
@@ -2771,7 +2767,7 @@ fn a_concurrent_admit_of_a_removed_macs_key_keeps_it_revoked_in_every_arrival_or
             [3; 32],
             [X.0; 16],
             [0x70; 16],
-            &X.identity(),
+            X.identity(),
             &[0x70; 32],
         )
         .unwrap(),

@@ -4418,6 +4418,13 @@ impl StateDir {
         self.asks().index().settled(off, sid)
     }
 
+    /// Every other offset, at or above `floor` and not `off`, where the asks journal as this open
+    /// holds it keeps a recipient or a deadline a landing of the post in flight at sequence `seq`
+    /// noted ([`asks::Index::landed_elsewhere`], ATERM-KI-1116-7314), written or not.
+    pub(crate) fn ask_landed_elsewhere(&self, seq: u64, floor: u64, off: u64) -> Vec<u64> {
+        self.asks().index().landed_elsewhere(seq, floor, off)
+    }
+
     /// Note `frames` in the asks journal as this open holds it, for the next write
     /// ([`StateDir::write_asks`]) to append in one. The open holds each as true from now on,
     /// written or not: a write the disk refuses leaves the journal to be rewritten whole from

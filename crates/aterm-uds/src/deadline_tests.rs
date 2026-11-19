@@ -1118,6 +1118,61 @@ fn descendant_progress_excludes_polling_but_counts_worker_work() {
     assert_eq!(probe.read_over(None), None);
 }
 
+/// THE PROBE READS THE WHOLE TREE ([`super::ProcessProgressProbe::read`] over the platform's tree
+/// reader): three shells, each waiting on the next and the last on its input, read as three
+/// members and, once quiet, as a flat generation, which is what lets a stall be named; work that
+/// only the grandchild does, while its parents wait, advances it. NEGATIVE CONTROL: a reader that
+/// read the root alone, or its children without theirs, reads the grandchild's work as no
+/// progress.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_progress_probe_counts_a_grandchilds_work_and_reads_a_quiet_tree_flat() {
+    use std::io::Write as _;
+    let dir = scratch("probe-tree");
+    std::fs::write(dir.join("mid.sh"), "/bin/sh \"$1/leaf.sh\" \"$1\"\n:\n").expect("mid");
+    std::fs::write(
+        dir.join("leaf.sh"),
+        ": > \"$1/ready\"\nread go\ni=0\nwhile [ $i -lt 20000 ]; do i=$((i+1)); done\n\
+         : > \"$1/done\"\nread end\n",
+    )
+    .expect("leaf");
+    let mut cmd = sh("/bin/sh \"$0/mid.sh\" \"$0\"; :", &[&dir]);
+    cmd.process_group(0)
+        .stdin(crate::spawnfd::Stdio::piped())
+        .stdout(crate::spawnfd::Stdio::null());
+    let mut root = cmd.spawn().expect("the shells start");
+    let mut input = root.stdin.take().expect("the leaf's input");
+    let pid = root.id();
+    let mut probe = super::ProcessProgressProbe::default();
+    aterm_spec::wait::until_while_working(pid, "the leaf is ready", || {
+        dir.join("ready").exists().then_some(())
+    });
+    let mut last = None;
+    // The hang detector reads this same tree, and an unread tree is no evidence of a stall, so an
+    // unread tree fails here at once rather than waiting out the detector's guard.
+    let quiet = aterm_spec::wait::until_while_working(pid, "the tree goes quiet", || {
+        let now = Some(probe.read(pid).expect("the quiet tree reads"));
+        let was = std::mem::replace(&mut last, now);
+        now.filter(|_| was == now)
+    });
+    input.write_all(b"go\n").expect("the leaf's go");
+    aterm_spec::wait::until_while_working(pid, "the grandchild's work", || {
+        dir.join("done").exists().then_some(())
+    });
+    let worked = probe.read(pid);
+    let members = super::process_progress_tree(pid).map(|members| members.len());
+    let killed = crate::process::kill_group_until_empty(i32::try_from(pid).expect("a pid"));
+    let _ = root.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    killed.expect("the shells' group ends");
+    assert_eq!(
+        worked,
+        Some(quiet + 1),
+        "the grandchild's work advances the tree"
+    );
+    assert_eq!(members, Some(3), "root, child and grandchild");
+}
+
 /// Negative control: a complete probe whose bytes and descendant-work generation stay flat
 /// reaches zero at exactly one injected evidence window, without a production-minute sleep.
 #[test]

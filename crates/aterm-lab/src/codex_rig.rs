@@ -264,13 +264,60 @@ pub fn sse(items: Vec<J>) -> String {
 
 /// The fake Responses API on `listener`.
 pub fn serve(listener: TcpListener, log: Arc<Mutex<ApiLog>>, answer: Answer) {
+    serve_model(listener, log, answer, None);
+}
+
+/// One in-memory credential for the isolated provider. Only the synthetic issuer and
+/// provider share it; a withheld-Source run keeps it exclusively at the provider.
+#[derive(Clone)]
+pub(crate) struct SourceBearer(Arc<aterm_secrets::SecretBytes>);
+
+impl SourceBearer {
+    pub(crate) fn fresh() -> std::io::Result<Self> {
+        Ok(Self(Arc::new(aterm_uds::rand::hex_token::<32>()?.into())))
+    }
+
+    fn admits(&self, request: &crate::stub::Request) -> bool {
+        let Some((scheme, value)) =
+            single_header(request, "authorization").and_then(|value| value.split_once(' '))
+        else {
+            return false;
+        };
+        scheme.eq_ignore_ascii_case("Bearer")
+            && aterm_digest::ct_eq(value.trim_start_matches(' ').as_bytes(), self.0.as_slice())
+    }
+}
+
+fn single_header<'a>(request: &'a crate::stub::Request, name: &str) -> Option<&'a str> {
+    let mut headers = request.headers.iter().filter(|(key, _)| key == name);
+    let (_, value) = headers.next()?;
+    headers.next().is_none().then_some(value)
+}
+
+/// Serve one candidate's proof with authenticated Responses and content-free journals.
+pub(crate) fn serve_with_source(
+    listener: TcpListener,
+    log: Arc<Mutex<ApiLog>>,
+    answer: Answer,
+    bearer: SourceBearer,
+) {
+    serve_model(listener, log, answer, Some(bearer));
+}
+
+fn serve_model(
+    listener: TcpListener,
+    log: Arc<Mutex<ApiLog>>,
+    answer: Answer,
+    bearer: Option<SourceBearer>,
+) {
     while let Ok((conn, _)) = aterm_uds::accept(
         &listener,
         aterm_uds::AcceptWait::Forever,
         aterm_uds::AcceptedMode::Blocking,
     ) {
         let (log, answer) = (Arc::clone(&log), Arc::clone(&answer));
-        std::thread::spawn(move || serve_one(conn, &log, &answer));
+        let bearer = bearer.clone();
+        std::thread::spawn(move || serve_one(conn, &log, &answer, bearer.as_ref()));
     }
 }
 
@@ -279,6 +326,15 @@ pub struct ApiLog {
     path: PathBuf,
     clock: Instant,
     next_request: i64,
+}
+
+/// All accepted Responses requests in the isolated run, and the selected turn's
+/// refused requests and completed 401 writes. A missing request contributes to none.
+#[derive(Default)]
+pub(crate) struct SourceResponses {
+    pub accepted: usize,
+    pub refused: usize,
+    pub written: usize,
 }
 
 impl ApiLog {
@@ -310,6 +366,45 @@ impl ApiLog {
                 .collect()
         };
         Ok((read(&self.path)?, read(&response_log(&self.path))?))
+    }
+
+    /// Join the wire thread and last user prompt to the response actually flushed.
+    pub(crate) fn source_responses(
+        &self,
+        thread: &str,
+        prompt: &str,
+    ) -> std::io::Result<SourceResponses> {
+        let (requests, writes) = self.snapshot()?;
+        let delivered = writes
+            .iter()
+            .filter(|row| row.get("status").and_then(J::as_i64) == Some(401))
+            .filter_map(|row| row.get("request_id").and_then(J::as_i64))
+            .collect::<std::collections::BTreeSet<_>>();
+        let thread = crate::stub::message_digest(thread);
+        let prompt = crate::stub::message_digest(prompt);
+        let mut responses = SourceResponses::default();
+        for row in requests {
+            match row.get("source_auth").and_then(J::as_str) {
+                Some("accepted") => responses.accepted += 1,
+                Some("refused")
+                    if row.get("thread_sha256").and_then(J::as_str) == Some(thread.as_str())
+                        && row.get("prompt_sha256").and_then(J::as_str)
+                            == Some(prompt.as_str())
+                        && row.get("status").and_then(J::as_i64) == Some(401) =>
+                {
+                    responses.refused += 1;
+                    if row
+                        .get("request_id")
+                        .and_then(J::as_i64)
+                        .is_some_and(|id| delivered.contains(&id))
+                    {
+                        responses.written += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(responses)
     }
 
     fn append(path: &Path, row: &J) -> std::io::Result<()> {
@@ -356,14 +451,76 @@ pub fn monotonic_ms(clock: Instant) -> i64 {
     i64::try_from(clock.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
-fn serve_one(conn: TcpStream, log: &Mutex<ApiLog>, answer: &Answer) {
+fn source_answer(
+    request: &crate::stub::Request,
+    bearer: &SourceBearer,
+    log: &Mutex<ApiLog>,
+    answer: &Answer,
+) -> std::io::Result<(Answered, Option<i64>)> {
+    let path = request.target.split('?').next().unwrap_or_default();
+    let admitted = bearer.admits(request);
+    let refusal = || {
+        Answered::now((
+            401,
+            "application/json",
+            r#"{"error":{"message":"Invalid provider credential","type":"invalid_request_error","code":"invalid_api_key"}}"#.into(),
+        ))
+    };
+    if request.method != "POST" || path != "/v1/responses" {
+        let reply = if !admitted {
+            refusal()
+        } else if request.method == "GET" && path == "/v1/models" {
+            model_list()
+        } else {
+            Answered::now((404, "application/json", "{}".into()))
+        };
+        return Ok((reply, None));
+    }
+    let body = J::parse_bytes(&request.body).unwrap_or(J::Null);
+    let reply = if admitted { answer(&body) } else { refusal() };
+    let thread = single_header(request, "x-client-request-id")
+        .filter(|id| !id.is_empty())
+        .map_or(J::Null, |id| J::s(crate::stub::message_digest(id)));
+    let (prompt, _) = request_view(&body);
+    let id = log
+        .lock()
+        .map_err(|_| std::io::Error::other("model log poisoned"))?
+        .request(vec![
+            (
+                "source_auth".into(),
+                J::s(if admitted { "accepted" } else { "refused" }),
+            ),
+            ("thread_sha256".into(), thread),
+            (
+                "prompt_sha256".into(),
+                J::s(crate::stub::message_digest(&prompt)),
+            ),
+            ("status".into(), J::Int(i64::from(reply.status))),
+        ])?;
+    Ok((reply, Some(id)))
+}
+
+fn model_list() -> Answered {
+    Answered::now((
+        200,
+        "application/json",
+        r#"{"object":"list","data":[{"id":"fake-model"}],"models":[]}"#.to_string(),
+    ))
+}
+
+fn serve_one(conn: TcpStream, log: &Mutex<ApiLog>, answer: &Answer, bearer: Option<&SourceBearer>) {
     let Ok(w) = conn.try_clone() else {
         return;
     };
     let mut w = w;
     let mut r = std::io::BufReader::new(conn);
     while let Ok(Some(req)) = crate::stub::read_request(&mut r) {
-        let (a, request_id) = if req.method == "POST" {
+        let (a, request_id) = if let Some(bearer) = bearer {
+            let Ok(response) = source_answer(&req, bearer, log, answer) else {
+                return;
+            };
+            response
+        } else if req.method == "POST" {
             let parsed = J::parse_bytes(&req.body).unwrap_or(J::Obj(Vec::new()));
             let (user, tool) = request_view(&parsed);
             let a = answer(&parsed);
@@ -406,14 +563,7 @@ fn serve_one(conn: TcpStream, log: &Mutex<ApiLog>, answer: &Answer) {
             };
             (a, Some(id))
         } else {
-            (
-                Answered::now((
-                    200,
-                    "application/json",
-                    r#"{"object":"list","data":[{"id":"fake-model"}],"models":[]}"#.to_string(),
-                )),
-                None,
-            )
+            (model_list(), None)
         };
         if !a.delay.is_zero() {
             std::thread::sleep(a.delay);
@@ -447,6 +597,8 @@ fn write_response(
 ) -> std::io::Result<()> {
     let reason = match a.status {
         200 => "OK",
+        401 => "Unauthorized",
+        404 => "Not Found",
         429 => "Too Many Requests",
         _ => "Error",
     };

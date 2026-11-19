@@ -480,7 +480,7 @@ fn vault_checkpoint_a_rewritten_file_is_read_through_its_head() {
                 &file,
                 stamp,
                 context,
-                &identity,
+                identity,
                 empty(),
                 head::Publication::Allowed,
             )
@@ -488,7 +488,7 @@ fn vault_checkpoint_a_rewritten_file_is_read_through_its_head() {
         };
         let store = full();
         let writes = head::WRITES.get();
-        head::write(store.log().unwrap(), &identity, &head::Resolved::default());
+        head::write(store.log().unwrap(), identity, &head::Resolved::default());
         assert_eq!(head::WRITES.get(), writes + 1, "the head is written");
         let read = through_head().expect("the head of a rooted log's file is read");
         assert!(is_the_log(&log, read.log().unwrap()));
@@ -498,7 +498,7 @@ fn vault_checkpoint_a_rewritten_file_is_read_through_its_head() {
         assert!(through_head().is_none(), "no head, no open through it");
         let store = full();
         MUTANT.set(Some(Mutant::HeadWithoutFrame));
-        head::write(store.log().unwrap(), &identity, &head::Resolved::default());
+        head::write(store.log().unwrap(), identity, &head::Resolved::default());
         MUTANT.set(None);
         assert!(head_file.exists(), "the mutant's head is written");
         assert!(

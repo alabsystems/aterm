@@ -1262,7 +1262,9 @@ impl Planner<'_> {
             .map_or((String::new(), provider_at.clone()), |(t, at, _)| (t, at));
         let notes = read.get("notes").map(|(t, _, _)| t).unwrap_or_default();
         let (terms, paused) = match self.input.vendors.mark(provider, &tier, &notes) {
-            Mark::Absent => {
+            // A replica's `0` tier reads as no account here; its banned birth is SF-47's
+            // follow-up, which reads the dump's tier and status together.
+            Mark::Absent | Mark::Zero | Mark::No => {
                 if let Some((id, _, _)) = read.get("id") {
                     self.no_account.insert(id);
                 }

@@ -77,6 +77,34 @@ fn a_native_seal_needs_neither_stock_proxies_nor_foreign_standard_libraries() {
         &compiler.pin.stock_toolchain,
     ));
     let sdk = AppleSdk::capture().unwrap();
+    // The first take holds its seal only once the scratch tree's statuses are older than
+    // SETTLE_NS: taken sooner, its seal is neither held nor kept, and the next call hashes the
+    // whole Apple SDK and toolchain again. A must-happen wait, for the last status change the
+    // fixture made to settle.
+    let (mut newest_ns, mut walk) = (i128::MIN, vec![root.clone()]);
+    while let Some(path) = walk.pop() {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        newest_ns =
+            newest_ns.max(i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()));
+        if meta.is_dir() {
+            walk.extend(
+                std::fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        }
+    }
+    let settle = aterm_toolchain::stat_digest::SETTLE_NS;
+    assert!(
+        aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(50),
+            || (input_seal::now_ns() >= newest_ns + settle).then_some(()),
+        )
+        .is_some(),
+        "the fixture's statuses never settled"
+    );
     let before = crate::buildplan::TakePurpose::Native
         .identity(Some(&compiler), &sdk)
         .unwrap()

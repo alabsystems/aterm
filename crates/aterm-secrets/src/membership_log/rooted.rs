@@ -4,8 +4,10 @@
 //! A vault log rooted at a final checkpoint (`docs/DESIGN-vault-log-2026-11-14.md` step 4,
 //! trackers FL-148c and FL-148C2): the records [`checkpoint::plan_at`]'s prune keeps, every record outside the
 //! cut, and in place of each record it drops a [`Stub`]. Nothing here signs, writes a records
-//! file or chooses when to prune (FL-148d rewrites the file, FL-148f runs the pass), and nothing
-//! outside the tests prunes: this lands dark.
+//! file or chooses when to prune (`client::persist_stored` rewrites the file, and
+//! [`super::pass`] chooses the checkpoint a Mac's pass and a vault server prune at), and nothing
+//! prunes on a build whose [`crate::commons::hearing::READS_FORMAT`] names no release: this
+//! lands dark.
 //!
 //! - **What is kept of a dropped record.** Fields of its record alone, so a stub always takes
 //!   fewer bytes than its record ([`Stub::bytes`]): its id, its signer, sequence and previous
@@ -200,24 +202,18 @@
 //! whole and shed (`crate::client::Paths::records_generation`, [`super::record_id`],
 //! `aterm_mesh::egress::MembersCursor`).
 //!
-//! Not yet (each with the row that owns it, which FL-148F's pass waits on):
+//! Not yet (each with the row that owns it):
 //!
-//! - **Consumers that read records by id or position** (FL-148E). The set a reconciling peer
-//!   compares ([`super::Store::complete_inventory`]) names a dropped record as known, and a
-//!   cursor at one starts again at genesis ([`super::Store::complete_missing`]). Not yet read as
-//!   dropped: [`super::entries`]'s winning ops and carried reps, which may name a dropped op (the
-//!   evaluators place it; a consumer that opens its ciphertext does not);
-//!   `legacy_applied_held`, whose search for the applied heads walks held
-//!   records alone, so a log that dropped one reads it absent; and the mesh's
-//!   members unit and aterm-db's records exchange (`Store::missing`, `complete_missing`), which
-//!   send records alone, so a peer behind the cut is sent, on every round, records that wait, and
-//!   its summary never matches. Their own crates' tests need a rooted store, which only this
-//!   crate's tests build. (A member's join bundle hands its roots after its records,
-//!   `crate::client::admit`'s `held_records`.) (The mesh's
-//!   members unit carries no rooted store's records: a rewritten file is format 2's, and a Mac
-//!   past format 1 leaves the unit out, `crate::client::members_lane_open`. A write's hook now
-//!   says which generation the records it hands over are of, [`super::store::Written`], and
-//!   the mesh egress takes them under it.)
+//! - **The mesh's members unit** (FL-148E). The set a reconciling peer compares
+//!   ([`super::Store::complete_inventory`]) names a dropped record as known, and a cursor at one
+//!   starts again at genesis ([`super::Store::complete_missing`]). The mesh's members unit sends
+//!   records alone, so a peer behind the cut would be sent records that wait; it carries no
+//!   rooted store's records (a rewritten file is format 2's, and a Mac past format 1 leaves the
+//!   unit out, `crate::client::members_lane_open`), and a write's hook says which generation the
+//!   records it hands over are of ([`super::store::Written`]), which the mesh egress takes them
+//!   under. (aterm-db's records exchange serves the roots with the records on `atdb/8`, and a
+//!   member's join bundle hands them after its records, `crate::client::admit`'s
+//!   `held_records`.)
 //! - **The storage sites that read this build's format** (FL-148E, the row that first stores
 //!   a format mark: a store past format 1 exists from then on, and each of these sites must
 //!   read it by then). A store, its log and its file read their bytes' bound from the store's
@@ -232,13 +228,13 @@
 //!   while a store is one reply and stops the build once it is not (FL-249). A vault server
 //!   reads its records file, a POST's body and the frames its peer pull reads at its mark's
 //!   format too (`server::Shared::records_reading`). (The first transition's layout and
-//!   aterm-db's legacy wires are format 1's by what they are, and name format 1.) Not yet:
-//!   the readers that name the records entry's data file without a store select it as format
-//!   1 does and refuse a rewritten layout (`crate::client::Paths::records_data_file`, the
-//!   vault memo's and the seat ask's standing, `client::genesis`'s private-realm read,
-//!   `client::remove`'s look, aterm-db's moved-home check, aterm-agent's fleet log and
-//!   census): on a Mac whose entry a rewrite made they fail or read nothing, and change
-//!   nothing.
+//!   aterm-db's legacy wires are format 1's by what they are, and name format 1.) The
+//!   readers that name the records entry's data file without a store select it as the Mac's
+//!   records reader does, a rewritten layout's pinned generation where it reads format 2
+//!   (`crate::client::Paths::records_data_file`, the vault memos' and the seat ask's
+//!   standing, `client::genesis`'s private-realm read, `client::remove`'s look, aterm-db's
+//!   moved-home check, aterm-agent's fleet log and census). Not yet: the watchers of the
+//!   entry's files name format 1's (`super::follow`'s "Not yet").
 //! - **A served reply past one reply's bytes** (FL-249). A root's reply holds every record the
 //!   peer lacks and the frame, which a prefix cannot replace ([`super::Store::missing_served`]).
 //!   It is the held records the peer lacks and the stubs, both counted in the store's bytes,
@@ -253,14 +249,6 @@
 //!   Once a store's capacity is past a reply (FL-249) every such reply passes it, and closing
 //!   it needs a pull that names the records it holds waiting, so a reply need not carry them
 //!   again and a root is served with the prefix that settles it: that row owns it.
-//! - **Taking a served root into a vault server's file** (FL-148E). A Mac's records pass and
-//!   a new Mac's join take a served root into a rewritten records file (`super::follow`'s
-//!   "Served roots": a pull that reads format 2 asks for the frame,
-//!   [`crate::transport::RECORDS_SERVED_HEADER`], and a rooted store is written through
-//!   `crate::records_storage::rewrite` and read back from [`super::stored`]'s file). A vault
-//!   server's peer pull still asks for none and reads records alone: its records file is one
-//!   flat file with no rewritten form, so a server behind a cut holds what follows the cut
-//!   waiting (`super::follow`'s "Not yet" names each site left of that row).
 
 use super::checkpoint::{self, Plan};
 use super::{Body, EpochAudience, Kind, Log, MemberId, Record, RecordId};
@@ -347,6 +335,9 @@ pub(super) enum Mutant {
     /// held records alone, as before this slice: a checkpoint whose head a prune dropped is
     /// never nested, and the plan keeps every share of it.
     HeldNesting,
+    /// Whether a stub lies in a held record's past is found by walking every stub after it,
+    /// at each question, and not read off the held records each stub's descendants lead to.
+    WalkStubs,
 }
 
 #[cfg(test)]
@@ -355,6 +346,9 @@ thread_local! {
     pub(super) static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
     /// Whether this thread is inside [`Log::pruned`].
     static PRUNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The steps [`StubView`]'s question whether a stub lies in a held record's past took on
+    /// this thread: a stub walked or a held record asked of.
+    pub(super) static STUB_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Under [`Mutant::GoneFromTheLastCut`], every record the cut of a prune on this thread held
     /// gone ([`checkpoint::gone_in_cut`]): what FL-148C's stubs said of themselves.
     pub(super) static LAST_CUT_GONE: std::cell::RefCell<BTreeSet<RecordId>> =
@@ -950,7 +944,12 @@ impl Virtual {
 #[derive(Clone, Copy)]
 pub(super) struct StubView<'a> {
     pub(super) virt: &'a Virtual,
+    /// Read only by `Mutant::WalkStubs`: `entries` is read off it.
+    #[cfg(test)]
     followers: &'a BTreeMap<RecordId, Vec<usize>>,
+    /// For each stub, the earliest held records that name it or a stub after it as a parent
+    /// ([`entries_of`]).
+    entries: &'a [Vec<usize>],
     reach: &'a super::reach::Reach,
 }
 
@@ -969,14 +968,30 @@ impl StubView<'_> {
     }
 
     /// Whether the stub `j` lies in the past of the held record `b`: a held record that names it,
-    /// or a stub after it, as a parent is `b` or lies in `b`'s past.
+    /// or a stub after it, as a parent is `b` or lies in `b`'s past. Read off `j`'s entries
+    /// ([`entries_of`]): one question of the index for each, however many stubs follow `j`.
     fn stub_before_held(&self, j: usize, b: usize) -> bool {
+        #[cfg(test)]
+        if mutant(Mutant::WalkStubs) {
+            return self.walk_before_held(j, b);
+        }
+        self.entries[j].iter().any(|&f| {
+            #[cfg(test)]
+            STUB_STEPS.set(STUB_STEPS.get() + 1);
+            self.reach.upto(f, b)
+        })
+    }
+
+    /// [`StubView::stub_before_held`] as a walk of every stub after `j`: `Mutant::WalkStubs`.
+    #[cfg(test)]
+    fn walk_before_held(&self, j: usize, b: usize) -> bool {
         let mut seen: BTreeSet<usize> = BTreeSet::new();
         let mut stack = vec![j];
         while let Some(k) = stack.pop() {
             if !seen.insert(k) {
                 continue;
             }
+            STUB_STEPS.set(STUB_STEPS.get() + 1);
             if self
                 .followers
                 .get(&self.virt.ids[k])
@@ -1012,12 +1027,62 @@ impl StubView<'_> {
     }
 }
 
+/// For each stub of `virt`, the held records that name it, or a stub that follows it, as a
+/// parent, less each that lies in the past of another of them (`b` holds one of the rest in
+/// its past wherever it holds any of them): found once, each stub after every stub that names
+/// it, so a log of `s` stubs pays for each stub's children and the few records it leads to,
+/// not for a walk of every stub after it at each question. A cycle (which no log holds) leaves
+/// out what its members reach through it.
+fn entries_of(
+    virt: &Virtual,
+    followers: &BTreeMap<RecordId, Vec<usize>>,
+    reach: &super::reach::Reach,
+) -> Vec<Vec<usize>> {
+    let n = virt.ids.len();
+    let mut out: Vec<Option<Vec<usize>>> = vec![None; n];
+    let mut open = vec![false; n];
+    for root in 0..n {
+        let mut stack = vec![(root, false)];
+        while let Some((k, expanded)) = stack.pop() {
+            if out[k].is_some() || (!expanded && open[k]) {
+                continue;
+            }
+            if !expanded {
+                open[k] = true;
+                stack.push((k, true));
+                stack.extend(virt.children[k].iter().map(|&c| (c, false)));
+                continue;
+            }
+            let mut set: BTreeSet<usize> = followers
+                .get(&virt.ids[k])
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            for &c in &virt.children[k] {
+                set.extend(out[c].iter().flatten().copied());
+            }
+            let mut least: Vec<usize> = Vec::with_capacity(set.len());
+            for f in set {
+                if !least.iter().any(|&g| reach.before(g, f)) {
+                    least.push(f);
+                }
+            }
+            out[k] = Some(least);
+        }
+    }
+    out.into_iter().map(Option::unwrap_or_default).collect()
+}
+
 /// A rooted log's [`Virtual`], built on first read, and the held records that name each stub
 /// as a parent, which [`Log::hold`] extends.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Stubbed {
     virt: Arc<OnceLock<Virtual>>,
     followers: Arc<BTreeMap<RecordId, Vec<usize>>>,
+    /// Each stub's entries ([`entries_of`]), built on first read from `virt` and `followers`,
+    /// and read afresh once either changes.
+    entries: Arc<OnceLock<Vec<Vec<usize>>>>,
 }
 
 impl Stubbed {
@@ -1025,6 +1090,12 @@ impl Stubbed {
     /// each held record that names a stub as a parent.
     pub(super) fn bytes(&self) -> usize {
         self.virt.get().map_or(0, Virtual::bytes)
+            + self.entries.get().map_or(0, |entries| {
+                entries
+                    .iter()
+                    .map(|of| size_of::<Vec<usize>>() + of.len() * size_of::<usize>())
+                    .sum::<usize>()
+            })
             + self
                 .followers
                 .values()
@@ -1065,6 +1136,20 @@ impl Root {
             + size_of::<Vec<RecordId>>()
             + self.dropped.len() * size_of::<RecordId>()
     }
+}
+
+/// The draft an op was written in, as [`Log::drafted`] reads it, held or dropped: one draft's
+/// writes share a signer, a clock and an epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Drafted {
+    /// Its signer.
+    pub(crate) actor: MemberId,
+    /// Its signer's clock (unix milliseconds).
+    pub(crate) authored_ms: u64,
+    /// Its kind.
+    pub(crate) kind: Kind,
+    /// The epoch a `Put` or `Delete` was sealed under; `None` for any other kind.
+    pub(crate) epoch: Option<RecordId>,
 }
 
 /// What a rooted log keeps of the checkpoints it was pruned at.
@@ -1124,6 +1209,33 @@ impl Log {
         self.rooting.as_deref().and_then(|r| r.stubs.get(id))
     }
 
+    /// What a reader of an op needs of the draft that wrote it ([`Drafted`]), read off the
+    /// record this log holds, or off its stub where a root of this log dropped it: the op a
+    /// register's winner or carry stands for may be one a prune dropped
+    /// ([`super::entries::OpenedAudienceEntries::stands_for`]), and its stub keeps every field
+    /// of it a reader reads but its ciphertext. `None` where the log neither holds nor dropped
+    /// `id`.
+    pub(crate) fn drafted(&self, id: &RecordId) -> Option<Drafted> {
+        if let Some(record) = self.get(id) {
+            return Some(Drafted {
+                actor: *record.actor(),
+                authored_ms: record.authored_ms(),
+                kind: record.kind(),
+                epoch: match record.body() {
+                    Body::Put { epoch, .. } | Body::Delete { epoch, .. } => Some(*epoch),
+                    _ => None,
+                },
+            });
+        }
+        let stub = self.stub(id)?;
+        Some(Drafted {
+            actor: stub.actor,
+            authored_ms: stub.authored_ms,
+            kind: stub.kind,
+            epoch: stub.epoch,
+        })
+    }
+
     /// The stubs as the evaluators read them; `None` for a whole log, whose evaluators read
     /// held records alone.
     pub(super) fn stub_view(&self) -> Option<StubView<'_>> {
@@ -1133,9 +1245,14 @@ impl Log {
             return None;
         }
         let stubbed = self.stubbed.as_ref()?;
+        let virt = stubbed.virt.get_or_init(|| Virtual::of(self));
         Some(StubView {
-            virt: stubbed.virt.get_or_init(|| Virtual::of(self)),
+            virt,
+            #[cfg(test)]
             followers: &stubbed.followers,
+            entries: stubbed
+                .entries
+                .get_or_init(|| entries_of(virt, &stubbed.followers, &self.reach)),
             reach: &self.reach,
         })
     }
@@ -1240,6 +1357,7 @@ impl Log {
         for parent in dropped {
             followers.entry(parent).or_default().push(at);
         }
+        stubbed.entries = Arc::default();
     }
 
     /// The audience and kind of the op `id`, held or dropped: a held `Put`'s or `Delete`'s body
@@ -1802,6 +1920,7 @@ impl Log {
         out.budgets = self.budgets;
         out.stored_at = self.stored_at;
         out.enforce_seats = self.enforce_seats;
+        out.writing = self.writing_afresh();
         #[cfg(unix)]
         out.head.clone_from(&self.head);
         out.rooting = Some(Arc::new(rooting));
@@ -1827,6 +1946,7 @@ impl Log {
         // resolves to is held.
         if let Some(stubbed) = out.stubbed.as_mut() {
             stubbed.virt = Arc::default();
+            stubbed.entries = Arc::default();
         }
         // Each stub also keeps its place, once every record it resolves to is held.
         #[cfg(test)]
@@ -1837,6 +1957,43 @@ impl Log {
                 let place = out.placed(id).map_or(0, |place| place.len());
                 out.stub_bytes += 2 + place * size_of::<RecordId>();
             }
+        }
+        out.stub_heads();
+        Ok(out)
+    }
+
+    /// This log with each held record of `shed` in its shed form ([`Record::shed`]), every
+    /// record in its place, its roots and stubs kept: what the shedding pass makes
+    /// ([`super::pass`]). A whole log stays whole. It carries no head's reading of the ops
+    /// ([`super::head`]): the head read a shed op opened, which it no longer is, so the next
+    /// resolve reads every op.
+    ///
+    /// # Errors
+    /// A record of `shed` is no whole version-2 record, or a record no longer fits its bounds.
+    pub(super) fn with_shed(&self, shed: &BTreeSet<RecordId>) -> Result<Self> {
+        let mut out = Self::new(self.order[0].clone())?;
+        out.budgets = self.budgets;
+        out.stored_at = self.stored_at;
+        out.enforce_seats = self.enforce_seats;
+        out.writing = self.writing_afresh();
+        out.rooting.clone_from(&self.rooting);
+        out.restub();
+        for record in self.order.iter().skip(1) {
+            let record = if shed.contains(record.id()) {
+                record
+                    .shed()
+                    .ok_or_else(|| Error::new("only a whole version-2 record is shed"))?
+            } else {
+                record.clone()
+            };
+            out.insert(record)?;
+        }
+        for record in self.waiting.values() {
+            let _ = out.insert(record.clone());
+        }
+        if let Some(stubbed) = out.stubbed.as_mut() {
+            stubbed.virt = Arc::default();
+            stubbed.entries = Arc::default();
         }
         out.stub_heads();
         Ok(out)

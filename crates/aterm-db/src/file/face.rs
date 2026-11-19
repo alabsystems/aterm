@@ -37,10 +37,15 @@ use crate::typed::{
     Collection,
     grid::{self, Absent, Base, Seen},
 };
-use aterm_file::{Draft, Face, File, Name, OwnerAct, exit, snapshot::PK};
+use amacs::table::{Delimiter, Table as Sheet};
+use aterm_file::{Column, Draft, Face, File, Name, OwnerAct, exit, snapshot::PK};
 use aterm_json::{Map, Value};
 use aterm_secrets::client::Paths;
-use std::{cell::Cell, collections::BTreeMap, path::Path};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 /// The format word of a stored baseline: JSON Lines, a header, one line a row in key order
 /// ([`Baseline::row_line`]) and a last line holding the SHA-256 of every byte before it, so a
@@ -69,19 +74,64 @@ pub(super) struct Baseline {
     /// The face's header cells but the key's, in face order: the columns the face shows
     /// ([`aterm_file::snapshot::face_columns`]).
     pub(super) header: Vec<String>,
+    whole: Whole,
     /// Each row's non-empty face cells by column name, the computed ones included.
     pub(super) cells: BTreeMap<String, BTreeMap<String, String>>,
 }
 
+/// How a flat export recovers every column, including computed cells missing from a wide face.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Whole {
+    Face,
+    Columns(Vec<String>),
+    /// Early /2 baselines named only the compact face. The signed snapshot names all columns.
+    Snapshot,
+}
+
+fn headers<'a>(columns: impl Iterator<Item = &'a Column>) -> Vec<String> {
+    columns
+        .filter(|column| column.name != PK)
+        .map(|column| column.header(0))
+        .collect()
+}
+
+/// A retained baseline with its displayed cells, or the original grid-only representation.
+enum Stored {
+    Face(Baseline),
+    Grid(Base),
+}
+
+impl Stored {
+    fn read(bytes: &[u8]) -> Option<Self> {
+        if bytes.last() == Some(&b'\n')
+            && let Some(baseline) = Baseline::decode(bytes)
+        {
+            return Some(Self::Face(baseline));
+        }
+        let value: Value = aterm_json::from_slice(bytes).ok()?;
+        match value.get("format")?.as_str()? {
+            "aterm-file-base/1" => Baseline::wrapped(&value).map(Self::Face),
+            grid::FORMAT => Base::from_json(&value).ok().map(Self::Grid),
+            _ => None,
+        }
+    }
+}
+
 impl Baseline {
-    /// The header line of a baseline of `grid`'s table and collection whose face shows
-    /// `face`'s columns (every column of the snapshot but its key, in face order).
-    pub(super) fn header_line(grid: &Base, face: &[&aterm_file::Column]) -> String {
-        let header: Vec<Value> = face
-            .iter()
-            .filter(|column| column.name != PK)
-            .map(|column| Value::from(column.header(0)))
-            .collect();
+    /// The full grid layout, the columns shown in its editable face, and the complete TSV
+    /// header where the face omits columns. All layouts retain the original snapshot order.
+    pub(super) fn header_line(grid: &Base, face: &[&Column], columns: &[Column]) -> String {
+        let header = headers(face.iter().copied());
+        let whole = if face.len() == columns.len() {
+            Value::Null
+        } else {
+            Value::Array(
+                headers(columns.iter())
+                    .into_iter()
+                    .map(Value::from)
+                    .collect(),
+            )
+        };
         let mut object = Map::new();
         object.insert("format".to_owned(), Value::from(FORMAT));
         object.insert("table".to_owned(), Value::from(grid.table.as_str()));
@@ -99,7 +149,11 @@ impl Baseline {
                     .collect(),
             ),
         );
-        object.insert("header".to_owned(), Value::Array(header));
+        object.insert(
+            "header".to_owned(),
+            Value::Array(header.into_iter().map(Value::from).collect()),
+        );
+        object.insert("whole".to_owned(), whole);
         Value::Object(object).to_string()
     }
 
@@ -243,6 +297,107 @@ impl Baseline {
                 rows,
             },
             header: strings(head.get("header")?)?,
+            whole: match head.get("whole") {
+                None => Whole::Snapshot,
+                Some(Value::Null) => Whole::Face,
+                Some(columns) => Whole::Columns(strings(columns)?),
+            },
+            cells,
+        })
+    }
+
+    /// The operation IDs behind the cells of any retained baseline generation.
+    pub(super) fn read_grid(bytes: &[u8]) -> Option<Base> {
+        Some(match Stored::read(bytes)? {
+            Stored::Face(baseline) => baseline.grid,
+            Stored::Grid(grid) => grid,
+        })
+    }
+
+    fn for_export(file: &File, rev: u64, digest: &str, content: &str) -> Option<Self> {
+        if let Some(bytes) = file.baseline_for_export(rev, digest) {
+            return Self::at(file, rev, &bytes, Some(content));
+        }
+        // An older writer wrapped the bare grid in place at the same revision without
+        // archiving it. Recover its original bytes only when the export authenticates them.
+        let Stored::Face(baseline) = Stored::read(&file.baseline(rev)?)? else {
+            return None;
+        };
+        let grid = baseline.grid;
+        let bytes = aterm_json::to_vec(&grid.to_json()).ok()?;
+        if file.baseline_digest(rev, &bytes) != digest {
+            return None;
+        }
+        Self::from_grid(grid, file.snapshot_for_export(rev, content)?)
+    }
+
+    /// A bare grid needs the snapshot this replica published at the same revision to recover
+    /// derived columns. For an import its content must also match what the exporter saw.
+    fn at(file: &File, rev: u64, bytes: &[u8], expected_content: Option<&str>) -> Option<Self> {
+        let snapshot = || match expected_content {
+            Some(content) => file.snapshot_for_export(rev, content),
+            None => file.snapshot_for_grid(rev, bytes),
+        };
+        let grid = match Stored::read(bytes)? {
+            Stored::Face(mut baseline) => {
+                if expected_content.is_some() {
+                    match std::mem::replace(&mut baseline.whole, Whole::Face) {
+                        Whole::Face => {}
+                        Whole::Columns(header) => baseline.header = header,
+                        Whole::Snapshot => baseline.header = headers(snapshot()?.columns.iter()),
+                    }
+                }
+                return Some(baseline);
+            }
+            Stored::Grid(grid) => grid,
+        };
+        Self::from_grid(grid, snapshot()?)
+    }
+
+    fn from_grid(grid: Base, snapshot: aterm_file::Snapshot) -> Option<Self> {
+        let header = headers(snapshot.columns.iter());
+        let cells: BTreeMap<_, _> = snapshot
+            .rows
+            .into_iter()
+            .map(|row| (row.pk, row.cells))
+            .collect();
+        if cells.len() != grid.rows.len() || grid.rows.iter().any(|(pk, _)| !cells.contains_key(pk))
+        {
+            return None;
+        }
+        Some(Self {
+            grid,
+            header,
+            whole: Whole::Face,
+            cells,
+        })
+    }
+
+    fn wrapped(value: &Value) -> Option<Self> {
+        let grid = Base::from_json(value.get("grid")?).ok()?;
+        let header = value
+            .get("header")?
+            .as_array()?
+            .iter()
+            .map(|cell| cell.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        let cells = value
+            .get("cells")?
+            .as_object()?
+            .iter()
+            .map(|(pk, row)| {
+                let row = row
+                    .as_object()?
+                    .iter()
+                    .map(|(name, text)| Some((name.clone(), text.as_str()?.to_owned())))
+                    .collect::<Option<BTreeMap<_, _>>>()?;
+                Some((pk.clone(), row))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()?;
+        Some(Self {
+            grid,
+            header,
+            whole: Whole::Face,
             cells,
         })
     }
@@ -251,36 +406,29 @@ impl Baseline {
     /// key's cell `=pk@<rev>`, and each cell's text as that face showed it (a sealed value a
     /// newer build wrote shows empty, a computed cell its computed text) beside the candidates
     /// its register held.
-    fn for_face(&self, rev: u64) -> Base {
-        let mut header = self.header.clone();
-        header.push(format!("{}{PK}@{rev}", grid::READ_ONLY));
-        let none = BTreeMap::new();
-        let rows = self
-            .grid
-            .rows
-            .iter()
-            .map(|(pk, seen)| {
-                let shown = self.cells.get(pk).unwrap_or(&none);
-                let row: BTreeMap<String, Seen> = self
-                    .header
-                    .iter()
-                    .map(|cell| {
-                        let name = cell.trim_start_matches(grid::READ_ONLY);
-                        let mut held = seen.get(name).cloned().unwrap_or_default();
-                        held.shown = shown.get(name).cloned().unwrap_or_default();
-                        (name.to_owned(), held)
-                    })
-                    .collect();
-                (pk.clone(), row)
-            })
-            .collect();
-        Base {
-            table: self.grid.table.clone(),
-            collection: self.grid.collection.clone(),
-            version: self.grid.version,
-            header,
-            rows,
+    fn into_grid(mut self, rev: u64) -> Base {
+        self.header.push(format!("{}{PK}@{rev}", grid::READ_ONLY));
+        self.grid.header = self.header;
+        for (pk, seen) in &mut self.grid.rows {
+            let mut shown = self.cells.remove(pk).unwrap_or_default();
+            seen.retain(|name, held| {
+                held.shown = shown.remove(name).unwrap_or_default();
+                !held.shown.is_empty()
+                    || held.raw
+                    || !held.candidates.is_empty()
+                    || !held.elements.is_empty()
+            });
+            for (name, shown) in shown {
+                seen.insert(
+                    name,
+                    Seen {
+                        shown,
+                        ..Seen::default()
+                    },
+                );
+            }
         }
+        self.grid
     }
 }
 
@@ -337,7 +485,6 @@ const STAND_IN: &str = "new-";
 /// Read `text`, the face of `target`, against the baseline of the revision its header names:
 /// the drafts it asks for, or why it asks for nothing.
 pub(super) fn plan(target: &Target, text: &str) -> Planned {
-    let name = &target.name;
     let Some(rev) = revision(text) else {
         return Planned::Refused(format!(
             "the face's header lost its last cell, `={PK}@<rev>`: nothing says which revision \
@@ -347,12 +494,23 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
     let Some(baseline) = target
         .held
         .baseline(rev)
-        .and_then(|bytes| Baseline::decode(&bytes))
+        .and_then(|bytes| Baseline::at(&target.held, rev, &bytes, None))
     else {
         return Planned::Refused(format!(
             "the face was written at revision {rev}, whose baseline is no longer kept here"
         ));
     };
+    plan_against(target, text, rev, baseline, None)
+}
+
+fn plan_against(
+    target: &Target,
+    text: &str,
+    rev: u64,
+    baseline: Baseline,
+    sheet: Option<&Sheet>,
+) -> Planned {
+    let name = &target.name;
     let compiled = match target.generation(&baseline.grid.table) {
         Some(compiled) => compiled,
         None => {
@@ -376,20 +534,32 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
             baseline.grid.version, collection.version
         ));
     }
-    let base = baseline.for_face(rev);
+    let base = baseline.into_grid(rev);
     let born = Cell::new(0_usize);
     let birth = |_: &Collection, _: &BTreeMap<String, Value>| {
         born.set(born.get() + 1);
         Ok(format!("{STAND_IN}{}", born.get()))
     };
-    let planned = match grid::plan_saved(
-        compiled.table,
-        collection,
-        &base,
-        text,
-        &birth,
-        Absent::Keeps,
-    ) {
+    let edits = match sheet {
+        Some(sheet) => grid::plan_scanned(
+            compiled.table,
+            collection,
+            &base,
+            text,
+            sheet,
+            &birth,
+            Absent::Keeps,
+        ),
+        None => grid::plan_saved(
+            compiled.table,
+            collection,
+            &base,
+            text,
+            &birth,
+            Absent::Keeps,
+        ),
+    };
+    let planned = match edits {
         Ok(planned) => planned,
         Err(problems) => {
             return Planned::Problems(
@@ -404,12 +574,12 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
     // says the face's text asks for nothing (a commit cut short and run again, a `set` the face
     // repeats).
     let read = target.held.read();
-    let now = |pk: &str, column: &str| {
-        read.rows()
-            .iter()
-            .find(|row| row.pk == pk)
-            .map(|row| row.cell(column).to_owned())
-    };
+    let current: BTreeMap<_, _> = read
+        .rows()
+        .iter()
+        .map(|row| (row.pk.as_str(), row))
+        .collect();
+    let frontier = std::cell::OnceCell::new();
     let outbox = target.held.outbox();
     // A held write of this Mac's is shown `⚠ mine ‖ theirs`, never as its text: a cell a held
     // write already asks for asks for nothing again (the held write is resolved, not repeated).
@@ -430,6 +600,7 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
             .map(|edit| (edit.column.clone(), edit.mine.clone()))
             .collect()
     };
+    let exported: BTreeSet<&str> = base.rows.iter().map(|(pk, _)| pk.as_str()).collect();
     let asked = |cells: &BTreeMap<String, String>| {
         let intents = outbox
             .waiting()
@@ -445,7 +616,7 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
                     .iter()
                     .all(|(column, text)| theirs.get(column.as_str()) == Some(&text.as_str()))
         }) || read.rows().iter().any(|row| {
-            !baseline.cells.contains_key(&row.pk)
+            !exported.contains(row.pk.as_str())
                 && cells
                     .iter()
                     .all(|(column, text)| row.cell(column) == text.as_str())
@@ -454,7 +625,7 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
     // A face that leaves out a column a new row needs (`aterm_file::snapshot::face_columns`)
     // cannot give one its value: such a row is added with `aterm file add`.
     if !planned.born.is_empty() {
-        let shown: Vec<&str> = baseline
+        let shown: Vec<&str> = base
             .header
             .iter()
             .map(|cell| cell.trim_start_matches(grid::READ_ONLY))
@@ -484,7 +655,9 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
         let mut kept = Vec::with_capacity(edits.len());
         for edit in edits {
             if !new
-                && (now(&pk, &edit.column).as_deref() == Some(edit.mine.as_str())
+                && (current
+                    .get(pk.as_str())
+                    .is_some_and(|row| row.cell(&edit.column) == edit.mine)
                     || held(&pk, &edit.column, &edit.mine))
             {
                 continue;
@@ -498,7 +671,13 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
             continue;
         }
         if !new {
-            write::follow_at(&target.held, &outbox, rev, &mut kept);
+            write::follow_from(
+                &outbox,
+                frontier
+                    .get_or_init(|| target.held.projected_at(rev))
+                    .as_ref(),
+                &mut kept,
+            );
         }
         drafts.push(Draft {
             born: new,
@@ -598,13 +777,7 @@ pub(super) fn commit(
         Planned::Drafts(drafts) => drafts,
     };
     clear()?;
-    let mut ids = Vec::with_capacity(drafts.len());
-    for draft in drafts {
-        match held.write(act, draft, env.now_ms) {
-            Ok(accepted) => ids.push((accepted.id.clone(), accepted.unflushed.clone())),
-            Err(why) => return Err(unqueue(held, name, act, &ids, &why.to_string())),
-        }
-    }
+    let ids = queue(held, name, act, env, drafts)?;
     // Every write the face asks for is queued: the face is the snapshot's again. Its bytes are
     // taken as the face's own first, so the pass the publisher's attempt runs writes the new
     // snapshot's face over them, and where nothing is signed yet the face is written again from
@@ -612,30 +785,161 @@ pub(super) fn commit(
     // already queued or a held write's cell as a change again: what this Mac queued shows in a
     // read (`cat`) and in `outbox`, never as the face's own text.
     held.adopt(&bytes).map_err(problem)?;
-    let id_list: Vec<String> = ids.iter().map(|(id, _)| id.clone()).collect();
-    let said = if id_list.is_empty() {
-        Vec::new()
-    } else {
-        write::attempt_all(paths, config, target, &id_list, env)
-    };
+    let answer = publish(paths, config, target, env, &ids, None);
     held.restore().map_err(|error| {
         problem(format!(
             "{name}: the writes are queued, but the face could not be written again from the \
              snapshot: {error}"
         ))
     })?;
+    Ok(answer)
+}
+
+fn queue(
+    held: &File,
+    name: &Name,
+    act: &OwnerAct,
+    env: &Env<'_>,
+    drafts: Vec<Draft>,
+) -> Result<Vec<(String, Option<String>)>, Refusal> {
+    held.batch_local_updates(|| {
+        let mut ids = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            match held.write(act, draft, env.now_ms) {
+                Ok(accepted) => ids.push((accepted.id.clone(), accepted.unflushed.clone())),
+                Err(why) => return Err(unqueue(held, name, act, &ids, &why.to_string())),
+            }
+        }
+        Ok(ids)
+    })
+}
+
+fn publish(
+    paths: &Paths,
+    config: &Path,
+    target: &Target,
+    env: &Env<'_>,
+    ids: &[(String, Option<String>)],
+    import_cells: Option<usize>,
+) -> Wrote {
+    let name = &target.name;
+    let id_list: Vec<String> = ids.iter().map(|(id, _)| id.clone()).collect();
+    let said = if id_list.is_empty() {
+        Vec::new()
+    } else {
+        write::attempt_all(paths, config, target, &id_list, env)
+    };
+    if env.json
+        && let Some(cells) = import_cells
+    {
+        let code = if said.iter().any(|said| matches!(said, Said::Held { .. })) {
+            exit::CONFLICT
+        } else {
+            exit::OK
+        };
+        let outcomes: Vec<_> = said
+            .iter()
+            .zip(ids)
+            .map(|(said, (_, unflushed))| {
+                write::result_json(&target.name, said, unflushed.as_deref())
+            })
+            .collect();
+        let report = aterm_json::json!({"applied": true, "rows": ids.len(), "cells": cells, "outcomes": outcomes});
+        return Wrote::of_face(format!("{report}\n"), code);
+    }
     if said.is_empty() {
         // Every changed cell already says what this Mac's queued writes say.
-        return Ok(write::answer(name, Said::Unchanged, None, env.json));
+        return write::answer(name, Said::Unchanged, None, env.json);
     }
     let mut out = String::new();
     let mut code = exit::OK;
-    for (said, (_, unflushed)) in said.into_iter().zip(&ids) {
+    for (said, (_, unflushed)) in said.into_iter().zip(ids) {
         let (text, said_code) = write::answer(name, said, unflushed.as_deref(), env.json).printed();
         out.push_str(&text);
         code = code.max(said_code);
     }
-    Ok(Wrote::of_face(out, code))
+    Wrote::of_face(out, code)
+}
+
+/// Import a separate editable TSV against its exact baseline. Missing rows are preserved.
+pub(super) fn import(
+    paths: &Paths,
+    config: &Path,
+    target: &Target,
+    act: &OwnerAct,
+    env: &Env<'_>,
+    source: &Path,
+    apply: bool,
+) -> Result<Wrote, Refusal> {
+    let text = aterm_uds::atomic_file::read_regular_text(source, aterm_file::MAX_EXPORT_BYTES)
+        .map_err(|why| problem(format!("could not read the TSV: {why}")))?;
+    let mut sheet = Sheet::scan_rectangular(
+        &text,
+        Delimiter::Tab,
+        aterm_file::MAX_EXPORT_BYTES as usize,
+        aterm_file::MAX_EXPORT_CELLS,
+    )
+    .map_err(|_| problem("the TSV exceeds the editable export limits"))?;
+    if let Some(error) = sheet.problems.first() {
+        let line = amacs::table::line_of(&text, error.at);
+        return Err(problem(format!("invalid TSV quoting at line {line}")));
+    }
+    let key = sheet
+        .records
+        .first_mut()
+        .and_then(|row| row.cells.last_mut())
+        .filter(|cell| cell.after.is_empty())
+        .ok_or_else(|| problem("missing TSV header"))?;
+    let field = &text[key.content.clone()];
+    let (prefix, signature) = field
+        .rsplit_once('.')
+        .ok_or_else(|| problem("expected a TSV from aterm file export"))?;
+    let (digest, content) = signature
+        .split_once('+')
+        .filter(|(digest, content)| {
+            aterm_codec::hex::is_lower(digest, 64) && aterm_codec::hex::is_lower(content, 64)
+        })
+        .ok_or_else(|| problem("invalid TSV export digest"))?;
+    let rev = prefix
+        .strip_prefix("=pk@")
+        .and_then(|rev| rev.parse().ok())
+        .ok_or_else(|| problem("missing export revision"))?;
+    // Present the ordinary revisioned key to the planner. Every other cell retains its original
+    // range, including headers or values containing quoted tabs and line breaks.
+    key.content.end = key.content.start + prefix.len();
+    let held = &target.held;
+    let _lock = if apply {
+        held.make_dirs().map_err(problem)?;
+        Some(
+            aterm_uds::file_lock::LockFile::take(
+                &held.root().commit_lock(&target.name),
+                std::time::Instant::now() + COMMIT_WAIT,
+                "another import or commit is running",
+            )
+            .map_err(problem)?,
+        )
+    } else {
+        None
+    };
+    let baseline = Baseline::for_export(held, rev, digest, content)
+        .ok_or_else(|| problem("this replica does not hold the export's edit baseline"))?;
+    let drafts = match plan_against(target, &text, rev, baseline, Some(&sheet)) {
+        Planned::Refused(why) => return Err(problem(why)),
+        Planned::Problems(lines) => return Err(problem(lines.join("\n"))),
+        Planned::Drafts(drafts) => drafts,
+    };
+    let rows = drafts.len();
+    let cells: usize = drafts.iter().map(|draft| draft.edits.len()).sum();
+    if !apply {
+        let preview = if env.json {
+            aterm_json::json!({"rows": rows, "cells": cells, "applied": false}).to_string()
+        } else {
+            format!("{rows} changed rows, {cells} changed cells")
+        };
+        return Ok(Wrote::of_face(format!("{preview}\n"), exit::OK));
+    }
+    let ids = queue(held, &target.name, act, env, drafts)?;
+    Ok(publish(paths, config, target, env, &ids, Some(cells)))
 }
 
 /// A commit whose outbox refused one of its writes (`why`) queues none of them: the ones

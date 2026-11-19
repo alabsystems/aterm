@@ -145,7 +145,13 @@ fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
     let mut handle = super::super::control_redraw_conformance::registered_session(1, &term);
     let sid = handle.sid.as_str().to_owned();
-    let launch = SourceProofLaunch::admit(&env, frame.trim_end(), &lifetime, &scope, &sid)?;
+    let launch = Arc::new(SourceProofLaunch::admit(
+        &env,
+        frame.trim_end(),
+        &lifetime,
+        &scope,
+        &sid,
+    )?);
     let retained_mode = launch.retained_frontend();
     let root = launch.directory().to_path_buf();
     let socket = root.join("control.sock");

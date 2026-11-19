@@ -895,6 +895,18 @@ fn whole_width(cell_h: u16) -> i32 {
     least_width(&fly(&run, cell_h, (PAGES[0].1, PAGES[0].2))).expect("the glide came on glass")
 }
 
+/// Whether two frames' sprites composite to the same pixels: the same arts, by their texels, at
+/// the same places, sizes and clips, with the same tints, alphas and facings, in the same order.
+fn same_drawing(a: &[FreeSprite], b: &[FreeSprite]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(s, t)| {
+            (s.x, s.y, s.w, s.h, s.clip, s.tint, s.alpha, s.flip_x)
+                == (t.x, t.y, t.w, t.h, t.clip, t.tint, t.alpha, t.flip_x)
+                && (std::sync::Arc::ptr_eq(&s.art, &t.art)
+                    || (s.art.w(), s.art.h(), s.art.data()) == (t.art.w(), t.art.h(), t.art.data()))
+        })
+}
+
 fn read(phases: &[(&str, u32)], shots: &[Shot], bg: u32, cell_w: u16) -> Reading {
     let (x0, y0, x1, y1) = reach(shots);
     assert!(x1 > x0 && y1 > y0, "the flier drew nothing");
@@ -907,7 +919,29 @@ fn read(phases: &[(&str, u32)], shots: &[Shot], bg: u32, cell_w: u16) -> Reading
         .collect();
     let mut glide_frames = vec![0; phases.len()];
     let mut canvas = vec![[0.0_f32; 3]; w * h];
+    // Each pixel's luminance on the frame before, that frame's phase and the sprites last
+    // composited. A pixel that kept its luminance turned nothing ([`Turns::see`] of the value it
+    // saw last changes nothing), so, as the film's own `Flicker::frame` reads its frames, each
+    // count sees a pixel only where it changed: the whole run's after its first frame, a phase's
+    // after the phase's first frame. A frame that draws what the frame before drew
+    // ([`same_drawing`]) keeps every pixel, and is composited only for nothing.
+    let mut last = vec![0.0_f64; w * h];
+    let mut last_phase = None;
+    let mut drawn: Option<&[FreeSprite]> = None;
     for shot in shots {
+        let (phase, _) = phase_at(phases, shot.ms);
+        glide_frames[phase] += usize::from(shot.glide);
+        let (first, same_phase) = (last_phase.is_none(), last_phase == Some(phase));
+        last_phase = Some(phase);
+        if drawn.is_some_and(|drawn| same_drawing(drawn, &shot.sprites)) {
+            if !same_phase {
+                for (i, &y) in last.iter().enumerate() {
+                    each[phase].see(i, y, shot.ms);
+                }
+            }
+            continue;
+        }
+        drawn = Some(&shot.sprites);
         canvas.fill(bg);
         for s in &shot.sprites {
             let art = Art::of(s);
@@ -931,10 +965,15 @@ fn read(phases: &[(&str, u32)], shots: &[Shot], bg: u32, cell_w: u16) -> Reading
                 }
             }
         }
-        let (phase, _) = phase_at(phases, shot.ms);
-        glide_frames[phase] += usize::from(shot.glide);
         for (i, c) in canvas.iter().enumerate() {
             let y = f64::from(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]);
+            if !first && y == last[i] {
+                if !same_phase {
+                    each[phase].see(i, y, shot.ms);
+                }
+                continue;
+            }
+            last[i] = y;
             whole.see(i, y, shot.ms);
             each[phase].see(i, y, shot.ms);
         }
@@ -986,11 +1025,17 @@ fn report(label: &str, phases: &[(&str, u32)], r: &Reading) -> String {
     out
 }
 
+/// The fit's floor at `cell_h`, to the pixel its box rounds to: [`HEAD_FIT_FLOOR`] of the glide's
+/// whole width, read with the control seams as they stand.
+fn floor_px(cell_h: u16) -> i32 {
+    (HEAD_FIT_FLOOR * whole_width(cell_h) as f32).floor() as i32
+}
+
 /// Whether `run` at `cell_h` on `page` keeps the laws: some pixel turning more than six times a
-/// second, a pop, a frame on a letter or the caret, a full-alpha glide narrower than its fit's
-/// floor, a step along its row tail first, or a wobble breaks them. The reading's line, and the
-/// glide's largest step.
-fn judged(run: &Run, cell_h: u16, page: (&str, u32, u32)) -> Judged {
+/// second, a pop, a frame on a letter or the caret, a full-alpha glide narrower than `floor`
+/// (its fit's floor at `cell_h`, [`floor_px`], read under the same seams), a step along its row
+/// tail first, or a wobble breaks them. The reading's line, and the glide's largest step.
+fn judged(run: &Run, cell_h: u16, page: (&str, u32, u32), floor: i32) -> Judged {
     let (name, bg, fg) = page;
     let shots = fly(run, cell_h, (bg, fg));
     let r = read(run.phases, &shots, bg, (cell_h / 2).max(1));
@@ -1002,8 +1047,6 @@ fn judged(run: &Run, cell_h: u16, page: (&str, u32, u32)) -> Judged {
             run.phases[i].0
         );
     }
-    // The fit's floor, to the pixel its box rounds to.
-    let floor = (HEAD_FIT_FLOOR * whole_width(cell_h) as f32).floor() as i32;
     let line = format!("{line} floor_px={floor}");
     let kept = r.whole.over.is_empty()
         && r.pops.is_empty()
@@ -1067,10 +1110,12 @@ fn the_flier_never_flashes() {
     let mut broken = Vec::new();
     // Each run's largest step at each cell height and page, in order.
     let mut most_steps = std::collections::HashMap::<&str, Vec<i32>>::new();
+    // The fit's floor at each cell height, read once with no control seam on.
+    let floors = [26_u16, 20].map(|cell_h| (cell_h, floor_px(cell_h)));
     for run in &runs {
-        for cell_h in [26_u16, 20] {
+        for (cell_h, floor) in floors {
             for &page in &PAGES {
-                let j = judged(run, cell_h, page);
+                let j = judged(run, cell_h, page, floor);
                 eprintln!("{}", j.line);
                 most_steps.entry(run.name).or_default().push(j.most_step);
                 if !j.kept {
@@ -1090,7 +1135,7 @@ fn the_flier_never_flashes() {
 
     let control = |off: &'static std::thread::LocalKey<std::cell::Cell<bool>>, label: &str| {
         off.with(|c| c.set(true));
-        let Judged { kept, line, .. } = judged(&runs[0], 26, PAGES[0]);
+        let Judged { kept, line, .. } = judged(&runs[0], 26, PAGES[0], floor_px(26));
         off.with(|c| c.set(false));
         eprintln!("{label}: {line}");
         assert!(
@@ -1105,28 +1150,44 @@ fn the_flier_never_flashes() {
 
     // Each move's own control, 0a12236dc7b's behaviour back: some reading of the move breaks a
     // law.
-    // Every cell height and page, with `offs` on.
-    let under = |name: &str, offs: &[Seam], label: &str| -> Vec<Judged> {
+    // With `offs` on, the cell heights and pages in the sweep's order (each height's floor read
+    // under them), up to the first reading `broke` names (its index in that order): a control
+    // holds once one reading breaks, and one that fails has read every one. `Err` holds them.
+    let first_broken = |name: &str,
+                        offs: &[Seam],
+                        label: &str,
+                        broke: &dyn Fn(usize, &Judged) -> bool|
+     -> Result<(), Vec<Judged>> {
         let run = runs.iter().find(|r| r.name == name).expect("the run");
         offs.iter().for_each(|off| off.with(|c| c.set(true)));
-        let lines: Vec<Judged> = [26_u16, 20]
+        let mut read = Vec::new();
+        let mut floor_at: Option<(u16, i32)> = None;
+        let mut found = false;
+        let readings = [26_u16, 20]
             .into_iter()
-            .flat_map(|cell_h| PAGES.iter().map(move |&page| (cell_h, page)))
-            .map(|(cell_h, page)| judged(run, cell_h, page))
-            .collect();
-        offs.iter().for_each(|off| off.with(|c| c.set(false)));
-        for j in &lines {
+            .flat_map(|cell_h| PAGES.iter().map(move |&page| (cell_h, page)));
+        for (k, (cell_h, page)) in readings.enumerate() {
+            let floor = match floor_at {
+                Some((h, px)) if h == cell_h => px,
+                _ => floor_at.insert((cell_h, floor_px(cell_h))).1,
+            };
+            let j = judged(run, cell_h, page, floor);
             eprintln!("{label}: {}", j.line);
+            found = broke(k, &j);
+            read.push(j);
+            if found {
+                break;
+            }
         }
-        lines
+        offs.iter().for_each(|off| off.with(|c| c.set(false)));
+        if found { Ok(()) } else { Err(read) }
     };
-    let moved = |name: &str, off: Seam, label: &str| {
-        let lines = under(name, &[off], label);
-        assert!(
-            lines.iter().any(|j| !j.kept),
-            "control: {name} with {label} must break a law: {lines:?}"
-        );
+    let moved_under = |name: &str, offs: &[Seam], label: &str| {
+        if let Err(lines) = first_broken(name, offs, label, &|_, j| !j.kept) {
+            panic!("control: {name} with {label} must break a law: {lines:?}");
+        }
     };
+    let moved = |name: &str, off: Seam, label: &str| moved_under(name, &[off], label);
     moved("paste-40", &FLIGHT_UNPLANNED, "the flight unplanned");
     for name in ["completion-30", "word-kill", "hop-5", "hop-2-rows"] {
         moved(name, &GLIDE_JUMPS, "the glide drawn at its rest");
@@ -1143,15 +1204,10 @@ fn the_flier_never_flashes() {
         "the take-off frame drawn where it was",
     );
     // Its rise with its last stride step and its fade out only where it is clear each hold it.
-    let open_wall = under(
+    moved_under(
         "open-wall",
         &[&WALL_RISE_OFF, &FADE_OUT_ANYWHERE],
         "no rise with the last stride step and the fade held out over letters",
-    );
-    assert!(
-        open_wall.iter().any(|j| !j.kept),
-        "control: open-wall with no rise with the last stride step and the fade held out over \
-         letters must break a law: {open_wall:?}"
     );
     moved(
         "right-wall",
@@ -1168,15 +1224,10 @@ fn the_flier_never_flashes() {
         "the fit shrunk onto a wall with no seat",
     );
     // Each of its seat below, its leave and its fade out only where it is clear holds it alone.
-    let two_full = under(
+    moved_under(
         "two-full-above-wall",
         &[&WALL_LEAVE_OFF, &FIT_BELOW_OFF, &FADE_OUT_ANYWHERE],
         "no seat below, the fit shrunk and the fade held out over letters",
-    );
-    assert!(
-        two_full.iter().any(|j| !j.kept),
-        "control: two-full-above-wall with no seat below, the fit shrunk and the fade held out \
-         over letters must break a law: {two_full:?}"
     );
     moved(
         "stair-wall",
@@ -1207,24 +1258,23 @@ fn the_flier_never_flashes() {
         "the streamed paste's flight steps further a frame than the paste's (once, streamed): \
          {steps:?}"
     );
-    let grown: Vec<(i32, i32)> = most_steps["paste-40"]
-        .iter()
-        .copied()
-        .zip(
-            under(
-                "paste-streamed",
-                &[&RETARGET_KEPT],
-                "the retargeted flight's plan kept",
-            )
+    let once = &most_steps["paste-40"];
+    if let Err(lines) = first_broken(
+        "paste-streamed",
+        &[&RETARGET_KEPT],
+        "the retargeted flight's plan kept",
+        &|k, j| j.most_step > once[k],
+    ) {
+        let grown: Vec<(i32, i32)> = once
             .iter()
-            .map(|j| j.most_step),
-        )
-        .collect();
-    assert!(
-        grown.iter().any(|&(once, streamed)| streamed > once),
-        "control: with the retargeted flight's plan kept, the streamed paste must step further: \
-         {grown:?}"
-    );
+            .copied()
+            .zip(lines.iter().map(|j| j.most_step))
+            .collect();
+        panic!(
+            "control: with the retargeted flight's plan kept, the streamed paste must step \
+             further (once, streamed): {grown:?}"
+        );
+    }
 }
 
 /// A control seam.

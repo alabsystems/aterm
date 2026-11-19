@@ -783,10 +783,16 @@ fn follower_rest_wakeups() {
     let worker = std::thread::spawn(move || {
         let files = watch_files(desk, &state);
         let routes = watch_routes(desk, aterm_uds::network::RouteChanges::open());
-        observe(desk, &state, files, routes, || {
-            reads.fetch_add(1, Ordering::SeqCst);
-            aterm_netplace::keeper::read_projected(&state)
-        });
+        observe(
+            desk,
+            || aterm_netplace::record::dir(&state),
+            files,
+            routes,
+            |dir| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                aterm_netplace::keeper::read_projected_in(dir)
+            },
+        );
     });
     std::thread::sleep(Duration::from_secs(2));
     let (wake0, reads0) = (wakeups(), reads.load(Ordering::SeqCst));
@@ -886,9 +892,12 @@ fn the_followers_clocks_are_the_keepers_bounded_looks_and_the_places_own_deadlin
 /// `remote · vpn`) but not the keeper's record, so no file of the folder changes; the route
 /// socket's change alone makes the owner read again, and the cached place is the new one. The
 /// file watch's first looks (one per file, each of which always tells) are taken before the
-/// owner starts, so no read but the route change's can follow the first.
-/// NEGATIVE CONTROL: `watch_routes` arming with a `changed` that tells nothing (`|| {}` for
-/// `|| desk.input_changed()`) hangs "the route change is read again" at the detector.
+/// owner starts, so no read but the route change's can follow the first. Each read resolves the
+/// place's folder once, and reads the folder it resolved.
+/// NEGATIVE CONTROLS: `watch_routes` arming with a `changed` that tells nothing (`|| {}` for
+/// `|| desk.input_changed()`) hangs "the route change is read again" at the detector; an owner
+/// that resolves the folder for its watch and again for its read (as before 2026-11-18, when
+/// the keeper's read resolved it from the state root) resolves it four times in the two reads.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_route_change_with_no_file_written_is_read_again() {
@@ -943,9 +952,18 @@ fn a_route_change_with_no_file_written_is_read_again() {
     let (read, reads) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel();
     let count: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let resolved: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let folder = aterm_netplace::record::dir(&state);
     let (worker_lan, worker_vpn) = (lan.clone(), vpn.clone());
+    let (read_in, worker_folder) = (std::sync::Arc::new(Mutex::new(Vec::new())), folder.clone());
+    let worker_read_in = std::sync::Arc::clone(&read_in);
     let worker = std::thread::spawn(move || {
-        observe(desk, &state, files, routes, || {
+        let resolve = || {
+            resolved.fetch_add(1, Ordering::SeqCst);
+            worker_folder.clone()
+        };
+        observe(desk, resolve, files, routes, |dir| {
+            worker_read_in.lock_or_recover().push(dir.to_owned());
             let n = count.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = read.send(n);
             if n == 2 {
@@ -991,6 +1009,14 @@ fn a_route_change_with_no_file_written_is_read_again() {
     assert_eq!(first, Ok(1));
     assert!(sent.is_ok());
     assert_eq!(after, Ok(2), "the route change is read again");
+    assert_eq!(
+        (
+            resolved.load(Ordering::SeqCst),
+            read_in.lock_or_recover().clone()
+        ),
+        (2, vec![folder.clone(), folder]),
+        "each read resolves the folder once and reads the folder it resolved"
+    );
     assert_eq!(
         before_publication.as_deref(),
         Some(&lan),

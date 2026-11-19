@@ -28,7 +28,7 @@ pub(in crate::harness) use kimi::{
     KimiProof, NativeError as KimiNativeError, RejectedSnapshot as KimiRejectedSnapshot,
     expire_pending as expire_kimi_pending, observation_error as kimi_observation_error,
     pending_expiry as kimi_pending_expiry, pending_files as kimi_pending_files,
-    rejected_snapshot as kimi_rejected_snapshot,
+    rejected_snapshot as kimi_rejected_snapshot, rejection_file as kimi_rejection_file,
     verify_native_classified as verify_native_kimi_classified,
     verify_or_refresh_with_rejection as verify_or_refresh_kimi_with_rejection,
 };

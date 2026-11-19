@@ -1633,6 +1633,155 @@ fn the_loop_hands_a_harness_read_wait_to_the_rollout_ask() {
     assert!(owed(&app), "a tick hands the wait over: {:?}", pair(&app));
 }
 
+/// THE STAND-DOWN'S SETTLE IS THE LOOP'S TO TICK (HX-15h review): while the record stream feeds
+/// the turns, the screen's rest arms no settle for the stream's turn; a claim's move that ends
+/// that stand-down arms the settle the rest owes, under the session's lock, and the loop's
+/// `MetaChanged` arm notes the wake, so the turn closes a settle later with no other event.
+/// NEGATIVE CONTROL: while the stream feeds the turns the same arm notes nothing.
+#[test]
+fn the_stand_downs_end_settle_is_noted_for_the_loops_tick() {
+    let mut app = crate::App::headless_for_test();
+    let timeline = app.pool.get(0).expect("session").ctx.timeline.clone();
+    let now = crate::turn_ledger::now_ms();
+    let _hand = hand_clock_from(&timeline, now);
+    let harness = aterm_slog::HarnessStamp::new("claude-code-alab@4242", Actor::Aterm, Some(1))
+        .expect("a holder ID");
+    {
+        let mut g = timeline.lock().unwrap();
+        g.note_root_group(100);
+        g.note_foreground_group(300);
+        g.set_program(300, Some("claude".into()));
+        g.slog_mut().set_stream_down(StreamDown {
+            turn: true,
+            ..StreamDown::default()
+        });
+        g.publish_agent(
+            "busy",
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            stamp(1),
+        );
+        let at = g.slog().now();
+        let started = aterm_slog::StreamTurn::Started {
+            turn: 1,
+            by: Some("person"),
+            peer: None,
+        };
+        assert!(g.slog_mut().stream_turn(started, &harness, at));
+        g.publish_agent(
+            "idle",
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            stamp(2),
+        );
+        assert_eq!(g.slog_wake(), None, "the stream feeds the turns");
+    }
+    app.on_meta_changed(0);
+    assert!(
+        app.session_status.slog_wakes.is_empty(),
+        "CONTROL: nothing owed while the stream feeds the turns"
+    );
+
+    timeline
+        .lock()
+        .unwrap()
+        .slog_mut()
+        .set_stream_down(StreamDown::default());
+    let owed = timeline.lock().unwrap().slog_wake();
+    assert!(
+        owed.is_some(),
+        "the stand-down's end armed the rest's settle"
+    );
+    app.on_meta_changed(0);
+    assert_eq!(
+        app.session_status.slog_wakes.next(),
+        owed,
+        "the loop ticks it"
+    );
+}
+
+/// THE STREAM'S OPEN STEPS ARE ITS FEED'S (HX-15h review, D8): a `tool` step one claimant's
+/// stream left open is no longer the stream's once it stops feeding `tool`, so a later
+/// claimant's record of the same call id opens and closes a step of its own instead of closing
+/// the earlier one's under its stamp; the earlier step ends with its turn or run. NEGATIVE
+/// CONTROL: while the feed lasts, the same id's end closes the step its start opened.
+#[test]
+fn a_stream_step_left_open_is_not_the_next_feeds() {
+    use crate::session_timeline::{ConversationTaken, StreamedStep};
+    use aterm_slog::Op;
+    let app = crate::App::headless_for_test();
+    let timeline = app.pool.get(0).expect("session").ctx.timeline.clone();
+    let now = crate::turn_ledger::now_ms();
+    let _hand = hand_clock_from(&timeline, now);
+    let holder = |holder: &str, hseq: u64| {
+        aterm_slog::HarnessStamp::new(holder, Actor::Aterm, Some(hseq)).expect("a holder ID")
+    };
+    let (a, b) = ("claude-code-alab@4242", "claude-code-alab@5151");
+    let feeds = StreamDown {
+        tool: true,
+        ..StreamDown::default()
+    };
+    let mut g = timeline.lock().unwrap();
+    g.note_root_group(100);
+    g.note_foreground_group(300);
+    g.set_program(300, Some("claude".into()));
+    g.publish_agent(
+        "busy",
+        None,
+        None,
+        Some(aterm_phase::Program::Claude),
+        stamp(1),
+    );
+    let at = g.slog().now();
+    let step = |g: &mut SessionTimeline, id: &str, state: StreamedStep, stamp| {
+        g.slog_mut()
+            .stream_step(Kind::Tool, id, Some("Bash"), state, &stamp, at)
+    };
+    g.slog_mut().set_stream_down(feeds);
+    for (id, state, hseq) in [
+        ("toolu_01", StreamedStep::Started, 1),
+        ("toolu_02", StreamedStep::Started, 2),
+        ("toolu_02", StreamedStep::Done, 3),
+    ] {
+        assert_eq!(
+            step(&mut g, id, state, holder(a, hseq)),
+            ConversationTaken::Applied
+        );
+    }
+    let tools = |g: &SessionTimeline, op: Op| {
+        g.slog()
+            .log()
+            .window()
+            .filter(|rec| rec.k == Kind::Tool && rec.op == op)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        (tools(&g, Op::Open).len(), tools(&g, Op::Close).len()),
+        (2, 1),
+        "CONTROL: within the feed the end closed its own step"
+    );
+
+    g.slog_mut().set_stream_down(StreamDown::default());
+    g.slog_mut().set_stream_down(feeds);
+    assert_eq!(
+        step(&mut g, "toolu_01", StreamedStep::Done, holder(b, 1)),
+        ConversationTaken::Applied
+    );
+    let opens = tools(&g, Op::Open);
+    let closes = tools(&g, Op::Close);
+    assert_eq!(opens.len(), 3, "the later feed's own step: {opens:?}");
+    assert_eq!(closes.len(), 2);
+    assert_eq!(closes[1].node, opens[2].node, "it closed its own step");
+    assert!(
+        g.slog().log().is_open(opens[0].node),
+        "the earlier feed's step is left to its turn"
+    );
+    assert_eq!(closes[1].f.get_str(Key::Holder), Some(b));
+}
+
 #[test]
 fn an_idle_session_arms_nothing_and_a_pending_settle_is_ticked() {
     let mut app = crate::App::headless_for_test();

@@ -747,6 +747,57 @@ pub(crate) enum Mutant {
     /// F4 (`Bridge::landing_line`): a bridge killed before the table is written again leaves
     /// the next one no deadline to sweep, and the ask never expires.
     RetireOverAnUnwrittenDeadline,
+    /// An ask the attach lands again as its own attempt, its entry standing past aterm's
+    /// `outbox sent`, has nothing noted where it lands (`Bridge::note_relanded_ask`), as every
+    /// build before ATERM-KI-1116-7314's fix: on a log the attach forgot its offset on (a power
+    /// loss's next generation, its fork below it), neither its recipient nor its deadline
+    /// stands, and the ask never expires. Witness: bridge's
+    /// `an_ask_the_replay_lands_again_on_a_moved_generation_expires_at_its_own_deadline`.
+    ReplayLeavesTheDeadlineUnnoted,
+    /// An ask the attach lands again has its deadline noted `dl` from now, as the drain's retry
+    /// measures one (`Bridge::note_relanded_ask`), not from the record's own `t=`: late by
+    /// however long the outage between its first landing and the attach lasted. Witness:
+    /// bridge's `an_ask_the_replay_lands_again_on_a_moved_generation_expires_at_its_own_deadline`.
+    ReplayDeadlineFromNow,
+    /// An entry held for the drain whose ask was landed again is ended while its deadline is
+    /// not on the disk (`Bridge::relanded_ask_noted`), as `RetireOverAnUnwrittenDeadline`
+    /// retires a post: a bridge killed then leaves the next one no entry and no deadline, and
+    /// the ask never expires. Witness: bridge's
+    /// `an_undecided_asks_record_taken_for_its_drain_is_released_once_its_deadline_is_on_disk`.
+    ReleaseOverAnUnwrittenDeadline,
+    /// Every record the attach's replay lands an ask's entry at is the entry's own attempt
+    /// (`Bridge::relanded_own_ask`), its key's winner's too: a keyed re-post deduped onto its
+    /// winner's record notes a deadline there, where a re-post deduped onto an existing record
+    /// creates none. Witness: bridge's
+    /// `an_ask_the_replay_lands_at_its_keys_winner_or_its_own_attempt_is_noted_only_at_its_own`.
+    ReplayTakesTheWinnerForItsOwn,
+    /// An ask the attach lands again at another offset than its first landing has its deadline
+    /// noted at the copy whatever the asks journal still holds of that landing
+    /// (`Bridge::note_relanded_ask`, as its fix first noted it, once an offset): past a cut that
+    /// gave the first record up on a log the attach forgot nothing of, or below a moved
+    /// generation's fork, the one ask holds two deadlines, and unanswered it expires twice.
+    /// Witness: bridge's
+    /// `an_ask_the_replay_lands_again_where_its_first_landing_stands_is_noted_once`.
+    RelandedAskNotedPerOffset,
+    /// The attach's replay decides whether a keyed re-post's landing is its own attempt by its
+    /// pin's winner's offset whatever log that offset was taken on (`replayed_own_attempt`), as
+    /// a landing decides by its post's pin: a copy landed past a move at the offset the pin kept
+    /// is taken for its winner's, noted nowhere, and a dedup onto its winner's record at any
+    /// other is taken for its own, a deadline noted on another post's record. Witness: bridge's
+    /// `a_keyed_ask_the_replay_lands_is_its_own_by_where_it_lies_against_its_pins_head`.
+    ReplayWinnerOffsetFromAnyLog,
+    /// A reply to an ask the attach landed again, delivered before the release notes its
+    /// recipient (`Bridge::reply_from`), is judged by `asked` and the deadlines alone, which a log
+    /// the attach forgot the offset on left empty there: another principal's reply settles the
+    /// ask, and the release arms no deadline. Witness: bridge's
+    /// `a_reply_to_an_ask_the_replay_lands_again_before_its_release_is_judged_by_its_recipient`.
+    ReplyFromIgnoresTheRelandedAsk,
+    /// An ask the attach lands again whose answer was delivered ahead of the release is armed
+    /// all the same (`Bridge::note_relanded_ask`), due at its own `t + dl`, mostly past: where
+    /// retention gave the answer up, the sweep publishes an `expired` over an answer the asker
+    /// holds. Witness: bridge's
+    /// `a_reply_to_an_ask_the_replay_lands_again_before_its_release_is_judged_by_its_recipient`.
+    ReplayArmsOverAnUnarmedSettle,
     /// A landed post's in-flight entry ends ahead of its offset in the self-lane log
     /// (`Bridge::land_group`, critic item E07; a landed receipt's too, since F15 settles it
     /// there): a bridge killed between leaves the next one an own record neither in flight nor
@@ -1391,6 +1442,63 @@ pub(crate) enum Mutant {
     /// `the_delivery_gate_takes_an_undecided_attempts_record_by_its_origin_else_by_the_newest_seen`
     /// and `the_delivery_gates_call_site_holds_each_of_its_rules`.
     UndecidedTakesTheFirst,
+    /// A keyed re-post's read from its own head, or from a keyed head not its own above a proved
+    /// fork, that cannot decide arms nothing (`Bridge::arm_undecided_keyed`), as every build before
+    /// ATERM-KI-1114-1414's keyed hold: its record is handed while the post is held, and once a
+    /// cut gave it up the retry reads nothing back and publishes the key's second record, which
+    /// the reader is handed too. No sim seed (the sim's bridges run with the mesh off, so every
+    /// producer is placed, and every row a stamping broker delivers names its origin; with it off
+    /// the keyed reminted world to 1,000 breaks the laws it breaks with every rule on, at the same
+    /// seeds and offsets, 2026-11-18); its witness is bridge's
+    /// `a_keyed_case_six_hold_hands_its_attempt_once_across_the_cut_that_gives_it_up`.
+    KeyedHoldUnarmed,
+    /// The delivery gate reads no keyed arm's floor (`undecided_takes`): an earlier post of the
+    /// key in the same words below the re-post's own head, the key's own post's record claimed at
+    /// the key's sequence among them, is taken for the re-post's attempt. No sim seed (as
+    /// `Mutant::KeyedHoldUnarmed`; the keyed reminted world to 128 with it off, 2026-11-18); its
+    /// witnesses are bridge's
+    /// `the_delivery_gate_takes_an_undecided_attempts_record_by_its_origin_else_by_the_newest_seen`
+    /// and `the_delivery_gates_call_site_holds_each_of_its_rules`.
+    UndecidedTakesBelowItsFloor,
+    /// A record a keyed arm took for a re-post in its winner's own words, whose pin names no
+    /// winner's offset, is not known as its own (`Bridge::keyed_own_copy`): the retry reads it
+    /// again, undecided, and holds its sender and its recipient's lane for as long as the record
+    /// stands. No sim seed (as `Mutant::KeyedHoldUnarmed`; the keyed reminted world to 128 with it
+    /// off, 2026-11-18); its witness is bridge's
+    /// `a_keyed_record_taken_in_its_winners_words_settles_its_retry_there`.
+    KeyedTakenUnowned,
+    /// A keyed arm armed again by a read of its words keeps the lower of the two floors
+    /// (`Bridge::arm_undecided_keyed`), not the higher: a record of those words between the two,
+    /// an earlier post's claimed at the key's sequence among them, is taken for the later read's
+    /// attempt. No sim seed (as `Mutant::KeyedHoldUnarmed`; the keyed reminted world to 128 with
+    /// it off, 2026-11-18); its witness is bridge's
+    /// `one_arm_a_sequence_stands_between_two_posts_and_a_keyed_re_arm_keeps_its_higher_floor`.
+    KeyedArmKeepsTheLowerFloor,
+    /// One arm a sequence goes unkept between the two posts that can hold one sequence at once, a
+    /// key's own post and a re-post of its key (`Bridge::one_arm_a_sequence_unkept`): a read that
+    /// decides takes out the other post's arm (`Bridge::disarm`), a plain read writes its
+    /// candidates over a keyed arm (`Bridge::arm_undecided`), a keyed read writes over a plain arm
+    /// and merges into a keyed arm with no want in common (`Bridge::arm_undecided_keyed`), a
+    /// keyed arm takes a record while its sequence's record awaits the drain, moving that hold
+    /// (`Bridge::undecided_candidate`), and a post that left aterm's outbox takes any arm at its
+    /// sequence, whatever its kind and words (`Bridge::land_group`): a re-post's landing takes
+    /// its key's own post's plain arm, and a landing an arm of other words. No sim seed (as
+    /// `Mutant::KeyedHoldUnarmed`; the keyed reminted world to 128 with it off, 2026-11-18,
+    /// before the landing's rule joined it: that rule acts only on a standing arm, and that
+    /// world's broker stamps every open, its producers placed, so no read there arms one, read,
+    /// not run); its witness is bridge's
+    /// `one_arm_a_sequence_stands_between_two_posts_and_a_keyed_re_arm_keeps_its_higher_floor`,
+    /// its landing rows for the landing's rule.
+    OneArmASequenceUnkept,
+    /// A post that left aterm's outbox while an arm of its words held its sequence leaves that
+    /// arm, and the entry the read that armed it read, standing (`Bridge::land_group`): its retry
+    /// settled by another read (a keyed re-post its key made its own, read by its words), the
+    /// refill's delivery of its record is taken for a post that is gone, held in hand and not
+    /// handed, and a fetch of it answers `unsettled`, until a later drain's listing names the post
+    /// nowhere (`Bridge::release_replays`). No sim seed (as `Mutant::KeyedHoldUnarmed`; the keyed
+    /// reminted world to 128 with it off, 2026-11-18); its witness is bridge's
+    /// `a_keyed_arm_goes_with_its_post_whatever_read_settled_it`.
+    ArmOutlivesItsPost,
     /// The attach reads no pin whose head is anywhere before its refill
     /// (`Bridge::arm_undecided_pins`): only the drain's retry arms it, after the refill handed
     /// its record, and a cut that then gave it up leaves the retry nothing to read back, so it
@@ -2241,7 +2349,7 @@ struct Sent {
 }
 
 /// One session's `ev` face as a reader sees it ([`World::mirror_faces`]).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Face {
     /// Per `ms`, the distinct `(ep, seq)` records that hold it.
     recs: BTreeMap<u64, BTreeSet<(u32, u64)>>,
@@ -2309,27 +2417,131 @@ impl Seen {
     }
 }
 
-/// THE MODEL BROKER'S LOG AS IT STANDS, by offset, hidden records included, through `seen`
-/// (the world's [`Seen`] of it): a record is read again only where the log no longer holds the
-/// one read last ([`Seen::is`]), so each is decoded once while the log keeps it. A caller drops
-/// what this returns before it reads the log again.
-fn log_of<'a>(
-    core: &Core,
-    seen: &'a std::cell::RefCell<Vec<Seen>>,
-) -> std::cell::Ref<'a, Vec<Seen>> {
-    {
-        let s = lock(&core.broker.state);
-        let mut seen = seen.borrow_mut();
-        seen.truncate(s.log.len());
-        for (i, rec) in s.log.iter().enumerate() {
-            match seen.get_mut(i) {
-                Some(was) if was.is(rec) => {}
-                Some(was) => *was = Seen::of(rec),
-                None => seen.push(Seen::of(rec)),
-            }
+/// A session's presence row as the laws read it ([`World::presence_rows`]): `(state=, inc=,
+/// statedir=)`.
+type PresenceRow = (String, Option<u64>, Option<String>);
+
+/// A record as the model's tap reads it ([`conform::View::records`]): `(sid, text)` of one on a
+/// lane of this node's inbox.
+type InboxRecord = Option<(String, String)>;
+
+/// A node presence row as the laws read it ([`World::node_rows`]): `(state=, inc=, statedir=)`,
+/// the mark read as hex.
+type NodeRow = (String, Option<u64>, Option<u64>);
+
+/// ONE FOLD OF THE LOG the laws read ([`LogReads`]), over its records in offset order and kept
+/// up with it: the records appended since it last folded are folded in, and a record changed
+/// below what it folded (a power loss's cut, then other records there) folds it again from the
+/// first. Its value is a function of the records it folded alone.
+struct Fold<T> {
+    /// The lowest offset of [`LogReads::seen`] changed since this fold last caught up.
+    dirty: std::cell::Cell<Option<usize>>,
+    /// How many records it folded, and what it made of them.
+    value: std::cell::RefCell<(usize, T)>,
+}
+
+impl<T: Default> Default for Fold<T> {
+    fn default() -> Self {
+        Self {
+            dirty: std::cell::Cell::new(None),
+            value: std::cell::RefCell::new((0, T::default())),
         }
     }
-    seen.borrow()
+}
+
+impl<T: Default> Fold<T> {
+    /// A change of `seen` at offset `at`.
+    fn lower(&self, at: usize) {
+        let low = self.dirty.get().map_or(at, |low| low.min(at));
+        self.dirty.set(Some(low));
+    }
+
+    /// The fold of `seen`, `step` taking each record not yet folded with its offset.
+    fn of<'a>(
+        &'a self,
+        seen: &[Seen],
+        step: impl Fn(&mut T, usize, &Seen),
+    ) -> std::cell::Ref<'a, T> {
+        if let Some(low) = self.dirty.take() {
+            let mut value = self.value.borrow_mut();
+            if low < value.0 {
+                *value = (0, T::default());
+            }
+            let (folded, acc) = &mut *value;
+            for (off, rec) in seen.iter().enumerate().skip(*folded) {
+                step(acc, off, rec);
+            }
+            *folded = seen.len();
+        }
+        std::cell::Ref::map(self.value.borrow(), |(_, value)| value)
+    }
+}
+
+/// THE MODEL BROKER'S LOG AS THE LAWS READ IT ([`World::log`]), and the folds of it they read at
+/// every step.
+#[derive(Default)]
+struct LogReads {
+    /// The log as it stood when last read, by offset, hidden records included.
+    seen: std::cell::RefCell<Vec<Seen>>,
+    /// The log's counts when `seen` was last brought up to it ([`bus::Log::read`]).
+    read: std::cell::Cell<Option<bus::LogRead>>,
+    inbox_records: Fold<Vec<InboxRecord>>,
+    inbox_texts: Fold<conform::Texts>,
+    bus_markers: Fold<BTreeMap<String, Vec<u64>>>,
+    presence_rows: Fold<BTreeMap<String, PresenceRow>>,
+    node_rows: Fold<Vec<NodeRow>>,
+    mirror_faces: Fold<BTreeMap<String, Face>>,
+}
+
+impl LogReads {
+    /// A change of `seen` at offset `at`, owed to every fold.
+    fn lower(&self, at: usize) {
+        self.inbox_records.lower(at);
+        self.inbox_texts.lower(at);
+        self.bus_markers.lower(at);
+        self.presence_rows.lower(at);
+        self.node_rows.lower(at);
+        self.mirror_faces.lower(at);
+    }
+}
+
+/// THE MODEL BROKER'S LOG AS IT STANDS, by offset, hidden records included, through `reads`
+/// (the world's [`LogReads`] of it): a record is read again only where the log no longer holds
+/// the one read last ([`Seen::is`]), so each is decoded once while the log keeps it; where the
+/// log was only appended to since it was last read ([`bus::Log::changes`]), only the records
+/// appended are read, and where it did not change, none. A caller drops what this returns
+/// before it reads the log again.
+fn log_of<'a>(broker: &bus::Broker, reads: &'a LogReads) -> std::cell::Ref<'a, Vec<Seen>> {
+    {
+        let s = lock(&broker.state);
+        let changes = s.log.changes(reads.read.get());
+        if changes != bus::LogChanges::None {
+            let mut seen = reads.seen.borrow_mut();
+            let mut low = None;
+            if seen.len() > s.log.len() {
+                seen.truncate(s.log.len());
+                low = Some(s.log.len());
+            }
+            let from = if changes == bus::LogChanges::Appended {
+                seen.len()
+            } else {
+                0
+            };
+            for (i, rec) in s.log.iter().enumerate().skip(from) {
+                match seen.get_mut(i) {
+                    Some(was) if was.is(rec) => continue,
+                    Some(was) => *was = Seen::of(rec),
+                    None => seen.push(Seen::of(rec)),
+                }
+                low = Some(low.map_or(i, |low: usize| low.min(i)));
+            }
+            if let Some(low) = low {
+                reads.lower(low);
+            }
+            reads.read.set(Some(s.log.read()));
+        }
+    }
+    reads.seen.borrow()
 }
 
 /// One bridge process, running.
@@ -2379,7 +2591,7 @@ struct World {
     /// The finite alias fixture's actual departed B1 session.
     alias_ghost: Option<String>,
     /// Tier-1 of `FabricExactlyOnce`.
-    tap: conform::Tap,
+    tap: std::cell::RefCell<conform::Tap>,
     /// The quarantine's names when the running bridge's process was launched.
     quarantine_at_launch: BTreeSet<String>,
     /// Retention's draws (sim item B05), a stream of their own.
@@ -2414,8 +2626,8 @@ struct World {
     says: BTreeMap<String, String>,
     /// Every follow a session made.
     follows: Vec<Follow>,
-    /// The model broker's log as the laws last read it ([`World::log`]).
-    seen: std::cell::RefCell<Vec<Seen>>,
+    /// The model broker's log as the laws last read it, and their folds of it ([`World::log`]).
+    reads: LogReads,
     /// The keyed re-posts ([`Opts::keys`]), a stream of their own.
     key_rng: Rng,
     /// Every key a note was posted under, by its name: who posted it, to whom, and the markers
@@ -2668,7 +2880,9 @@ impl World {
             sibling_dies_at: None,
             sibling_dead: false,
             alias_ghost: None,
-            tap: conform::Tap::new(aterm_models_session::fabric_exactly_once_model()),
+            tap: std::cell::RefCell::new(conform::Tap::new(
+                aterm_models_session::fabric_exactly_once_model(),
+            )),
             quarantine_at_launch: BTreeSet::new(),
             stats: Stats::default(),
             ret_rng: Rng::new(seed ^ 0x7e7a_14ed_c075_0b05),
@@ -2684,7 +2898,7 @@ impl World {
             say_rng: Rng::new(seed ^ 0x05a7_7091_c5f4_0b0b),
             says: BTreeMap::new(),
             follows: Vec::new(),
-            seen: std::cell::RefCell::new(Vec::new()),
+            reads: LogReads::default(),
             key_rng: Rng::new(seed ^ 0x0ce7_5eed_4e75_0f23),
             keyed: BTreeMap::new(),
             log_rng: Rng::new(seed ^ 0x0109_c0de_1111_0004),
@@ -3280,17 +3494,18 @@ impl World {
         if self.reads_past.is_empty() {
             return Vec::new();
         }
-        let records = self.core.broker.records();
         let mut bad = Vec::new();
         for (sid, read) in &self.reads_past {
-            for (q, subject, body, _) in &records {
-                if *q >= read.head && read.below.iter().any(|(s, b)| s == subject && b == body) {
-                    bad.push(format!(
-                        "fetch past: {sid} read @{} past an own record whose copy landed @{q}",
-                        read.off
-                    ));
-                }
-            }
+            self.core
+                .broker
+                .each_visible_from(read.head, |q, subject, body| {
+                    if read.below.iter().any(|(s, b)| s == subject && b == body) {
+                        bad.push(format!(
+                            "fetch past: {sid} read @{} past an own record whose copy landed @{q}",
+                            read.off
+                        ));
+                    }
+                });
         }
         bad
     }
@@ -3384,7 +3599,7 @@ impl World {
                 _ => ask.unnoted = true,
             }
         }
-        let log = log_of(&self.core, &self.seen);
+        let log = log_of(&self.core.broker, &self.reads);
         let records = || {
             log.iter()
                 .enumerate()
@@ -4562,38 +4777,55 @@ impl World {
 
     /// The model broker's log as it stands ([`log_of`]).
     fn log(&self) -> std::cell::Ref<'_, Vec<Seen>> {
-        log_of(&self.core, &self.seen)
+        log_of(&self.core.broker, &self.reads)
     }
 
     /// The text markers of the bus's records on this node's and the person's
     /// lanes: `marker -> [offset]`.
-    fn bus_markers(&self) -> BTreeMap<String, Vec<u64>> {
+    fn bus_markers(&self) -> std::cell::Ref<'_, BTreeMap<String, Vec<u64>>> {
         let lanes = format!("/f/{FLEET}/in/");
-        let mut out: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-        for (off, rec) in self.log().iter().enumerate() {
+        let log = self.log();
+        self.reads.bus_markers.of(&log, |out, off, rec| {
             if rec.hidden || !rec.subject.starts_with(&lanes) {
-                continue;
+                return;
             }
             let text = &rec.fabric().text;
             if is_marker(text) {
                 out.entry(text.clone()).or_default().push(off as u64);
             }
-        }
-        out
+        })
     }
 
-    /// What the model's tap reads of the world now ([`conform::View`]).
-    fn view(&self) -> conform::View {
+    /// The records of the log as the model's tap reads them ([`conform::View::records`]).
+    fn inbox_records(&self) -> std::cell::Ref<'_, Vec<InboxRecord>> {
         let lane = format!("/f/{FLEET}/in/{NODE}/");
-        let records = self
-            .log()
-            .iter()
-            .map(|r| {
+        let log = self.log();
+        self.reads.inbox_records.of(&log, |out, _, r| {
+            out.push((|| {
                 let rest = r.subject.strip_prefix(lane.as_str())?;
                 let sid = rest.split('/').next()?;
                 Some((sid.to_string(), r.fabric().text.clone()))
-            })
-            .collect();
+            })());
+        })
+    }
+
+    /// Where each text of [`World::inbox_records`] stands ([`conform::View::texts`]).
+    fn inbox_texts(&self) -> std::cell::Ref<'_, conform::Texts> {
+        let records = self.inbox_records();
+        let log = self.log();
+        self.reads.inbox_texts.of(&log, |texts, off, _| {
+            conform::add_text(texts, off, records[off].as_ref());
+        })
+    }
+
+    /// What the model's tap reads of the world now ([`conform::View`]): `records` as
+    /// [`World::inbox_records`] reads them, and the sessions of `ep`, the endpoint's state.
+    fn view<'a>(
+        &self,
+        records: &'a [InboxRecord],
+        texts: &'a conform::Texts,
+        ep: &'a EpState,
+    ) -> conform::View<'a> {
         let ident = {
             let s = lock(&self.core.broker.state);
             astream_broker::LogIdentity {
@@ -4602,22 +4834,23 @@ impl World {
             }
         };
         let group = crate::subject::inbox_group(FLEET, NODE);
-        let sessions = lock(&self.ep.state)
+        let sessions = ep
             .sessions
             .values()
             .map(|s| {
                 (
-                    s.sid.clone(),
+                    s.sid.as_str(),
                     conform::SessionView {
-                        dedup: s.dedup.clone(),
-                        rows: s.rows.iter().map(|r| (r.off, r.text.clone())).collect(),
-                        log: s.bus_log.clone(),
+                        dedup: &s.dedup,
+                        rows: &s.rows,
+                        log: s.bus_log.as_deref(),
                     },
                 )
             })
             .collect();
         conform::View {
             records,
+            texts,
             gone: self.core.broker.gone(),
             log: ident.to_string(),
             // The identity's moves so far, another log's among them: astream numbers another
@@ -4625,7 +4858,7 @@ impl World {
             // a reader can continue from (`FabricExactlyOnce`'s `g`).
             generation: self.stats.moves + self.stats.another_logs,
             retired_logs: self.stats.retired_logs,
-            forgot_remints: self.remints_forgotten(),
+            forgot_remints: self.reminted_ids.intersection(&ep.forgot_across).count() as u64,
             group_start: self.core.broker.group_start(&group),
             alive: self.live.is_some(),
             owed: self
@@ -4640,25 +4873,27 @@ impl World {
     /// The last presence row of every session face under this node, `sid ->
     /// (state=, inc=, statedir=)`: the face is a last-value one, so the row at the
     /// highest offset is what every reader takes for the session.
-    fn presence_rows(&self) -> BTreeMap<String, (String, Option<u64>, Option<String>)> {
+    fn presence_rows(&self) -> std::cell::Ref<'_, BTreeMap<String, PresenceRow>> {
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
-        let mut out = BTreeMap::new();
-        for rec in self.log().iter().filter(|rec| !rec.hidden) {
+        let log = self.log();
+        self.reads.presence_rows.of(&log, |out, _, rec| {
+            if rec.hidden {
+                return;
+            }
             let Some(sid) = rec
                 .subject
                 .strip_prefix(prefix.as_str())
                 .and_then(|rest| rest.strip_suffix("/presence"))
                 .filter(|sid| *sid != "node" && !sid.contains('/'))
             else {
-                continue;
+                return;
             };
             let b = rec.fabric();
             let state = b.unknown.get("state").cloned().unwrap_or_default();
             let inc = b.unknown.get("inc").and_then(|i| crate::parse_uint(i));
             let mark = b.unknown.get(crate::state::PRESENCE_MARK).cloned();
             out.insert(sid.to_string(), (state, inc, mark));
-        }
-        out
+        })
     }
 
     /// The running bridge's `(me, witnessed)` incarnation pair read from the bus.
@@ -4692,23 +4927,23 @@ impl World {
 
     /// Every row of this node's own presence face, in log order: `(state=,
     /// inc=)`.
-    fn node_rows(&self) -> Vec<(String, Option<u64>, Option<u64>)> {
+    fn node_rows(&self) -> std::cell::Ref<'_, Vec<NodeRow>> {
         let face = crate::subject::node_face(FLEET, NODE, "presence");
-        self.log()
-            .iter()
-            .filter(|rec| !rec.hidden && rec.subject == face)
-            .map(|rec| {
-                let b = rec.fabric();
-                let state = b.unknown.get("state").cloned().unwrap_or_default();
-                let inc = b.unknown.get("inc").and_then(|i| crate::parse_uint(i));
-                let mark = b
-                    .unknown
-                    .get(crate::state::PRESENCE_MARK)
-                    .filter(|m| m.bytes().all(|b| b.is_ascii_hexdigit()))
-                    .and_then(|mark| u64::from_str_radix(mark, 16).ok());
-                (state, inc, mark)
-            })
-            .collect()
+        let log = self.log();
+        self.reads.node_rows.of(&log, |out, _, rec| {
+            if rec.hidden || rec.subject != face {
+                return;
+            }
+            let b = rec.fabric();
+            let state = b.unknown.get("state").cloned().unwrap_or_default();
+            let inc = b.unknown.get("inc").and_then(|i| crate::parse_uint(i));
+            let mark = b
+                .unknown
+                .get(crate::state::PRESENCE_MARK)
+                .filter(|m| m.bytes().all(|b| b.is_ascii_hexdigit()))
+                .and_then(|mark| u64::from_str_radix(mark, 16).ok());
+            out.push((state, inc, mark));
+        })
     }
 
     /// PRESENCE, once settled: every hosted session's row says `live`, and no
@@ -4851,22 +5086,25 @@ impl World {
     /// THE READER'S VIEW of every session's `ev` face, decoded and deduped by
     /// `(ep, seq)` as every reader does: per `ms`, the distinct records that
     /// hold it, and the covers.
-    fn mirror_faces(&self) -> BTreeMap<String, Face> {
+    fn mirror_faces(&self) -> std::cell::Ref<'_, BTreeMap<String, Face>> {
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
-        let mut out: BTreeMap<String, Face> = BTreeMap::new();
-        for rec in self.log().iter().filter(|rec| !rec.hidden) {
+        let log = self.log();
+        self.reads.mirror_faces.of(&log, |out, _, rec| {
+            if rec.hidden {
+                return;
+            }
             let Some(sid) = rec
                 .subject
                 .strip_prefix(prefix.as_str())
                 .and_then(|rest| rest.strip_suffix("/ev"))
                 .filter(|sid| *sid != "node" && !sid.contains('/'))
             else {
-                continue;
+                return;
             };
             let Some(b) = rec.slog() else {
-                continue;
+                return;
             };
-            let Some(ms) = b.ms else { continue };
+            let Some(ms) = b.ms else { return };
             let face = out.entry(sid.to_string()).or_default();
             match b.rec.f.get_u(aterm_slog::Key::N) {
                 Some(n) if b.rec.op == aterm_slog::Op::Gap => face.covers.push((ms, n)),
@@ -4875,8 +5113,7 @@ impl World {
                     *face.raw.entry((b.ep, b.rec.seq)).or_default() += 1;
                 }
             }
-        }
-        out
+        })
     }
 
     /// THE MIRROR'S AT-MOST-ONCE, at every step (`LogMirror`'s
@@ -4884,7 +5121,7 @@ impl World {
     /// the reader's view.
     fn mirror_twice(&self) -> Vec<String> {
         let mut bad = Vec::new();
-        for (sid, face) in self.mirror_faces() {
+        for (sid, face) in self.mirror_faces().iter() {
             for (ms, ids) in &face.recs {
                 if ids.len() > 1 {
                     bad.push(format!(
@@ -4989,6 +5226,7 @@ impl World {
             }
         }
         drop(s);
+        drop(faces);
         self.stats.mirrored = mirrored;
         bad
     }
@@ -5114,16 +5352,18 @@ impl World {
 
     /// One step of the world, through the model's tap.
     fn observe_model(&mut self) {
-        let view = self.view();
-        let markers: BTreeSet<String> = self
-            .sent
-            .iter()
-            .filter(|(_, s)| s.to.is_some())
-            .map(|(m, _)| m.clone())
-            .collect();
-        let before = self.tap.violations.len();
-        self.tap.observe(&view, &markers);
-        let new: Vec<String> = self.tap.violations[before..].to_vec();
+        let new: Vec<String> = {
+            let records = self.inbox_records();
+            let texts = self.inbox_texts();
+            let ep = lock(&self.ep.state);
+            let view = self.view(&records, &texts, &ep);
+            let sent = &self.sent;
+            let marker = |text: &str| sent.get(text).is_some_and(|s| s.to.is_some());
+            let mut tap = self.tap.borrow_mut();
+            let before = tap.violations.len();
+            tap.observe(&view, &marker);
+            tap.violations[before..].to_vec()
+        };
         self.violations.extend(new);
     }
 
@@ -5167,14 +5407,14 @@ impl World {
         bad.extend(self.routed_after_exit());
         bad.extend(self.key_copies());
         let gone = self.core.broker.gone();
-        for (marker, records) in self.bus_markers() {
+        for (marker, records) in self.bus_markers().iter() {
             // Every copy but the newest given up by retention (sim item B05): the replay of an
             // entry whose record went unread (an own record is never delivered while its entry
             // stands) publishes the one copy a reader is handed. The rows' law is `dup delivery`.
             let once_read = records
                 .split_last()
                 .is_some_and(|(_, older)| older.iter().all(|r| gone.contains(r)));
-            if self.sent.get(&marker).is_some_and(|s| s.post.is_some())
+            if self.sent.get(marker).is_some_and(|s| s.post.is_some())
                 && records.len() > 1
                 && !once_read
             {
@@ -5518,6 +5758,7 @@ impl World {
             }
         }
         drop(s);
+        drop(markers);
         let alias_collision = lock(&self.core.broker.state)
             .race
             .as_ref()
@@ -5551,7 +5792,7 @@ impl World {
         self.stats.ghosts_left = left.len() as u64;
         let sibling = self.sibling();
         let sibling_row = sibling
-            .and_then(|_| self.presence_rows().remove(SIBLING_SID))
+            .and_then(|_| self.presence_rows().get(SIBLING_SID).cloned())
             .map(|(state, _, _)| state);
         let outranked = sibling.is_some_and(|sibling| {
             self.node_rows()
@@ -5738,7 +5979,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     w.launch();
     if opts.alias {
         w.settle();
-        let before = w.presence_rows();
+        let before = w.presence_rows().clone();
         let first_inc = w.running_bridge().map(|(inc, _)| inc);
         w.kill();
         w.exit_one();
@@ -5826,7 +6067,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     w.stats.cuts_after_dedup = w.core.broker.cuts_after_dedup();
     w.stats.strays = w.core.broker.strays().len() as u64;
     if !w.keyed.is_empty() {
-        let on_bus = w.bus_markers();
+        let on_bus = w.bus_markers().clone();
         let reposts: BTreeSet<&String> = w
             .keyed
             .values()
@@ -5869,14 +6110,15 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     w.stats.renamed_unflushed = errors.renamed_unflushed;
     w.stats.appends_cut = errors.appends_cut;
     w.stats.disk_full_refused = errors.disk_full;
-    w.stats.tap_past_a_retire = w.tap.checked_past_a_retire;
+    let tap = w.tap.into_inner();
+    w.stats.tap_past_a_retire = tap.checked_past_a_retire;
     Outcome {
         seed: opts.seed,
         tier: w.tier,
         violations: w.violations,
         trace,
         stats: w.stats,
-        model: (w.tap.opened, w.tap.checked, w.tap.fired.clone()),
+        model: (tap.opened, tap.checked, tap.fired),
         journal: w.core.broker.take_journal(),
     }
 }

@@ -153,6 +153,89 @@ pub fn payload_root(layout: &Layout, package: &str, build: u64) -> Option<PathBu
         .flatten()
 }
 
+/// The executable declared by a positively complete, numbered ALab package in this store.
+/// Linked development trees and entries outside the admitted payload have no build identity.
+#[must_use]
+pub fn ready_alab_entry(layout: &Layout, program: &str, build: u64) -> Option<PathBuf> {
+    crate::alab::agent(program)?;
+    let root = payload_root(layout, program, build)?;
+    if !crate::store::readably_complete(&layout.build_dir(program, build)) {
+        return None;
+    }
+    let entry = root
+        .join(crate::alab::validated_entrypoint_of(&root)?)
+        .canonicalize()
+        .ok()?;
+    #[cfg(unix)]
+    let runnable = crate::platform::executable_for_current_user(&entry)?;
+    #[cfg(not(unix))]
+    let runnable = executable(&entry);
+    (entry.starts_with(&root) && runnable).then_some(entry)
+}
+
+/// Absence of an optional launcher is distinct from a redirected directory or unreadable slot.
+fn launcher_present(path: &Path) -> Option<bool> {
+    match std::fs::symlink_metadata(path.parent()?) {
+        Ok(dir) if dir.is_dir() && !crate::platform::is_reparse(&dir) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        _ => return None,
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// The numbered ALab build the managed local launchers currently select. This reads the
+/// primary and any installed agent twin, including a stable alias a Unix producer would exec.
+/// A split publication, an unrecognized route or an unreadable entry has no agreed selection.
+#[must_use]
+pub fn selected_alab_entry(layout: &Layout, program: &str) -> Option<(u64, PathBuf)> {
+    crate::alab::agent(program)?;
+    let tool = ToolName::new(program)?;
+    let primary = layout.shim(&tool);
+    if !launcher_present(&primary)? {
+        return None;
+    }
+    let stable = crate::activate::exec_dir(layout, program).join(tool.exe_file());
+    let (declared, effective) = crate::platform::observed_alab_forward(&primary, &stable)?;
+    let (owner, build) = crate::ops::store_build_of(&layout.prefix, &declared)?;
+    if owner != program {
+        return None;
+    }
+    let entry = ready_alab_entry(layout, program, build)?;
+    if declared.canonicalize().ok()? != entry || effective.canonicalize().ok()? != entry {
+        return None;
+    }
+    let twin = layout.agent_shim(&tool);
+    let twin_present = launcher_present(&twin)?;
+    if twin_present {
+        let (_, effective) = crate::platform::observed_alab_forward(&twin, &stable)?;
+        if effective.canonicalize().ok()? != entry {
+            return None;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let reroute = layout.reroute_dir().join(program);
+        if launcher_present(&reroute)? {
+            let body = crate::metadata_io::read_bounded_regular_utf8(
+                &reroute,
+                crate::platform::MAX_SHIM_BYTES,
+            )
+            .ok()?;
+            if !twin_present
+                || !crate::platform::executable_for_current_user(&reroute)?
+                || body != crate::reroute::agents_stub_body_sh(program, &layout.agents_dir())
+            {
+                return None;
+            }
+        }
+    }
+    Some((build, entry))
+}
+
 /// Observe one installed shim and its local metadata. No PATH fallback, process,
 /// network request, lock, write, or repair is part of this lookup. A ready record is
 /// a point-in-time observation: callers must hold a lease and verify identity before

@@ -2474,3 +2474,570 @@ fn the_publication_384b3a9f_cells_pass_the_tracker_types_and_a_real_token_does_n
         }
     }
 }
+
+/// A Commons machine uuid of the link tests, each digit `n`.
+fn writer(n: u8) -> [u8; 16] {
+    [n; 16]
+}
+
+/// A registry read for the link tests (TK-07): `generation`'s `machine` rows, each a key, its
+/// lifecycle and the row it was merged into, written as that generation declares the
+/// collection, and each writer's `machine-facts` row.
+fn registry_read(
+    generation: &'static Table,
+    rows: &[(&str, &str, Option<&str>)],
+    facts: &[([u8; 16], Value)],
+) -> View {
+    let machine = generation.collection("machine").unwrap();
+    let mut book = Book::new();
+    for (pk, lifecycle, merged_into) in rows {
+        let mut changes = vec![
+            // One label on every row: a label names no one machine.
+            put(machine, pk, "label", json!("m72")),
+            put(machine, pk, "status", json!("active")),
+            put(machine, pk, LIFECYCLE, json!(lifecycle)),
+        ];
+        if let Some(into) = merged_into {
+            changes.push(put(machine, pk, "merged_into", json!(into)));
+        }
+        book.write(1, &[], changes);
+    }
+    let facts = owned::OwnedRead {
+        rows: facts
+            .iter()
+            .map(|(writer, value)| {
+                let row = owned::OwnedRow {
+                    machine: *writer,
+                    actor: [writer[0]; 48],
+                    value: value.clone(),
+                    rank: (0, 1, 1),
+                    operation: [0; 32],
+                };
+                (keys::uuid32(writer), row)
+            })
+            .collect(),
+        inert: 0,
+    };
+    View {
+        table: Some(generation),
+        cells: book.cells(),
+        owned: BTreeMap::from([(crate::alab::registry::MACHINE_FACTS.name, facts)]),
+        ..View::empty_for_test()
+    }
+}
+
+/// A principal aterm stated, on the machine `uuid` names.
+fn principal_on(uuid: &str) -> Value {
+    values::Principal {
+        session: Some("s-47051b9a207955a92b14".to_owned()),
+        program: Some("claude".to_owned()),
+        machine: Some(uuid.to_owned()),
+        ..values::Principal::default()
+    }
+    .to_value()
+}
+
+/// One sample of `metric` in the tracker's `measure` log, signed by `signer` as its entry `n`
+/// and taken on the machine `on` names.
+fn sample(signer: [u8; 16], n: u64, metric: &str, on: &str) -> owned::LogEntry {
+    owned::LogEntry {
+        machine: signer,
+        actor: [signer[0]; 48],
+        n,
+        sequence: n,
+        period: 0,
+        value: json!({"metric": metric, "value": "1121", "at": 1_800_000_000_000_u64, "machine": on}),
+        operation: [0; 32],
+    }
+}
+
+/// The tracker's link findings as (kind, collection, keys), each of them said in a sentence and
+/// headed.
+fn link_findings(
+    cells: &Cells,
+    samples: Vec<owned::LogEntry>,
+    machines: &crate::alab::link::Machines,
+) -> Vec<(&'static str, &'static str, Vec<String>)> {
+    use crate::lab::tracker::{MEASURE, TRACKER, checks};
+    let logs = BTreeMap::from([(
+        MEASURE.name,
+        owned::LogRead {
+            entries: samples,
+            inert: 0,
+        },
+    )]);
+    checks::links(&TRACKER, cells, &logs, machines)
+        .into_iter()
+        .map(|finding| {
+            assert_ne!(
+                check::said(finding.kind),
+                finding.kind,
+                "said in a sentence"
+            );
+            assert_eq!(
+                Some(check::headed(finding.kind).as_str()),
+                checks::heading(finding.kind),
+                "and headed"
+            );
+            (finding.kind, finding.collection, finding.pks)
+        })
+        .collect()
+}
+
+/// A LINK TO A RETIRED REGISTRY MACHINE IS A FINDING (TK-07; design §4.6). A row of the tracker
+/// names a machine by a link into another table family, the registry, which no rule of the
+/// tracker's own table can judge. A reader that holds both follows it: through the facts row
+/// the machine states of itself to the machine row that binds, in whichever generation of the
+/// registry holds its rows (the first, whose `machine` is the list-typed collection, and the
+/// fourth, whose `machine` is the set-typed one, read the same; a read of any other family is
+/// not followed).
+///
+/// * A link that comes to a live machine row is no finding, and neither is one whose machine
+///   states in its own facts row the row it was merged into: an acknowledged merge is the same
+///   machine, not a retirement.
+/// * A link that comes to a retired row is `link-retired`: in a cells table (a principal's
+///   machine, a claim's holder inside its struct) and in a log (`measure.machine`) alike.
+/// * A machine row's own `merged_into` moves no machine. A machine whose facts still bind a row
+///   that only the row's cells call merged stays on that row, which is not live:
+///   `link-retired`.
+/// * A link whose facts bind a row the registry does not hold is `link-missing`.
+/// * A retired tracker row is not read: it claims nothing now. Text that is no machine uuid
+///   names no machine, so it reaches no finding's keys.
+/// * The finding follows the registry, not the row: with the retired machine live again the
+///   same rows report only what the registry still does not settle.
+///
+/// NEGATIVE CONTROL, observed: with `checks::links` passing over `Machine::Retired` as it does
+/// `Machine::Row`, the first comparison of findings fails: the three `link-retired` findings
+/// that name the retired machine are missing from the left side.
+#[test]
+fn a_link_to_a_retired_registry_machine_is_a_finding() {
+    use crate::alab::{
+        link::{Machine, Machines},
+        registry::{MACHINE_LINK, REGISTRY, REGISTRY_4},
+    };
+    use crate::lab::tracker::{
+        TRACKER,
+        tables::{DECISION, LANE, PACKAGE, REQUEST},
+    };
+    const LIVE: &str = "mc-00000000000000a1";
+    const GONE: &str = "mc-00000000000000a2";
+    const FOLDED: &str = "mc-00000000000000a3";
+    const ABSENT: &str = "mc-00000000000000a4";
+    const HELD: &str = "mc-00000000000000a5";
+    let [desk, gone, folded, lost, held] = [1, 2, 3, 4, 5].map(|n| keys::uuid32(&writer(n)));
+    let facts = [
+        (writer(1), json!({"n": 1, "mac": LIVE})),
+        (writer(2), json!({"n": 1, "mac": GONE})),
+        // A merge its machine acknowledged, and one only the row's cells show.
+        (
+            writer(3),
+            json!({"n": 1, "mac": FOLDED, "merged_into": LIVE}),
+        ),
+        (writer(4), json!({"n": 1, "mac": ABSENT})),
+        (writer(5), json!({"n": 1, "mac": HELD})),
+    ];
+    let rows = |gone_is: &'static str| {
+        [
+            (LIVE, "live", None),
+            (GONE, gone_is, None),
+            (FOLDED, "merged", Some(LIVE)),
+            (HELD, "merged", Some(LIVE)),
+        ]
+    };
+
+    // The tracker's rows: each names a machine, in a column of its own shape.
+    let claim =
+        |by: &str| json!({"by": principal_on(by), "on": 20_775, "at": 1_800_000_000_000_u64});
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&LANE, "tracker", "coordinator", principal_on(&desk)),
+            put(&DECISION, "TK-D1", "decided_by", principal_on(&gone)),
+            put(&REQUEST, "RQ-1", "requested_by", principal_on(&folded)),
+            put(&REQUEST, "RQ-1", "triaged_by", principal_on(&held)),
+            put(&PACKAGE, "TK-07", "claim", claim(&lost)),
+            put(&PACKAGE, "TK-08", "claim", claim(&gone)),
+            // A retired row claims nothing now.
+            put(&DECISION, "TK-D2", "decided_by", principal_on(&gone)),
+            put(&DECISION, "TK-D2", LIFECYCLE, json!("retired")),
+        ],
+    );
+    let cells = book.cells();
+    let metric = crate::lab::tracker::mapped::key("A10.lab_objects");
+    let samples = || {
+        vec![
+            sample(writer(1), 1, &metric, &desk),
+            sample(writer(1), 2, &metric, &gone),
+            // A log entry is read as it was signed: text that is no uuid names no machine.
+            sample(writer(1), 3, &metric, "m72"),
+        ]
+    };
+    let unsettled = |lost: &str, held: &str| {
+        [
+            (
+                "link-missing",
+                "package",
+                vec!["TK-07".to_owned(), lost.to_owned()],
+            ),
+            (
+                "link-retired",
+                "request",
+                vec!["RQ-1".to_owned(), held.to_owned()],
+            ),
+        ]
+    };
+
+    for generation in [&REGISTRY, &REGISTRY_4] {
+        let role = generation.role;
+        assert!(MACHINE_LINK.follows(generation), "{role}");
+        let machines = Machines::of(&registry_read(generation, &rows("retired"), &facts))
+            .expect("a read of the registry is followed");
+        assert_eq!(machines.resolve(&desk), Machine::Row(LIVE.to_owned()));
+        assert_eq!(machines.resolve(&gone), Machine::Retired(GONE.to_owned()));
+        assert_eq!(
+            machines.resolve(&folded),
+            Machine::Row(LIVE.to_owned()),
+            "{role}: a merge its machine states is the row it was merged into"
+        );
+        assert_eq!(
+            machines.resolve(&held),
+            Machine::Unsettled(HELD.to_owned()),
+            "{role}: a merge only the row's cells show moves no machine"
+        );
+        assert_eq!(machines.resolve(&lost), Machine::Missing(ABSENT.to_owned()));
+        let [missing, held_row] = unsettled(&lost, &held);
+        assert_eq!(
+            link_findings(&cells, samples(), &machines),
+            [
+                missing,
+                (
+                    "link-retired",
+                    "decision",
+                    vec!["TK-D1".to_owned(), gone.clone()]
+                ),
+                (
+                    "link-retired",
+                    "measure",
+                    vec![format!("{desk}.2"), gone.clone()]
+                ),
+                (
+                    "link-retired",
+                    "package",
+                    vec!["TK-08".to_owned(), gone.clone()]
+                ),
+                held_row,
+            ],
+            "{role}: a link to a retired or missing machine row is a finding"
+        );
+
+        // The finding is the registry's state at the read: the machine live again, the same
+        // rows report only what the registry still does not settle.
+        let machines = Machines::of(&registry_read(generation, &rows("live"), &facts)).unwrap();
+        assert_eq!(
+            link_findings(&cells, samples(), &machines),
+            unsettled(&lost, &held),
+            "{role}: a live machine row is no finding"
+        );
+    }
+
+    // Only the family the link names is followed.
+    assert!(!MACHINE_LINK.follows(&TRACKER) && !MACHINE_LINK.follows(&TABLE));
+    assert!(
+        Machines::of(&View {
+            table: Some(&TRACKER),
+            ..View::empty_for_test()
+        })
+        .is_none(),
+        "a read of another family is no registry"
+    );
+}
+
+/// A MACHINE IS NAMED BY ITS UUID, A LABEL IS REFUSED, AND TWO WRITERS OF ONE LINEAGE RESOLVE TO
+/// ONE MACHINE (TK-07; design §4.6).
+///
+/// * A principal's machine and a link to a machine are one text, the 32-digit Commons machine
+///   uuid. A label (`m72`) is refused in both: every machine row of this fixture is labelled
+///   `m72`, since the registry declares no unique label.
+/// * A writer succession gives one machine three uuids here. The newest's facts row states the
+///   fold of the lineage's birth row into the machine row, and names the writer before it; that
+///   one's facts row still binds the birth row, as a build from before the fold leaves it; the
+///   earliest states no facts row at all. All three resolve to the one machine row, and are the
+///   same machine as one another.
+/// * A writer of another lineage, bound to another row with the same label, is another machine.
+/// * A lease compares uuids through the same lineage, and never joins two lineages.
+/// * A host name is found among the hosts each machine states in its own facts row, with or
+///   without `.local`: the two writers of the lineage that state `m72` are one machine, named
+///   by the newer. A name two lineages state is two matches, and a name no facts row states
+///   names nothing. A machine row's label is never read: with no facts row stating `m72`, the
+///   label every row carries names nothing.
+///
+/// NEGATIVE CONTROLS, each observed: with `values::machine` taking `keys::is_label` again,
+/// `a label names no principal's machine` fails. With `Machines::resolve` following no merge
+/// (`states_merge` always false), `the writer before it, through the fold` fails:
+/// `Unsettled("mc-00000000000000b1")`, not the machine row.
+#[test]
+fn a_machine_is_named_by_its_uuid_a_label_is_refused_and_two_writers_of_one_lineage_resolve_to_one_machine()
+ {
+    use crate::alab::{
+        link::{Host, Machine, Machines, Same},
+        registry::{MACHINE_LINK, REGISTRY, REGISTRY_4},
+    };
+    use crate::lab::tracker::tables::DECISION;
+    const BIRTH: &str = "mc-00000000000000b1";
+    const KEPT: &str = "mc-00000000000000b2";
+    const OTHER: &str = "mc-00000000000000b3";
+
+    // The uuid names a machine; a label names none.
+    let uuid = keys::uuid32(&writer(3));
+    let decided_by = DECISION.column("decided_by").unwrap();
+    assert_eq!(
+        cell::validate(&DECISION, decided_by, &principal_on(&uuid)).map_err(|e| e.0),
+        Ok(())
+    );
+    assert_eq!(values::link(&MACHINE_LINK, &uuid), Ok(()));
+    for label in ["m72", "m40-3fa2"] {
+        assert!(keys::is_label(label));
+        assert_eq!(
+            values::principal(&principal_on(label)),
+            Err("a principal's machine is its 32-digit machine uuid"),
+            "a label names no principal's machine"
+        );
+        assert!(
+            cell::validate(&DECISION, decided_by, &principal_on(label)).is_err(),
+            "nor in a cell"
+        );
+        assert!(
+            values::link(&MACHINE_LINK, label).is_err(),
+            "a label is no link to a machine"
+        );
+    }
+
+    let [earliest, old, new, other, twin] = [1, 2, 3, 4, 5].map(|n| keys::uuid32(&writer(n)));
+    let rows = [
+        (BIRTH, "merged", Some(KEPT)),
+        (KEPT, "live", None),
+        (OTHER, "live", None),
+    ];
+    let facts = [
+        (
+            writer(2),
+            json!({"n": 1, "mac": BIRTH, "predecessor": earliest, "hosts": ["m72.local"]}),
+        ),
+        (
+            writer(3),
+            json!({"n": 1, "mac": BIRTH, "merged_into": KEPT, "predecessor": old, "hosts": ["M72"]}),
+        ),
+        (
+            writer(4),
+            json!({"n": 1, "mac": OTHER, "hosts": ["studio.local", "bench"]}),
+        ),
+        (
+            writer(5),
+            json!({"n": 1, "mac": OTHER, "hosts": ["studio"]}),
+        ),
+    ];
+    for generation in [&REGISTRY, &REGISTRY_4] {
+        let role = generation.role;
+        let machines = Machines::of(&registry_read(generation, &rows, &facts)).unwrap();
+        let kept = Machine::Row(KEPT.to_owned());
+        assert_eq!(machines.resolve(&new), kept, "{role}: the newest writer");
+        assert_eq!(
+            machines.resolve(&old),
+            kept,
+            "{role}: the writer before it, through the fold"
+        );
+        assert_eq!(
+            machines.resolve(&earliest),
+            kept,
+            "{role}: the earliest, which states no facts row, through its successor"
+        );
+        for (a, b) in [(&old, &new), (&earliest, &new), (&earliest, &old)] {
+            assert_eq!(
+                machines.same(a, b),
+                Same::Same,
+                "{role}: two writers of one lineage are one machine"
+            );
+            assert!(machines.one_writer(a, b) && machines.one_writer(b, a));
+        }
+        assert_eq!(
+            machines.same(&new, &other),
+            Same::Another,
+            "{role}: one label, another machine"
+        );
+        assert!(!machines.one_writer(&new, &other), "two lineages are two");
+
+        // A host name is read from the facts rows' own hosts, never from a label.
+        for name in ["m72", "m72.local", "M72.LOCAL"] {
+            assert_eq!(
+                machines.host(name),
+                Host::One(new.clone()),
+                "{role}: {name}"
+            );
+        }
+        assert_eq!(machines.host("bench"), Host::One(other.clone()));
+        assert_eq!(
+            machines.host("studio"),
+            Host::Many(vec![other.clone(), twin.clone()]),
+            "{role}: a name two lineages state is two matches"
+        );
+        assert_eq!(
+            machines.host("m5"),
+            Host::None,
+            "{role}: no facts row states it"
+        );
+
+        // Every machine row is labelled `m72`: where no facts row states it, it names nothing.
+        let unstated = [(writer(4), json!({"n": 1, "mac": OTHER, "hosts": ["bench"]}))];
+        let machines = Machines::of(&registry_read(generation, &rows, &unstated)).unwrap();
+        assert_eq!(
+            machines.host("m72"),
+            Host::None,
+            "{role}: a label names no machine"
+        );
+    }
+}
+
+/// A WRITER WITH NO FACTS ROW IS NEITHER THE SAME MACHINE NOR ANOTHER (TK-07; design §4.6). A
+/// machine that states no facts (a Linux member before LT-C6, a debug build, a machine alone on
+/// its LAN) reads as its uuid: no machine row is known for it, and each reader that asks
+/// whether two writers are one machine takes the side that claims nothing.
+///
+/// * Its link resolves to nothing, and the tracker's check reports each row that names it
+///   (`link-unbound`).
+/// * Asked against a writer the registry binds, against another unbound writer, and against
+///   itself, the answer is unanswered: neither the same machine nor another. Two bound writers
+///   are answered, so the question is not unanswered for everyone.
+/// * An evidence grade stays `self-run`: `independent` needs another machine, and unanswered is
+///   not another.
+/// * A lease compares the uuids through writer lineage: the same uuid is one writer, a writer
+///   and the successor whose facts row names it are one, and two uuids nothing joins are two.
+/// * A sample of a metric compared on the same machine, taken on such a machine, is a finding
+///   (`same-machine-unanswered`); one of a metric compared on any machine is not that finding.
+///
+/// NEGATIVE CONTROL, observed: with `Machines::same` comparing the two uuids where either comes
+/// to no machine row (equal text the same, any other another), `against a bound writer` fails:
+/// `Another`, not `Unanswered`.
+#[test]
+fn a_writer_with_no_facts_row_is_neither_the_same_machine_nor_another() {
+    use crate::alab::{
+        link::{Machine, Machines, Same},
+        registry::{REGISTRY, REGISTRY_4},
+    };
+    use crate::lab::tracker::{
+        mapped,
+        tables::{DECISION, METRIC},
+    };
+    const DESK: &str = "mc-00000000000000c1";
+    const BENCH: &str = "mc-00000000000000c2";
+    const ABSENT: &str = "mc-00000000000000c3";
+    let [desk, bench, lone, stray, first, heir] =
+        [1, 2, 3, 4, 5, 6].map(|n| keys::uuid32(&writer(n)));
+    let rows = [(DESK, "live", None), (BENCH, "live", None)];
+    let facts = [
+        (writer(1), json!({"n": 1, "mac": DESK})),
+        (writer(2), json!({"n": 1, "mac": BENCH})),
+        // A successor whose facts bind a row the registry does not hold: the lineage is its
+        // own signed word, and neither writer of it comes to a machine row.
+        (
+            writer(6),
+            json!({"n": 1, "mac": ABSENT, "predecessor": first}),
+        ),
+    ];
+    let same_machine = mapped::key("A10.build_seconds");
+    let any = mapped::key("A10.lab_objects");
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(
+                &METRIC,
+                &same_machine,
+                "comparable_on",
+                json!("same-machine"),
+            ),
+            put(&METRIC, &any, "comparable_on", json!("any")),
+            put(&DECISION, "TK-D1", "decided_by", principal_on(&lone)),
+        ],
+    );
+    let cells = book.cells();
+    let samples = vec![
+        sample(writer(1), 1, &same_machine, &desk),
+        sample(writer(3), 1, &same_machine, &lone),
+        sample(writer(3), 2, &any, &lone),
+    ];
+
+    for generation in [&REGISTRY, &REGISTRY_4] {
+        let role = generation.role;
+        let machines = Machines::of(&registry_read(generation, &rows, &facts)).unwrap();
+        assert_eq!(machines.resolve(&lone), Machine::Unbound, "{role}");
+        assert_eq!(machines.resolve(&lone).row(), None, "it reads as its uuid");
+
+        assert_eq!(
+            machines.same(&lone, &desk),
+            Same::Unanswered,
+            "{role}: against a bound writer"
+        );
+        assert_eq!(machines.same(&desk, &lone), Same::Unanswered);
+        assert_eq!(
+            machines.same(&lone, &stray),
+            Same::Unanswered,
+            "{role}: against another unbound writer"
+        );
+        assert_eq!(
+            machines.same(&lone, &lone),
+            Same::Unanswered,
+            "{role}: against itself"
+        );
+        assert_eq!(machines.same(&first, &heir), Same::Unanswered);
+        assert_eq!(machines.same(&desk, &desk), Same::Same);
+        assert_eq!(machines.same(&desk, &bench), Same::Another);
+
+        // An evidence grade: `independent` needs another machine.
+        assert!(machines.same(&desk, &bench).another());
+        for (ran, claimed) in [(&lone, &desk), (&desk, &lone), (&lone, &stray)] {
+            let answer = machines.same(ran, claimed);
+            assert!(
+                !answer.another() && !answer.same(),
+                "{role}: neither the same machine nor another, so the grade stays self-run"
+            );
+        }
+
+        // A lease: the uuids, through writer lineage.
+        assert!(machines.one_writer(&lone, &lone), "one uuid is one writer");
+        assert!(
+            machines.one_writer(&first, &heir) && machines.one_writer(&heir, &first),
+            "{role}: a writer and its successor are one lineage"
+        );
+        assert!(!machines.one_writer(&lone, &stray) && !machines.one_writer(&lone, &desk));
+
+        assert_eq!(
+            link_findings(&cells, samples.clone(), &machines),
+            [
+                (
+                    "link-unbound",
+                    "decision",
+                    vec!["TK-D1".to_owned(), lone.clone()]
+                ),
+                (
+                    "link-unbound",
+                    "measure",
+                    vec![format!("{lone}.1"), lone.clone()]
+                ),
+                (
+                    "link-unbound",
+                    "measure",
+                    vec![format!("{lone}.2"), lone.clone()]
+                ),
+                (
+                    "same-machine-unanswered",
+                    "measure",
+                    vec![format!("{lone}.1"), lone.clone(), same_machine.clone()]
+                ),
+            ],
+            "{role}: a writer with no facts row is a finding, and so is its same-machine sample"
+        );
+    }
+}

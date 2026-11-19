@@ -64,8 +64,8 @@
 //!   not its frame's. The price, recorded as the cost of a version-1 drop: a Mac behind a cut
 //!   whose prune dropped a version-1 record, in a vault whose live seats are half or fewer of its
 //!   seats (dead seats outnumbering live ones, or the minority side of a split), takes no root
-//!   read through stubs, and waits on a peer that holds the cut; FL-148f's writers sign version
-//!   2, so a cut of their records drops none. The relabelling cases are `served_tests.rs`'s
+//!   read through stubs, and waits on a peer that holds the cut; a format-2 writer signs version
+//!   2 ([`super::writer`]), so a cut of its records drops none. The relabelling cases are `served_tests.rs`'s
 //!   `vault_checkpoint_one_seat_cannot_certify_the_stubs_it_serves` (version 1) and
 //!   `vault_checkpoint_a_forged_version_two_stub_is_refused`; the minority cases its
 //!   `vault_checkpoint_a_mac_behind_a_minority_cut_catches_up_from_self_checking_stubs`.
@@ -586,7 +586,7 @@ impl Log {
 
     /// Whether this log's roots already hold `body`'s cut: a root is `body`, or its cut holds
     /// every head of `body`'s.
-    fn nests(&self, body: &Body) -> bool {
+    pub(super) fn nests(&self, body: &Body) -> bool {
         let (Some(id), Body::Checkpoint { heads, .. }) = (checkpoint_id(body), body) else {
             return false;
         };

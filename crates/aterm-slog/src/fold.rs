@@ -1281,9 +1281,11 @@ impl Fold {
                         conf: r.conf,
                         t: r.t,
                     };
-                    // A phase the screen reader or the session's own harness gave stands until it
-                    // reads `-`: the shell's status never displaces it.
-                    if !matches!(self.st.phase.src, Src::Screen | Src::Harness)
+                    // A phase the screen reader, the session's own harness or aterm's harness
+                    // watchdog (`unknown` for a harness whose beats stopped, `stopped` for one
+                    // the kernel stopped) gave stands until it reads `-`: the shell's status
+                    // never displaces it.
+                    if !matches!(self.st.phase.src, Src::Screen | Src::Harness | Src::Aterm)
                         || self.st.phase.word == "-"
                     {
                         self.st.phase = phase.clone();

@@ -19,7 +19,16 @@ use super::{Held, Key, Records, Seat, becoming, hand_over};
 use crate::claim_command::{ClaimCommand, PublicClaim};
 
 pub(crate) fn claim_exec(cmd: ClaimCommand) -> ExitCode {
-    let seat = Seat::live();
+    let (code, said) = claimed(cmd, &Seat::live());
+    if let Some(line) = said {
+        eprintln!("{line}");
+    }
+    code
+}
+
+/// `cmd` on `seat`: the claim's exit status, with the line it says on stderr where it started
+/// nothing (75, `atpkg claim: <why>`).
+fn claimed(cmd: ClaimCommand, seat: &Seat<'_>) -> (ExitCode, Option<String>) {
     let result = (|| {
         let ledger = seat
             .ledger
@@ -35,13 +44,13 @@ pub(crate) fn claim_exec(cmd: ClaimCommand) -> ExitCode {
                 println!("aterm-claim-exec-v1");
                 Ok(ExitCode::SUCCESS)
             }
-            ClaimCommand::Exec(request) => run(request, &seat, ledger),
+            ClaimCommand::Exec(request) => run(request, seat, ledger),
         }
     })();
-    result.unwrap_or_else(|err| {
-        eprintln!("atpkg claim: {err}");
-        ExitCode::from(75)
-    })
+    match result {
+        Ok(code) => (code, None),
+        Err(err) => (ExitCode::from(75), Some(format!("atpkg claim: {err}"))),
+    }
 }
 
 /// An optional caller lock held for this admission. The guard locks a kept-out
@@ -221,8 +230,11 @@ fn run(request: PublicClaim, seat: &Seat<'_>, ledger: &Ledger) -> io::Result<Exi
         };
         let (claim, guard) = loop {
             waiting.check()?;
-            let (result, guard) =
-                waiter.poll_until_guarded(seat.machine, &|| waiting.stopped(), &mut lock);
+            let Ok((result, guard)) =
+                waiter.poll_until_guarded(seat.machine, &|| waiting.stopped(), &mut lock)
+            else {
+                return Err(io::Error::other("wait ended before the command started"));
+            };
             match (result, guard) {
                 (Polled::Admitted(claim), Some(guard)) => break (claim, guard),
                 (Polled::Waiting(next, _), None) => {
@@ -315,3 +327,7 @@ fn write_admission(mut status: &File, record: &aterm_json::Value) -> io::Result<
         Err(io::Error::other("incomplete claim status write"))
     }
 }
+
+#[cfg(test)]
+#[path = "build_admit_claim_tests.rs"]
+mod tests;

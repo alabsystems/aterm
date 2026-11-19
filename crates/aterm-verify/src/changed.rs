@@ -804,19 +804,89 @@ pub fn default_base(root: &Path, path_env: &OsStr) -> String {
     }
 }
 
+/// The dependency graph of one working tree as `targo tree` prints it, each read made once
+/// however many selections ask: its members, its path packages outside the workspace, and what
+/// a change to each package reaches. Its inputs are the tree's manifests, lock and configs, the
+/// files each package's targets are found by, the toolchain and the environment, so one `Graph`
+/// serves only selections made while those hold still: the three a round makes of one merge
+/// ([`resolve_round`]), never a tree changed since.
+pub(crate) struct Graph {
+    root: std::path::PathBuf,
+    tools: Toolchain,
+    path_env: std::ffi::OsString,
+    members: std::cell::OnceCell<Result<Members, String>>,
+    path_packages: std::cell::OnceCell<Result<Vec<(String, String)>, String>>,
+    /// What a change to each package reaches, by its spec.
+    reach: std::cell::RefCell<BTreeMap<String, Result<Reach, String>>>,
+}
+
+impl Graph {
+    /// The graph of the working tree at `root`, read by `tools`' targo under `path_env`; nothing
+    /// is read until a selection asks.
+    pub(crate) fn new(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            tools: tools.clone(),
+            path_env: path_env.to_os_string(),
+            members: std::cell::OnceCell::new(),
+            path_packages: std::cell::OnceCell::new(),
+            reach: std::cell::RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// The workspace's members ([`read_members`]).
+    fn members(&self) -> Result<Members, String> {
+        self.members
+            .get_or_init(|| read_members(&self.root, &self.tools, &self.path_env))
+            .clone()
+    }
+
+    /// The path packages outside the workspace ([`read_path_packages`]).
+    fn path_packages(&self) -> Result<Vec<(String, String)>, String> {
+        let members = self.members()?;
+        self.path_packages
+            .get_or_init(|| read_path_packages(&self.root, &self.tools, &self.path_env, &members))
+            .clone()
+    }
+
+    /// What a change to the package `spec` reaches ([`invert`]).
+    fn reach(&self, spec: &str) -> Result<Reach, String> {
+        if let Some(known) = self.reach.borrow().get(spec) {
+            return known.clone();
+        }
+        let members = self.members()?;
+        let found = invert(
+            &self.root,
+            &self.tools.targo,
+            &self.path_env,
+            spec,
+            &members,
+        );
+        self.reach
+            .borrow_mut()
+            .insert(spec.to_owned(), found.clone());
+        found
+    }
+}
+
 /// Resolve the change cone against a repository checkout.
 #[must_use]
 pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> Selection {
-    if !tools.have_targo() {
+    resolve_in(&Graph::new(root, tools, path_env), base)
+}
+
+/// [`resolve`] over `graph`, its working tree's graph.
+pub(crate) fn resolve_in(graph: &Graph, base: &str) -> Selection {
+    if !graph.tools.have_targo() {
         return Selection::Unavailable(
             "targo is absent, so the dependency graph cannot be read".to_string(),
         );
     }
-    let (merge_base, paths) = match changed_paths(root, path_env, base) {
+    let (merge_base, paths) = match changed_paths(&graph.root, &graph.path_env, base) {
         Ok(found) => found,
         Err(why) => return Selection::Widened(why),
     };
-    resolve_paths(root, tools, path_env, &merge_base, paths, Some(&merge_base))
+    resolve_reading(graph, &merge_base, paths, &[], Some(&merge_base))
 }
 
 /// Resolve an explicit committed path selection through the ordinary dependency cone. `from` is
@@ -831,7 +901,17 @@ pub fn resolve_paths(
     paths: Vec<String>,
     from: Option<&str>,
 ) -> Selection {
-    resolve_reading(root, tools, path_env, merge_base, paths, &[], from)
+    resolve_paths_in(&Graph::new(root, tools, path_env), merge_base, paths, from)
+}
+
+/// [`resolve_paths`] over `graph`, its working tree's graph.
+pub(crate) fn resolve_paths_in(
+    graph: &Graph,
+    merge_base: &str,
+    paths: Vec<String>,
+    from: Option<&str>,
+) -> Selection {
+    resolve_reading(graph, merge_base, paths, &[], from)
 }
 
 /// [`resolve_paths`], where each of `reading` is a file that may read one of `paths` that no
@@ -844,15 +924,14 @@ pub fn resolve_paths(
 /// with every dependent. A file of `reading` that no workspace member owns widens the cone:
 /// nothing then says which crate's rows its reads reach.
 fn resolve_reading(
-    root: &Path,
-    tools: &Toolchain,
-    path_env: &OsStr,
+    graph: &Graph,
     merge_base: &str,
     mut paths: Vec<String>,
     reading: &[String],
     from: Option<&str>,
 ) -> Selection {
-    let members = match read_members(root, tools, path_env) {
+    let (root, path_env) = (graph.root.as_path(), graph.path_env.as_os_str());
+    let members = match graph.members() {
         Ok(members) => members,
         Err(why) => return Selection::Unavailable(why),
     };
@@ -919,16 +998,8 @@ fn resolve_reading(
         &readers,
         &manifests,
         &members,
-        &|| {
-            graph_value(&failure, || {
-                read_path_packages(root, tools, path_env, &members)
-            })
-        },
-        &|c| {
-            graph_value(&failure, || {
-                invert(root, &tools.targo, path_env, members.spec(c), &members)
-            })
-        },
+        &|| graph_value(&failure, || graph.path_packages()),
+        &|c| graph_value(&failure, || graph.reach(members.spec(c))),
         &|p| replan_of(root, path_env, merge_base, p, &members),
         // A member is alone where its own changed files and its readers are confined to it.
         &|member, owned| {
@@ -1070,17 +1141,21 @@ pub fn resolve_round(
     base: &str,
     round: &Round,
 ) -> Selection {
+    resolve_round_in(&Graph::new(root, tools, path_env), base, round)
+}
+
+/// [`resolve_round`] over `graph`, the merge's graph, which its three selections share: the
+/// merge in the working tree is the tree each of them reads.
+pub(crate) fn resolve_round_in(graph: &Graph, base: &str, round: &Round) -> Selection {
     let Round {
         judged,
         shared,
         readers,
         mechanical,
     } = round;
-    let unowned = no_crate_may_own(root, path_env, shared);
+    let unowned = no_crate_may_own(&graph.root, &graph.path_env, shared);
     let shared = resolve_reading(
-        root,
-        tools,
-        path_env,
+        graph,
         judged,
         shared.clone(),
         readers,
@@ -1092,15 +1167,15 @@ pub fn resolve_round(
     if unowned && *mechanical && readers.is_empty() {
         return shared;
     }
-    let whole = resolve(root, tools, path_env, base);
+    let whole = resolve_in(graph, base);
     if matches!(whole, Selection::Unavailable(_)) {
         return whole;
     }
-    let since = resolve(root, tools, path_env, judged);
+    let since = resolve_in(graph, judged);
     if matches!(since, Selection::Unavailable(_)) {
         return since;
     }
-    let members = match read_members(root, tools, path_env) {
+    let members = match graph.members() {
         Ok(members) => members,
         Err(why) => return Selection::Unavailable(why),
     };

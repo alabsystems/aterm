@@ -7675,7 +7675,7 @@ impl Renderer {
 
     /// Test/debug: make every lazy-parse poll wait for the parse ([`Self::poll_fallback_parses`]), so a parse kicked by one cell's probe lands at the next cell's probe.
     #[doc(hidden)]
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn debug_land_lazy_parses_on_poll(&mut self, on: bool) {
         self.land_parses_on_poll = on;
     }

@@ -24,8 +24,14 @@ mod stderr_diagnostics;
 mod settings;
 pub(crate) use settings::Settings;
 
+#[path = "codex_retained_body.rs"]
+mod body_delivery;
 #[path = "codex_retained_delivery.rs"]
 mod frontend_delivery;
+#[path = "codex_retained_lifecycle.rs"]
+mod lifecycle;
+#[path = "codex_retained_replacement.rs"]
+mod replacement;
 
 /// An original start intent on an actual native-issued controller. The opaque
 /// identity holds no request scope and grants no constructor or attachment.
@@ -81,18 +87,50 @@ struct Delivered {
     receipt: registry::PreparedServiceAttachment,
     transport: Option<frontend_delivery::FrontendDelivery>,
     result: Result<(), registry::Error>,
+    attachment: Option<String>,
 }
 struct Running {
     service: Option<registry::OwnedService>,
     delivered: Vec<Delivered>,
+    lifecycle: lifecycle::Lifecycle,
 }
 #[derive(Clone)]
 pub(crate) struct Delivery {
     inner: Arc<Mutex<Running>>,
     ctx: Weak<crate::SessionCtx>,
     cancelled: account_work::Cancellation,
+    creator: registry::ServiceIdentity,
+    service_id: String,
 }
 impl Delivery {
+    pub(crate) fn origin(
+        &self,
+        backend: &registry::ServiceFrontend,
+        attachment: &str,
+        master: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<(), registry::Error> {
+        if !self.live() {
+            return Err(registry::Error::Stale);
+        }
+        let mut running = self.inner.try_lock().map_err(|_| registry::Error::Busy)?;
+        let Running {
+            service, delivered, ..
+        } = &mut *running;
+        if !delivered.iter().any(|entry| {
+            entry.attachment.as_deref() == Some(attachment)
+                && entry.result.is_ok()
+                && entry
+                    .transport
+                    .as_ref()
+                    .is_some_and(frontend_delivery::FrontendDelivery::received)
+        }) {
+            return Err(registry::Error::Denied);
+        }
+        service
+            .as_mut()
+            .ok_or(registry::Error::Busy)?
+            .current_origin(backend, attachment, master)
+    }
     fn live(&self) -> bool {
         !self.cancelled.cancelled()
             && self
@@ -117,7 +155,13 @@ impl Delivery {
             return Err(registry::Error::Stale);
         }
         let mut running = self.inner.try_lock().map_err(|_| registry::Error::Busy)?;
-        let Running { service, delivered } = &mut *running;
+        let Running {
+            service,
+            delivered,
+            lifecycle,
+        } = &mut *running;
+        lifecycle.allow_attachment(&frontend, foreground, &self.creator)?;
+        let requester = frontend.clone();
         let service = service.as_mut().ok_or(registry::Error::Busy)?;
         attach(
             service,
@@ -130,7 +174,8 @@ impl Delivery {
             },
             foreground,
             self,
-        )
+        )?;
+        lifecycle.attached(&requester)
     }
 }
 
@@ -301,9 +346,12 @@ impl Controller {
             inner: Arc::new(Mutex::new(Running {
                 service: None,
                 delivered: Vec::new(),
+                lifecycle: lifecycle::Lifecycle::default(),
             })),
             ctx: Arc::downgrade(ctx),
             cancelled: scope.cancellation(),
+            creator: owner.controller.clone(),
+            service_id: id.clone(),
         };
         let result = Self {
             namespace: Arc::downgrade(sources),
@@ -574,6 +622,7 @@ fn attach(
         receipt,
         transport: None,
         result: Err(registry::Error::Stale),
+        attachment: None,
     });
     let entry = delivered.last_mut().ok_or(registry::Error::Unavailable)?;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -600,6 +649,7 @@ fn attach(
             service,
             &mut entry.receipt,
             &mut entry.transport,
+            &mut entry.attachment,
             callback,
             foreground,
             delivery,
@@ -613,6 +663,7 @@ fn deliver(
     service: &mut registry::OwnedService,
     attachment: &mut registry::PreparedServiceAttachment,
     transport: &mut Option<frontend_delivery::FrontendDelivery>,
+    original_attachment: &mut Option<String>,
     callback: aterm_uds::CtlStream,
     foreground: &registry::FrontendMember<'_>,
     delivery: &Delivery,
@@ -628,6 +679,9 @@ fn deliver(
             #[cfg(debug_assertions)]
             eprintln!("Retained native delivery: commit={_error:?}");
         })?;
+        *original_attachment = Some(retry_delivery_metadata(deadline, delivery, || {
+            service.attachment_data(attachment, foreground)
+        })?);
         let endpoint = retry_delivery_metadata(deadline, delivery, || {
             service.take_frontend(attachment, foreground)
         })

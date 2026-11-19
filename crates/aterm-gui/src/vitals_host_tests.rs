@@ -7140,7 +7140,7 @@ const MID_SWEEP: CoalProbe = CoalProbe {
         if let Some(hook) = AT_SWEEP.with(|h| h.borrow_mut().take()) {
             hook();
         }
-        aterm_sysprobe::processes_keeping(opts, ids)
+        aterm_sysprobe::processes_keeping_table(opts, ids)
     },
     ..CoalProbe::KERNEL
 };

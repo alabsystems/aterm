@@ -260,12 +260,18 @@ struct HeldRecord {
 /// saw below that head, by no claim another sequence's and of no origin that is another's
 /// (`seen`, `None` where no read ran whole: one that went on at a floor no told read looks below,
 /// or a page that did not advance). The delivery that meets the record decides it
-/// ([`Bridge::take_undecided`]).
+/// ([`Bridge::take_undecided`]). A KEYED RE-POST'S arm (`floor`, [`Bridge::arm_undecided_keyed`])
+/// names the start of the read that armed it, its own head ([`Head::OwnFrom`]) or a keyed head
+/// not its own above a proved fork ([`Head::Since`]): every re-post of a key takes the key's
+/// sequence, so only at or above that start is a record of its words at that sequence its own
+/// attempt, and no record below it is taken (`seen` keeps none below it). `None` for every other
+/// arm.
 #[derive(Debug, Clone)]
 struct UndecidedHold {
     wants: Vec<PublishIdentity>,
     below: u64,
     seen: Option<BTreeSet<u64>>,
+    floor: Option<u64>,
 }
 
 /// A delivery of a record of an undecided attempt's words, as [`undecided_takes`] judges it: its
@@ -285,6 +291,7 @@ struct Delivered<'a> {
 struct GateRules {
     by_origin: bool,
     by_seen: bool,
+    floored: bool,
 }
 
 /// WHETHER A DELIVERY TAKES ITS RECORD FOR SEQUENCE `seq`'S UNDECIDED ATTEMPT (`arm`, case 6 of
@@ -295,13 +302,21 @@ struct GateRules {
 /// under a producer of no node the hand-off names is as one with none; and with no origin, the
 /// newest record of its words the last whole read saw (`rules.by_seen`): a sender's posts drain
 /// one at a time, so its earlier posts of the same words lie below its attempt, and with no whole
-/// read (one that went on at a floor, or stopped advancing), the first that comes. NEGATIVE
-/// CONTROLS: `Mutant::UndecidedTakesPastItsOrigin`, no origin read, so a sender's earlier post of
-/// the same words, of another sequence, is taken where no whole read ran;
-/// `Mutant::UndecidedTakesTheFirst`, the first record of its words taken, a sender's earlier post
-/// of the same words among them.
+/// read (one that went on at a floor, or stopped advancing), the first that comes. A keyed
+/// re-post's arm takes none below its floor (`rules.floored`, [`UndecidedHold::floor`]), a claim
+/// of its own sequence's included: every post of a key, the key's own post that claimed it among
+/// them, takes the key's sequence, and only at or above the floor is a record of its words this
+/// re-post's own attempt. NEGATIVE CONTROLS: `Mutant::UndecidedTakesPastItsOrigin`, no origin
+/// read, so a sender's earlier post of the same words, of another sequence, is taken where no
+/// whole read ran; `Mutant::UndecidedTakesTheFirst`, the first record of its words taken, a
+/// sender's earlier post of the same words among them; `Mutant::UndecidedTakesBelowItsFloor`, a
+/// keyed arm's floor read nowhere, so an earlier post of the key in the same words, the key's own
+/// post's record claimed at its sequence among them, is taken for the re-post's attempt.
 fn undecided_takes(arm: &UndecidedHold, seq: u64, at: &Delivered<'_>, rules: GateRules) -> bool {
-    if at.off >= arm.below || at.claimed_by.is_some_and(|by| by != seq) {
+    if at.off >= arm.below
+        || (rules.floored && arm.floor.is_some_and(|floor| at.off < floor))
+        || at.claimed_by.is_some_and(|by| by != seq)
+    {
         return false;
     }
     if at.claimed_by == Some(seq) {
@@ -424,7 +439,8 @@ enum PinLanding {
 
 /// Whether a keyed re-post's copy at `off`, of its own pin's identity, is its own attempt's
 /// rather than its key's winner's: its words are not its winner's, or its pin says the winner
-/// landed elsewhere. With the same words and no winner's offset, neither can be told.
+/// landed elsewhere. With the same words and no winner's offset, neither can be told here; a copy
+/// a keyed arm took for it can ([`Bridge::keyed_own_copy`]).
 fn keyed_own_copy_at(pin: &PublishPin, off: u64) -> bool {
     pin.original != pin.identity || pin.original_off.is_some_and(|winner| winner != off)
 }
@@ -2041,6 +2057,16 @@ pub struct Bridge {
     acked_floored: bool,
     unsettled: BTreeMap<u64, u64>,
     awaiting_drain: BTreeMap<u64, (u64, bool)>,
+    /// THE ASKS THE ATTACH LANDED AGAIN AS THEIR OWN ATTEMPTS, by their entries' sequences
+    /// (ATERM-KI-1116-7314, [`RelandedAsk`]), each beside its entry in
+    /// [`Bridge::awaiting_drain`]: what the first landing noted before its `outbox sent`
+    /// ([`Bridge::landing_line`]), the ask's recipient and its deadline, at the offset its record
+    /// holds now, read by the replay ([`Bridge::replay_in_flight`]) or by a delivery that takes a
+    /// record for an undecided attempt ([`Bridge::bind_undecided`]). [`Bridge::release_replays`]
+    /// notes what is missing of it before it ends an entry aterm no longer lists
+    /// ([`Bridge::note_relanded_ask`]); one aterm still lists is noted by the drain's retry at its
+    /// pin, as every build before noted it.
+    relanded_asks: BTreeMap<u64, RelandedAsk>,
     /// OWN RECORDS HELD IN HAND FOR ATERM'S DRAIN, by session, each with its session's later
     /// inbox records queued behind it, by offset (ATERM-KI-1111-3, [`Bridge::hold_record`]). An
     /// own-lane record whose in-flight entry stands for the drain's retry
@@ -2074,11 +2100,28 @@ pub struct Bridge {
     /// [`Bridge::unverified_publication`], ATERM-KI-1114-1414), by sequence ([`UndecidedHold`]).
     /// Each attach empties it and arms it again before its refill delivers anything: the replay's
     /// reads of its entries, and a read of each post's and owed receipt's pin whose head is
-    /// anywhere ([`Bridge::arm_undecided_pins`]). A read that decides takes its sequence out; the
-    /// delivery of the record it names takes it for the drain ([`Bridge::take_undecided`]), held in
-    /// hand as a record the replay read back is ([`Bridge::awaiting_drain`]), and the drain's
-    /// retry settles at it. Memory only: the next attach reads again.
+    /// anywhere, and of each keyed re-post's pin at its own head ([`Bridge::arm_undecided_pins`]).
+    /// A keyed re-post's read, from its own head or from a keyed head not its own above a proved
+    /// fork, arms its key's sequence with a floor at its start ([`Bridge::arm_undecided_keyed`]),
+    /// one arm a sequence: where a key's own post and a re-post of its key both hold it, each
+    /// post's arm stands against the other's reads ([`Bridge::one_arm_a_sequence_unkept`]). A
+    /// read that decides takes its sequence out; the delivery of the record it names takes it for
+    /// the drain ([`Bridge::take_undecided`]), held in hand as a record the replay read back is
+    /// ([`Bridge::awaiting_drain`]), and the drain's retry settles at it; and a post that left
+    /// aterm's outbox takes the arm of its words with it, whatever settled it
+    /// ([`Bridge::land_group`]). Memory only: the next attach reads again.
     undecided: BTreeMap<u64, UndecidedHold>,
+    /// THE RECORDS A KEYED ARM TOOK ([`Bridge::undecided`]'s with a floor), by the key's
+    /// sequence, at the offset taken ([`Bridge::bind_undecided`]): a re-post in its winner's own
+    /// words whose pin names no winner's offset cannot tell its own copy from its winner's by its
+    /// bytes ([`keyed_own_copy_at`]), so its retry settles at that copy as its own landing by this
+    /// mark ([`Bridge::keyed_own_copy`]), believed only while the copy is held for that sequence's
+    /// drain there ([`Bridge::taken_as_its_own`]). Kept across link drops, as the binding it marks
+    /// is: emptied by the replay, as every arm is, the retry after a drop would read its copy as
+    /// undecided again, and its re-arm is refused while the binding stands, so the sender and the
+    /// recipient's lane would be held for good. Each other write of that sequence's binding takes
+    /// it out, but one that binds the same offset again. Memory only, as the binding is.
+    keyed_taken: BTreeMap<u64, u64>,
     /// The head the attach read the log at ([`UndecidedHold::below`]).
     attach_head: u64,
     /// THE OWED RECEIPTS WHOSE RESERVATION AN ATTACH COULD NOT READ (ATERM-KI-1114-1414 review),
@@ -2559,11 +2602,13 @@ impl Bridge {
             window_vouched,
             unsettled: BTreeMap::new(),
             awaiting_drain: BTreeMap::new(),
+            relanded_asks: BTreeMap::new(),
             held_own: BTreeMap::new(),
             releasing: None,
             held_retry: None,
             reader_waits: BTreeSet::new(),
             undecided: BTreeMap::new(),
+            keyed_taken: BTreeMap::new(),
             attach_head: 0,
             unread_receipts: BTreeMap::new(),
             handed_unread: BTreeMap::new(),
@@ -4064,7 +4109,9 @@ impl Bridge {
     ///    writer's under this producer id on another face, or one the pin's read cannot see).
     ///    The cut that drops its key releases it.
     /// 6. AN UNDECIDED READ FROM ANYWHERE (ATERM-KI-1114-1414): on a log that continues none of the
-    ///    pin's or entry's, or of a keyed re-post's key's records on a log a proved step reaches
+    ///    pin's or entry's, from a keyed re-post's own head or a keyed head above a proved fork
+    ///    (`Head::OwnFrom`, `Head::Since`: [`Bridge::found_since`]), or of a keyed re-post's key's
+    ///    records on a log a proved step reaches
     ///    ([`Bridge::keyed_winner_on_a_proved_log`]), a record of its words whose origin the broker
     ///    cannot say (or stands under a producer of no node it knows while the mesh's hand-off does
     ///    not read), a read that went on at a floor no told read looks below, or a page that does
@@ -4072,7 +4119,9 @@ impl Bridge {
     ///    stamps, a hand-off that reads, or the cut that gives the record up. On a lane this
     ///    bridge's deliveries reach (its own node's sessions to each other,
     ///    [`Bridge::delivered_here`]) the attempt is armed ([`Bridge::undecided`]), at the read
-    ///    and, for every pin, at the attach before its refill ([`Bridge::arm_undecided_pins`]),
+    ///    and, for every pin, at the attach before its refill ([`Bridge::arm_undecided_pins`]); a
+    ///    keyed re-post's read of its own attempt is armed at its key's sequence with a floor at
+    ///    that read's start ([`Bridge::arm_undecided_keyed`]), its key's records' read not at all;
     ///    and the delivery of its newest candidate takes that record for its drain
     ///    ([`Bridge::take_undecided`]): held in hand, the retry settles there and the record is
     ///    handed once, so a cut that gives it up leaves nothing to append anew; a fetch of it
@@ -7982,6 +8031,32 @@ impl Bridge {
             let mut wants = vec![publication_identity(&entry.subject, &entry.body)];
             let reworded = !reconstructs(&entry.pin, &entry.body);
             wants.extend(entry.pin.identity.clone().filter(|_| reworded));
+            // AN ASK LANDED AGAIN AS ITS OWN ATTEMPT IS NOTED AGAIN before its entry ends
+            // (ATERM-KI-1116-7314, [`Bridge::relanded_asks`]): read here, beside each landing of
+            // the entry's own words, its ownership decided by its words `wants` where they
+            // decide, else by where it lies against its pin's head on the log read
+            // ([`replayed_own_attempt`]).
+            let pin_head = self.read_back_from(entry.log, entry.pin.at, true);
+            #[cfg(test)]
+            let by_winner_off = self
+                .fx
+                .mutant(crate::sim::world::Mutant::ReplayWinnerOffsetFromAnyLog);
+            #[cfg(not(test))]
+            let by_winner_off = false;
+            let owns = |off: u64, deduped: bool, actual: Option<&PublishIdentity>| {
+                if by_winner_off {
+                    own_attempt(
+                        &entry.pin,
+                        off,
+                        deduped,
+                        actual,
+                        &wants,
+                        entry.pin.original_off,
+                    )
+                } else {
+                    replayed_own_attempt(&entry.pin, off, deduped, actual, &wants, pin_head)
+                }
+            };
             // AN ENTRY WHOSE COPY THIS BRIDGE HOLDS IN HAND, unhanded for the drain's retry
             // (ATERM-KI-1115-149, [`Bridge::unhanded_landing`]): a link drop on the same log
             // keeps it, and past a cut that gave it up on the bus no read back finds it, so a
@@ -8021,7 +8096,16 @@ impl Bridge {
                             return false;
                         }
                         let ours = self.on_own_lane(&landed.subject);
-                        self.land_replayed(seq, off, ours);
+                        let own = owns(off, entry.pin.via_key, Some(&landed));
+                        let ask = self.relanded_own_ask(
+                            seq,
+                            &entry,
+                            &decoded,
+                            off,
+                            Some(&landed.subject),
+                            own,
+                        );
+                        self.land_replayed(seq, off, ours, ask);
                         continue;
                     }
                     Ok((None, decided)) => {
@@ -8160,7 +8244,16 @@ impl Bridge {
                             .original
                             .as_ref()
                             .is_none_or(|winner| self.on_own_lane(&winner.subject));
-                        self.land_replayed(seq, off, ours);
+                        // Another post's record (the dup=1 rule): its ask is not this entry's.
+                        let ask = self.relanded_own_ask(
+                            seq,
+                            &entry,
+                            &decoded,
+                            off,
+                            entry.pin.original.as_ref().map(|w| w.subject.as_str()),
+                            Some(false),
+                        );
+                        self.land_replayed(seq, off, ours, ask);
                         continue;
                     }
                     // ITS OWN ATTEMPT, its key's newest record, read from anywhere on a proved
@@ -8184,7 +8277,15 @@ impl Bridge {
                             return false;
                         }
                         let ours = self.on_own_lane(&landed.subject);
-                        self.land_replayed(seq, off, ours);
+                        let ask = self.relanded_own_ask(
+                            seq,
+                            &entry,
+                            &decoded,
+                            off,
+                            Some(&landed.subject),
+                            Some(true),
+                        );
+                        self.land_replayed(seq, off, ours, ask);
                         continue;
                     }
                     Ok(_) => {}
@@ -8274,7 +8375,7 @@ impl Bridge {
                     .is_some_and(|wait| wait <= crate::rate_hold::PRODUCER_HOLD_MAX)
             };
             match claimed {
-                Ok((off, _, actual)) => {
+                Ok((off, deduped, actual)) => {
                     // A keyed pin may land as its key's winner, another identity.
                     if !entry.pin.via_key {
                         self.claim(off, seq);
@@ -8288,7 +8389,16 @@ impl Bridge {
                     let ours = actual
                         .as_ref()
                         .is_none_or(|identity| self.on_own_lane(&identity.subject));
-                    self.land_replayed(seq, off, ours);
+                    let own = owns(off, deduped, actual.as_ref());
+                    let ask = self.relanded_own_ask(
+                        seq,
+                        &entry,
+                        &decoded,
+                        off,
+                        actual.as_ref().map(|identity| identity.subject.as_str()),
+                        own,
+                    );
+                    self.land_replayed(seq, off, ours, ask);
                     // AN `expired` LANDED AGAIN IS FENCED AS THE SWEEP'S IS (ATERM-KI-1115-7889):
                     // judged over the lane below where it landed, moot behind an answer the bus
                     // holds there, said and journaled so, the ask's deadline taken out with it.
@@ -8343,11 +8453,15 @@ impl Bridge {
 
     /// ARM EVERY POST'S AND OWED RECEIPT'S ATTEMPT THAT NO READ FROM ANYWHERE DECIDES, BEFORE THE
     /// ATTACH'S REFILL (ATERM-KI-1114-1414): each pin whose head is anywhere ([`Head::Anywhere`]:
-    /// kept on a log the one the link reads continues none of), not a keyed re-post's, on a lane
+    /// kept on a log the one the link reads continues none of), not a keyed re-post's, and each
+    /// keyed re-post's pin at its own head ([`Head::OwnFrom`]) on a broker that tells fetches
+    /// (where a broker that does not, that head is read by its words, never case 6), on a lane
     /// this bridge's deliveries reach ([`Bridge::delivered_here`]), and not one of the replay's
     /// entries (`journaled`, read above) nor one whose record is held for its drain already, is
-    /// read from anywhere now ([`Bridge::found_anywhere`]), which arms it where it cannot decide
-    /// ([`Bridge::undecided`]). The drain's retry reads it again, after the refill: armed only
+    /// read now from its head ([`Bridge::found_since`]: from anywhere, or from the own head by its
+    /// words and its origin), which arms it where it cannot decide ([`Bridge::undecided`], a keyed
+    /// one by [`Bridge::arm_undecided_keyed`]). A keyed pin at a head `From` it is read by its
+    /// words and never case 6. The drain's retry reads it again, after the refill: armed only
     /// there, a record the refill handed meanwhile, and a cut then gave up, left that retry
     /// nothing to read back, and it published a second copy the reader was handed too. A read
     /// that fails, or that dropped the link, refuses the attach, as the replay's own reads do: the
@@ -8420,20 +8534,27 @@ impl Bridge {
                 }
             }
         }
+        let told = self
+            .conn
+            .as_ref()
+            .is_some_and(|conn| conn.supports_told_fetch());
         for pin in pins {
             let Some(identity) = pin.identity.clone() else {
                 continue;
             };
-            if pin.via_key
-                || pin.at != Some(Head::Anywhere)
-                || journaled.contains(&pin.seq)
+            let head = match pin.at {
+                Some(Head::Anywhere) if !pin.via_key => Head::Anywhere,
+                Some(own @ Head::OwnFrom(_)) if pin.via_key && told => own,
+                _ => continue,
+            };
+            if journaled.contains(&pin.seq)
                 || self.awaiting_drain.contains_key(&pin.seq)
                 || !self.delivered_here(&identity.subject)
             {
                 continue;
             }
             let face = identity.subject.clone();
-            match self.found_anywhere(Anywhere::Attempt, &face, &[identity], 0, pin.seq) {
+            match self.found_since(&face, std::slice::from_ref(&identity), head, pin.seq) {
                 Ok(_) => {}
                 Err(e) if unverifiable(&e) => {
                     stderr_line!(
@@ -8750,6 +8871,14 @@ impl Bridge {
     /// read by its words and retired the post (the third review of the own head, confirmed).
     /// NEGATIVE CONTROLS (`Mutant::OwnHeadReadAnywhereUntold`,
     /// `Mutant::OwnHeadReadAnywhereUnstamped`): the own head read from anywhere on such a broker.
+    /// A read from the own head, or from `Since`, that cannot decide for any other reason (a
+    /// producer the hand-off does not place, a row a stamping broker left with no origin, a page
+    /// that does not advance) answers case 6 of [`Bridge::unverified_publication`] and ARMS THE
+    /// KEY'S SEQUENCE for the delivery that meets the record (ATERM-KI-1114-1414,
+    /// [`Bridge::arm_undecided_keyed`]), its floor the read's start, as a read from anywhere arms
+    /// a post's ([`Bridge::found_anywhere`]); one that decides takes a keyed arm out. Unarmed, the
+    /// record was handed while the post was held, and once a cut gave it up the retry read nothing
+    /// back and published the key's second record, which astream's dedup no longer answered.
     fn found_since(
         &mut self,
         subject: &str,
@@ -8778,14 +8907,20 @@ impl Bridge {
             Head::OwnFrom(from) | Head::Since(from) if !told_fetches && !untold_anywhere => from,
             Head::OwnFrom(from) | Head::Since(from) => {
                 match self.read_anywhere(subject, wants, from, seq)? {
-                    AnywhereRead::Found(found) => return Ok((found, true)),
+                    AnywhereRead::Found(found) => {
+                        self.disarm(seq, true);
+                        return Ok((found, true));
+                    }
                     AnywhereRead::Undecided {
                         no_origins: true, ..
                     } if !unstamped_anywhere => from,
-                    AnywhereRead::Undecided { why, .. } => {
-                        return self
-                            .anywhere_undecided(Anywhere::Attempt, &why)
-                            .map(|found| (found, true));
+                    AnywhereRead::Undecided { why, seen, .. } => {
+                        let answer = self.anywhere_undecided(Anywhere::Attempt, &why);
+                        match answer {
+                            Err(_) => self.arm_undecided_keyed(seq, subject, wants, seen, from),
+                            Ok(_) => self.disarm(seq, true),
+                        }
+                        return answer.map(|found| (found, true));
                     }
                 }
             }
@@ -8888,18 +9023,19 @@ impl Bridge {
     /// record, delivered, is taken for the drain, held in hand, and the retry at the pin settles at
     /// it, handed once ([`Bridge::take_undecided`]); a record this bridge already holds untaken, in
     /// hand or queued, is taken by the retry before it reads ([`Bridge::take_undecided_in_hand`]).
-    /// A read that decides takes the arm out. THE EXCEPTION: a post's attempt (`Anywhere::Attempt`)
-    /// on a lane no delivery of this bridge's reaches (a peer node's, a person's inbox group, a
-    /// receipt to another node; [`Bridge::delivered_here`] says no), whose undecided read met a
-    /// candidate with no origin from a reader the broker took no ask for origins on
-    /// ([`AnywhereRead::Undecided`]'s `no_origins`): no read will ever decide that candidate, and
-    /// held, the post would wait for good, so this answers `Ok(None)` and it is published at its
-    /// pin, as every build before case 6 published it, astream's dedup answering it where its key
-    /// stands, and appending anew past a cut that dropped the key, which a reader that took the
-    /// first copy is handed again (ATERM-KI-1114-1414's Left). Every other undecided read of such a
-    /// lane is held: one whose broker stamps, one that went on at a floor on a broker that does not
-    /// tell fetches, and one whose page did not advance (none of which sets `no_origins`); the
-    /// floor's waits while the floor stands, for good where that broker keeps it
+    /// A read that decides takes the arm out, never a keyed re-post's, which its own reads arm and
+    /// disarm ([`Bridge::found_since`], [`Bridge::disarm`]). THE EXCEPTION: a post's attempt
+    /// (`Anywhere::Attempt`) on a lane no delivery of this bridge's reaches (a peer node's, a
+    /// person's inbox group, a receipt to another node; [`Bridge::delivered_here`] says no), whose
+    /// undecided read met a candidate with no origin from a reader the broker took no ask for
+    /// origins on ([`AnywhereRead::Undecided`]'s `no_origins`): no read will ever decide that
+    /// candidate, and held, the post would wait for good, so this answers `Ok(None)` and it is
+    /// published at its pin, as every build before case 6 published it, astream's dedup answering
+    /// it where its key stands, and appending anew past a cut that dropped the key, which a reader
+    /// that took the first copy is handed again (ATERM-KI-1114-1414's Left). Every other undecided
+    /// read of such a lane is held: one whose broker stamps, one that went on at a floor on a
+    /// broker that does not tell fetches, and one whose page did not advance (none of which sets
+    /// `no_origins`); the floor's waits while the floor stands, for good where that broker keeps it
     /// (ATERM-KI-1114-1414's Left). NEGATIVE CONTROL (`Mutant::UnstampedUnreachableHolds`): the
     /// exception held too, for good.
     ///
@@ -8916,7 +9052,7 @@ impl Bridge {
         match self.read_anywhere(subject, wants, from, seq)? {
             AnywhereRead::Found(found) => {
                 if about == Anywhere::Attempt {
-                    self.undecided.remove(&seq);
+                    self.disarm(seq, false);
                 }
                 Ok(found)
             }
@@ -8936,7 +9072,7 @@ impl Bridge {
                     && !self.delivered_here(subject)
                     && !holds
                 {
-                    self.undecided.remove(&seq);
+                    self.disarm(seq, false);
                     stderr_line!(
                         "aterm-link: sequence {seq}'s attempt on {subject} is undecided ({why}), \
                          and no delivery of this bridge's reaches that lane on a broker that \
@@ -8951,7 +9087,7 @@ impl Bridge {
                     match answer {
                         Err(_) => self.arm_undecided(seq, subject, wants, seen),
                         Ok(_) => {
-                            self.undecided.remove(&seq);
+                            self.disarm(seq, false);
                         }
                     }
                 }
@@ -8964,7 +9100,9 @@ impl Bridge {
     /// not decide ([`Bridge::undecided`]): on `subject`, a lane this bridge's own deliveries reach
     /// ([`Bridge::delivered_here`]), with the identities `wants`, below the head the attach read,
     /// and the candidates the read saw where it ran to its head (`seen`), which replace those of
-    /// an earlier read; a read that did not run whole keeps them.
+    /// an earlier read; a read that did not run whole keeps them. A keyed re-post's arm of the
+    /// same sequence stands: it is another post's, whose candidates are not this read's
+    /// ([`Bridge::one_arm_a_sequence_unkept`]).
     fn arm_undecided(
         &mut self,
         seq: u64,
@@ -8972,7 +9110,13 @@ impl Bridge {
         wants: &[PublishIdentity],
         seen: Option<BTreeSet<u64>>,
     ) {
-        if !self.delivered_here(subject) {
+        if !self.delivered_here(subject)
+            || (!self.one_arm_a_sequence_unkept()
+                && self
+                    .undecided
+                    .get(&seq)
+                    .is_some_and(|arm| arm.floor.is_some()))
+        {
             return;
         }
         let below = self.attach_head;
@@ -8981,9 +9125,159 @@ impl Bridge {
             wants: wants.to_vec(),
             below,
             seen: None,
+            floor: None,
         });
         if seen.is_some() {
             arm.seen = seen;
+        }
+    }
+
+    /// ARM THE DELIVERY OF A RECORD OF A KEYED RE-POST'S ATTEMPT that a read from its own head
+    /// ([`Head::OwnFrom`]) or from a keyed head not its own above a proved fork ([`Head::Since`])
+    /// could not decide (ATERM-KI-1114-1414, [`Bridge::found_since`]): at the key's sequence
+    /// `seq`, on `subject`, a lane this bridge's deliveries reach ([`Bridge::delivered_here`]),
+    /// with the identities `wants` (the re-post's own words, never its winner's), below the head
+    /// the attach read, at or above `floor`, the read's start, and the candidates the read saw
+    /// there where it ran to its head (`seen`). Every re-post of a key takes the key's sequence,
+    /// the winner's own post among them, so neither an origin nor a claim tells its records apart
+    /// below that start; at or above it the only records of its words are its own attempts, since
+    /// a sender's posts drain one at a time and the head is taken before the first attempt (the
+    /// premise its read decides by). Not armed where the sequence's record is held for its drain
+    /// already ([`Bridge::awaiting_drain`]). ONE ARM A SEQUENCE: where a plain arm holds it, that
+    /// stands, and where another post's keyed arm holds it (no want in common), that stands
+    /// ([`Bridge::one_arm_a_sequence_unkept`]); where a keyed arm of its words holds it, the
+    /// HIGHER FLOOR STANDS, the wants are joined and the candidates are this read's where it ran
+    /// whole, none below the kept floor. Two undecided reads arm one sequence at two floors: the
+    /// replay's of a keyed entry from its last attempt's own head, which each retry that
+    /// publishes journals anew, and the attach's of its pin, or the retry's, from the pin's own
+    /// head, taken before its first attempt ([`Bridge::keyed_repost_own_attempt`]); and an
+    /// earlier re-post's stale entry in the same words (one the disk refused to clear) beside a
+    /// later re-post's pin. Kept at the lower floor, the gate takes an earlier post's record of
+    /// those words lying between the two for the later post's attempt; at the higher, an attempt
+    /// between them goes untaken and holds as before. NEGATIVE CONTROLS
+    /// (`Mutant::KeyedHoldUnarmed`): nothing is armed, as every build before it, and the record is
+    /// handed while its post is held, and once a cut gave it up the retry reads nothing back and
+    /// publishes the key's second record, which its reader is handed too;
+    /// (`Mutant::KeyedArmKeepsTheLowerFloor`): the lower floor kept, so a record between the two
+    /// floors, claimed at the key's sequence, is taken.
+    fn arm_undecided_keyed(
+        &mut self,
+        seq: u64,
+        subject: &str,
+        wants: &[PublishIdentity],
+        seen: Option<BTreeSet<u64>>,
+        floor: u64,
+    ) {
+        #[cfg(test)]
+        let (unarmed, lower) = (
+            self.fx.mutant(crate::sim::world::Mutant::KeyedHoldUnarmed),
+            self.fx
+                .mutant(crate::sim::world::Mutant::KeyedArmKeepsTheLowerFloor),
+        );
+        #[cfg(not(test))]
+        let (unarmed, lower) = (false, false);
+        if unarmed || !self.delivered_here(subject) || self.awaiting_drain.contains_key(&seq) {
+            return;
+        }
+        let unkept = self.one_arm_a_sequence_unkept();
+        let below = self.attach_head;
+        let within = |seen: BTreeSet<u64>, floor: u64| -> BTreeSet<u64> {
+            seen.into_iter()
+                .filter(|&off| off >= floor && off < below)
+                .collect()
+        };
+        let standing = self
+            .undecided
+            .get(&seq)
+            .map(|arm| (arm.floor, arm.wants.iter().any(|want| wants.contains(want))));
+        match standing {
+            Some((None, _)) if !unkept => {
+                stderr_line!(
+                    "aterm-link: sequence {seq}'s keyed attempt on {subject} is undecided, and \
+                     another post's attempt no read decided holds that sequence's arm; it is not \
+                     armed for this one"
+                );
+            }
+            Some((Some(standing), ours)) if ours || unkept => {
+                let kept = if lower {
+                    standing.min(floor)
+                } else {
+                    standing.max(floor)
+                };
+                if let Some(arm) = self.undecided.get_mut(&seq) {
+                    for want in wants {
+                        if !arm.wants.contains(want) {
+                            arm.wants.push(want.clone());
+                        }
+                    }
+                    if seen.is_some() {
+                        arm.seen = seen;
+                    }
+                    arm.seen = arm.seen.take().map(|seen| within(seen, kept));
+                    arm.floor = Some(kept);
+                }
+            }
+            Some((Some(_), _)) if !unkept => {}
+            _ => {
+                self.undecided.insert(
+                    seq,
+                    UndecidedHold {
+                        wants: wants.to_vec(),
+                        below,
+                        seen: seen.map(|seen| within(seen, floor)),
+                        floor: Some(floor),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Take sequence `seq`'s arm out ([`Bridge::undecided`]) where it is of the kind a read that
+    /// decided arms: a keyed re-post's (`keyed`, [`Bridge::arm_undecided_keyed`]) or a plain one
+    /// ([`Bridge::arm_undecided`]). The other kind's arm stands: it is another post's
+    /// ([`Bridge::one_arm_a_sequence_unkept`]).
+    fn disarm(&mut self, seq: u64, keyed: bool) {
+        let unkept = self.one_arm_a_sequence_unkept();
+        if self
+            .undecided
+            .get(&seq)
+            .is_some_and(|arm| unkept || arm.floor.is_some() == keyed)
+        {
+            self.undecided.remove(&seq);
+        }
+    }
+
+    /// ONE ARM A SEQUENCE, KEPT BETWEEN THE TWO POSTS THAT CAN HOLD ONE SEQUENCE AT ONCE
+    /// ([`Bridge::undecided`], ATERM-KI-1114-1414): a key's own post, its pin plain at its key's
+    /// sequence, left queued at its pin where aterm refused its `outbox sent` (a landing answers
+    /// `PostNext::Moves` whatever aterm answers, [`Bridge::land_group`], so the drain goes on to
+    /// its sender's next post), and a re-post of that key drained behind it, keyed at the same
+    /// sequence; where a log change reads the first from anywhere ([`Head::Anywhere`]: a log that
+    /// continues none, or a head above a proved fork, `StateDir::publication_offset_resets`) and
+    /// the second from its own head ([`Head::OwnFrom`]), one connection reads both. Each post's
+    /// arm stands against the other's reads: a read that decides takes out only an arm of its own
+    /// kind ([`Bridge::disarm`]), a plain read writes nothing over a keyed arm
+    /// ([`Bridge::arm_undecided`]), a keyed read writes nothing over a plain arm or over a keyed
+    /// arm with no want in common ([`Bridge::arm_undecided_keyed`]); a keyed arm takes no
+    /// record while its sequence's record awaits the drain ([`Bridge::undecided_candidate`]: the
+    /// other post's landing, or its own retry's that aterm kept queued, [`Bridge::land_group`]),
+    /// which a take would move; and a post that left aterm's outbox takes with it only an arm of
+    /// its own words at its sequence, and, for a re-post of its key, only a keyed one
+    /// ([`Bridge::land_group`]). Whether each of those is off: never, but under the NEGATIVE
+    /// CONTROL (`Mutant::OneArmASequenceUnkept`), where one post's decided read takes the other's
+    /// arm out, each read writes over the other post's arm, a take moves the record a landing
+    /// holds for its drain, and a landing takes any arm at its sequence, whatever its kind and
+    /// words: a re-post's landing takes its key's own post's plain arm, and a landing an arm of
+    /// other words.
+    fn one_arm_a_sequence_unkept(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.fx
+                .mutant(crate::sim::world::Mutant::OneArmASequenceUnkept)
+        }
+        #[cfg(not(test))]
+        {
+            false
         }
     }
 
@@ -9911,8 +10205,11 @@ impl Bridge {
     /// dropped its dedup key, the retry published at the pin lands a second copy beside the one
     /// a reader is still handed (the keyed lossy-log world's seeds 3794 and 4380).
     /// First its own copy this bridge holds unhanded for the standing entry at the pin's
-    /// sequence ([`Bridge::unhanded_landing`], ATERM-KI-1115-149), where it is its own attempt's
-    /// and not its winner's ([`keyed_own_copy_at`]): held in hand, `PinLanding::Held`, settled
+    /// sequence ([`Bridge::unhanded_landing`], ATERM-KI-1115-149), a record of it a keyed arm
+    /// names taken first where this bridge holds it untaken, in hand or queued
+    /// ([`Bridge::take_undecided_in_hand`], ATERM-KI-1114-1414), where it is its own attempt's
+    /// and not its winner's ([`Bridge::keyed_own_copy`]: by its words or its pin's winner's
+    /// offset, or taken by a keyed arm for it): held in hand, `PinLanding::Held`, settled
     /// there before any read and claiming nothing; queued in the mailbox, the read runs and,
     /// finding none, answers `PinLanding::Queued`; not yet read by the inbox's reader, whoever's
     /// copy it is, `PinLanding::Unread` likewise, which [`Bridge::keyed_repost_landed`] holds to
@@ -9935,12 +10232,13 @@ impl Bridge {
         let Some(own) = pin.identity.as_ref() else {
             return Ok(None);
         };
+        self.take_undecided_in_hand(pin.seq);
         let mut waits = None;
         match self.unhanded_landing(pin.seq, std::slice::from_ref(own)) {
-            Some(Unhanded::Held(off, identity)) if keyed_own_copy_at(pin, off) => {
+            Some(Unhanded::Held(off, identity)) if self.keyed_own_copy(pin, off) => {
                 return Ok(Some(PinLanding::Held(off, identity)));
             }
-            Some(Unhanded::Queued(off)) if keyed_own_copy_at(pin, off) => {
+            Some(Unhanded::Queued(off)) if self.keyed_own_copy(pin, off) => {
                 waits = Some(PinLanding::Queued(off));
             }
             Some(Unhanded::Unread(off)) => waits = Some(PinLanding::Unread(off)),
@@ -10002,7 +10300,33 @@ impl Bridge {
     /// settle is the journal's ([`StateDir::deadline_settled`], `asks::Frame::DeadlineGone`):
     /// written, it holds for a retry by the next bridge too, after a kill (C04: a bridge before
     /// it held the post's ask in memory only).
-    fn note_deadline(&mut self, sid: &str, off: u64, dl: u64, to: Option<String>) -> bool {
+    ///
+    /// `landing` is the in-flight sequence of the post whose landing this is, which the journal
+    /// keeps beside the deadline (`asks::Frame::DeadlineAt`, ATERM-KI-1116-7314); `None` for one
+    /// no landing of this bridge's notes.
+    fn note_deadline(
+        &mut self,
+        sid: &str,
+        off: u64,
+        dl: u64,
+        to: Option<String>,
+        landing: Option<u64>,
+    ) -> bool {
+        let at = self.fx.wall_ms().saturating_add(dl);
+        self.note_deadline_at(sid, off, at, dl, to, landing)
+    }
+
+    /// [`Bridge::note_deadline`], the deadline due at `at`: a landing's, `dl` from now; an ask
+    /// the attach landed again, `dl` from its record's own `t=` ([`Bridge::note_relanded_ask`]).
+    fn note_deadline_at(
+        &mut self,
+        sid: &str,
+        off: u64,
+        at: u64,
+        dl: u64,
+        to: Option<String>,
+        landing: Option<u64>,
+    ) -> bool {
         #[cfg(test)]
         let settled = !self.fx.mutant(crate::sim::world::Mutant::ArmOverASettle)
             && self.state.deadline_settled(off, sid);
@@ -10013,7 +10337,7 @@ impl Bridge {
             let deadline = Deadline {
                 off,
                 sid: sid.to_string(),
-                at: self.fx.wall_ms().saturating_add(dl),
+                at,
                 dl,
                 to,
             };
@@ -10024,7 +10348,10 @@ impl Bridge {
                     self.deadlines_unwritten.insert(trimmed, d.sid);
                 }
             }
-            self.note_asks([asks::Frame::Deadline(deadline)]);
+            self.note_asks([match landing {
+                Some(seq) => asks::Frame::DeadlineAt { deadline, seq },
+                None => asks::Frame::Deadline(deadline),
+            }]);
             self.arm_deadline_sweep(was_empty, false);
         }
         self.deadline_on_disk(off)
@@ -10034,6 +10361,137 @@ impl Bridge {
     /// it owes: that write took, or no change at `off` is unwritten.
     fn deadline_on_disk(&mut self, off: u64) -> bool {
         self.persist_asks() || !self.deadlines_unwritten.contains_key(&off)
+    }
+
+    /// NOTE AGAIN WHAT AN ASK THE ATTACH LANDED AGAIN IS MISSING (ATERM-KI-1116-7314,
+    /// [`RelandedAsk`]), sequence `seq`'s: its recipient where `asked` names another or none, and
+    /// its deadline where the table holds none at its offset and the journal no settle of it, as
+    /// its first landing noted both ahead of its `outbox sent` ([`Bridge::landing_line`]); and say
+    /// whether the journal on disk holds its deadline ([`Bridge::deadline_on_disk`]), which
+    /// [`Bridge::release_replays`] waits for before it ends the entry. A log the attach forgot the
+    /// ask's offset on ([`Bridge::forget_log_offsets`]: a moved generation's fork below it, a
+    /// proved remint's, or a log that continues none) took both with it, and nothing else notes
+    /// an ask aterm no longer lists: it never expired (the asking world's seed 1468, its copy
+    /// published again on the next generation).
+    ///
+    /// NOTED ONCE AN ASK, NOT ONCE AN OFFSET: a copy that lands at another offset than the first
+    /// landing (a cut gave the first record up and its dedup key with it, on the same log or below
+    /// a moved generation's fork, and the replay published the entry again) is the same ask, so
+    /// where the asks journal still holds a recipient or a deadline another landing of its
+    /// sequence noted, at or above its floor ([`StateDir::ask_landed_elsewhere`],
+    /// [`RelandedAsk::floor`]), nothing is noted at the copy, as every build before noted nothing
+    /// there, and the release waits only for that landing's deadline to be on the disk. The
+    /// journal keeps which landing each row is (`asks::Frame::AskedAt`, `asks::Frame::DeadlineAt`)
+    /// rather than the attach marking what it forgot: a forget drops rows by offset and names no
+    /// entry, a cut gives a record up where no forget runs (on the same log, below a fork), and a
+    /// landing's rows say what they say while its recipient or its deadline stands, past its
+    /// settle while its recipient does. Left: a first landing an older build noted, or whose rows
+    /// the journal's trims took ([`ASKED_KEEP`], [`DEADLINES_KEEP`]), or whose settle left no
+    /// recipient row, names no landing, and the copy is noted as well; and an answer to the copy
+    /// settles nothing at the first landing (`re=` names the copy), as every build before.
+    ///
+    /// THE DEADLINE IS DUE AT THE RECORD'S OWN `t=` PLUS ITS `dl=` (`deadline-expiry`'s `t + d`):
+    /// the drain stamps `t=` at the attempt (`post_body`) and the replay publishes the entry's
+    /// bytes as they are, so every note of one ask by any bridge is due at the same time, never
+    /// later than its first landing's `now + dl`; one already overdue is swept at once
+    /// ([`Bridge::arm_deadline_sweep`]). A `t=0` (no clock) is read as now. One answered while
+    /// no deadline of it stood ([`Bridge::settle_deadline_for`]: its answer delivered ahead of
+    /// this release) is settled, never armed, as a held post's retry settles one
+    /// ([`Bridge::settle_a_retry_answered_ahead`]). NEGATIVE CONTROLS
+    /// (`Mutant::ReplayLeavesTheDeadlineUnnoted`): nothing is noted, as every build before;
+    /// (`Mutant::ReplayDeadlineFromNow`): due `dl` from now, as the drain's retry measures it,
+    /// late by however long the outage lasted; (`Mutant::RelandedAskNotedPerOffset`): noted at
+    /// the copy whatever the journal holds of the first landing, so an unanswered ask expires
+    /// twice; (`Mutant::ReplayArmsOverAnUnarmedSettle`): armed over an answer delivered ahead of
+    /// the release, so the sweep publishes an `expired` over an answer the asker holds.
+    fn note_relanded_ask(&mut self, seq: u64, ask: &RelandedAsk) -> bool {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReplayLeavesTheDeadlineUnnoted)
+        {
+            return true;
+        }
+        let off = ask.off;
+        #[cfg(test)]
+        let per_offset = self
+            .fx
+            .mutant(crate::sim::world::Mutant::RelandedAskNotedPerOffset);
+        #[cfg(not(test))]
+        let per_offset = false;
+        let elsewhere = if per_offset {
+            Vec::new()
+        } else {
+            self.state.ask_landed_elsewhere(seq, ask.floor, off)
+        };
+        if !elsewhere.is_empty() {
+            stderr_line!(
+                "aterm-link: the ask at @{off} (in-flight sequence {seq}) landed again, and the \
+                 asks journal holds its landing at @{elsewhere:?}; nothing is noted at the copy"
+            );
+            let unwritten = elsewhere
+                .iter()
+                .any(|at| self.deadlines_unwritten.contains_key(at));
+            return !unwritten || self.persist_asks();
+        }
+        let mut owed = false;
+        if let Some(to) = ask
+            .to
+            .as_deref()
+            .filter(|to| self.asked.get(&off).map(String::as_str) != Some(*to))
+        {
+            self.note_asked(off, to, Some(seq));
+            owed = true;
+        }
+        let Some(dl) = ask.dl else {
+            // The recipient alone: a refused write is said and rewritten at the next, as the
+            // landing's is.
+            if owed {
+                self.persist_asks();
+            }
+            return true;
+        };
+        if self.deadlines.contains_key(&off) || self.state.deadline_settled(off, &ask.sid) {
+            return if owed || self.deadlines_unwritten.contains_key(&off) {
+                self.deadline_on_disk(off)
+            } else {
+                true
+            };
+        }
+        #[cfg(test)]
+        let over_a_settle = self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReplayArmsOverAnUnarmedSettle);
+        #[cfg(not(test))]
+        let over_a_settle = false;
+        if !over_a_settle && self.settled_unarmed.get(&off) == Some(&ask.sid) {
+            self.note_asks([asks::Frame::DeadlineGone {
+                off,
+                sid: ask.sid.clone(),
+                how: None,
+            }]);
+            self.persist_asks();
+            return true;
+        }
+        let now = self.fx.wall_ms();
+        let from = if ask.t == 0 { now } else { ask.t.min(now) };
+        #[cfg(test)]
+        let from = if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReplayDeadlineFromNow)
+        {
+            now
+        } else {
+            from
+        };
+        self.note_deadline_at(
+            &ask.sid,
+            off,
+            from.saturating_add(dl),
+            dl,
+            ask.to.clone(),
+            Some(seq),
+        )
     }
 
     /// Take the deadline at `off` out of the table, its settle owed to the asks journal, with
@@ -10053,16 +10511,22 @@ impl Bridge {
     }
 
     /// Note who the ask at `off` went to: owed to the asks journal, written by the next write
-    /// with the ask's deadline where it has one ([`Bridge::landing_line`]).
-    fn note_asked(&mut self, off: u64, to: &str) {
+    /// with the ask's deadline where it has one ([`Bridge::landing_line`]), beside the in-flight
+    /// sequence of the post whose landing it is (`landing`, as [`Bridge::note_deadline`] keeps
+    /// it).
+    fn note_asked(&mut self, off: u64, to: &str, landing: Option<u64>) {
         self.asked.insert(off, to.to_string());
         while self.asked.len() > ASKED_KEEP {
             self.asked.pop_first();
         }
-        self.note_asks([asks::Frame::Asked(Asked {
+        let asked = Asked {
             off,
             to: to.to_string(),
-        })]);
+        };
+        self.note_asks([match landing {
+            Some(seq) => asks::Frame::AskedAt { asked, seq },
+            None => asks::Frame::Asked(asked),
+        }]);
     }
 
     /// Owe `frames` to the asks journal ([`StateDir::note_asks`]). One whose record would not
@@ -10081,6 +10545,14 @@ impl Bridge {
     /// Mac carried names its sender `<person>@<node>` ([`Bridge::carried_person`]), and comes
     /// from that node, the Mac whose lane brought it, as the deadline sweep reads it off the lane
     /// (§11 C3d): an ask to a person there is answered by them.
+    ///
+    /// AN ASK THE ATTACH LANDED AGAIN WENT WHERE ITS RECORD SAYS from its landing on
+    /// ([`Bridge::relanded_asks`], ATERM-KI-1116-7314): its recipient is noted only at the
+    /// release ([`Bridge::note_relanded_ask`]), which waits for a whole listing of aterm's
+    /// outbox, and a log the attach forgot its offset on left no row there, so a reply of
+    /// another principal's at that offset meanwhile (one to an ask that stood there on the log
+    /// before) would settle it, and the release would arm nothing. NEGATIVE CONTROL
+    /// (`Mutant::ReplyFromIgnoresTheRelandedAsk`): read from `asked` and the deadlines alone.
     fn reply_from(&mut self, off: u64, src: &str) -> Option<bool> {
         #[cfg(test)]
         let carried = !PERSON_REPLY_AS_SENDER.with(std::cell::Cell::get);
@@ -10090,11 +10562,24 @@ impl Bridge {
             Some((person, node)) if carried && crate::person::is_person_id(person) => node,
             _ => src,
         };
+        #[cfg(test)]
+        let relanded = !self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReplyFromIgnoresTheRelandedAsk);
+        #[cfg(not(test))]
+        let relanded = true;
         let to = self
             .asked
             .get(&off)
             .cloned()
-            .or_else(|| self.deadlines.get(&off).and_then(|d| d.to.clone()))?;
+            .or_else(|| self.deadlines.get(&off).and_then(|d| d.to.clone()))
+            .or_else(|| {
+                self.relanded_asks
+                    .values()
+                    .filter(|_| relanded)
+                    .find(|ask| ask.off == off)
+                    .and_then(|ask| ask.to.clone())
+            })?;
         Some(
             to == src
                 || (!src.is_empty() && matches!(self.member_for(&to), Ok(Some(now)) if now == src)),
@@ -10991,6 +11476,8 @@ impl Bridge {
         if cleared {
             self.unsettled.retain(|_, s| *s != seq);
             self.awaiting_drain.remove(&seq);
+            self.relanded_asks.remove(&seq);
+            self.keyed_taken.remove(&seq);
         } else {
             self.unsettled.insert(off, seq);
         }
@@ -11016,9 +11503,7 @@ impl Bridge {
         }
         // A post's `from=` is its session (`post_body`); anything that cannot name a file in
         // `keys/` names no key.
-        let Some(sid) = sender.filter(|sid| {
-            !sid.is_empty() && !sid.starts_with('.') && !sid.contains(['/', '@', '\0'])
-        }) else {
+        let Some(sid) = sender.filter(|sid| names_a_session(sid)) else {
             return true;
         };
         match self.state.land_key_winner(sid, seq, landed, off) {
@@ -11033,7 +11518,11 @@ impl Bridge {
         }
     }
 
-    fn land_replayed(&mut self, seq: u64, off: u64, ours: bool) {
+    /// The attach's replay landed sequence `seq`'s entry at `off` (`ours`: on this node's own
+    /// lane): held for the drain ([`Bridge::awaiting_drain`]), with `ask`, the ask it lands again
+    /// as its own attempt, where it is one ([`Bridge::relanded_asks`]). An observer, which drains
+    /// nothing and notes no deadline, settles it at once.
+    fn land_replayed(&mut self, seq: u64, off: u64, ours: bool, ask: Option<RelandedAsk>) {
         #[cfg(test)]
         let at_once = self.deliver_replay_at_once;
         #[cfg(not(test))]
@@ -11047,6 +11536,114 @@ impl Bridge {
         }
         self.unsettled.insert(off, seq);
         self.awaiting_drain.insert(seq, (off, ours));
+        if self.keyed_taken.get(&seq) != Some(&off) {
+            self.keyed_taken.remove(&seq);
+        }
+        self.hold_relanded_ask(seq, ask);
+    }
+
+    /// THE ASK THE REPLAY LANDS AGAIN AS sequence `seq`'S `entry`, `decoded` its body, at `off`
+    /// on `face` (the face of the identity it landed as; the entry's own subject where none is
+    /// named, as an acknowledgement's pin publishes it), where `own` says it is the entry's own
+    /// attempt ([`own_attempt`]): the ask its first landing noted, its deadline due from the
+    /// entry's own `t=` ([`relanded_ask`]). Its key's winner's record is not (`Some(false)`: a
+    /// re-post deduped onto an existing record creates no deadline), nor one whose ownership
+    /// nothing verifies, which is said: no deadline stands for it ([`Bridge::landing_line`]
+    /// holds such a post where aterm lists it). NEGATIVE CONTROL
+    /// (`Mutant::ReplayTakesTheWinnerForItsOwn`): every record it lands is its own attempt, the
+    /// key's winner's too.
+    fn relanded_own_ask(
+        &self,
+        seq: u64,
+        entry: &InFlight,
+        decoded: &Body,
+        off: u64,
+        face: Option<&str>,
+        own: Option<bool>,
+    ) -> Option<RelandedAsk> {
+        let mut ask = relanded_ask(&entry.subject, decoded, off, face.unwrap_or(&entry.subject))?;
+        // A pin that names no head (an older build's, which the drain still lands and retries) is
+        // read from its entry's own head, which the drain journals before the attempt: above
+        // every earlier post of its key, at or below its own landings. Where neither reads (no
+        // log identity, so no forget ran; a keyed head on a log that continues none, whose forget
+        // dropped every row before any drain wrote one there), 0: any standing landing of its
+        // sequence keeps the copy unnoted, as every build before noted nothing there, never a
+        // second deadline.
+        if entry.pin.via_key {
+            ask.floor = self
+                .read_back_from(entry.log, entry.pin.at.or(entry.at), true)
+                .map_or(0, Head::start);
+        }
+        #[cfg(test)]
+        let own = if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReplayTakesTheWinnerForItsOwn)
+        {
+            Some(true)
+        } else {
+            own
+        };
+        match own {
+            Some(true) => Some(ask),
+            Some(false) => None,
+            None => {
+                stderr_line!(
+                    "aterm-link: the in-flight ask at sequence {seq} landed again at @{off}, and \
+                     nothing verifies the record is its own attempt; no deadline is noted there"
+                );
+                None
+            }
+        }
+    }
+
+    /// Keep `ask` beside sequence `seq`'s entry held for the drain ([`Bridge::relanded_asks`]),
+    /// or none.
+    fn hold_relanded_ask(&mut self, seq: u64, ask: Option<RelandedAsk>) {
+        match ask {
+            Some(ask) => {
+                self.relanded_asks.insert(seq, ask);
+            }
+            None => {
+                self.relanded_asks.remove(&seq);
+            }
+        }
+    }
+
+    /// THE ASK SEQUENCE `seq`'S ENTRY LANDED AGAIN AT `off`, NOTED BEFORE THE ENTRY ENDS
+    /// (ATERM-KI-1116-7314, [`Bridge::note_relanded_ask`]): whether its deadline is on the disk,
+    /// or it is none. One that is not stays held for the drain, its record with it, until a later
+    /// release's write takes; meanwhile an answer to it waits for its settle as an answer to any
+    /// ask does ([`Bridge::settle_deadline_for`]). Ended so, a kill left no entry and no deadline,
+    /// and the ask never expired. While the asks journal refuses, this record holds its session's
+    /// later mail behind it and the node's inbox commit below it, as every record held for the
+    /// drain does ([`Bridge::hold_record`]), and the node's other sessions' mail goes on; past the
+    /// hand's cap the refill drops the link at the next record of that lane, on every attach
+    /// ([`Bridge::make_room_in_hand`]'s drain tries the write again, and a refusal frees
+    /// nothing). That is bounded by the refusal, as [`Bridge::landing_line`]'s hold of a listed
+    /// ask is. NEGATIVE CONTROL (`Mutant::ReleaseOverAnUnwrittenDeadline`): ended all the same, as
+    /// `Mutant::RetireOverAnUnwrittenDeadline` retires a post.
+    fn relanded_ask_noted(&mut self, seq: u64, off: u64) -> bool {
+        let Some(ask) = self
+            .relanded_asks
+            .get(&seq)
+            .filter(|ask| ask.off == off)
+            .cloned()
+        else {
+            return true;
+        };
+        let noted = self.note_relanded_ask(seq, &ask);
+        #[cfg(test)]
+        let noted = noted
+            || self
+                .fx
+                .mutant(crate::sim::world::Mutant::ReleaseOverAnUnwrittenDeadline);
+        if !noted {
+            stderr_line!(
+                "aterm-link: the ask at @{off} (in-flight sequence {seq}) landed again, and its \
+                 deadline could not persist; its entry stands, its record held, until it does"
+            );
+        }
+        noted
     }
 
     /// THE ATTACH'S DRAIN OF THE POSTS ITS REPLAY LANDED ([`Bridge::awaiting_drain`]), ahead of
@@ -11136,6 +11733,12 @@ impl Bridge {
         }
     }
 
+    /// END EVERY ENTRY HELD FOR THE DRAIN THAT `drain`, A WHOLE LISTING OF ATERM'S OUTBOX, NO
+    /// LONGER LISTS ([`Bridge::awaiting_drain`]): no retry at its pin will settle it, so it is
+    /// settled where it landed ([`Bridge::settle_landed`]) and its record delivered. An ask landed
+    /// again as its own attempt is noted first, and one whose deadline is not on the disk stays
+    /// held ([`Bridge::relanded_ask_noted`]); a listed one is noted by its retry
+    /// ([`Bridge::landing_line`]).
     fn release_replays(&mut self, drain: &Drain) {
         if self.awaiting_drain.is_empty() || drain.more {
             return;
@@ -11150,9 +11753,16 @@ impl Bridge {
             .map(|(&seq, &(off, ours))| (seq, off, ours))
             .collect();
         for (seq, off, ours) in free {
+            if !self.relanded_ask_noted(seq, off) {
+                continue;
+            }
             self.awaiting_drain.remove(&seq);
+            self.keyed_taken.remove(&seq);
             self.settle_landed(seq, off, ours);
         }
+        let awaiting = &self.awaiting_drain;
+        self.relanded_asks
+            .retain(|seq, ask| awaiting.get(seq).is_some_and(|&(off, _)| off == ask.off));
     }
 
     /// THE DELIVERY OF A RECORD OF AN ATTEMPT NO READ FROM ANYWHERE DECIDED (case 6 of
@@ -11189,18 +11799,40 @@ impl Bridge {
         let Some(seq) = self.undecided_candidate(off, subject, raw, origin) else {
             return false;
         };
-        self.bind_undecided(seq, off);
+        self.bind_undecided(seq, off, subject, raw);
         true
     }
 
-    /// Take the own record at `off` for sequence `seq`'s undecided attempt ([`Bridge::undecided`]):
-    /// the arm out, its offset in `unsettled` and its entry awaiting the drain there, as
-    /// [`Bridge::land_replayed`] leaves a record the replay read back.
-    fn bind_undecided(&mut self, seq: u64, off: u64) {
-        self.undecided.remove(&seq);
+    /// Take the own record at `off` of `subject`, `raw` its body, for sequence `seq`'s undecided
+    /// attempt ([`Bridge::undecided`]): the arm out, its offset in `unsettled` and its entry
+    /// awaiting the drain there, as [`Bridge::land_replayed`] leaves a record the replay read
+    /// back; a keyed arm's take marked ([`Bridge::keyed_taken`]), and every mark no binding
+    /// stands for any more dropped; and the ask it is, the post's own attempt (a keyed arm's take
+    /// is its re-post's own landing: the gate takes a record of the re-post's own words only at
+    /// or above the arm's floor, the start of a read from its own head or from above a proved
+    /// fork, below which every earlier post of its key lies, [`undecided_takes`]), kept beside
+    /// it, due from the record's own `t=`, its earlier landings looked for from that floor
+    /// ([`Bridge::relanded_asks`], [`RelandedAsk::floor`]).
+    fn bind_undecided(&mut self, seq: u64, off: u64, subject: &str, raw: &[u8]) {
+        let floor = self.undecided.remove(&seq).and_then(|arm| arm.floor);
+        let keyed = floor.is_some();
         let _ = self.remember_self_ack(off);
         self.unsettled.insert(off, seq);
         self.awaiting_drain.insert(seq, (off, true));
+        if keyed {
+            self.keyed_taken.insert(seq, off);
+        } else {
+            self.keyed_taken.remove(&seq);
+        }
+        let awaiting = &self.awaiting_drain;
+        self.keyed_taken
+            .retain(|seq, off| awaiting.get(seq).is_some_and(|&(at, _)| at == *off));
+        let ask =
+            relanded_ask(subject, &Body::decode(raw).0, off, subject).map(|ask| RelandedAsk {
+                floor: floor.unwrap_or(0),
+                ..ask
+            });
+        self.hold_relanded_ask(seq, ask);
         #[cfg(test)]
         self.fx
             .reservation_tap(crate::fx::ReservationTap::UndecidedTaken);
@@ -11282,12 +11914,14 @@ impl Bridge {
                 wants: vec![identity.clone()],
                 below,
                 seen: Some(handed.clone()),
+                floor: None,
             };
             let (ours, placed) = self.own_producers();
             let claims = self.claims_now().cloned().unwrap_or_default();
             let rules = GateRules {
                 by_origin: true,
                 by_seen: true,
+                floored: true,
             };
             let taken = handed.iter().rev().copied().find(|&off| {
                 let delivered = Delivered {
@@ -11320,8 +11954,9 @@ impl Bridge {
     /// (ATERM-KI-1114-1414 review): at the first read of `pin`, the reservation of a receipt an
     /// attach could not read ([`Bridge::unread_receipts`]), whose attempt was made below that
     /// attach's head `below`, the attempt is armed as [`Bridge::arm_undecided_pins`] arms a pin it
-    /// reads ([`Bridge::undecided`]): one whose head is anywhere, not a keyed re-post's, on a lane
-    /// this bridge's deliveries reach ([`Bridge::delivered_here`]), whose record is not held for
+    /// reads ([`Bridge::undecided`]): one whose head is anywhere, not a keyed re-post's (no
+    /// receipt's pin is), on a lane this bridge's deliveries reach ([`Bridge::delivered_here`]),
+    /// whose record is not held for
     /// its drain already and that no claim settles ([`Bridge::claims`], which a read would answer),
     /// with its identity, `below`, and no candidates seen; an arm a read of this attach left for
     /// its sequence stands. A record of it this bridge holds untaken, in hand behind another own
@@ -11357,6 +11992,7 @@ impl Bridge {
             wants: vec![identity],
             below,
             seen: None,
+            floor: None,
         });
         self.take_undecided_in_hand(pin.seq);
     }
@@ -11407,7 +12043,7 @@ impl Bridge {
                 continue;
             }
             if self.undecided_candidate(off, &subject, &raw, origin) == Some(seq) {
-                self.bind_undecided(seq, off);
+                self.bind_undecided(seq, off, &subject, &raw);
                 return;
             }
         }
@@ -11415,7 +12051,9 @@ impl Bridge {
 
     /// The sequence whose undecided attempt ([`Bridge::undecided`]) the own record at `off` of
     /// `subject`, `raw` its body, read with `origin`, is taken for: one whose identities name it
-    /// and that [`undecided_takes`] takes it for, the lowest such first. `None` for none.
+    /// and that [`undecided_takes`] takes it for, the lowest such first, never a keyed arm whose
+    /// sequence's record is held for its drain already ([`Bridge::awaiting_drain`]), which a take
+    /// would move ([`Bridge::one_arm_a_sequence_unkept`]). `None` for none.
     fn undecided_candidate(
         &mut self,
         off: u64,
@@ -11427,10 +12065,15 @@ impl Bridge {
             return None;
         }
         let identity = publication_identity(subject, raw);
+        let unkept = self.one_arm_a_sequence_unkept();
         let named: Vec<u64> = self
             .undecided
             .iter()
-            .filter(|(_, arm)| off < arm.below && arm.wants.contains(&identity))
+            .filter(|(seq, arm)| {
+                off < arm.below
+                    && arm.wants.contains(&identity)
+                    && (arm.floor.is_none() || unkept || !self.awaiting_drain.contains_key(seq))
+            })
             .map(|(&seq, _)| seq)
             .collect();
         if named.is_empty() {
@@ -11448,11 +12091,15 @@ impl Bridge {
             by_seen: !self
                 .fx
                 .mutant(crate::sim::world::Mutant::UndecidedTakesTheFirst),
+            floored: !self
+                .fx
+                .mutant(crate::sim::world::Mutant::UndecidedTakesBelowItsFloor),
         };
         #[cfg(not(test))]
         let rules = GateRules {
             by_origin: true,
             by_seen: true,
+            floored: true,
         };
         let delivered = Delivered {
             off,
@@ -13735,6 +14382,8 @@ impl Bridge {
         }
         self.unsettled.retain(|off, _| kept(*off));
         self.awaiting_drain.retain(|_, (off, _)| kept(*off));
+        self.relanded_asks.retain(|_, ask| kept(ask.off));
+        self.keyed_taken.retain(|_, off| kept(*off));
         for lane in self.held_own.values_mut() {
             lane.retain(|off, _| kept(*off));
         }
@@ -13742,6 +14391,12 @@ impl Bridge {
         self.judge_waits.retain(|off| kept(*off));
         self.moots_in_flight
             .retain(|a, (_, re, moot)| kept(*a) && kept(*re) && kept(moot.at()));
+        // On the new log such an offset names another record. An ask whose entry stands is
+        // noted again where the replay lands it, before its entry ends (ATERM-KI-1116-7314,
+        // [`Bridge::relanded_asks`]); a settled entry's ask is not: past a move's fork its
+        // record went with the tail, and on a log that keeps the records it forgets (a remint)
+        // it may stand with no deadline to expire it. The settles go too, so there an ask whose
+        // entry stood past its verdict is noted again (ATERM-KI-1116-7314's Left).
         let before = self.deadlines.len();
         self.load_self_window();
         self.deadlines.retain(|off, _| kept(*off));
@@ -15220,8 +15875,9 @@ impl Bridge {
     /// WHETHER `pin`'S RECORD IS ONE THIS BRIDGE HOLDS FOR ITS RETRY
     /// ([`Bridge::landed_for_its_retry`]), AN UNDECIDED ATTEMPT'S RECORD THIS BRIDGE HOLDS
     /// UNTAKEN TAKEN FOR IT FIRST ([`Bridge::take_undecided_in_hand`], ATERM-KI-1114-1414 review),
-    /// as the retry's own look at its pin takes it ([`Bridge::landed_at_its_pin`], which takes
-    /// none for a keyed re-post's pin, whose sequence no arm names): for a post or receipt behind
+    /// as the retry's own look at its pin takes it ([`Bridge::landed_at_its_pin`], and for a keyed
+    /// re-post's pin [`Bridge::keyed_repost_own_attempt`], its key's sequence armed by its read
+    /// from its own head, [`Bridge::arm_undecided_keyed`]): for a post or receipt behind
     /// its lane's hold ([`Bridge::landed_behind_an_unverifiable_hold`]) or its session's stall
     /// ([`Bridge::held_receipt_landed`]), whose copy is held in hand untaken it settles there, and
     /// one queued is taken for the loop to hold. Untaken, the post or receipt waited behind the
@@ -15236,7 +15892,7 @@ impl Bridge {
             .mutant(crate::sim::world::Mutant::UndecidedUntakenPastAHold);
         #[cfg(not(test))]
         let untaken = false;
-        if !pin.via_key && !untaken {
+        if !untaken {
             self.take_undecided_in_hand(pin.seq);
         }
         self.landed_for_its_retry(pin)
@@ -15245,15 +15901,47 @@ impl Bridge {
     /// Whether `pin`'s record is one this bridge holds for its retry: read back by the attach's
     /// replay ([`Bridge::read_back_for_its_retry`]), or its copy held in hand for its standing
     /// entry ([`Bridge::unhanded_landing`]), in its pin's words and, for a keyed re-post, its own
-    /// attempt's ([`keyed_own_copy_at`]).
+    /// attempt's ([`Bridge::keyed_own_copy`]).
     fn landed_for_its_retry(&self, pin: &PublishPin) -> bool {
         if self.read_back_for_its_retry(pin).is_some() {
             return true;
         }
         match self.unhanded_landing(pin.seq, pin.identity.as_slice()) {
-            Some(Unhanded::Held(off, _)) => !pin.via_key || keyed_own_copy_at(pin, off),
+            Some(Unhanded::Held(off, _)) => !pin.via_key || self.keyed_own_copy(pin, off),
             _ => false,
         }
+    }
+
+    /// WHETHER A KEYED RE-POST'S COPY AT `off`, OF ITS OWN PIN'S IDENTITY, IS ITS OWN ATTEMPT'S
+    /// rather than its key's winner's: as its words or its pin's winner's offset say it
+    /// ([`keyed_own_copy_at`]), or where a keyed arm took it for the pin's sequence
+    /// ([`Bridge::taken_as_its_own`], ATERM-KI-1114-1414) at or above the pin's own head where it
+    /// keeps one ([`Head::own`]): that arm took no record below its read's start, and a re-post in
+    /// its winner's own words whose pin names no winner's offset has nothing else to tell its own
+    /// copy by. Unrecognised there, the retry read that copy again, undecided, and held its sender
+    /// and its recipient's lane for as long as the copy stood. NEGATIVE CONTROL
+    /// (`Mutant::KeyedTakenUnowned`): the mark is not read.
+    fn keyed_own_copy(&self, pin: &PublishPin, off: u64) -> bool {
+        #[cfg(test)]
+        let unowned = self.fx.mutant(crate::sim::world::Mutant::KeyedTakenUnowned);
+        #[cfg(not(test))]
+        let unowned = false;
+        keyed_own_copy_at(pin, off)
+            || (!unowned
+                && self.taken_as_its_own(pin.seq, off)
+                && pin.at.and_then(Head::own).is_none_or(|own| off >= own))
+    }
+
+    /// Whether a keyed arm took the record at `off` for sequence `seq` ([`Bridge::keyed_taken`])
+    /// and it is still held for that sequence's drain there ([`Bridge::awaiting_drain`],
+    /// `unsettled`).
+    fn taken_as_its_own(&self, seq: u64, off: u64) -> bool {
+        self.keyed_taken.get(&seq) == Some(&off)
+            && self
+                .awaiting_drain
+                .get(&seq)
+                .is_some_and(|&(at, _)| at == off)
+            && self.unsettled.get(&off) == Some(&seq)
     }
 
     /// AN OWED RECEIPT HELD BEHIND ITS SESSION'S STALL OR HOLD THAT LANDED ALREADY IS RETIRED WHERE
@@ -16286,11 +16974,11 @@ impl Bridge {
     /// ahead of the dropped post's send from the drain (ATERM-KI-1114-56: the sim's windowed world,
     /// seed 56 at 1200 steps, where #7's entry was dropped, #8 to #11 replayed at @553 to @556 and
     /// #7 sent at @560; seed 8988 since the grouped post send, 814 since ATERM-KI-1116-7314's
-    /// told rows). An unwritten post's sequence lies above every written one of its sender's in its
-    /// group, so the group's are dropped first. NEGATIVE CONTROL (`Mutant::DropBehindLowestFirst`,
-    /// which reverses the whole order): that found seed, and for the group's part
-    /// `a_failures_unwritten_group_entries_are_dropped_highest_first`, whose every cut of the
-    /// journal leaves a sender's lowest entries standing.
+    /// told rows, and no seed of that world to 60,000 since its replayed asks are noted). An
+    /// unwritten post's sequence lies above every written one of its sender's in its group, so the
+    /// group's are dropped first. NEGATIVE CONTROL (`Mutant::DropBehindLowestFirst`, which reverses
+    /// the whole order): `a_failures_unwritten_group_entries_are_dropped_highest_first`, whose
+    /// every cut of the journal leaves a sender's lowest entries standing, on the group's part.
     fn drop_behind_a_failed_post(&mut self, sid: &str, seq: u64, e: &io::Error) {
         let mut behind = self.unwritten_behind(sid, seq);
         behind.extend(self.fenced_behind_a_refused_post(sid, seq, e));
@@ -16605,12 +17293,67 @@ impl Bridge {
                 *left |= *answered || *next != PostNext::Moves;
             }
         }
+        // A POST THAT LEFT ATERM'S OUTBOX TAKES ITS SEQUENCE'S ARM WITH IT (ATERM-KI-1114-1414
+        // review): an arm ([`Bridge::undecided`]) holds a record for a retry, and none follows a
+        // post that is gone. Its arm is one of its own words at its sequence, and, for a re-post
+        // of its key, a keyed one: a plain arm there is its key's own post's, and an arm of other
+        // words the other post's ([`Bridge::one_arm_a_sequence_unkept`], under whose control a
+        // landing takes any arm at its sequence, whatever its kind and words). One stands at its
+        // landing where the read that armed it never decided and the retry settled by another (a
+        // keyed re-post its key made its own, a plain pin read by its words,
+        // [`Bridge::drain_post`]; a claim): left standing, it took the record the refill
+        // delivered next for a post that is gone, held in hand, and a fetch of that record
+        // answered `unsettled`, until a later drain's listing named the post nowhere
+        // ([`Bridge::release_replays`]). So it goes, and with it the entry that read armed it
+        // from, where this landing names none (the replay held it undecided, so nothing awaits
+        // the drain there): left where no take met its record, every later attach's replay read
+        // it undecided again and armed it anew (read, not run). Remembered as an entry the
+        // landing names is, where its record is this node's own. NEGATIVE CONTROL
+        // (`Mutant::ArmOutlivesItsPost`): both stand.
+        #[cfg(test)]
+        let outlives = self
+            .fx
+            .mutant(crate::sim::world::Mutant::ArmOutlivesItsPost);
+        #[cfg(not(test))]
+        let outlives = false;
+        let unkept = self.one_arm_a_sequence_unkept();
+        let armed: Vec<bool> = group
+            .iter()
+            .zip(&left)
+            .map(|(landing, left)| {
+                *left
+                    && !outlives
+                    && self.undecided.get(&landing.pin.seq).is_some_and(|arm| {
+                        unkept
+                            || ((!landing.pin.via_key || arm.floor.is_some())
+                                && landing
+                                    .pin
+                                    .identity
+                                    .as_ref()
+                                    .is_some_and(|words| arm.wants.contains(words)))
+                    })
+            })
+            .collect();
         let ends: Vec<Option<u64>> = every_entry(&group, remembered)
             .into_iter()
             .zip(&left)
             .map(|(end, left)| end.filter(|_| *left))
+            .zip(group.iter().zip(&armed))
+            .map(|(end, (landing, armed))| {
+                end.or_else(|| {
+                    (*armed
+                        && landing.entry.is_none()
+                        && (remembered || !landing.remembers(|face| self.on_own_lane(face))))
+                    .then_some(landing.pin.seq)
+                })
+            })
             .collect();
         self.settle_group(&group, &ends, &retired);
+        for (landing, armed) in group.iter().zip(&armed) {
+            if *armed {
+                self.undecided.remove(&landing.pin.seq);
+            }
+        }
         for ((landing, end), left) in group.iter().zip(&ends).zip(&left) {
             let (Some(ours), None, false) = (landing.entry, *end, ends_first || ends_at_the_ack)
             else {
@@ -16624,6 +17367,9 @@ impl Bridge {
             self.unsettled.insert(landing.off, seq);
             if !left {
                 self.awaiting_drain.insert(seq, (landing.off, ours));
+                if self.keyed_taken.get(&seq) != Some(&landing.off) {
+                    self.keyed_taken.remove(&seq);
+                }
             }
         }
         group
@@ -16666,6 +17412,8 @@ impl Bridge {
                     Ok(()) => {
                         self.unsettled.retain(|_, s| *s != seq);
                         self.awaiting_drain.remove(&seq);
+                        self.relanded_asks.remove(&seq);
+                        self.keyed_taken.remove(&seq);
                     }
                     Err(e) => {
                         stderr_line!(
@@ -16709,21 +17457,14 @@ impl Bridge {
             }
         };
         let (seq, via_key) = (pin.seq, pin.via_key);
-        let own_attempt = if !deduped || !via_key {
-            Some(true)
-        } else {
-            match (
-                actual.as_ref(),
-                pin.original.as_ref(),
-                pin.identity.as_ref(),
-            ) {
-                (Some(actual), Some(original), Some(attempt)) if original != attempt => {
-                    // Verified different semantic identities decide ownership without an offset.
-                    Some(actual == attempt)
-                }
-                _ => pin.original_off.map(|original_off| off != original_off),
-            }
-        };
+        let own_attempt = own_attempt(
+            pin,
+            off,
+            deduped,
+            actual.as_ref(),
+            pin.identity.as_slice(),
+            pin.original_off,
+        );
         if (actual.is_none() || own_attempt.is_none())
             && WAITING_KINDS.contains(&post.kind.as_str())
         {
@@ -16760,7 +17501,7 @@ impl Bridge {
         let waiting = appended && WAITING_KINDS.contains(&post.kind.as_str());
         if waiting {
             if let Some(to) = &to {
-                self.note_asked(off, to);
+                self.note_asked(off, to, Some(seq));
             }
         }
         if waiting && post.dl.is_none() && to.is_some() {
@@ -16769,7 +17510,7 @@ impl Bridge {
             self.persist_asks();
         }
         if let Some(dl) = post.dl.filter(|_| waiting) {
-            let noted = self.note_deadline(&post.sid, off, dl, to);
+            let noted = self.note_deadline(&post.sid, off, dl, to, Some(seq));
             #[cfg(test)]
             let noted = noted
                 || self
@@ -18325,7 +19066,8 @@ impl Bridge {
             match found.continues {
                 Some(fork) if found.proved => stderr_line!(
                     "aterm-link: the bus log has another id: {}; every offset this node held \
-                     below {fork} is kept, and every one at or above it is forgotten",
+                     below {fork} is kept, and every one at or above it is forgotten (an \
+                     ask still in flight has its deadline noted again where the replay lands it)",
                     found.why()
                 ),
                 Some(fork) => stderr_line!(
@@ -18333,8 +19075,10 @@ impl Bridge {
                      under a weak tier, a torn batch cut, or a repair); every offset this node \
                      held at or above {fork} is forgotten and its cursors resume there — {} \
                      open deadline(s) and {} in-flight record(s) named a record the move took \
-                     — the halt watermark is cleared so a standing halt is answered again, and \
-                     every halt this node held stands until its human writes a row here",
+                     (an ask still in flight has its deadline noted again where the replay \
+                     lands it) — the halt watermark is cleared so a standing halt is answered \
+                     again, and every halt this node held stands until its human writes a row \
+                     here",
                     found.why(),
                     found.deadlines,
                     found.inflight
@@ -18343,9 +19087,10 @@ impl Bridge {
                     "aterm-link: the bus log is not the one this node last read: {} (deleted, \
                      moved aside, repaired, restored, or another broker's); every offset this \
                      node held there is forgotten — the seen and topic cursors, the halt and \
-                     self-ack watermarks, {} open deadline(s) no reply here can settle, and {} \
-                     in-flight record(s) decided there — and every halt this node held stands \
-                     until its human writes a row here",
+                     self-ack watermarks, {} open deadline(s) no reply here can settle (an ask \
+                     still in flight has its deadline noted again where the replay lands it), \
+                     and {} in-flight record(s) decided there — and every halt this node held \
+                     stands until its human writes a row here",
                     found.why(),
                     found.deadlines,
                     found.inflight
@@ -20495,6 +21240,124 @@ fn adoptable(inc: Option<u64>, self_inc: u64, witnessed_dead: Option<u64>, marke
         Some(inc) => (marked && inc <= self_inc) || witnessed_dead == Some(inc),
         None => false,
     }
+}
+
+/// WHETHER A LANDING AT `off` IS `pin`'S OWN ATTEMPT, `pin` a post's or an in-flight entry's:
+/// `Some(true)` for one that is no keyed re-post's dedup answer (`deduped`, `pin.via_key`); else,
+/// where the key's winner (`pin.original`) is in other words than each of `attempts`, the words
+/// the attempt's record may hold, whether `actual`, the record's, is one of them (verified
+/// different semantic identities decide ownership without an offset), and where one of them is
+/// the winner's, `Some(true)` for `actual` another of them; else by the winner's offset
+/// `original_off`, on the log `off` is an offset of, and `None` where none is known: nothing
+/// verifies whose the record is. [`Bridge::landing_line`] holds a waiting kind's post at `None`;
+/// the attach's replay notes no ask there, and says so ([`Bridge::relanded_own_ask`]).
+fn own_attempt(
+    pin: &PublishPin,
+    off: u64,
+    deduped: bool,
+    actual: Option<&PublishIdentity>,
+    attempts: &[PublishIdentity],
+    original_off: Option<u64>,
+) -> Option<bool> {
+    if !deduped || !pin.via_key {
+        return Some(true);
+    }
+    if let (Some(actual), Some(original)) = (actual, pin.original.as_ref()) {
+        if !attempts.is_empty() && !attempts.contains(original) {
+            return Some(attempts.contains(actual));
+        }
+        if actual != original && attempts.contains(actual) {
+            return Some(true);
+        }
+    }
+    original_off.map(|original_off| off != original_off)
+}
+
+/// WHETHER A LANDING THE ATTACH'S REPLAY MADE OR READ BACK AT `off` IS THE ENTRY'S OWN ATTEMPT
+/// (ATERM-KI-1116-7314), `pin` its entry's: as a landing's ([`own_attempt`]) where the words
+/// decide; else by where `off` lies against `head`, the pin's head on the log the replay reads
+/// (`Bridge::read_back_from`), which a keyed pin takes before its first attempt: every earlier
+/// post of its key was published below it, so a record at or above it is its own attempt, and
+/// one below it, where it is its own head ([`Head::own`], at or below each of its attempts),
+/// another post's. Never by the pin's winner's offset, which `StateDir::rewitnessed_entry`
+/// keeps across a move onto a log it is no offset of (a later generation past its fork, a log
+/// that continues none): a record of the entry's own copy there, landed at that offset, was
+/// taken for its winner's, and its ask never expired. `None` where neither decides: an older
+/// build's pin with no head, or a record below a head not its own. NEGATIVE CONTROL
+/// (`Mutant::ReplayWinnerOffsetFromAnyLog`): decided by the pin's winner's offset whatever log
+/// it was taken on, as [`Bridge::landing_line`] decides by its post's pin.
+fn replayed_own_attempt(
+    pin: &PublishPin,
+    off: u64,
+    deduped: bool,
+    actual: Option<&PublishIdentity>,
+    attempts: &[PublishIdentity],
+    head: Option<Head>,
+) -> Option<bool> {
+    own_attempt(pin, off, deduped, actual, attempts, None).or_else(|| {
+        let head = head?;
+        if off >= head.start() {
+            Some(true)
+        } else {
+            head.own().map(|_| false)
+        }
+    })
+}
+
+/// AN ASK THE ATTACH LANDED AGAIN AS ITS OWN ATTEMPT (ATERM-KI-1116-7314,
+/// [`Bridge::relanded_asks`]): what its first landing noted ahead of its `outbox sent`
+/// ([`Bridge::landing_line`]), read off the record it holds now ([`relanded_ask`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RelandedAsk {
+    /// Where its record lies now.
+    off: u64,
+    /// Its asker, the record's `from=`.
+    sid: String,
+    /// The record's own `t=`: the clock of the attempt whose bytes it holds.
+    t: u64,
+    /// Its `dl=`.
+    dl: Option<u64>,
+    /// Where it went: [`replier_of`] the face it landed on.
+    to: Option<String>,
+    /// Where its post's earlier landings may lie: a landing of its sequence the asks journal
+    /// holds at or above it is its own post's, an earlier one ([`asks::Index::landed_elsewhere`]).
+    /// A plain post's sequence is its own, so 0; every re-post of a key takes the key's sequence,
+    /// so a keyed one's is the start ([`Head::start`]) of the head the replay reads
+    /// ([`Bridge::read_back_from`]) from its pin's head, else its entry's own head: an own head
+    /// ([`Head::OwnFrom`]), a keyed `From` or a `Since` read start, below which every earlier post
+    /// of its key was published; 0 where none reads. For a case-6 take it is the arm's floor
+    /// ([`Bridge::bind_undecided`]).
+    floor: u64,
+}
+
+/// THE ASK `subject`'S BODY `body` IS, LANDED AGAIN AT `off` ON `face` ([`RelandedAsk`]): one of a
+/// waiting kind ([`WAITING_KINDS`]: `body.kind` on an exact route, else `subject`'s last
+/// segment, so never an `expired`), from a session (`from=`, as [`Bridge::land_key_winner`]
+/// reads it), gone to [`replier_of`] `face`, the face of the identity it landed as, as
+/// [`Bridge::landing_line`] reads it; `None` for anything else.
+fn relanded_ask(subject: &str, body: &Body, off: u64, face: &str) -> Option<RelandedAsk> {
+    let kind = body
+        .kind
+        .as_deref()
+        .or_else(|| subject.rsplit('/').next())?;
+    if !WAITING_KINDS.contains(&kind) {
+        return None;
+    }
+    let sid = body.from.as_deref().filter(|sid| names_a_session(sid))?;
+    Some(RelandedAsk {
+        off,
+        sid: sid.to_string(),
+        t: body.t,
+        dl: body.dl,
+        to: replier_of(face),
+        floor: 0,
+    })
+}
+
+/// Whether a post's `from=` names a session (`post_body`): anything that cannot name a file in
+/// `keys/` names none.
+fn names_a_session(sid: &str) -> bool {
+    !sid.is_empty() && !sid.starts_with('.') && !sid.contains(['/', '@', '\0'])
 }
 
 fn replier_of(subject: &str) -> Option<String> {

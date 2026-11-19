@@ -367,3 +367,69 @@ fn a_mac_past_format_one_neither_feeds_nor_takes_the_members_lane() {
         "a marked Mac takes nothing the lane brings: {took:?}"
     );
 }
+
+/// A Mac past format 1 states no membership digest in its presence row, so no repair round is
+/// asked for its membership store, on its side or a neighbour's (ATERM-KI-1116-1471, tracker
+/// FL-148E3). With no format mark its row states the digest of the records its vault holds
+/// ([`crate::presence::membership_of_vault`]), and the digest trigger asks a round of a
+/// neighbour whose digest differs two rows in a row. Once its format mark names format 2 (the
+/// file a follow stores, written here; no running build stores one) its records ride no members
+/// lane and its row states none: the trigger asks nothing of a neighbour whatever that
+/// neighbour holds, and a neighbour that reads its row asks nothing of it either, since the
+/// trigger asks only where both digests are known. A round would move no membership record and
+/// reconcile every table both hold for nothing; a round its tables ask still runs.
+///
+/// NEGATIVE CONTROL: `membership_of_vault` stating the store's digest whatever the lane says
+/// (as before), run against this test and seen to fail with ``a marked Mac states no
+/// membership digest``.
+#[test]
+fn a_mac_past_format_one_states_no_membership_digest_so_no_round_is_asked_for_it() {
+    use crate::presence::{Held, membership_of_vault};
+    use aterm_mesh_core::relay_digest::Trigger;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let home = aterm_tempfile::tempdir().expect("a home");
+    let paths = Paths::locate_for_home(home.path());
+    let stores = VaultStores::new(paths.clone(), home.path().join("aterm.toml"));
+    let (genesis, _) = founded();
+    let wire = genesis.wire_bytes().expect("its bytes").into_owned();
+    assert_eq!(stores.ingest_members(&[wire]), vec![Verdict::Applied]);
+
+    let theirs = Some(Held::membership(&BTreeSet::from([[9; 32]])));
+    // Two rows of a neighbour, read against this Mac's own digest `mine`: whether each asks.
+    let rows = |theirs: Option<Held>, mine: Option<Held>| {
+        let mut trigger = Trigger::default();
+        [
+            trigger.row(theirs, mine, true, false),
+            trigger.row(theirs, mine, true, false),
+        ]
+    };
+    let unmarked = membership_of_vault(&paths);
+    assert_eq!(
+        unmarked,
+        Some(Held::membership(&BTreeSet::from([*genesis.id()])))
+    );
+    assert_eq!(
+        rows(theirs, unmarked),
+        [false, true],
+        "a digest that differs asks"
+    );
+
+    let mark = paths.records_file().with_file_name("records.format");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&mark)
+        .expect("the format mark");
+    io::Write::write_all(&mut file, b"aterm-secrets records format 2\n").expect("its text");
+    drop(file);
+    let marked = membership_of_vault(&paths);
+    assert_eq!(marked, None, "a marked Mac states no membership digest");
+    assert_eq!(rows(theirs, marked), [false, false], "it asks no round");
+    assert_eq!(
+        rows(marked, unmarked),
+        [false, false],
+        "a neighbour reading its row asks none of it"
+    );
+}

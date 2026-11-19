@@ -188,8 +188,8 @@ impl Stand {
             changes.extend(account(&claude_bea, "anthropic", "claude", &bea));
         }
         registry.write(vec![changes]).unwrap();
-        // This Mac's program states one sample of a metric, a minute before the pass clock, and
-        // one note: every file has a row.
+        // This Mac's program writes the tracker's packages, states one sample of a metric, a
+        // minute before the pass clock, and one note: every file has a row.
         Stand::tracker_rows(&lab.paths[SEAT]);
         // This Mac's harness states its login, its reading and an event of the account in the
         // journal's week ring, as its flusher's record would.
@@ -274,9 +274,13 @@ impl Stand {
     }
 
     /// The Mac whose home is `paths` appends one sample of a metric, at `<uuid32>.1` of
-    /// `lab/measures`, and one note, at `<uuid32>.1` of `lab/notes`.
+    /// `lab/measures`, and one note, at `<uuid32>.1` of `lab/notes`, the first append declaring
+    /// the table; then it writes one package, a row of `lab/packages`, and the lane and repo it
+    /// names. Those alone: with the tracker's whole fixture the table would hold more records
+    /// than one repair round carries (`crate::replica::BATCH`), and a test that counts its
+    /// rounds would wait one more for the ring.
     fn tracker_rows(paths: &Paths) {
-        use crate::lab::tracker::{MEASURE, NOTE};
+        use crate::lab::tracker::{MEASURE, NOTE, tests};
         let tracker = att::Handle::at(paths.clone(), &att::TRACKER);
         tracker
             .append_log(&MEASURE, &[metric("4", NOW - 60_000)])
@@ -289,6 +293,10 @@ impl Stand {
         });
         tracker
             .append_log(&NOTE, &[note.as_object().unwrap().clone()])
+            .unwrap();
+        tracker
+            .saying(crate::said::Said::by(tests::agent()))
+            .commit_owner(|_| Ok(((), tests::packages())))
             .unwrap();
     }
 
@@ -1001,14 +1009,23 @@ fn the_face_is_the_grid_export_with_computed_columns_and_the_revision() {
     let registry = Registry::at(stand.paths().clone());
     let compiled = registry.generation();
     let view = registry.view().unwrap();
+    let tracker = att::Handle::at(stand.paths().clone(), &att::TRACKER)
+        .view()
+        .unwrap();
     for file in super::FILES {
         // A log, a file of the journal ring and a view have no grid export; the exit tests of
         // SF-08 and TK-05 read their faces.
-        let Some((_, bound)) = file.edited() else {
+        let Some((family, bound)) = file.edited() else {
             continue;
         };
+        // `lab/packages` is the tracker's; every other edited file is the registry's.
+        let (compiled, cells) = if family.name() == att::TRACKER.name() {
+            (&att::TRACKER, &tracker.cells)
+        } else {
+            (compiled, &view.cells)
+        };
         let collection = compiled.collection(bound.name).unwrap();
-        let export = grid::export(compiled.table, collection, &view.cells, &[]).unwrap();
+        let export = grid::export(compiled.table, collection, cells, &[]).unwrap();
         let face = std::fs::read_to_string(stand.root().face(&file.file(), "tsv")).unwrap();
         let (theirs, ours) = (grid_of(&export.text), grid_of(&face));
         assert_eq!(theirs.len(), ours.len(), "{}", file.name);
@@ -1216,7 +1233,8 @@ fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
             Class::Mac,
             Class::Derived,
             Class::Mac,
-            Class::Mac
+            Class::Mac,
+            Class::Owner
         ]
     );
     assert_eq!(
@@ -1225,7 +1243,7 @@ fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
             .map(|file| file.kind())
             .collect::<Vec<_>>(),
         [
-            "table", "table", "table", "table", "table", "log", "view", "log", "log"
+            "table", "table", "table", "table", "table", "log", "view", "log", "log", "table"
         ]
     );
 
@@ -1907,7 +1925,8 @@ fn refresh_runs_a_pass_and_reports_each_file() {
          ai/events: live · snapshot written\n\
          ai/limits: live · snapshot written\n\
          lab/measures: live · snapshot written\n\
-         lab/notes: live · snapshot written\n"
+         lab/notes: live · snapshot written\n\
+         lab/packages: live · snapshot written\n"
     );
     // Again with nothing changed: the forced pass projects, finds what the files say, and
     // writes nothing.
@@ -1923,7 +1942,8 @@ fn refresh_runs_a_pass_and_reports_each_file() {
          ai/events: live · nothing changed\n\
          ai/limits: live · nothing changed\n\
          lab/measures: live · nothing changed\n\
-         lab/notes: live · nothing changed\n"
+         lab/notes: live · nothing changed\n\
+         lab/packages: live · nothing changed\n"
     );
     stand.commons("[commons]\nenabled = false\n");
     let (text, code) = refresh(&["ai/links", "--json"]).unwrap();
@@ -6923,6 +6943,284 @@ fn a_logs_file_shows_a_commit_a_command_and_evidence_as_their_types_admit_them()
     assert_eq!(row.unwrap().cell("source"), SOURCE);
 }
 
+#[test]
+fn exported_tsv_import_is_bound_to_its_baseline_and_leaves_the_local_face_alone() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let paths = stand.paths();
+    let config = &stand.config;
+    op_of(
+        &wrote(
+            paths,
+            config,
+            &["add", "lab/machines", "label=m9", "status=planned"],
+        )
+        .0,
+    );
+    let root = stand.root();
+    let machines = stand.file(&super::MACHINES);
+    let m7 = stand.machine.as_str();
+    let m9 = keys::machine_pk("m9");
+    let export = verb(&root, &["export", "lab/machines"]);
+    let face = rewritten(
+        &face_of(&machines),
+        m7,
+        "note",
+        "edited only in the face",
+        &[],
+    );
+    std::fs::write(machines.face_path(), &face).unwrap();
+    let changed = rewritten(
+        &rewritten(&export, m7, "location", "rack one", &[]),
+        &m9,
+        "location",
+        "rack two",
+        &[],
+    );
+    let source = stand.lab._home.path().join("inventory.tsv");
+    let argv = [
+        "import",
+        "lab/machines",
+        source.to_str().unwrap(),
+        "--apply",
+    ];
+    let offline = write::Env {
+        json: true,
+        attempt: std::time::Duration::ZERO,
+        ..env()
+    };
+    let import = |apply: bool| {
+        let words = if apply { &argv[..] } else { &argv[..3] };
+        run_verb(paths, config, words, &offline)
+    };
+    let json_answer = |(text, code): (String, u8)| {
+        assert_eq!(code, aterm_file::exit::OK, "{text}");
+        aterm_json::from_str::<Value>(&text).expect("each response is one JSON document")
+    };
+    std::fs::write(&source, &changed).unwrap();
+    // A rebuilt replica can number a different baseline with the same revision. Its rows and
+    // headers may still parse, but its cell candidates cannot stand for the exported ones.
+    let rev = machines.status().rev();
+    let path = root.baseline(machines.name(), rev);
+    let original = std::fs::read(&path).unwrap();
+    // An installed replica may still carry a bare att/1-grid baseline when custody is
+    // held. Its published snapshot supplies the matching face's derived columns.
+    let mut baseline = super::face::Baseline::decode(&original).unwrap();
+    std::fs::write(&path, aterm_json::to_vec(&baseline.grid.to_json()).unwrap()).unwrap();
+    let legacy_export = verb(&root, &["export", "lab/machines"]);
+    std::fs::write(&source, &legacy_export).unwrap();
+    assert_eq!(json_answer(import(false).unwrap())["cells"], json!(0));
+    let (header, rows) = legacy_export.split_once('\n').unwrap();
+    let (prefix, _) = header.rsplit_once('+').unwrap();
+    let wrong_rendering = format!("{prefix}+{}\n{rows}", "0".repeat(64));
+    let (key, signature) = header.rsplit_once('.').unwrap();
+    let (_, content) = signature.split_once('+').unwrap();
+    let wrong_grid = format!("{key}.{}+{content}\n{rows}", "0".repeat(64));
+    let legacy_edit = rewritten(&legacy_export, m7, "location", "rack one", &[]);
+    let wrapped = json!({
+        "format": "aterm-file-base/1", "grid": baseline.grid.to_json(),
+        "header": &baseline.header, "cells": &baseline.cells,
+    });
+    // A deployed writer replaces the bare grid in place and leaves no archived copy.
+    // Both wrapper formats can still authenticate that grid and its independently stamped render.
+    for current in [aterm_json::to_vec(&wrapped).unwrap(), original.clone()] {
+        std::fs::write(&path, current).unwrap();
+        std::fs::write(&source, &legacy_export).unwrap();
+        assert_eq!(json_answer(import(false).unwrap())["cells"], json!(0));
+        std::fs::write(&source, &wrong_rendering).unwrap();
+        assert!(matches!(import(true), Err(write::Refusal::Problem(_))));
+        std::fs::write(&source, &wrong_grid).unwrap();
+        assert!(matches!(import(true), Err(write::Refusal::Problem(_))));
+        std::fs::write(&source, &legacy_edit).unwrap();
+        assert_eq!(json_answer(import(false).unwrap())["cells"], json!(1));
+    }
+    std::fs::write(&source, &changed).unwrap();
+    baseline
+        .cells
+        .get_mut(m7)
+        .unwrap()
+        .insert("location".into(), "another baseline".into());
+    let header = std::str::from_utf8(&original)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
+    let rows: Vec<_> = baseline
+        .grid
+        .rows
+        .iter()
+        .map(|(pk, seen)| super::face::Baseline::row_line(pk, seen, &baseline.cells[pk]))
+        .collect();
+    let other = super::face::Baseline::assemble(header, rows.iter().map(String::as_str));
+    assert!(
+        super::face::Baseline::decode(&other).is_some(),
+        "a valid competing baseline"
+    );
+    std::fs::write(&path, other).unwrap();
+    assert!(
+        matches!(import(true), Err(write::Refusal::Problem(why)) if why.contains("edit baseline"))
+    );
+    std::fs::write(&path, original).unwrap();
+    let duplicate = format!("{changed}{}\n", changed.lines().nth(1).unwrap());
+    std::fs::write(&source, duplicate).unwrap();
+    assert!(matches!(import(true), Err(write::Refusal::Problem(_))));
+    assert!(machines.outbox().queued.is_empty());
+    let recovered = rewritten(&legacy_edit, &m9, "location", "rack two", &[]);
+    std::fs::write(&source, recovered).unwrap();
+    assert_eq!(json_answer(import(false).unwrap())["rows"], json!(2));
+    assert!(machines.outbox().queued.is_empty());
+    let accepted = json_answer(import(true).unwrap());
+    assert_eq!(accepted["rows"], json!(2));
+    assert_eq!(accepted["outcomes"].as_array().unwrap().len(), 2);
+    assert_eq!(machines.outbox().queued.len(), 2);
+    assert_eq!(json_answer(import(true).unwrap())["rows"], json!(0));
+    assert_eq!(machines.outbox().queued.len(), 2);
+    assert_eq!(face_of(&machines), face);
+    publish_pass(paths, config);
+    assert_eq!(stored(paths, m7, "location"), Some(json!("rack one")));
+    assert_eq!(stored(paths, &m9, "location"), Some(json!("rack two")));
+    std::fs::write(&source, &changed).unwrap();
+    assert_eq!(json_answer(import(false).unwrap())["cells"], json!(0));
+    assert_eq!(face_of(&machines), face);
+}
+
+/// Editable TSVs made by earlier releases survive the baseline rewrite even when the next
+/// materialization has the same displayed revision. A later revision still verifies their
+/// original cells, including the rendering a bare grid never recorded.
+#[test]
+fn imports_keep_the_exact_older_baseline_and_render_after_upgrade() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let file = stand.file(&super::MACHINES);
+    let root = stand.root();
+    let rev = file.status().rev();
+    let source = stand.lab._home.path().join("earlier.tsv");
+    let path = root.baseline(file.name(), rev);
+    let stored = file.baseline(rev).unwrap();
+    let baseline = super::face::Baseline::decode(&stored).unwrap();
+    let grid = baseline.grid.to_json();
+    let wrapped = json!({
+        "format": "aterm-file-base/1",
+        "grid": &grid,
+        "header": &baseline.header,
+        "cells": &baseline.cells,
+    });
+    let text = std::str::from_utf8(&stored).unwrap();
+    let mut lines = text.lines();
+    let mut head: Value = aterm_json::from_str(lines.next().unwrap()).unwrap();
+    head.as_object_mut().unwrap().remove("whole");
+    let old_rows =
+        super::face::Baseline::assemble(&head.to_string(), lines.take(baseline.grid.rows.len()));
+    let mut exports = Vec::new();
+    for bytes in [
+        aterm_json::to_vec(&wrapped).unwrap(),
+        aterm_json::to_vec(&grid).unwrap(),
+        old_rows,
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        let old = verb(&root, &["export", "lab/machines"]);
+        exports.push(rewritten(
+            &old,
+            &stand.machine,
+            "location",
+            "at the bench",
+            &[],
+        ));
+        all(&stand, &stand.pass(true), Word::Live, None);
+        assert_eq!(file.status().rev(), rev);
+        assert_eq!(file.baseline(rev).unwrap(), stored);
+    }
+    op_of(
+        &wrote(
+            stand.paths(),
+            &stand.config,
+            &[
+                "set",
+                "lab/machines",
+                &stand.machine,
+                "note",
+                "after the export",
+            ],
+        )
+        .0,
+    );
+    assert!(file.status().rev() > rev);
+    for old in exports {
+        std::fs::write(&source, old).unwrap();
+        let (text, code) = wrote(
+            stand.paths(),
+            &stand.config,
+            &["import", "lab/machines", source.to_str().unwrap()],
+        );
+        assert_eq!(code, aterm_file::exit::OK, "{text}");
+        assert_eq!(text, "1 changed rows, 1 changed cells\n");
+    }
+    assert!(file.outbox().waiting().next().is_none());
+}
+
+/// A locally saved face from before baselines carried displayed cells can still commit
+/// after a newer numbered revision, using only the matching old grid and rendering.
+#[test]
+fn an_older_unstamped_face_commits_against_its_vouched_raw_grid() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let file = stand.file(&super::MACHINES);
+    let root = stand.root();
+    let rev = file.status().rev();
+    let baseline = super::face::Baseline::decode(&file.baseline(rev).unwrap()).unwrap();
+    let raw = aterm_json::to_vec(&baseline.grid.to_json()).unwrap();
+    std::fs::write(root.baseline(file.name(), rev), &raw).unwrap();
+    let saved = rewritten(
+        &face_of(&file),
+        &stand.machine,
+        "location",
+        "the reading room",
+        &[],
+    );
+    std::fs::write(file.face_path(), &saved).unwrap();
+
+    op_of(
+        &wrote(
+            stand.paths(),
+            &stand.config,
+            &[
+                "set",
+                "lab/machines",
+                &stand.machine,
+                "note",
+                "after saving the grid",
+            ],
+        )
+        .0,
+    );
+    assert!(file.status().rev() > rev);
+    assert_eq!(face_of(&file), saved);
+    let mut other = raw.clone();
+    other.push(b' ');
+    assert!(
+        file.snapshot_for_grid(rev, &other).is_none(),
+        "another raw grid at the same revision"
+    );
+    let render = root.baselines(file.name()).join(format!("{rev}.render"));
+    let bytes = std::fs::read(&render).unwrap();
+    std::fs::write(&render, file.published().snapshot.unwrap().encode()).unwrap();
+    assert!(
+        file.snapshot_for_grid(rev, &raw).is_none(),
+        "a later rendering cannot stand for the old one"
+    );
+    std::fs::write(&render, bytes).unwrap();
+    let (said, code) = wrote(stand.paths(), &stand.config, &["commit", "lab/machines"]);
+    assert_eq!(code, aterm_file::exit::OK, "{said}");
+    assert_eq!(
+        stored(stand.paths(), &stand.machine, "location"),
+        Some(json!("the reading room"))
+    );
+    assert_eq!(
+        stored(stand.paths(), &stand.machine, "note"),
+        Some(json!("after saving the grid"))
+    );
+}
+
 /// The tracker's packages as the publication repo held them (`testdata/publication-384b3a9f`):
 /// every column a TSV of the corpus has, its key `id` the table's own.
 const PACKAGE_COLUMNS: [crate::typed::Column; 17] = {
@@ -7074,14 +7372,16 @@ fn packages_lab(rows: Vec<Vec<crate::database::Change>>) -> (Lab, PathBuf) {
 /// How many rows one commit of [`packages_lab`] writes.
 const PACKAGE_BATCH: usize = 500;
 
-/// One pass over the packages file; `again` projects though nothing moved.
+/// One pass over the packages file; `again` projects though nothing moved. The pass is this
+/// thread's own work, which a loaded machine stretches without bound: it reads until the hang
+/// detector's guard ([`aterm_spec::wait::WORKING_GUARD`]), not a minute.
 fn packages_pass(paths: &Paths, config: &std::path::Path, again: bool) -> Outcome {
     let mut outcomes = materialize::pass_over(
         paths,
         config,
         &PACKAGES_FILES,
         &Pass {
-            read_by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            read_by: Instant::now() + aterm_spec::wait::WORKING_GUARD,
             vault_wait: materialize::VAULT_WAIT,
             again,
             now_ms: NOW,
@@ -7107,6 +7407,14 @@ fn packages_pass(paths: &Paths, config: &std::path::Path, again: bool) -> Outcom
 ///
 /// NEGATIVE CONTROL, observed: with `aterm_file::snapshot::face_columns` keeping every column,
 /// the face passes the bound and is not written: `` left: Missing right: Written ``.
+///
+/// Its loopback rounds run under the exchange's hang detector (`network::Patience::HANG`), which
+/// cuts only a round whose stream stops moving. CONTROL of that patience, observed: with the
+/// test's `network::PATIENCE` an absolute 5 s, the packages round (about 10 s alone) is cut at
+/// `table/fixture.rs:207`, `` Commons application round did not complete ``, the initiator's
+/// operation send `Broken pipe` and the responder's receive `peer closed connection without
+/// sending TLS close_notify`; with a 5 s window of no byte moved under the working guard, it
+/// passes.
 #[test]
 fn a_5000_row_packages_family_has_a_face() {
     const ROWS: usize = 5000;
@@ -7168,6 +7476,46 @@ fn a_5000_row_packages_family_has_a_face() {
     assert_eq!(baseline.grid.rows.len(), ROWS);
     assert!(!baseline.header.iter().any(|cell| cell.contains("outcome")));
     assert!(baseline.grid.rows[0].1.contains_key("outcome"));
+    drop(baseline);
+    drop(read);
+    drop(face);
+
+    // The complete export includes the widest columns. Change the first package's outcome
+    // and import the whole table through the same planner and outbox as the installed CLI.
+    let mut exported = verb(&root, &["export", PACKAGES_FILE.name]);
+    assert!(exported.len() as u64 > aterm_file::MAX_FACE_BYTES);
+    let old = &corpus[0]["outcome"];
+    let offset = exported
+        .find(old.as_str())
+        .expect("first package's outcome");
+    let updated = "the edited outcome of the first package";
+    exported.replace_range(offset..offset + old.len(), updated);
+    let source = lab._home.path().join("packages.tsv");
+    std::fs::write(&source, exported).unwrap();
+    let target = write::Target::from_file(paths, &PACKAGES_FILE).unwrap();
+    let act = seam::owner();
+    let offline = write::Env {
+        attempt: Duration::ZERO,
+        json: true,
+        ..env()
+    };
+    let (result, code) =
+        super::face::import(paths, &config, &target, &act, &offline, &source, true)
+            .unwrap()
+            .printed();
+    assert_eq!(code, aterm_file::exit::OK, "{result}");
+    let report: Value = aterm_json::from_str(&result).unwrap();
+    assert_eq!(
+        (report["rows"].as_u64(), report["cells"].as_u64()),
+        (Some(1), Some(1))
+    );
+    let outbox = file.outbox();
+    let edits = &outbox.queued[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(
+        (&*edits[0].key, &*edits[0].column, &*edits[0].text),
+        ("p00000", "outcome", updated)
+    );
 }
 
 /// A MATERIALIZER PASS AFTER ONE RECORD AT 20000 ROWS TOUCHES O(Δ) ROWS (package TK-09, design

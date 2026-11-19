@@ -2838,6 +2838,7 @@ fn a_leaf_names_its_agent_and_an_unknown_one_is_relaunched_by_nothing() {
     let codex = Snapshot {
         program: "/opt/codex/bin/codex".into(),
         run: aterm_agent::harness::relaunch::AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: "/Users//me/.codex".into(),
             home_env: None,
             self_claimed: None,
@@ -3037,6 +3038,7 @@ fn a_restored_agents_home_and_login_ride_its_leaf_into_its_relaunch_line() {
     }
     let codex = Snapshot {
         run: AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: "/Users//me/lab codex".into(),
             home_env: Some("/Users//me/lab codex/".into()),
             self_claimed: None,
@@ -3382,6 +3384,7 @@ fn the_agent_leaf_reads_both_ways_across_0_104_and_0_105() {
         session: Some(THREAD.into()),
         version: Some("0.163.0".into()),
         run: AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: "/Users//me/.codex".into(),
             home_env: Some("/Users//me/.codex".into()),
             self_claimed: None,
@@ -3895,6 +3898,7 @@ fn held_codex_resume_line_at_routes_off_recorded_limited_or_unenrolled_row() {
             cwd: "/work".into(),
             version: Some("0.1.0".into()),
             run: AgentRun::Codex(aterm_agent::harness::relaunch::CodexRun {
+                selected_default: false,
                 home: default_codex.clone(),
                 home_env: None,
                 self_claimed: Some(aterm_agent::harness::self_claimed::Resume {

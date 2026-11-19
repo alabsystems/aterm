@@ -6,9 +6,9 @@
 use aterm_models_session::turn_tracker_model;
 use aterm_slog::{
     ActWord, Actor, Admission, Binding, BoxWord, CarryAdopt, CarryBudget, Chose, Conf, Cursor,
-    Fields, Key, Kind, LastClose, Limits, Log, Lvl, Node, Op, Open, Out, Rec, STEP_ACT_MS,
-    ScreenStep, SettleCause, ShortId, Src, Stamp, TurnTracker, TxEvent, TxPos, TxState, Verdict,
-    WallJudge, WallKind, dismisses, within_lead,
+    Fields, HarnessStamp, Key, Kind, LastClose, Limits, Log, Lvl, Node, Op, Open, Out, Rec,
+    STEP_ACT_MS, ScreenStep, SettleCause, ShortId, Src, Stamp, StreamTurn, TurnOut, TurnTracker,
+    TxEvent, TxPos, TxState, Verdict, WallJudge, WallKind, dismisses, within_lead,
 };
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, with_buggy};
@@ -55,15 +55,62 @@ fn see(v: Verdict) -> &'static str {
 
 /// The model's action for observing `v` on `rig`: another box's word while
 /// a box is open replaces it (`SeeNextBox`); boxes of one word are one step.
-fn see_in(rig: &Rig, v: Verdict) -> &'static str {
+/// A wall's word that does not hold the open wall replaces it (`SeeOtherWall`):
+/// the new one hangs under the turn where one is open, where the held one
+/// stays where it stood (on the run, beside a turn the stream opened).
+pub fn see_in(rig: &Rig, v: Verdict) -> &'static str {
     match (v, rig.tracker.view(rig.now).step) {
         (Verdict::Prompt(b), Some((_, ScreenStep::Approval(a), _)))
             if !b.is_question() && a != b =>
         {
             "SeeNextBox"
         }
+        (Verdict::Wall(_) | Verdict::Walled, Some((_, w @ ScreenStep::Wall(_), _)))
+            if !w.held_by(v) =>
+        {
+            "SeeOtherWall"
+        }
         _ => see(v),
     }
+}
+
+/// The harness that claims the rig's stream (`holder=`) and the tab it writes as (`by=`).
+pub const STREAM_HOLDER: &str = "claude-code-alab@4242";
+
+/// The tab the rig's stream rows are written as (`by=<sid>`).
+pub fn stream_tab() -> Actor {
+    Actor::sid(ShortId::new("t0000000001").expect("an ID"))
+}
+
+/// A harness's `turn` record, as the rig feeds it ([`Rig::stream`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamEdge {
+    /// `started`, of the harness's turn number, opened by the `turn_by=` word.
+    Started(u64, &'static str),
+    /// `done|failed|interrupted|walled` of the harness's turn number.
+    Ended(u64, TurnOut),
+}
+
+/// What the tracker's stream source does with a `turn` record, by the rig's own reading of the
+/// stream's hold ([`Rig::stream_says`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamSays {
+    /// A `started` of the turn the stream holds open: nothing written.
+    Repeats,
+    /// A number at or below the newest the stream named, not a repeat: nothing written.
+    History,
+    /// A `started` of a newer number closes the held turn `out=superseded` and opens its own.
+    Supersedes,
+    /// A `started` takes the open turn the stream does not hold.
+    Takes,
+    /// A `started` with no turn open opens one.
+    Opens,
+    /// An end closes the open turn.
+    Closes,
+    /// An end with no turn open: nothing written.
+    NoTurn,
+    /// An end of another number than the held turn's: nothing written.
+    OtherTurn,
 }
 
 /// The model's time actions for `prev` to `next`: a `Tick` per settle
@@ -152,6 +199,14 @@ pub struct Rig {
     pub lead_sender: Option<Actor>,
     /// The ring's bounds, which an update's successor keeps.
     pub limits: Limits,
+    /// The stream's records fed so far (each record's `hseq=`).
+    pub hseq: u64,
+    /// The stream's hold, as the rig fed its records: the newest turn number they named, and
+    /// the turn they opened or took under it while it runs ([`Rig::stream_says`]).
+    pub stream_hold: Option<(u64, Option<Node>)>,
+    /// A ghost (the model's `sg`): a call other than the stream's opened a turn, or closed one
+    /// short of the program's end (`out=gone`), while the stream fed the turns.
+    pub stream_moved: bool,
     /// Its birth order and the host calls it made, while [`crate::seq_twins::record`] records (nothing otherwise).
     pub born: usize,
     pub path: Vec<Took>,
@@ -192,6 +247,9 @@ impl Rig {
             bound_sender: None,
             lead_sender: None,
             limits,
+            hseq: 0,
+            stream_hold: None,
+            stream_moved: false,
             born: seq_twins::born(),
             path: Vec::new(),
         }
@@ -252,6 +310,105 @@ impl Rig {
         next
     }
 
+    /// The harness's stream applied a `turn` record now ([`TurnTracker::stream_turn`]), stamped
+    /// with the next `hseq=`: whether it stands.
+    pub fn stream(&mut self, edge: StreamEdge) -> bool {
+        let before = self.before();
+        self.hseq += 1;
+        let stamp = HarnessStamp::new(STREAM_HOLDER, stream_tab(), Some(self.hseq))
+            .expect("the stamp's holder fits");
+        let at = self.stamp();
+        let wall = self.wall_step();
+        let record = match edge {
+            StreamEdge::Started(turn, by) => StreamTurn::Started {
+                turn,
+                by: Some(by),
+                peer: None,
+            },
+            StreamEdge::Ended(turn, out) => StreamTurn::Ended { turn, out },
+        };
+        let says = self.stream_says(edge);
+        let stood = self.tracker.stream_turn(&mut self.log, record, &stamp, at);
+        let named = self.stream_hold.map(|(n, _)| n);
+        self.stream_hold = match (edge, says) {
+            (_, StreamSays::Repeats | StreamSays::History | StreamSays::OtherTurn) => {
+                self.stream_hold
+            }
+            (StreamEdge::Started(n, _), _) => Some((n, self.tracker.turn())),
+            (StreamEdge::Ended(n, _), _) => Some((named.map_or(n, |m| m.max(n)), None)),
+        };
+        self.note_wall(wall, before.seq);
+        self.judge(before, Call::Stream);
+        stood
+    }
+
+    /// What the tracker's stream source does with `edge` now, read from the rig's own record of
+    /// the stream's hold, not the tracker's: the harness counts its turns, so a number at or
+    /// below the newest one it named is history unless it repeats the turn it holds open; an
+    /// end closes the turn it holds under that number, or an open turn it does not hold where
+    /// the number is newer than any it named.
+    pub fn stream_says(&self, edge: StreamEdge) -> StreamSays {
+        let open = self.tracker.turn().filter(|t| self.log.is_open(*t));
+        let named = self.stream_hold.map(|(n, _)| n);
+        let held = self
+            .stream_hold
+            .and_then(|(_, t)| t)
+            .filter(|t| Some(*t) == open);
+        match edge {
+            StreamEdge::Started(n, _) => {
+                if held.is_some() && named == Some(n) {
+                    StreamSays::Repeats
+                } else if named.is_some_and(|m| n <= m) {
+                    StreamSays::History
+                } else if held.is_some() {
+                    StreamSays::Supersedes
+                } else if open.is_some() {
+                    StreamSays::Takes
+                } else {
+                    StreamSays::Opens
+                }
+            }
+            StreamEdge::Ended(n, _) => match (open, held) {
+                (None, _) => StreamSays::NoTurn,
+                (Some(_), Some(_)) if named == Some(n) => StreamSays::Closes,
+                (Some(_), Some(_)) => StreamSays::OtherTurn,
+                (Some(_), None) if named.is_some_and(|m| n <= m) => StreamSays::History,
+                (Some(_), None) => StreamSays::Closes,
+            },
+        }
+    }
+
+    /// The host tells the tracker whether the stream feeds the turns now
+    /// ([`TurnTracker::set_stream_turns`]).
+    pub fn stream_feeds(&mut self, on: bool) {
+        let before = self.before();
+        let stamp = self.stamp();
+        self.tracker.set_stream_turns(on, stamp);
+        self.judge(before, Call::Stream);
+    }
+
+    /// The wall step the tracker holds.
+    fn wall_step(&self) -> Option<Node> {
+        self.tracker
+            .view(self.now)
+            .step
+            .filter(|(_, w, _)| matches!(w, ScreenStep::Wall(_)))
+            .map(|(n, ..)| n)
+    }
+
+    /// A wall the tracker held before a call that holds none after it, and that nothing retracted,
+    /// is the model's `wg`: its need went with a turn's close.
+    fn note_wall(&mut self, wall: Option<Node>, seq0: u64) {
+        let held = self.wall_step().is_some();
+        let retracted = self
+            .since(seq0)
+            .iter()
+            .any(|r| r.op == Op::Close && r.out() == Some("retracted"));
+        if wall.is_some() && !held && !retracted {
+            self.wall_gone = true;
+        }
+    }
+
     /// The host admits an input from `by` with `act` now (T1), whose key the frame showed choosing
     /// `chose` (fix E8).
     pub fn admit(&mut self, by: Actor, act: Option<ActWord>, chose: Option<Chose>) {
@@ -308,6 +465,7 @@ impl Rig {
             pd: pending_code(self),
             pl: person_lead(self),
             seq: self.log.last_seq(),
+            stream: self.tracker.stream_turns(),
         }
     }
 
@@ -328,7 +486,7 @@ impl Rig {
                     Call::See => {
                         (b.pd == 3 && by != Actor::Human) || (b.pl == 1 && by == Actor::Human)
                     }
-                    Call::Other => false,
+                    Call::Stream | Call::Other => false,
                 };
             self.bound_next |= !legit;
             if matches!(call, Call::See) && by != Actor::Human {
@@ -342,6 +500,12 @@ impl Rig {
             }
         }
         let now = self.stamp();
+        if b.stream && call != Call::Stream {
+            self.stream_moved |= self.since(b.seq).iter().any(|r| {
+                r.node.lvl == Lvl::Turn
+                    && (r.op == Op::Open || (r.op == Op::Close && r.out() != Some("gone")))
+            });
+        }
         for r in self.since(b.seq) {
             if r.op != Op::Close || !matches!(r.k, Kind::Approval | Kind::Question) {
                 continue;
@@ -398,13 +562,7 @@ impl Rig {
         }
         let before = self.before();
         self.tx_off += 120;
-        let wall = self
-            .tracker
-            .view(self.now)
-            .step
-            .filter(|(_, w, _)| matches!(w, ScreenStep::Wall(_)))
-            .map(|(n, ..)| n);
-        let seq0 = self.log.last_seq();
+        let wall = self.wall_step();
         let next = self.tracker.transcript(
             &mut self.log,
             ev,
@@ -412,20 +570,27 @@ impl Rig {
             TxState::On,
             stamp,
         );
-        let held = self
-            .tracker
-            .view(self.now)
-            .step
-            .is_some_and(|(_, w, _)| matches!(w, ScreenStep::Wall(_)));
-        let retracted = self
-            .since(seq0)
-            .iter()
-            .any(|r| r.op == Op::Close && r.out() == Some("retracted"));
-        if wall.is_some() && !held && !retracted {
-            self.wall_gone = true;
-        }
+        self.note_wall(wall, before.seq);
         self.judge(before, Call::Other);
         next
+    }
+
+    /// The transcript reads the next vendor turn's prompt (`v<n>`), its row dated `row` (rig
+    /// ms), else now.
+    pub fn tx_prompt(&mut self, row: Option<u64>) {
+        self.vturns += 1;
+        let vref = ShortId::new(&format!("v{}", self.vturns)).expect("an id");
+        self.tx(TxEvent::Prompt { vref }, WALL0 + row.unwrap_or(self.now));
+    }
+
+    /// The transcript reads the vendor turn's end now.
+    pub fn tx_end_alone(&mut self) {
+        let end = TxEvent::TurnEnd {
+            vdur_ms: 900,
+            tok_in: 40,
+            tok_out: 12,
+        };
+        self.tx(end, WALL0 + self.now);
     }
 
     /// The vendor turn of the open turn.
@@ -463,11 +628,13 @@ impl Rig {
 }
 
 /// What a rig call was, for its judge.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Call {
     See,
     Accept,
     Person,
+    /// The stream's record, or the host's word on whether the stream feeds the turns.
+    Stream,
     Other,
 }
 
@@ -478,6 +645,8 @@ struct Before {
     pd: i64,
     pl: i64,
     seq: u64,
+    /// The stream fed the turns.
+    stream: bool,
 }
 
 /// The model's `pd` (T1): 1 the input in flight was admitted under the open
@@ -612,6 +781,8 @@ pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
                 12
             } else if c.ctl {
                 11
+            } else if c.stream {
+                13
             } else {
                 code(c.cause)
             },
@@ -670,6 +841,8 @@ pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
         ("ab", i64::from(rig.bound_twice)),
         ("gn", i64::from(rig.bound_next)),
         ("ga", i64::from(rig.approved_unseen)),
+        ("sf", i64::from(rig.tracker.stream_turns())),
+        ("sg", i64::from(rig.stream_moved)),
     ]
     .into_iter()
     .collect()
@@ -738,8 +911,12 @@ fn admitted(
         (ups, downs),
         "turn records of real {actions:?} are not the model's: {appended:?}"
     );
+    // Only the stream's `started` of a new number supersedes a turn (`StreamEnd`, `StreamStart`).
+    let superseding = actions
+        .windows(2)
+        .any(|w| w == ["StreamEnd", "StreamStart"]);
     assert!(
-        !appended.iter().any(|r| r.out() == Some("superseded")),
+        superseding || !appended.iter().any(|r| r.out() == Some("superseded")),
         "the tracker superseded its own turn: {appended:?}"
     );
     if ups == 0 && downs == 0 {
@@ -766,6 +943,13 @@ pub enum Step {
     TxEnd,
     /// The wall judge refutes the screen's wall (any wall, when none is open: nothing to refute).
     TxRefute,
+    /// The transcript reads the next vendor turn's prompt, its row dated at that rig time (a
+    /// prompt read late), else now; only while the stream feeds the turns, where it opens,
+    /// closes and supersedes none.
+    TxPrompt(Option<u64>),
+    /// The transcript reads the vendor turn's end now, alone; only while the stream feeds the
+    /// turns, where it closes none.
+    TxEndAlone,
     /// [`Step::See`] with the publication's detail (a wall's reset).
     SeeWith(Verdict, ShortId),
     /// `ms` pass, then the host wakes the tracker if its deadline passed (`Rig::wait`).
@@ -786,6 +970,14 @@ pub enum Step {
     /// A person's input (`Person` when an approval/question step is open, else `PersonLeads`),
     /// and what the frame showed its key choose (fix E8).
     Person(Option<Chose>),
+    /// The harness's stream applied a `turn` record ([`Rig::stream`]): `StreamStart` (a new
+    /// number while the stream holds the open turn: `StreamEnd`, `StreamStart`), or `StreamEnd`
+    /// (`StreamOn` alone where it ends nothing: no turn open, or the stream holds it under
+    /// another number).
+    Stream(StreamEdge),
+    /// The host says whether the stream feeds the turns ([`Rig::stream_feeds`]): `StreamOn` or
+    /// `StreamOff`.
+    StreamFeeds(bool),
 }
 
 /// Drive `steps`, checking each against the model.
@@ -929,6 +1121,19 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
                 admitted(m, rig, path, &prev, &project(rig, None), before);
             }
         }
+        Step::TxPrompt(_) | Step::TxEndAlone => {
+            // Under the stream the transcript only names turns and writes their metrics: no
+            // model action.
+            assert!(
+                rig.tracker.stream_turns(),
+                "a vendor prompt or end alone is read only while the stream feeds the turns"
+            );
+            match step {
+                Step::TxPrompt(row) => rig.tx_prompt(row),
+                _ => rig.tx_end_alone(),
+            }
+            admitted(m, rig, &[], &prev, &project(rig, None), before);
+        }
         Step::TxRefute => {
             let kind = match rig.tracker.view(rig.now).step {
                 Some((_, ScreenStep::Wall(Some(k)), _)) => k,
@@ -997,13 +1202,36 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
             };
             admitted(m, rig, path, &prev, &project(rig, None), before);
         }
+        Step::Stream(edge) => {
+            // A record that writes nothing is the host's word that the stream feeds the turns.
+            let path: &[&str] = match rig.stream_says(edge) {
+                StreamSays::Supersedes => &["StreamEnd", "StreamStart"],
+                StreamSays::Repeats | StreamSays::Takes | StreamSays::Opens => &["StreamStart"],
+                StreamSays::Closes => &["StreamEnd"],
+                StreamSays::History | StreamSays::NoTurn | StreamSays::OtherTurn => &["StreamOn"],
+            };
+            assert!(rig.stream(edge), "the log refused {edge:?}");
+            admitted(m, rig, path, &prev, &project(rig, None), before);
+        }
+        Step::StreamFeeds(on) => {
+            rig.stream_feeds(on);
+            let path: &[&str] = if on { &["StreamOn"] } else { &["StreamOff"] };
+            admitted(m, rig, path, &prev, &project(rig, None), before);
+        }
         Step::Handoff(carried) => {
             let stamp = rig.stamp();
             rig.run = handoff(&mut rig.log, &mut rig.tracker, rig.limits, carried, stamp);
             rig.pending = None;
             rig.person_on = None;
+            // The stream's hold crosses with a carried tracker; a successor that starts over
+            // holds nothing.
+            if !carried {
+                rig.stream_hold = None;
+            }
             (rig.bound_sender, rig.lead_sender) = (None, None);
             rig.opened = rig.open_binding().map(|n| (n, None));
+            // The stream's word is never carried: a successor's stream feeds no turn until its
+            // first `turn` record.
             let want = if carried {
                 let mut kept = prev.clone();
                 for (k, v) in [
@@ -1016,12 +1244,14 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
                     ("pa", 0),
                     ("ba", 0),
                     ("bs", 0),
+                    ("sf", 0),
                 ] {
                     kept.insert(k, v);
                 }
                 kept
             } else {
                 rig.wall_gone = false;
+                rig.stream_moved = false;
                 (rig.bound_next, rig.bound_twice, rig.approved_unseen) = (false, false, false);
                 m.init_state()
             };
@@ -1380,7 +1610,7 @@ fn turn_tracker_conformance_rejects_tx_closes_that_take_a_wall() {
             .successors("TxCloseTakesWall", &walled)
             .contains(&taken)
     );
-    assert!(!m.check_invariant("WallNeedOutlivesTxClose", &taken));
+    assert!(!m.check_invariant("WallNeedOutlivesItsTurn", &taken));
 
     let mut rig = drive(&[
         Step::See(Verdict::Busy),

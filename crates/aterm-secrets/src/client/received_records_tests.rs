@@ -112,6 +112,7 @@ impl History {
             body: Body::Name {
                 name: format!("name-{sequence}"),
             },
+            statement: None,
         }
         .sign(&self.writer, self.incarnation)
         .unwrap()
@@ -407,6 +408,7 @@ fn decoded_receive_preserves_seat_order_and_current_store_floor() {
             entrant,
             evidence: Evidence::Phrase,
         },
+        statement: None,
     }
     .sign(&history.writer, history.incarnation)
     .unwrap();
@@ -419,6 +421,7 @@ fn decoded_receive_preserves_seat_order_and_current_store_floor() {
         body: Body::Name {
             name: "missing-parent".into(),
         },
+        statement: None,
     }
     .sign(&writer, incarnation)
     .unwrap();
@@ -431,6 +434,7 @@ fn decoded_receive_preserves_seat_order_and_current_store_floor() {
         body: Body::Name {
             name: "waiting-child".into(),
         },
+        statement: None,
     }
     .sign(&writer, incarnation)
     .unwrap();

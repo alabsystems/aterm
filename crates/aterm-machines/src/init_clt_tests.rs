@@ -3278,6 +3278,189 @@ fn an_update_the_broker_did_not_adopt_asks_no_password_by_itself() {
     }
 }
 
+/// A person's run whose one owed step is Spotlight asks the root LAN broker of this build first,
+/// and asks no password where the broker excluded every folder owed, as the home reads after its
+/// answer; it carries Spotlight into the password wherever the home still owes a folder: the
+/// broker refused it (a home it will not take), was busy twice, a pace apart, failed (a denial of
+/// its edit), took part of the folders, excluded none, is no broker of this build, or left
+/// Spotlight as it is. A busy broker is asked once more after one pace, the person told why the
+/// run waits, and a broker that then excludes every folder owed asks no password. Where no
+/// broker of this build serves, nothing is said or asked of a broker and the password is asked;
+/// where another step is owed it asks no broker, and the one password carries both; an
+/// automatic run never asks the broker. The run says why it waits before it asks, since the
+/// broker may wait out its pace first.
+/// NEGATIVE CONTROLS: an apply that does not ask the broker first asks the password where the
+/// broker would have excluded the folders; reading a refused, busy or failed answer as served
+/// asks no password for a home the broker left indexed; an ask that says nothing first leaves
+/// the person a silent wait; a busy answer not asked again asks the password the broker would
+/// have spared, and one asked again with nothing said leaves the person a silent minute; an ask
+/// with no reading of whether a broker serves tells and asks where none does.
+#[test]
+fn a_persons_run_asks_the_broker_before_the_password_for_spotlight_alone() {
+    use crate::init_spotlight::SCOPE_RECEIPT;
+    use crate::root_steps::Owed;
+    use aterm_uds::lan::ScopeAnswer;
+    let scoped = String::from_utf8(crate::init_spotlight::tests::FULL.to_vec()).unwrap();
+    let root = format!("{} --root-steps-only", argv());
+    // A home setup's password scoped, with two folders made since, read live as the production
+    // reader reads Spotlight's step, on a Mac whose broker of this build serves where `serves`
+    // says. Each ask of the broker answers the next of `answers`, the last repeating, with how
+    // many of the two folders it took; with none scripted, the fake answers unserved.
+    let applied = |owed: Vec<Owed>, answers: &[(ScopeAnswer, usize)], serves: bool| {
+        let scoped = scoped.clone();
+        let mut sys = console();
+        if serves {
+            crate::items::lan::tests::serving(&mut sys);
+        }
+        crate::init_spotlight::tests::home(&sys);
+        sys.logged_in(&alice()).on(
+            "/usr/bin/mdutil -s /System/Volumes/Data",
+            Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"),
+        );
+        sys.file(SCOPE_RECEIPT, scoped.as_bytes());
+        for made in ["/Users//alice/codex-worktree", "/Users//alice/trust"] {
+            sys.file(made, b"").stat_of(
+                made,
+                Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o755,
+                    dir: true,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+        }
+        // The account's own name rule in place, so Spotlight is the one step owed.
+        let rule = crate::root_steps::name_rule("alice").unwrap();
+        sys.file(crate::root_steps::ADMITTED_NAME_RULE, rule.as_bytes())
+            .stat_of(
+                crate::root_steps::ADMITTED_NAME_RULE,
+                Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o440,
+                    dir: false,
+                    symlink: false,
+                    len: rule.len() as u64,
+                },
+            );
+        sys.on(&root, Ran::ok(""));
+        if !answers.is_empty() {
+            let answers = Mutex::new(std::collections::VecDeque::from(answers.to_vec()));
+            sys.on_scope_home(move |sys| {
+                let mut answers = answers.lock().unwrap();
+                let (answer, excludes) = if answers.len() > 1 {
+                    answers.pop_front().unwrap()
+                } else {
+                    answers[0].clone()
+                };
+                let taken: String =
+                    ["/Users//alice/codex-worktree\n", "/Users//alice/trust\n"][..excludes].concat();
+                sys.file(SCOPE_RECEIPT, format!("{scoped}{taken}").as_bytes());
+                answer
+            });
+        }
+        let reads = move |sys: &dyn System| {
+            let mut steps = owed.clone();
+            if crate::init_spotlight::scope_owed(sys) {
+                steps.push(Owed::Spotlight);
+            }
+            steps
+        };
+        let made = item(Found::Present(CC.into())).with_owed(Box::new(reads));
+        let made = made.with_explicit_tab(true);
+        let _ = made.apply(&sys, &ctx(&[]));
+        sys
+    };
+    let brokered = |sys: &Fake| sys.calls().iter().filter(|c| *c == "scope home").count();
+    let told = |sys: &Fake, line: &str| {
+        let line = format!("tell {line}");
+        sys.calls().iter().filter(|call| **call == line).count()
+    };
+    let sys = applied(Vec::new(), &[(ScopeAnswer::Excluded(2), 2)], true);
+    assert_eq!(brokered(&sys), 1, "{:?}", sys.calls());
+    assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
+    let calls = sys.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .position(|call| *call == format!("tell {BROKER_ASKED}")),
+        calls
+            .iter()
+            .position(|call| call == "scope home")
+            .and_then(|at| at.checked_sub(1)),
+        "{calls:?}"
+    );
+    for answer in [
+        None,
+        Some((ScopeAnswer::Excluded(1), 1)),
+        Some((ScopeAnswer::Excluded(0), 0)),
+        Some((ScopeAnswer::Refused("not a folder of its own".into()), 0)),
+        Some((ScopeAnswer::Failed("TCC denied the edit".into()), 0)),
+        Some((ScopeAnswer::Unserved("no broker".into()), 0)),
+        Some((ScopeAnswer::Unchanged("the receipt is full".into()), 0)),
+    ] {
+        let sys = applied(Vec::new(), answer.as_slice(), true);
+        assert_eq!(brokered(&sys), 1, "{answer:?}: {:?}", sys.calls());
+        assert_eq!(told(&sys, BROKER_BUSY), 0, "{answer:?}");
+        assert_eq!(asked(&sys), std::slice::from_ref(&root), "{answer:?}");
+    }
+    let pace = format!("sleep {}ms", aterm_uds::lan::SCOPE_PACE.as_millis());
+    let then_served = applied(
+        Vec::new(),
+        &[(ScopeAnswer::Busy, 0), (ScopeAnswer::Excluded(2), 2)],
+        true,
+    );
+    let calls = then_served.calls();
+    assert_eq!(brokered(&then_served), 2, "{calls:?}");
+    assert!(asked(&then_served).is_empty(), "{calls:?}");
+    let busy_told = calls
+        .iter()
+        .position(|call| *call == format!("tell {BROKER_BUSY}"))
+        .expect("the person hears why the run waits");
+    let paced = calls
+        .iter()
+        .position(|call| *call == pace)
+        .expect("one pace");
+    let asks: Vec<usize> = (0..calls.len())
+        .filter(|at| calls[*at] == "scope home")
+        .collect();
+    assert!(
+        asks[0] < busy_told && busy_told < paced && paced < asks[1],
+        "{calls:?}"
+    );
+    let still_busy = applied(Vec::new(), &[(ScopeAnswer::Busy, 0)], true);
+    assert_eq!(brokered(&still_busy), 2, "{:?}", still_busy.calls());
+    assert_eq!(told(&still_busy, BROKER_BUSY), 1);
+    assert_eq!(asked(&still_busy), std::slice::from_ref(&root));
+
+    let unserved = applied(Vec::new(), &[(ScopeAnswer::Excluded(2), 2)], false);
+    assert_eq!(brokered(&unserved), 0, "{:?}", unserved.calls());
+    assert_eq!(told(&unserved, BROKER_ASKED), 0, "{:?}", unserved.calls());
+    assert_eq!(asked(&unserved), std::slice::from_ref(&root));
+
+    let both = applied(
+        vec![Owed::LanBroker],
+        &[(ScopeAnswer::Excluded(2), 2)],
+        true,
+    );
+    assert_eq!(brokered(&both), 0, "{:?}", both.calls());
+    assert_eq!(asked(&both), std::slice::from_ref(&root));
+    // A home setup's password never scoped, which the automatic run still owes Spotlight.
+    let automatic = console();
+    crate::init_spotlight::tests::home(&automatic);
+    automatic.logged_in(&alice()).on(
+        "/usr/bin/mdutil -s /System/Volumes/Data",
+        Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"),
+    );
+    automatic.on_scope_home(|_| ScopeAnswer::Excluded(2));
+    let made = item(Found::Present(CC.into())).with_owed(Box::new(|_| vec![Owed::Spotlight]));
+    assert_eq!(made.owed_now(&automatic), [Owed::Spotlight]);
+    let _ = made.apply(&automatic, &ctx(&[]));
+    assert_eq!(brokered(&automatic), 0, "{:?}", automatic.calls());
+}
+
 /// Why a no-verdict must stall in a boot (`aterm_types::macos_setup::refused`): in the Mac Setup
 /// tab, a root half that exits 0 having left developer mode off leaves the step owed after the
 /// tab's one password, which is the tab's unfinished end, so the account's ask never reads

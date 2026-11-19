@@ -1286,11 +1286,23 @@ fn a_run_takes_one_lane_and_only_the_options_that_lane_reads() {
         "--restart-only",
         "--window-only",
         "--capacity-only",
+        "--withheld-source-only",
+        "--withheld-source-tui-only",
     ] {
         assert_eq!(usage(&[lane, "--upgrade-package", "b"]), 2, "{lane}");
     }
     assert_eq!(usage(&["--capacity-only", "--aterm", "/a"]), 2);
     assert_eq!(usage(&["--capacity-only", "--expect-rollout", "bound"]), 2);
+    assert_eq!(usage(&["--withheld-source-only", "--aterm", "/a"]), 2);
+    assert!(run(&["--withheld-source-tui-only", "--aterm", "/a"]).is_ok());
+    assert_eq!(
+        usage(&["--withheld-source-tui-only", "--expect-rollout", "bound"]),
+        2
+    );
+    assert_eq!(
+        usage(&["--withheld-source-only", "--expect-rollout", "bound"]),
+        2
+    );
     let alone = run(&["--capacity-only", "--package", "/p", "--keep"]).expect("its package");
     assert_eq!(
         alone,
@@ -1646,6 +1658,35 @@ fn repo_remote(fixture: &RepoFixture) -> String {
 }
 
 #[test]
+fn repository_actions_require_the_reported_file_or_unpublished_commit() {
+    for (facts, action) in [
+        ("1 untracked (notes.txt)", Some(RepoAction::Commit)),
+        (
+            "1 unpushed commit, 1 commit not on origin/main",
+            Some(RepoAction::Push),
+        ),
+        (
+            "1 unpushed commit, 1 commit not on cached origin/main",
+            Some(RepoAction::Push),
+        ),
+        ("1 untracked (old-notes.txt)", None),
+        ("2 untracked (notes.txt, draft)", None),
+        ("1 unpushed commit, 1 commit not on cached origin/wip", None),
+        ("1 commit not on origin/main", None),
+    ] {
+        let nudge = format!("A native finding (/fixture: {facts}): land the work.");
+        assert_eq!(
+            RepoAction::Commit.reported_by(&nudge),
+            action == Some(RepoAction::Commit)
+        );
+        assert_eq!(
+            RepoAction::Push.reported_by(&nudge),
+            action == Some(RepoAction::Push)
+        );
+    }
+}
+
+#[test]
 fn repository_responses_follow_real_mutations_before_the_sequential_judge_reads_them() {
     let (_scratch, fixture) = repo_fixture();
     let initial = repo_head(&fixture);
@@ -1686,7 +1727,7 @@ fn repository_responses_follow_real_mutations_before_the_sequential_judge_reads_
         "the answer cannot claim a push until it actually landed locally"
     );
     let receipt = fixture.receipt(RepoAction::Push).unwrap().unwrap();
-    assert!(receipt.request.contains("not on cached origin/main"));
+    assert!(RepoAction::Push.reported_by(&receipt.request));
     let change = receipt.result.unwrap();
     assert_eq!(
         (

@@ -139,9 +139,9 @@ fn a_link_names_another_familys_row_and_a_machine_by_its_uuid() {
 }
 
 /// A principal names its session, its program or what an imported record said; its machine is
-/// a label or machine uuid, its account a key, and no member it does not name rides along (the
-/// name `mac`, which the member had before any record held one, is such a member). Its value
-/// reads back as itself.
+/// its machine uuid, never a label (design §4.6), its account a key, and no member it does not
+/// name rides along (the name `mac`, which the member had before any record held one, is such a
+/// member). Its value reads back as itself.
 /// NEGATIVE CONTROL: with `principal` not asking for a session, program or `said`, `` only a
 /// model is no principal `` fails.
 #[test]
@@ -149,7 +149,7 @@ fn a_principal_names_who_acted_and_reads_back_as_itself() {
     let agent = Principal {
         session: Some("s-47051b9a207955a92b14".into()),
         program: Some("claude".into()),
-        machine: Some("m72".into()),
+        machine: Some("0123456789abcdef0123456789abcdef".into()),
         account: Some("ac-0011223344556677".into()),
         model: Some("claude-opus-5-5".into()),
         harness: Some("land".into()),
@@ -170,6 +170,10 @@ fn a_principal_names_who_acted_and_reads_back_as_itself() {
         (
             json!({"session": "15", "machine": "m72 desk"}),
             "a machine in words",
+        ),
+        (
+            json!({"session": "15", "machine": "m72"}),
+            "a machine's label",
         ),
         (
             json!({"session": "15", "mac": "m72"}),

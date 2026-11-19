@@ -28,8 +28,6 @@ const fn cfg(dark: bool) -> Config {
         dark_theme: dark,
         intensity: 1.0,
         duration: Duration::from_millis(900),
-        ribbon_tall: true,
-        ribbon_flat: false,
         theme_fg: if dark { 0x00FF_FFFF } else { 0x0016_161C },
         theme_bg: if dark { 0x0000_0000 } else { 0x00FF_FFFF },
         reduced_motion: false,
@@ -440,8 +438,6 @@ fn the_stroke_band_is_one_set_of_pixels_for_the_probe_the_zones_and_the_headroom
     let t0 = Instant::now();
     let ribbon = Ribbon::new();
     let tall = cfg(true);
-    let mut under = cfg(true);
-    under.ribbon_tall = false;
     for ch in 6usize..=48 {
         let cw = (ch / 2).max(3);
         let g = geom_cell(cw, ch);
@@ -477,28 +473,26 @@ fn the_stroke_band_is_one_set_of_pixels_for_the_probe_the_zones_and_the_headroom
                 );
             }
         }
-        // Both anchors' skies are in the row above's foot (`sky_birth_px`).
-        for (c, row, side) in [(&tall, 4, "tall"), (&under, 4, "underline")] {
-            let cx = ctx_in(g, t0, c, (5, 30));
-            let mut births = 0usize;
-            for seed in 0..256u32 {
-                let Some((bx, by)) = sky.sky_birth_px((5, 30), mix32(seed), &cx, &ribbon) else {
-                    continue;
-                };
-                births += 1;
-                let off = by as i32 - row_top(row);
-                assert!(
-                    (0..ch as i32).contains(&off) && !band.contains(&off),
-                    "ch {ch} {side}: a birth at pixel {off} of row {row}, in the band {band:?}"
-                );
-                assert_eq!(
-                    sky.probe().at_px(bx as i32, by as i32, g),
-                    Some(false),
-                    "ch {ch} {side}: a birth at ({bx}, {by}) is on ink by the probe"
-                );
-            }
-            assert!(births > 0, "ch {ch} {side}: no birth under a rule row");
+        // The sky is in the row above's foot (`sky_birth_px`).
+        let cx = ctx_in(g, t0, &tall, (5, 30));
+        let mut births = 0usize;
+        for seed in 0..256u32 {
+            let Some((bx, by)) = sky.sky_birth_px((5, 30), mix32(seed), &cx, &ribbon) else {
+                continue;
+            };
+            births += 1;
+            let off = by as i32 - row_top(4);
+            assert!(
+                (0..ch as i32).contains(&off) && !band.contains(&off),
+                "ch {ch}: a birth at pixel {off} of row 4, in the band {band:?}"
+            );
+            assert_eq!(
+                sky.probe().at_px(bx as i32, by as i32, g),
+                Some(false),
+                "ch {ch}: a birth at ({bx}, {by}) is on ink by the probe"
+            );
         }
+        assert!(births > 0, "ch {ch}: no birth under a rule row");
         for off in 0..ch as i32 {
             let y = (row_top(4) + off) as f32;
             let room = sky.rule_headroom_px(30..=30, y, g);
@@ -835,41 +829,23 @@ fn strike_trace(c: &Config, t0: Instant, after_sow: impl FnOnce(&mut GlyphProbe)
 #[test]
 fn a_sky_star_keeps_its_centre_when_the_probe_forgets_its_row() {
     let t0 = Instant::now();
-    let tall = cfg(true);
-    let mut underline = cfg(true);
-    underline.ribbon_tall = false;
-    type Case<'a> = (&'a str, &'a Config, fn(&mut GlyphProbe));
-    let cases: [Case<'_>; 2] = [
-        ("its row forgotten", &tall, |probe| {
-            for row in 20..=22 {
-                probe.probe_row(row, &[false; 120]);
-            }
-            assert!(
-                probe.at_px(200, 100, geom()).is_none(),
-                "the fixture did not forget the star's row"
-            );
-        }),
-        ("its own cell inked under underline", &underline, |probe| {
-            let mut row = [false; 120];
-            row[px_col(200.0, geom()) as usize] = true;
-            probe.probe_row(3, &row);
-            assert_eq!(
-                probe.at_px(200, 100, geom()),
-                Some(true),
-                "the fixture did not ink the star's own cell"
-            );
-        }),
-    ];
-    for (label, c, change) in cases {
-        let before = strike_trace(c, t0, |_| {});
-        let after = strike_trace(c, t0, change);
-        let peak = before.iter().copied().max().unwrap_or(0);
-        assert!(peak > 0, "{label}: the strike m1 never drew");
-        assert_eq!(
-            before, after,
-            "{label}: a sky star's trace changed when the probe changed under it"
+    let c = cfg(true);
+    let before = strike_trace(&c, t0, |_| {});
+    let after = strike_trace(&c, t0, |probe| {
+        for row in 20..=22 {
+            probe.probe_row(row, &[false; 120]);
+        }
+        assert!(
+            probe.at_px(200, 100, geom()).is_none(),
+            "the fixture did not forget the star's row"
         );
-    }
+    });
+    let peak = before.iter().copied().max().unwrap_or(0);
+    assert!(peak > 0, "the strike m1 never drew");
+    assert_eq!(
+        before, after,
+        "a sky star's trace changed when the probe forgot its row"
+    );
 }
 
 #[test]
@@ -1980,63 +1956,60 @@ fn band_moves_follow_the_earning_glyph_at_sky_and_footer_edges() {
     let now = Instant::now();
     let ribbon = Ribbon::new();
     let mut caught_pixel_only = 0;
-    for tall in [false, true] {
-        let mut config = cfg(true);
-        config.ribbon_tall = tall;
-        for top in [0u16, 4] {
-            let bottom = top + 6;
-            for home in [top, top + 1, bottom, bottom + 1] {
-                for delta in [-1i16, 1] {
-                    let mut sky = Stardust::new();
-                    if let Some(above) = home.checked_sub(1) {
-                        sky.probe_mut().probe_row(i32::from(above), &[false; 120]);
+    let config = cfg(true);
+    for top in [0u16, 4] {
+        let bottom = top + 6;
+        for home in [top, top + 1, bottom, bottom + 1] {
+            for delta in [-1i16, 1] {
+                let mut sky = Stardust::new();
+                if let Some(above) = home.checked_sub(1) {
+                    sky.probe_mut().probe_row(i32::from(above), &[false; 120]);
+                }
+                sky.probe_mut().probe_row(i32::from(home), &[false; 120]);
+                let context = ctx(now, &config, (home, 10));
+                assert!(sky.deal_star(
+                    Deal {
+                        class: StarClass::M2,
+                        lane: StarLane::Field,
+                        cell: (home, 10),
+                        earned: false,
+                        pull: None,
+                        tint: None,
+                    },
+                    now,
+                    &context,
+                    &ribbon
+                ));
+                let before = *sky.live_iter().next().unwrap();
+                assert_eq!(before.home_row, Some(home));
+                let moved = i32::from(home) + i32::from(delta);
+                let expected = if home > bottom {
+                    Some(home)
+                } else if moved < i32::from(top) || moved > i32::from(bottom) {
+                    None
+                } else {
+                    Some(moved as u16)
+                };
+                sky.translate_band(top, bottom, delta, geom().ch as u16, geom().origin_y);
+                if let Some(row) = expected {
+                    let after = sky.live_iter().next().unwrap();
+                    assert_eq!(after.home_row, Some(row));
+                    let wanted_y =
+                        before.y + (i32::from(row) - i32::from(home)) as f32 * geom().ch as f32;
+                    assert_eq!(after.y, wanted_y);
+                    assert_eq!(
+                        (after.born, after.lit, after.seed),
+                        (before.born, before.lit, before.seed)
+                    );
+                    let mut wrong_y = before.y;
+                    let retained =
+                        BandPx::new(top, bottom, delta, geom().ch as u16, geom().origin_y)
+                            .point(&mut wrong_y);
+                    if !retained || wrong_y != wanted_y {
+                        caught_pixel_only += 1;
                     }
-                    sky.probe_mut().probe_row(i32::from(home), &[false; 120]);
-                    let context = ctx(now, &config, (home, 10));
-                    assert!(sky.deal_star(
-                        Deal {
-                            class: StarClass::M2,
-                            lane: StarLane::Field,
-                            cell: (home, 10),
-                            earned: false,
-                            pull: None,
-                            tint: None,
-                        },
-                        now,
-                        &context,
-                        &ribbon
-                    ));
-                    let before = *sky.live_iter().next().unwrap();
-                    assert_eq!(before.home_row, Some(home));
-                    let moved = i32::from(home) + i32::from(delta);
-                    let expected = if home > bottom {
-                        Some(home)
-                    } else if moved < i32::from(top) || moved > i32::from(bottom) {
-                        None
-                    } else {
-                        Some(moved as u16)
-                    };
-                    sky.translate_band(top, bottom, delta, geom().ch as u16, geom().origin_y);
-                    if let Some(row) = expected {
-                        let after = sky.live_iter().next().unwrap();
-                        assert_eq!(after.home_row, Some(row));
-                        let wanted_y =
-                            before.y + (i32::from(row) - i32::from(home)) as f32 * geom().ch as f32;
-                        assert_eq!(after.y, wanted_y);
-                        assert_eq!(
-                            (after.born, after.lit, after.seed),
-                            (before.born, before.lit, before.seed)
-                        );
-                        let mut wrong_y = before.y;
-                        let retained =
-                            BandPx::new(top, bottom, delta, geom().ch as u16, geom().origin_y)
-                                .point(&mut wrong_y);
-                        if !retained || wrong_y != wanted_y {
-                            caught_pixel_only += 1;
-                        }
-                    } else {
-                        assert_eq!(sky.live(), 0, "a star outlived its ejected glyph row");
-                    }
+                } else {
+                    assert_eq!(sky.live(), 0, "a star outlived its ejected glyph row");
                 }
             }
         }
@@ -2797,164 +2770,161 @@ fn one_sky_star_per_cell_and_no_pile_outshines_the_caret() {
 }
 
 #[test]
-fn no_mark_crosses_ink_or_the_pane_edge_at_any_instant_under_either_band_anchor() {
-    for tall in [true, false] {
-        let mut c = cfg(true);
-        c.ribbon_tall = tall;
-        let t0 = Instant::now();
-        let g = geom_cell(15, 28);
-        let cw = g.cw as f32;
-        let ribbon = Ribbon::new();
-        let priced = stream_travel_px(stream_px_per_s_with_share(
-            EXHAUST_SHARE_CW,
-            cw,
-            1000.0 / 12.0,
-        )) * stream_unit(EXHAUST_THROW_MS);
-        let sky_travel = stream_travel_px(stream_px_per_s(cw, 1000.0 / 12.0));
-        let sweep = |sky: &Stardust, s: &Star, at: Instant, min_col: i32| -> f32 {
-            let (x0, _) = s.pos(at, false);
-            let mut x_end = x0;
-            for step in 0..=250u64 {
-                let now = at + Duration::from_millis(step * 2);
-                if s.dead(now) {
-                    break;
-                }
-                let (x, y) = s.pos(now, false);
-                x_end = x;
-                assert_eq!(
-                    sky.probe().at_px(x, y, g),
-                    Some(false),
-                    "tall {tall}: a {:?} mark stood on ink or the unknown at ({x}, {y}), \
-                     +{} ms",
-                    s.lane,
-                    step * 2
-                );
-                assert!(
-                    px_col(x as f32, g) >= min_col,
-                    "tall {tall}: a {:?} mark stood over column {} at +{} ms — the floor \
-                     is column {min_col}",
-                    s.lane,
-                    px_col(x as f32, g),
-                    step * 2
-                );
-                assert!(
-                    x >= g.fx_left(),
-                    "tall {tall}: a {:?} mark stood at x {x}, left of the effects box's {} \
-                     px edge, +{} ms",
-                    s.lane,
-                    g.fx_left(),
-                    step * 2
-                );
-                if s.lane == StarLane::Exhaust {
-                    assert!(
-                        in_sky_of_row(y as f32, 5, g),
-                        "tall {tall}: a grain left the caret row's sky at y {y}, +{} ms",
-                        step * 2
-                    );
-                }
+fn no_mark_crosses_ink_or_the_pane_edge_at_any_instant() {
+    let c = cfg(true);
+    let t0 = Instant::now();
+    let g = geom_cell(15, 28);
+    let cw = g.cw as f32;
+    let ribbon = Ribbon::new();
+    let priced = stream_travel_px(stream_px_per_s_with_share(
+        EXHAUST_SHARE_CW,
+        cw,
+        1000.0 / 12.0,
+    )) * stream_unit(EXHAUST_THROW_MS);
+    let sky_travel = stream_travel_px(stream_px_per_s(cw, 1000.0 / 12.0));
+    let sweep = |sky: &Stardust, s: &Star, at: Instant, min_col: i32| -> f32 {
+        let (x0, _) = s.pos(at, false);
+        let mut x_end = x0;
+        for step in 0..=250u64 {
+            let now = at + Duration::from_millis(step * 2);
+            if s.dead(now) {
+                break;
             }
-            (x0 - x_end) as f32
-        };
-        let mut sky = Stardust::new();
-        let mut occupied = [false; 120];
-        let (mut marks, mut grains, mut clamped, mut sky_clamped) = (0usize, 0, 0, 0);
-        let mut lanes: Vec<StarLane> = Vec::new();
-        let mut widest = 0.0f32;
-        for k in 0..20u16 {
-            let col = 40 + k;
-            for slot in occupied.iter_mut().take(usize::from(col) - 1) {
-                *slot = true;
-            }
-            sky.probe_mut().probe_row(4, &[false; 120]);
-            sky.probe_mut().probe_row(band_row(&c), &occupied);
-            let at = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
-            let mut cx = ctx_in(g, at, &c, (5, col));
-            cx.disp = 0.9;
-            cx.birth_disp = 0.9;
-            sky.budget.refill(at);
-            sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
-            let floor = (g.fx_left() + (i32::from(col) - 1) * g.cw as i32) as f32;
-            for s in sky.live_iter().filter(|s| s.born == at) {
-                marks += 1;
-                if !lanes.contains(&s.lane) {
-                    lanes.push(s.lane);
-                }
-                let drift = sweep(&sky, s, at, i32::from(col) - 1);
-                widest = widest.max(drift);
-                let (x0, _) = s.pos(at, false);
-                if s.lane == StarLane::Exhaust {
-                    grains += 1;
-                    let travel = (x0 - s.rest().0) as f32;
-                    assert!(
-                        travel > 0.0,
-                        "tall {tall}: a grain over an inked row did not move at all"
-                    );
-                    clamped += usize::from(travel < priced - 1.0);
-                } else if x0 as f32 - sky_travel < floor {
-                    sky_clamped += 1;
-                }
+            let (x, y) = s.pos(now, false);
+            x_end = x;
+            assert_eq!(
+                sky.probe().at_px(x, y, g),
+                Some(false),
+                "a {:?} mark stood on ink or the unknown at ({x}, {y}), \
+                 +{} ms",
+                s.lane,
+                step * 2
+            );
+            assert!(
+                px_col(x as f32, g) >= min_col,
+                "a {:?} mark stood over column {} at +{} ms — the floor \
+                 is column {min_col}",
+                s.lane,
+                px_col(x as f32, g),
+                step * 2
+            );
+            assert!(
+                x >= g.fx_left(),
+                "a {:?} mark stood at x {x}, left of the effects box's {} \
+                 px edge, +{} ms",
+                s.lane,
+                g.fx_left(),
+                step * 2
+            );
+            if s.lane == StarLane::Exhaust {
+                assert!(
+                    in_sky_of_row(y as f32, 5, g),
+                    "a grain left the caret row's sky at y {y}, +{} ms",
+                    step * 2
+                );
             }
         }
-        assert!(
-            marks >= 20 && lanes.len() >= 2,
-            "tall {tall}: the fixture carried {marks} marks of {} lanes — too thin to be a \
-             census of the sky",
-            lanes.len()
-        );
-        assert!(
-            widest >= cw,
-            "tall {tall}: the widest drift over the whole run was {widest:.1} px — under a \
-             cell, so the sweep is not reading a moving sky at all"
-        );
-        assert!(
-            grains >= 15,
-            "tall {tall}: the inked fixture threw {grains} grains over twenty keys — the \
-             clamp is dropping them, not shortening them"
-        );
-        assert_eq!(
-            clamped, grains,
-            "tall {tall}: only {clamped} of {grains} grains were clamped short of the \
-             priced {priced:.1} px: the frontier is not what is stopping them"
-        );
-        assert!(
-            sky_clamped > 0,
-            "tall {tall}: no sky star was born within its travel of the ink — the sky's \
-             clamp was not exercised"
-        );
-        let mut sky = Stardust::new();
+        (x0 - x_end) as f32
+    };
+    let mut sky = Stardust::new();
+    let mut occupied = [false; 120];
+    let (mut marks, mut grains, mut clamped, mut sky_clamped) = (0usize, 0, 0, 0);
+    let mut lanes: Vec<StarLane> = Vec::new();
+    let mut widest = 0.0f32;
+    for k in 0..20u16 {
+        let col = 40 + k;
+        for slot in occupied.iter_mut().take(usize::from(col) - 1) {
+            *slot = true;
+        }
         sky.probe_mut().probe_row(4, &[false; 120]);
-        sky.probe_mut().probe_row(5, &[false; 120]);
-        let (mut edge_grains, mut edge_sky) = (0usize, 0usize);
-        for k in 0..8u16 {
-            let at = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
-            let mut cx = ctx_in(g, at, &c, (5, k));
-            cx.disp = 0.9;
-            cx.birth_disp = 0.9;
-            sky.budget.refill(at);
-            sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
-            for s in sky.live_iter().filter(|s| s.born == at) {
-                sweep(&sky, s, at, 0);
-                let (x0, _) = s.pos(at, false);
-                let travel = if s.lane == StarLane::Exhaust {
-                    priced
+        sky.probe_mut().probe_row(band_row(&c), &occupied);
+        let at = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
+        let mut cx = ctx_in(g, at, &c, (5, col));
+        cx.disp = 0.9;
+        cx.birth_disp = 0.9;
+        sky.budget.refill(at);
+        sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+        let floor = (g.fx_left() + (i32::from(col) - 1) * g.cw as i32) as f32;
+        for s in sky.live_iter().filter(|s| s.born == at) {
+            marks += 1;
+            if !lanes.contains(&s.lane) {
+                lanes.push(s.lane);
+            }
+            let drift = sweep(&sky, s, at, i32::from(col) - 1);
+            widest = widest.max(drift);
+            let (x0, _) = s.pos(at, false);
+            if s.lane == StarLane::Exhaust {
+                grains += 1;
+                let travel = (x0 - s.rest().0) as f32;
+                assert!(
+                    travel > 0.0,
+                    "a grain over an inked row did not move at all"
+                );
+                clamped += usize::from(travel < priced - 1.0);
+            } else if x0 as f32 - sky_travel < floor {
+                sky_clamped += 1;
+            }
+        }
+    }
+    assert!(
+        marks >= 20 && lanes.len() >= 2,
+        "the fixture carried {marks} marks of {} lanes — too thin to be a \
+         census of the sky",
+        lanes.len()
+    );
+    assert!(
+        widest >= cw,
+        "the widest drift over the whole run was {widest:.1} px — under a \
+         cell, so the sweep is not reading a moving sky at all"
+    );
+    assert!(
+        grains >= 15,
+        "the inked fixture threw {grains} grains over twenty keys — the \
+         clamp is dropping them, not shortening them"
+    );
+    assert_eq!(
+        clamped, grains,
+        "only {clamped} of {grains} grains were clamped short of the \
+         priced {priced:.1} px: the frontier is not what is stopping them"
+    );
+    assert!(
+        sky_clamped > 0,
+        "no sky star was born within its travel of the ink — the sky's \
+         clamp was not exercised"
+    );
+    let mut sky = Stardust::new();
+    sky.probe_mut().probe_row(4, &[false; 120]);
+    sky.probe_mut().probe_row(5, &[false; 120]);
+    let (mut edge_grains, mut edge_sky) = (0usize, 0usize);
+    for k in 0..8u16 {
+        let at = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
+        let mut cx = ctx_in(g, at, &c, (5, k));
+        cx.disp = 0.9;
+        cx.birth_disp = 0.9;
+        sky.budget.refill(at);
+        sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+        for s in sky.live_iter().filter(|s| s.born == at) {
+            sweep(&sky, s, at, 0);
+            let (x0, _) = s.pos(at, false);
+            let travel = if s.lane == StarLane::Exhaust {
+                priced
+            } else {
+                sky_travel
+            };
+            if (x0 as f32 - travel) < g.fx_left() as f32 {
+                if s.lane == StarLane::Exhaust {
+                    edge_grains += 1;
                 } else {
-                    sky_travel
-                };
-                if (x0 as f32 - travel) < g.fx_left() as f32 {
-                    if s.lane == StarLane::Exhaust {
-                        edge_grains += 1;
-                    } else {
-                        edge_sky += 1;
-                    }
+                    edge_sky += 1;
                 }
             }
         }
-        assert!(
-            edge_grains > 0 && edge_sky > 0,
-            "tall {tall}: {edge_grains} grains and {edge_sky} sky stars were born within \
-             their travel of the pane's edge — the edge clamp was not exercised"
-        );
     }
+    assert!(
+        edge_grains > 0 && edge_sky > 0,
+        "{edge_grains} grains and {edge_sky} sky stars were born within \
+         their travel of the pane's edge — the edge clamp was not exercised"
+    );
 }
 
 #[test]
@@ -3702,47 +3672,17 @@ fn the_exhaust_needs_a_blank_cell_behind_the_caret() {
         grains, 15,
         "tall under a blank row threw {grains} grains, not one per key from the second"
     );
-    // The underline's sky is the row above's foot, as tall's is
-    // (`sky_birth_px`), so its grains are tall's.
-    let mut under = cfg(true);
-    under.ribbon_tall = false;
-    let (grains, _) = run(&under, &|sky, col| {
-        sky.probe_mut().probe_row(4, &[false; 120]);
-        text_to(sky, col, 0);
-    });
-    assert_eq!(
-        grains, 15,
-        "underline under a blank row threw {grains} grains, not one per key from the second"
-    );
-    let (grains, brisk) = run(&under, &|sky, col| {
-        let mut above = [true; 120];
-        above[usize::from(col)] = false;
-        sky.probe_mut().probe_row(4, &above);
-        text_to(sky, col, 0);
-    });
-    assert_eq!(
-        grains, 0,
-        "underline with the row above inked but for the caret's own column threw {grains} \
-         grains"
-    );
-    assert!(
-        !brisk,
-        "underline with the row above inked owed a frame-cadence wake {edge_in_ms} ms after \
-         the key"
-    );
     let glyph_under_caret = |sky: &mut Stardust, col: u16| {
         let mut cells = [true; 120];
         cells[usize::from(col) - 1] = false;
         sky.probe_mut().probe_row(4, &[false; 120]);
         sky.probe_mut().probe_row(5, &cells);
     };
-    for (c, side) in [(&under, "underline"), (&tall, "tall")] {
-        assert_eq!(
-            run(c, &glyph_under_caret).0,
-            15,
-            "{side} over a blank row threw no grain past a caret over a glyph"
-        );
-    }
+    assert_eq!(
+        run(&tall, &glyph_under_caret).0,
+        15,
+        "tall over a blank row threw no grain past a caret over a glyph"
+    );
 }
 
 #[test]
@@ -4078,7 +4018,7 @@ fn the_blank_frontiers_early_stop_is_the_whole_walks_answer() {
                 } else {
                     0.0
                 };
-                let by = default_band_top(g, &c, 5) - 0.2 * g.ch as f32;
+                let by = default_band_top(g, 5) - 0.2 * g.ch as f32;
                 let got = sky.blank_frontier_px(x, (by, by), want, &cx);
                 assert!(
                     (got - reference).abs() < 1e-4,

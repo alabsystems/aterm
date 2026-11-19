@@ -1150,7 +1150,7 @@ fn a_due_wake_goes_before_the_stuck_fact_at_a_break() {
 }
 
 /// A peer's minted sid, as the host's overlap names it.
-const PEER: &str = "s-0a1b2c3d4e5f60718293";
+const PEER: &str = "t5f60718293";
 
 /// The overlap sentence of one file shared with [`PEER`].
 fn overlap_told() -> String {

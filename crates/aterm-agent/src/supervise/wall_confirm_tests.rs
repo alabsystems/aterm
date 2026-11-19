@@ -1382,8 +1382,11 @@ fn a_tail_names_the_model_chosen_since_a_notice() {
 /// 2026-11-13), and the same process served turns on the same login 90 minutes later. It names
 /// the retried API error with its status, confirms no login wall the screen may read, and stands
 /// no login wall in the transcript's login scan; read by its status alone it is no lost login
-/// either. CONTROL: `Not logged in` (2.1.294) and a 401 refusal (2.1.294's invalid key) stay the
-/// lost login, and so does a 403 with no page of Cloudflare's typed `authentication_failed`.
+/// either. A 403 with no page of Cloudflare's typed `authentication_failed` is the login wall
+/// Claude Code draws, yet one named by its status alone stands no login wall in the scan: it
+/// names no credential, so it is a blocked path (plan package UB-05).
+/// CONTROL: `Not logged in` (2.1.294) and a 401 refusal (2.1.294's invalid key) stay the lost
+/// login, and so does a 403 whose words name the token revoked.
 #[test]
 fn cloudflares_block_page_is_an_api_wall_and_a_401_still_the_lost_login() {
     use crate::harness::upgrade::transcript_login_wall;
@@ -1427,9 +1430,23 @@ fn cloudflares_block_page_is_an_api_wall_and_a_401_still_the_lost_login() {
     assert_eq!(
         transcript_wall(&end),
         Some(WallKind::Auth),
-        "CONTROL: a 403 with no page of Cloudflare's"
+        "a 403 with no page of Cloudflare's"
     );
-    assert!(transcript_login_wall(&forbidden), "CONTROL: its login wall");
+    assert!(
+        !transcript_login_wall(&forbidden),
+        "a 403 named by its status alone stands no login wall"
+    );
+    let revoked = edge.replace(
+        "Please run /login · API Error: 403 Attention Required! | Cloudflare",
+        "Please run /login · API Error: 403 OAuth token has been revoked.",
+    );
+    let end = transcript_ends_on(&revoked);
+    assert_eq!(
+        transcript_wall(&end),
+        Some(WallKind::Auth),
+        "CONTROL: a 403 that names the token revoked"
+    );
+    assert!(transcript_login_wall(&revoked), "CONTROL: its login wall");
 }
 
 /// THE API LAST ANSWERED A PROCESS WITH THE MODEL'S OWN REPLY: read where no point reads its login

@@ -5,7 +5,6 @@
 //! why` read. RD is `docs/DESIGN-resource-details-2026-10-20.md`, SA
 //! `docs/DESIGN-system-awareness-2026-10-16.md`.
 
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::model::{Membership, Sample, Snapshot};
@@ -30,64 +29,48 @@ pub use episodes::{DeckCause, OpenCause, deck_cause};
 pub use reap::{HistoricalReported, ReapLedger, ReapTotals, Scope};
 pub use split::{CoalBase, SplitIn, WINDOW_MAX_NS, split};
 
-/// A map keyed by the kernel's integer ids (pids, coalition ids, a pid and
-/// its birth), hashed by [`IdHasher`].
-pub type IdMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<IdHasher>>;
+/// A map keyed by the kernel's integer ids (pids, coalition ids, a pid and its birth), hashed
+/// by the workspace's FxHash ([`IdHash`], [`aterm_hash::FxHasher`]): one multiply a word, where
+/// std's SipHash runs its rounds over each key. A reading hashes ids tens of thousands of times:
+/// the model's absorb some thirty times per swept process, and the split once or more per
+/// coalition. The kernel assigns the ids: a process can steer the one it gets only by forking
+/// until the kernel hands it out, and a sweep's ids made to collide need as many live
+/// processes, which the process table bounds. A map keyed by what a process chooses (its name)
+/// keeps std's keyed hash.
+pub type IdMap<K, V> = std::collections::HashMap<K, V, IdHash>;
 
-/// A set of the kernel's integer ids, hashed by [`IdHasher`].
-pub type IdSet<K> = std::collections::HashSet<K, BuildHasherDefault<IdHasher>>;
+/// A set of the kernel's integer ids, hashed as [`IdMap`] is.
+pub type IdSet<K> = std::collections::HashSet<K, IdHash>;
 
-/// The split's hasher for integer ids (FxHash's multiply-rotate, rustc's): a split tick hashes ids
-/// some ten thousand times (700 processes, 650 coalitions), where std's SipHash cost about half the
-/// split's own CPU. The ids are the kernel's, which no process picks, so a keyed hash buys nothing.
-/// Local, since this crate depends on nothing.
+/// [`IdMap`]'s and [`IdSet`]'s hasher builder: a new [`aterm_hash::FxHasher`] for each key, as
+/// [`aterm_hash::FxBuildHasher`] builds, so an id hashes to the same value as in an
+/// [`aterm_hash::FxHashMap`]. In this crate's tests it also counts the keys hashed
+/// ([`ids_hashed`]), so a law can count the work an id map does.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct IdHasher(u64);
+pub struct IdHash;
 
-impl IdHasher {
-    const K: u64 = 0xf135_7aea_2e62_a9c5;
+impl std::hash::BuildHasher for IdHash {
+    type Hasher = aterm_hash::FxHasher;
 
-    fn add(&mut self, word: u64) {
-        self.0 = self.0.wrapping_add(word).wrapping_mul(Self::K);
+    #[inline]
+    fn build_hasher(&self) -> aterm_hash::FxHasher {
+        #[cfg(test)]
+        IDS_HASHED.with(|n| n.set(n.get() + 1));
+        aterm_hash::FxHasher::default()
     }
 }
 
-impl Hasher for IdHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        let (words, tail) = bytes.as_chunks::<8>();
-        for w in words {
-            self.add(u64::from_le_bytes(*w));
-        }
-        let mut last = [0u8; 8];
-        last[..tail.len()].copy_from_slice(tail);
-        self.add(u64::from_le_bytes(last) ^ ((tail.len() as u64) << 56));
-    }
+#[cfg(test)]
+thread_local! {
+    /// [`IdHash`]'s hashers built on this thread: one for each key an [`IdMap`] or [`IdSet`]
+    /// hashed (a lookup in one that holds any, an insert, a removal, a key moved as it grows).
+    static IDS_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
-    fn write_u8(&mut self, n: u8) {
-        self.add(u64::from(n));
-    }
-
-    fn write_u16(&mut self, n: u16) {
-        self.add(u64::from(n));
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.add(u64::from(n));
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.add(n);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.add(n as u64);
-    }
-
-    fn finish(&self) -> u64 {
-        // The multiply leaves the low bits, which pick the bucket, the
-        // weakest: rotate the strong high bits down (rustc-hash 2's finish).
-        self.0.rotate_left(26)
-    }
+/// The keys this thread's [`IdMap`]s and [`IdSet`]s have hashed so far (test-only).
+#[cfg(test)]
+pub(crate) fn ids_hashed() -> u64 {
+    IDS_HASHED.with(std::cell::Cell::get)
 }
 
 /// Whether the coalition lane reads.

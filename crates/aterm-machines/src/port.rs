@@ -981,6 +981,13 @@ pub trait System: Sync {
         false
     }
 
+    /// Say `line` to the person this run is for, on standard error
+    /// ([`aterm_uds::stdout::stderr_line`]), its own failure dropped: what a step that waits by
+    /// itself before the person's next prompt says it is doing.
+    fn tell(&self, line: &str) {
+        let _ = line;
+    }
+
     /// Whether `user`'s login session can take clicks in its apps now ([`SessionReach`]), read
     /// without WindowServer and without asking anything: the Messages and FaceTime sign-outs
     /// read it right before their clicks, again after a wait for an update's handoff, and again
@@ -1256,6 +1263,16 @@ pub trait System: Sync {
     /// List entry names in directory `path`.
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>>;
 
+    /// [`Self::list_dir`], read until more than `max` names are found: `None` once more are, so
+    /// a folder of any size costs a reader at most `max` names.
+    ///
+    /// # Errors
+    /// The folder could not be listed.
+    fn list_dir_within(&self, path: &Path, max: usize) -> io::Result<Option<Vec<String>>> {
+        let names = self.list_dir(path)?;
+        Ok((names.len() <= max).then_some(names))
+    }
+
     /// Compute the lowercase hex SHA-256 of the file at `path` without following symlinks.
     fn sha256(&self, path: &Path) -> io::Result<String>;
 
@@ -1311,6 +1328,13 @@ pub trait System: Sync {
     /// identity probe.
     fn account_home(&self) -> Option<PathBuf> {
         self.identity().ok().map(|id| PathBuf::from(id.user.home))
+    }
+
+    /// The home directory services name for the account `uid` (`getpwuid_r`), read in this
+    /// process: `None` where they name none.
+    fn home_of(&self, uid: u32) -> Option<PathBuf> {
+        let _ = uid;
+        None
     }
 
     /// Whether the network this Mac uses now is in Low Data Mode, as macOS's network path
@@ -1435,6 +1459,26 @@ pub trait System: Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// Hold an exclusive lock on root's own regular file at `path`
+    /// ([`aterm_uds::file_lock::LockFile::take`]: made 0600 by this open where none stands, never
+    /// opened through a link or on a FIFO; its folder must exist), waiting while another holder
+    /// has it until `wait` has passed, a first try made all the same; let go when the returned
+    /// guard drops. The file's owner is read from the open descriptor.
+    ///
+    /// # Errors
+    /// `WouldBlock` with `busy` where another holder kept it past `wait`; `PermissionDenied`
+    /// where the file is not uid 0's; the open's and the lock's own error; `Unsupported` for a
+    /// backend without locking.
+    fn hold_root_lock(
+        &self,
+        path: &Path,
+        wait: Duration,
+        busy: &str,
+    ) -> io::Result<Box<dyn std::any::Any>> {
+        let _ = (path, wait, busy);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Listen on a loopback port and spawn `cmd` per connection with stdio bound to the socket.
     fn relay(&self, cmd: &Cmd) -> Result<Box<dyn Relaying + '_>, RunFailed> {
         let _ = cmd;
@@ -1525,6 +1569,20 @@ pub trait System: Sync {
     /// The strict exchange failed, or this platform supplies no broker reader.
     fn installed_lan_broker(&self) -> Result<aterm_uds::lan::BrokerHello, String> {
         Err("this system reads no installed LAN broker".into())
+    }
+
+    /// Ask the root LAN broker to exclude from Spotlight this account's own new top-level home
+    /// folders ([`aterm_uds::lan::scope_home`]): unserved where this system asks no broker.
+    fn scope_home(&self) -> aterm_uds::lan::ScopeAnswer {
+        aterm_uds::lan::ScopeAnswer::Unserved("this system asks no LAN broker".into())
+    }
+
+    /// Every path a filesystem is mounted on now, each firmlinked spelling beside it
+    /// ([`aterm_sysprobe::volumes::Table::points`]), read in this process with no question to
+    /// any mounted filesystem (`getfsstat(MNT_NOWAIT)`): `None` where the table could not be read
+    /// whole, or where this system reads none.
+    fn mount_points(&self) -> Option<std::collections::BTreeSet<PathBuf>> {
+        None
     }
 
     /// Judge a staged app against the designated requirement of this loaded process,
@@ -2833,6 +2891,10 @@ impl System for Live {
         processes::argv(process)
     }
 
+    fn tell(&self, line: &str) {
+        let _ = aterm_uds::stdout::stderr_line(format_args!("{line}"));
+    }
+
     fn has_tty(&self) -> bool {
         use std::io::IsTerminal as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -3135,6 +3197,18 @@ impl System for Live {
         Ok(names)
     }
 
+    fn list_dir_within(&self, path: &Path, max: usize) -> io::Result<Option<Vec<String>>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            if names.len() == max {
+                return Ok(None);
+            }
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(Some(names))
+    }
+
     fn sha256(&self, path: &Path) -> io::Result<String> {
         use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -3224,6 +3298,10 @@ impl System for Live {
 
     fn identity(&self) -> Result<Identity, String> {
         identity::read(self.euid())
+    }
+
+    fn home_of(&self, uid: u32) -> Option<PathBuf> {
+        aterm_uds::account::home_of(uid)
     }
 
     fn service(&self, restart: &aterm_vitals::services::Restart) -> aterm_uds::services::Look {
@@ -3436,6 +3514,23 @@ impl System for Live {
         Ok(copied)
     }
 
+    fn hold_root_lock(
+        &self,
+        path: &Path,
+        wait: Duration,
+        busy: &str,
+    ) -> io::Result<Box<dyn std::any::Any>> {
+        use std::os::unix::fs::MetadataExt as _;
+        let lock = aterm_uds::file_lock::LockFile::take(path, deadline_after(wait), busy)?;
+        if lock.metadata()?.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not root's own file", path.display()),
+            ));
+        }
+        Ok(Box::new(lock))
+    }
+
     fn exclusive(&self, path: &Path, limit: Duration) -> io::Result<Box<dyn std::any::Any>> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let file = aterm_uds::kept_out(|| {
@@ -3495,6 +3590,15 @@ impl System for Live {
             .map_err(|error| error.to_string());
         #[cfg(not(target_os = "macos"))]
         Err("only macOS installs a root LAN broker".into())
+    }
+
+    fn scope_home(&self) -> aterm_uds::lan::ScopeAnswer {
+        aterm_uds::lan::scope_home()
+    }
+
+    fn mount_points(&self) -> Option<std::collections::BTreeSet<PathBuf>> {
+        let table = aterm_sysprobe::volumes::table();
+        table.complete.then(|| table.points().into_iter().collect())
     }
 
     fn check_app_copy(&self, path: &Path) -> Result<(), aterm_keeper::identity::CheckError> {
@@ -3764,7 +3868,7 @@ fn fail_closed_github() -> (
 }
 
 #[cfg(any(test, debug_assertions))]
-pub use fake::Fake;
+pub use fake::{Fake, LetsGo};
 
 #[cfg(any(test, debug_assertions))]
 mod fake {
@@ -3799,6 +3903,14 @@ mod fake {
 
         exclusive_paths: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
         exclusive_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
+        /// The raw OS error each exclusive lock at a path fails with ([`Fake::exclusive_fails_os`]).
+        exclusive_errnos: Mutex<BTreeMap<PathBuf, i32>>,
+        /// Another holder of root's lock at a path, in this fake alone, and its last write
+        /// ([`Fake::held_elsewhere`]).
+        held_elsewhere: Mutex<BTreeMap<PathBuf, (LetsGo, HolderLast)>>,
+        /// The seconds [`Fake::advance`] moved [`System::now`] past [`Self::now`], less those
+        /// [`Fake::set_back`] took off it, modulo 2^64.
+        advanced: std::sync::atomic::AtomicU64,
         /// The tools a test models instead of scripting ([`Fake::simulate`]).
         model: Mutex<Option<Model>>,
         /// The processes (pid, birth) this world runs, as the record of aterm's own Command Line
@@ -3849,6 +3961,8 @@ mod fake {
         stat_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         stat_errors_once: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         rename_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
+        /// The paths whose [`System::write_file`] fails, and how ([`Fake::write_fails`]).
+        write_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         list_errors_once: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         directory_flush_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         links: Mutex<BTreeMap<PathBuf, PathBuf>>,
@@ -3926,6 +4040,17 @@ mod fake {
         identity: Mutex<Option<super::Identity>>,
         /// What a [`System::sleep`] does besides recording itself ([`Fake::on_sleep`]).
         on_sleep: Mutex<Option<SleepHook>>,
+        /// The homes [`System::home_of`] names beside [`Fake::logged_in`]'s
+        /// ([`Fake::home_of_uid`]).
+        homes: Mutex<BTreeMap<u32, PathBuf>>,
+        /// What a [`System::scope_home`] answers once it is recorded ([`Fake::on_scope_home`]).
+        on_scope_home: Mutex<Option<ScopeHook>>,
+        /// The paths [`System::mount_points`] names ([`Fake::mounted`]), none by default.
+        mounts: Mutex<std::collections::BTreeSet<PathBuf>>,
+        /// Whether [`System::mount_points`] reads no whole table ([`Fake::mount_table_unread`]).
+        mounts_unread: std::sync::atomic::AtomicBool,
+        /// What runs at each [`System::stat`] before it answers ([`Fake::on_stat_read`]).
+        on_stat_read: Mutex<Option<OwnedReadHook>>,
         on_owned_read: Mutex<Option<OwnedReadHook>>,
         /// What runs after each [`System::vault_entry`] read copied its value
         /// ([`Fake::on_vault_read`]), with the entry's name.
@@ -3985,6 +4110,22 @@ mod fake {
         std::collections::BTreeMap<String, Vec<Result<Vec<crate::items::person::TccRow>, String>>>;
 
     type SleepHook = Arc<dyn Fn(&Fake, std::time::Duration) + Send + Sync>;
+
+    /// What another holder of root's lock writes last, as it lets go ([`Fake::held_elsewhere`]).
+    type HolderLast = Box<dyn FnOnce(&Fake) + Send>;
+
+    /// When another holder of root's lock lets it go ([`Fake::held_elsewhere`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LetsGo {
+        /// While a take waits for it ([`System::hold_root_lock`] with a wait above zero): a take
+        /// that waits nothing finds it held.
+        WhileWaited,
+        /// Just before the next take, a take that waits nothing among them.
+        AtTheNextTake,
+    }
+
+    /// What a scripted [`System::scope_home`] answers, the Mac it is asked on in hand.
+    type ScopeHook = Arc<dyn Fn(&Fake) -> aterm_uds::lan::ScopeAnswer + Send + Sync>;
     type OwnedReadHook = Arc<dyn Fn(&Fake, &Path) + Send + Sync>;
     type VaultReadHook = Arc<dyn Fn(&Fake, &str) + Send + Sync>;
     type AppCheckHook =
@@ -4000,11 +4141,17 @@ mod fake {
     struct FakeExclusive {
         held: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
         path: PathBuf,
+        /// Where its letting go is recorded (`let go <path>`), for a hold of root's lock.
+        calls: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl Drop for FakeExclusive {
         fn drop(&mut self) {
             self.held.lock().unwrap().remove(&self.path);
+            if let Some(calls) = &self.calls {
+                let line = format!("let go {}", self.path.display());
+                calls.lock().unwrap().push(line);
+            }
         }
     }
 
@@ -4515,6 +4662,43 @@ mod fake {
             }
         }
 
+        /// Name `path` among the paths a filesystem is mounted on ([`System::mount_points`]).
+        pub fn mounted(&self, path: impl Into<PathBuf>) -> &Self {
+            self.mounts.lock().unwrap().insert(path.into());
+            self
+        }
+
+        /// Read no whole mount table: [`System::mount_points`] answers `None`.
+        pub fn mount_table_unread(&self) -> &Self {
+            self.mounts_unread
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        /// Run `hook` at each [`System::stat`], with its path, before it answers: a read a
+        /// filesystem holds (a hook that blocks), or one that changes what it reads.
+        pub fn on_stat_read(&self, hook: impl Fn(&Self, &Path) + Send + Sync + 'static) -> &Self {
+            *self.on_stat_read.lock().unwrap() = Some(Arc::new(hook));
+            self
+        }
+
+        /// Name `home` as the home directory services hold for `uid` ([`System::home_of`]).
+        pub fn home_of_uid(&self, uid: u32, home: impl Into<PathBuf>) -> &Self {
+            self.homes.lock().unwrap().insert(uid, home.into());
+            self
+        }
+
+        /// Answer each [`System::scope_home`], after it is recorded as `scope home`, with
+        /// `hook`'s answer (a test's real client of its own broker, or a scripted answer), which
+        /// reads this Mac as it is asked.
+        pub fn on_scope_home(
+            &self,
+            hook: impl Fn(&Self) -> aterm_uds::lan::ScopeAnswer + Send + Sync + 'static,
+        ) -> &Self {
+            *self.on_scope_home.lock().unwrap() = Some(Arc::new(hook));
+            self
+        }
+
         /// Run `hook` at each [`System::sleep`], after it is recorded: a model whose time a
         /// sleep moves on.
         pub fn on_sleep(
@@ -4755,6 +4939,47 @@ mod fake {
             self
         }
 
+        /// Another holder of root's lock at `path`, in this fake alone, that writes `last` and
+        /// lets go as `lets_go` says ([`System::hold_root_lock`]).
+        pub fn held_elsewhere(
+            &self,
+            path: &Path,
+            lets_go: LetsGo,
+            last: impl FnOnce(&Self) + Send + 'static,
+        ) -> &Self {
+            self.held_elsewhere
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), (lets_go, Box::new(last)));
+            self
+        }
+
+        /// Move [`System::now`] on by `seconds`, behind a shared reference as a broker's duty
+        /// holds this fake.
+        pub fn advance(&self, seconds: u64) -> &Self {
+            self.advanced
+                .fetch_add(seconds, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        /// Set [`System::now`] back by `seconds`, as a clock correction does, behind a shared
+        /// reference as a broker's duty holds this fake.
+        pub fn set_back(&self, seconds: u64) -> &Self {
+            self.advanced
+                .fetch_sub(seconds, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        /// Make exclusive lock acquisition at `path` fail with the raw OS error `errno` (one
+        /// [`io::ErrorKind`] has no kind for, such as `EMFILE`).
+        pub fn exclusive_fails_os(&self, path: &Path, errno: i32) -> &Self {
+            self.exclusive_errnos
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), errno);
+            self
+        }
+
         /// Make exclusive lock acquisition at `path` fail with `kind`.
         pub fn exclusive_fails(&self, path: &Path, kind: io::ErrorKind) -> &Self {
             self.exclusive_errors
@@ -4788,6 +5013,15 @@ mod fake {
                 .lock()
                 .unwrap()
                 .insert(PathBuf::from(to), kind);
+            self
+        }
+
+        /// Make each [`System::write_file`] of `path` fail with `kind`, writing nothing.
+        pub fn write_fails(&self, path: &str, kind: io::ErrorKind) -> &Self {
+            self.write_errors
+                .lock()
+                .unwrap()
+                .insert(PathBuf::from(path), kind);
             self
         }
 
@@ -4949,12 +5183,16 @@ mod fake {
             if let Some(kind) = self.exclusive_errors.lock().unwrap().get(path).copied() {
                 return Err(kind.into());
             }
+            if let Some(errno) = self.exclusive_errnos.lock().unwrap().get(path).copied() {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
             if !self.exclusive_paths.lock().unwrap().insert(path.to_owned()) {
                 return Err(io::ErrorKind::TimedOut.into());
             }
             Ok(Box::new(FakeExclusive {
                 held: Arc::clone(&self.exclusive_paths),
                 path: path.to_owned(),
+                calls: None,
             }))
         }
 
@@ -5347,6 +5585,70 @@ mod fake {
 
         fn has_tty(&self) -> bool {
             self.tty
+        }
+
+        fn tell(&self, line: &str) {
+            self.calls.lock().unwrap().push(format!("tell {line}"));
+        }
+
+        /// [`Self::exclusive`]'s lock table, a lock held there answering `WouldBlock` at once
+        /// whatever the wait (a holder that keeps it past any wait); a file [`Fake::stat_of`] says
+        /// is not root's, or a link, is refused. A holder elsewhere ([`Fake::held_elsewhere`])
+        /// writes its last and lets go as it says: one that lets go while a take waits answers a
+        /// take of no wait `WouldBlock`, and a take that waited for it is recorded
+        /// (`waited <path>`). A hold is recorded (`hold <path>`), and so is its letting go
+        /// (`let go <path>`).
+        fn hold_root_lock(
+            &self,
+            path: &Path,
+            wait: std::time::Duration,
+            busy: &str,
+        ) -> io::Result<Box<dyn std::any::Any>> {
+            if let Some(kind) = self.exclusive_errors.lock().unwrap().get(path).copied() {
+                return Err(kind.into());
+            }
+            if let Some(errno) = self.exclusive_errnos.lock().unwrap().get(path).copied() {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            let elsewhere = {
+                let mut held = self.held_elsewhere.lock().unwrap();
+                match held.get(path) {
+                    Some((LetsGo::WhileWaited, _)) if wait.is_zero() => {
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, busy.to_owned()));
+                    }
+                    Some(_) => held.remove(path),
+                    None => None,
+                }
+            };
+            if let Some((lets_go, last)) = elsewhere {
+                last(self);
+                if lets_go == LetsGo::WhileWaited {
+                    let line = format!("waited {}", path.display());
+                    self.calls.lock().unwrap().push(line);
+                }
+            }
+            if self.links.lock().unwrap().contains_key(path) {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            if self
+                .stats
+                .lock()
+                .unwrap()
+                .get(path)
+                .is_some_and(|stat| stat.uid != 0 || stat.dir || stat.symlink)
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            if !self.exclusive_paths.lock().unwrap().insert(path.to_owned()) {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, busy.to_owned()));
+            }
+            let line = format!("hold {}", path.display());
+            self.calls.lock().unwrap().push(line);
+            Ok(Box::new(FakeExclusive {
+                held: Arc::clone(&self.exclusive_paths),
+                path: path.to_owned(),
+                calls: Some(Arc::clone(&self.calls)),
+            }))
         }
 
         /// Recorded as `session-reach`; answered as [`Fake::session`] holds it.
@@ -5776,6 +6078,9 @@ mod fake {
                 .lock()
                 .unwrap()
                 .push(format!("write {} {mode:o}", path.display()));
+            if let Some(kind) = self.write_errors.lock().unwrap().get(path) {
+                return Err(io::Error::from(*kind));
+            }
             self.files
                 .lock()
                 .unwrap()
@@ -5971,6 +6276,10 @@ mod fake {
         }
 
         fn stat(&self, path: &Path) -> io::Result<Stat> {
+            let hook = self.on_stat_read.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(self, path);
+            }
             if let Some(kind) = self.stat_errors_once.lock().unwrap().remove(path) {
                 return Err(io::Error::from(kind));
             }
@@ -6133,8 +6442,10 @@ mod fake {
             self.euid
         }
 
+        /// [`Self::now`], moved on by [`Fake::advance`] and back by [`Fake::set_back`].
         fn now(&self) -> u64 {
             self.now
+                .wrapping_add(self.advanced.load(std::sync::atomic::Ordering::SeqCst))
         }
 
         fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
@@ -6285,6 +6596,36 @@ mod fake {
                 .unwrap()
                 .as_ref()
                 .map(|id| PathBuf::from(&id.user.home))
+        }
+
+        /// [`Fake::home_of_uid`]'s home for `uid`, else [`Fake::logged_in`]'s where it is that
+        /// account's.
+        fn home_of(&self, uid: u32) -> Option<PathBuf> {
+            if let Some(home) = self.homes.lock().unwrap().get(&uid) {
+                return Some(home.clone());
+            }
+            self.identity
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|id| id.user.uid == uid)
+                .map(|id| PathBuf::from(&id.user.home))
+        }
+
+        /// [`Fake::mounted`]'s paths, or `None` after [`Fake::mount_table_unread`].
+        fn mount_points(&self) -> Option<std::collections::BTreeSet<PathBuf>> {
+            (!self.mounts_unread.load(std::sync::atomic::Ordering::SeqCst))
+                .then(|| self.mounts.lock().unwrap().clone())
+        }
+
+        /// Recorded as `scope home`; answered by [`Fake::on_scope_home`], else unserved.
+        fn scope_home(&self) -> aterm_uds::lan::ScopeAnswer {
+            self.calls.lock().unwrap().push("scope home".into());
+            let hook = self.on_scope_home.lock().unwrap().clone();
+            hook.map_or_else(
+                || aterm_uds::lan::ScopeAnswer::Unserved("no LAN broker scripted".into()),
+                |hook| hook(self),
+            )
         }
 
         fn process_started(&self, pid: u32) -> Option<u64> {

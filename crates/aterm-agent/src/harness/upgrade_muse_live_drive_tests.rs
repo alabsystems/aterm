@@ -1508,7 +1508,8 @@ fn real_claim_relaunches() -> bool {
 /// (what the line read a Muse claim that named none as) lets go a key the SIGTERM waited on.
 #[test]
 fn a_muse_claim_holds_its_line_on_the_grace_its_sigterm_waited_out() {
-    use crate::harness::relaunch::{PromptLook, line_grace, line_held_by_status};
+    use crate::harness::relaunch::{line_grace, line_held_by_status};
+    use crate::harness::relaunch_type::PromptLook;
     let rig = LiveRig::new("claim-grace", Knobs::default());
     let mut snap = rig.snap_of(S1);
     snap.argv = rig.kernel.argv.clone();

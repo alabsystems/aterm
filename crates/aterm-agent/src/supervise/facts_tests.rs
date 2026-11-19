@@ -934,9 +934,9 @@ fn a_restart_holds_a_told_leftover_episode_until_it_clears() {
 use crate::supervise::overlap::OVERLAP_FRESH_MS;
 
 /// Two minted sids, as `aterm_session::SessionId::generate` makes them, and a third.
-const PEER_A: &str = "s-0a1b2c3d4e5f60718293";
-const PEER_B: &str = "s-ffeeddccbbaa99887766";
-const PEER_C: &str = "s-00000000000000000c0c";
+const PEER_A: &str = "t5f60718293";
+const PEER_B: &str = "taa99887766";
+const PEER_C: &str = "t0000000c0c";
 
 /// An overlap reading as of `as_of_ms`: `files` files shared with `peers`.
 fn shared(as_of_ms: i64, files: u32, peers: &[&str]) -> OverlapReading {

@@ -360,6 +360,8 @@ impl Drain {
 #[derive(Debug)]
 pub(crate) struct Device {
     root: PathBuf,
+    /// The mirror's pin, `logpin` under the root: what every write is asked whether it is.
+    pin: PathBuf,
     journal: Arc<Mutex<Journal>>,
     /// A CONTROL: a device that keeps every write (no power cut loses anything), so a failure only a lossy cut can cause vanishes under it.
     pub(crate) lossless: bool,
@@ -383,6 +385,7 @@ impl Device {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
+            pin: root.join(crate::state::LOGPIN),
             journal: Arc::new(Mutex::new(Journal::default())),
             lossless: false,
             tears: false,
@@ -564,7 +567,7 @@ impl Device {
             ..
         } = w
         {
-            if path == self.root.join(crate::state::LOGPIN) {
+            if path == self.pin {
                 lock(&self.journal).pin_durable += 1;
             }
         }
@@ -651,13 +654,10 @@ impl Device {
     /// barriered one a broker's full flush on this device drained after it (critic item F07,
     /// [`Journal::drained`]).
     pub(crate) fn pin_fenced(&self) -> bool {
-        lock(&self.journal)
-            .files
-            .get(&self.root.join(crate::state::LOGPIN))
-            .is_some_and(|f| {
-                matches!(&f.durable, Version::Bytes(bytes, _)
+        lock(&self.journal).files.get(&self.pin).is_some_and(|f| {
+            matches!(&f.durable, Version::Bytes(bytes, _)
                     if crate::mirror::Pin::by_this_build(bytes))
-            })
+        })
     }
 
     /// A file the world wrote before the bridge ever ran (the provisioned node id), on the media.
@@ -701,7 +701,7 @@ impl Device {
     /// A replace of `path` by `bytes` was made: where it is the mirror's pin,
     /// the highest total any pin was written with ([`Device::pin_total`]).
     fn note_pin(&self, path: &Path, bytes: &[u8]) {
-        if path == self.root.join(crate::state::LOGPIN) {
+        if path == self.pin {
             if let Some(pin) = std::str::from_utf8(bytes)
                 .ok()
                 .and_then(|t| crate::mirror::Pin::parse(t).ok())

@@ -2387,12 +2387,8 @@ fn a_tape_without_the_overlap_door_replays_none() {
     use crate::supervise::tape::replay::ReplayCore;
     use crate::supervise::tape::testing::TAPE_ID;
     use astream_effects::EffectRecord;
-    let reading = OverlapReading::new(
-        1_760_000_000_000,
-        2,
-        &["s-ffeeddccbbaa99887766", "s-0a1b2c3d4e5f60718293"],
-    )
-    .expect("a reading");
+    let reading = OverlapReading::new(1_760_000_000_000, 2, &["taa99887766", "t5f60718293"])
+        .expect("a reading");
     let replayed = |listed: bool| {
         let records = if listed {
             vec![EffectRecord::Exchange {

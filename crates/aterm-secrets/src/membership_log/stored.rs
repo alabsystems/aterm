@@ -5,10 +5,11 @@
 //! FL-148D): a store's records, and ahead of them, for a log rooted at a final checkpoint
 //! ([`super::rooted`]), its roots and the stubs of the records they dropped. A store read back
 //! from the file is the store that was written: the same records in the same order, the same
-//! stubs and roots, and so the same evaluation. A Mac that reads format 2 writes such a file
-//! where it takes a served root (`client::persist_stored`, through
-//! `crate::records_storage::rewrite`) and reads it back (`client::records_cache`); no running
-//! build reads format 2, so none does either.
+//! stubs and roots, and so the same evaluation. A Mac or a vault server that reads format 2
+//! writes such a file where it takes a served root (`client::persist_stored`,
+//! `server::persist_stored`, through `crate::records_storage::rewrite`) and reads it back
+//! (`client::records_cache`, `server::look_at_records`); no running build reads format 2, so
+//! none does either.
 //!
 //! **The file** ([`Store::write_stored`]): for a rooted log one frame ([`Kept`]), then the
 //! records' stream as every records file holds it ([`Store::write_encoded`]). A whole log's
@@ -435,6 +436,44 @@ impl Store {
             self.file_lead = lead as u64;
         }
         Ok(self)
+    }
+
+    /// The strict read of a records file's `bytes` that a check makes before it judges each
+    /// record itself (`client::genesis`'s private-realm read): every record of the file decoded
+    /// as [`super::decode_records_before_cut_in`] decodes a stream, and this empty store, for
+    /// the caller to offer them to. Where this store reads format 2 and the file begins with a
+    /// frame, the store is first rooted as the frame says, holding the genesis that follows it
+    /// alone, so a record placed by a stub is judged by the log it was written in, and the
+    /// records are those after the frame, the genesis among them. Every other file, and every
+    /// file a store that reads format 1 reads, is its records' stream alone, and the store is
+    /// as it was.
+    ///
+    /// # Errors
+    /// The stream does not decode; or the frame does not read ([`Kept::decode`]), the genesis
+    /// of its network does not follow it, or this store is not empty.
+    pub(crate) fn framed_strictly(mut self, bytes: &[u8]) -> Result<(Self, Vec<super::Record>)> {
+        let reading = self.reading();
+        if !(reading.admits_two() && bytes.starts_with(KEPT_MAGIC)) {
+            let records = super::decode_records_before_cut_in(bytes, reading)?;
+            return Ok((self, records));
+        }
+        let (kept, lead) = Kept::decode(bytes, reading)?;
+        let records = super::decode_records_before_cut_in(&bytes[lead..], reading)?;
+        let genesis = records
+            .first()
+            .filter(|record| record.kind() == Kind::Genesis && *record.id() == kept.network)
+            .ok_or_else(|| Error::new("a rooted records file holds its genesis after its frame"))?;
+        if !self.is_empty() {
+            return Err(Error::new("a records file is read into an empty store"));
+        }
+        self.insert(genesis.clone())?;
+        let log = self
+            .log
+            .as_ref()
+            .ok_or_else(|| Error::new("a rooted records file holds its genesis after its frame"))?;
+        let rooted = log.rebuilt(kept.into_rooting(), &BTreeSet::new())?;
+        self.log = Some(rooted);
+        Ok((self, records))
     }
 }
 

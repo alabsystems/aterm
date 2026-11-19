@@ -4644,7 +4644,7 @@ pub(crate) fn cmd_meta_supervisor_serving(
         }
         let changed = match holder {
             Some(h) => crate::session_timeline::publish_release_supervisor_held_by(ctx, h, now, by),
-            None => crate::session_timeline::publish_release_supervisor(ctx, None, now, by),
+            None => crate::session_timeline::publish_unset_supervisor(ctx, now, by),
         }
         .acknowledge();
         return Some(("OK\n".to_string(), changed));
@@ -4730,14 +4730,21 @@ pub(crate) fn cmd_meta_supervisor_serving(
             }
             let versions = claim.versions();
             let scope = claim.scopes.words();
+            let kept = child.map(|(_, kept)| kept);
             let scoped = crate::harness_claim::Scoped {
                 proven,
                 claim,
-                child: child.map(|(_, kept)| kept),
+                child: kept,
             };
             let claimed = crate::session_timeline::publish_claim_supervisor_admitted(
                 ctx, holder, conn, scoped, admitted, now, by,
             );
+            // The kept child's relaunch snapshot, read when a claim first keeps it and at each
+            // change of child (HX-15f, D22).
+            #[cfg(unix)]
+            if let (Ok(_), Some(kept)) = (&claimed, kept) {
+                crate::harness_watchdog::child_kept(ctx, kept);
+            }
             if claimed.as_ref().is_ok_and(|c| c.published_ref().changed) {
                 aterm_log::info!(
                     "harness @{}: {versions} holds the session under contract {contract}, \

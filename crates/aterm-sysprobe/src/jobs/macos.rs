@@ -11,7 +11,7 @@ use super::{
     Counters, FdKind, FdReading, Knote, KnoteFilter, Lane, Lanes, MAX_FD_DETAILS, MAX_FDS,
     MAX_KNOTES, MAX_THREADS, ProcFacts, RunState, StartFacts, TcpState, ThreadReading,
 };
-use crate::procs::imp::{rusage, short_info, timebase};
+use crate::procs::imp::{proc_listchildpids, rusage, short_info, timebase};
 use crate::procs::ticks_to_ns;
 
 const TASKALL_SIZE: usize = std::mem::size_of::<libc::proc_taskallinfo>();
@@ -162,35 +162,9 @@ pub(super) fn counters_of(pid: u32) -> Option<Counters> {
     counters(c_int::try_from(pid).ok().filter(|p| *p > 0)?, None)
 }
 
-unsafe extern "C" {
-    /// libproc's `proc_listchildpids` (`libproc.h`): `ppid`'s children into `buffer`, how many.
-    fn proc_listchildpids(ppid: c_int, buffer: *mut c_void, buffersize: c_int) -> c_int;
-}
-
 /// [`super::child_pids`] on macOS.
 pub(super) fn child_pids(pid: u32) -> Option<Vec<u32>> {
-    const ROOM: usize = 256;
-    let pid = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
-    let mut kids = vec![0 as libc::pid_t; ROOM];
-    let size = c_int::try_from(kids.len() * std::mem::size_of::<libc::pid_t>()).ok()?;
-    // SAFETY: `kids` is `size` writable bytes of pid slots; libproc writes at most that many.
-    // `__error` supplies this thread's live errno slot; capture it with the zero-or-failed call.
-    let (n, errno) = unsafe {
-        *libc::__error() = 0;
-        let n = proc_listchildpids(pid, kids.as_mut_ptr().cast(), size);
-        (n, *libc::__error())
-    };
-    let n = usize::try_from(crate::machine::owned_count(
-        i64::from(n),
-        errno,
-        kids.len(),
-    )?)
-    .ok()?;
-    let mut out: Vec<u32> = kids[..n]
-        .iter()
-        .filter_map(|k| u32::try_from(*k).ok())
-        .filter(|k| *k > 0)
-        .collect();
+    let mut out = crate::procs::imp::children(c_int::try_from(pid).ok().filter(|p| *p > 0)?, 255)?;
     out.sort_unstable();
     Some(out)
 }

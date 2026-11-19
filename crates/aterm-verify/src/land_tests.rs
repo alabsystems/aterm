@@ -345,6 +345,7 @@ fn quiet() -> Records<'static> {
             id: format!("{n:032x}"),
             ..crate::land_run::tests::run()
         },
+        hosting: Box::new(crate::hosting::Unhosted),
         interrupt: Box::new(|| None),
         tally: records::Tally::default(),
         lock: None,
@@ -5309,6 +5310,7 @@ impl Store {
                 started: crate::land_record::tests::NOW - 60,
                 ..crate::land_run::tests::run()
             },
+            hosting: Box::new(crate::hosting::Unhosted),
             interrupt: Box::new(move || signal.get()),
             tally: records::Tally::default(),
             lock: None,

@@ -46,6 +46,9 @@ mod flush;
 #[cfg(test)]
 #[path = "land_records_io_tests.rs"]
 mod io_tests;
+#[cfg(test)]
+#[path = "land_records_join_tests.rs"]
+mod join_tests;
 
 /// [`Records::publish`]'s append.
 pub type AppendSeam<'a> = Box<dyn FnMut(&Path, &[Signed], u64) -> Result<(), String> + 'a>;
@@ -90,8 +93,12 @@ pub struct Records<'a> {
     /// The Unix time now: records' times.
     pub now: Box<dyn Fn() -> u64 + 'a>,
     /// This run: its id and start (an image the landing hands itself to keeps both,
-    /// [`handoff::Handoff::run`]), this Mac and the session.
+    /// [`handoff::Handoff::run`]), this Mac, and the session the run belongs to with the
+    /// checkout and branch it lands ([`run_of`]).
     pub run: land_run::Run,
+    /// Where the run posts its end ([`finish`]), as it posted its start ([`run_of`]): the aterm
+    /// instance that hosts it, or nobody ([`crate::hosting::Unhosted`]).
+    pub hosting: Box<dyn crate::hosting::Host + 'a>,
     /// The interrupt the landing took, where one did: the signal its handler caught
     /// (`exec::group::kill_on_interrupt`), which it dies of once it has written its end record.
     pub interrupt: Box<dyn Fn() -> Option<i32> + 'a>,
@@ -552,8 +559,9 @@ pub(super) fn result_of(decision: &Decision) -> &'static str {
 
 /// The run's end, whatever its exit `code`: its end record (the exit, the interrupt it took, the
 /// checkout as it stands, and its landing where main holds one), kept with the rest of the run's
-/// records, after the run's last use of main; then what is left to deliver them, which says
-/// nothing until [`deliver`]. A run that took an interrupt leaves them in the clone
+/// records, after the run's last use of main; its end posted to the instance that hosts it
+/// ([`Records::hosting`], best effort within the post's bound); then what is left to deliver the
+/// records, which says nothing until [`deliver`]. A run that took an interrupt leaves them in the clone
 /// ([`Delivery::Interrupted`]: it dies of the signal). So does a run that pushed no landing,
 /// where this run's records, its end included, were all kept and the spool confirms them durable
 /// ([`Delivery::Kept`]), so a verdict that pushed nothing waits on no journal. The spool is the
@@ -595,6 +603,7 @@ pub(super) fn finish(
         ..land_run::Record::default()
     };
     let end_kept = records.run_record(Kind::End, end, &mut *say);
+    records.hosting.end(crate::hosting::LAND, Some(code));
     if let Some(signal) = signal {
         return Delivery::Interrupted(signal);
     }
@@ -669,11 +678,52 @@ fn token(host: &str) -> String {
     }
 }
 
+/// A new run of the landing in the checkout at `root`, on this Mac (`host`, `node`): a fresh id,
+/// started now, this Mac's memory and cores, the checkout and the `branch` its HEAD names, and
+/// the session the run belongs to, which is `hosting`'s answer to the run's start
+/// ([`crate::hosting::Host::start`]): the instance that hosts this process placed it by its
+/// lineage. No variable of this process's environment names that session (`ATERM_SESSION_ID`
+/// names a shell, and is not read), and where nothing answers the run names none: it belongs to
+/// its computer.
+pub(super) fn run_of(
+    root: &Path,
+    host: &str,
+    node: Option<String>,
+    branch: Option<&str>,
+    hosting: &dyn crate::hosting::Host,
+) -> land_run::Run {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    land_run::Run {
+        id: run_id(
+            aterm_uds::rand::hex_token::<16>(),
+            std::process::id(),
+            nanos,
+            host,
+        ),
+        started: unix_now(),
+        host: host.to_owned(),
+        node,
+        memory_mib: aterm_sysprobe::physical_memory_mib(),
+        cores: u32::try_from(aterm_sysprobe::cpu_layout().logical_cores())
+            .ok()
+            .filter(|cores| *cores > 0),
+        ..land_run::Run::default()
+    }
+    .placed(
+        hosting.start(crate::hosting::LAND),
+        &root.to_string_lossy(),
+        branch,
+    )
+}
+
 /// The live records: the journal on [`REMOTE`] under [`crate::judged`]'s deadline, the clone's
 /// spool, this Mac's fleet node identity (`fleet_member::read_node_identity` in aterm's state
-/// directory, which never mints one) and its kernel host name, and a new run: a fresh id, started
-/// now, this Mac's memory and cores and the aterm session it runs in, whose interrupt is the one
-/// `exec::group::kill_on_interrupt`'s handler took.
+/// directory, which never mints one) and its kernel host name, and a new run ([`run_of`]) of
+/// the branch HEAD names, posted to the aterm instance this process's environment finds
+/// ([`crate::runs::ToInstance`]), whose interrupt is the one `exec::group::kill_on_interrupt`'s
+/// handler took.
 pub(super) fn live(root: &Path) -> Records<'static> {
     let spool: Box<dyn Spool> = match crate::land_spool::Dir::of_clone(root) {
         Ok(dir) => Box::new(dir),
@@ -689,29 +739,9 @@ pub(super) fn live(root: &Path) -> Records<'static> {
     let node = identity.as_ref().map(|me| me.node().to_owned());
     let signer = identity.map(|identity| Box::new(identity) as Box<dyn Signer>);
     let host = token(&aterm_uds::process::kernel_host_name().unwrap_or_default());
-    let session = std::env::var("ATERM_SESSION_ID")
-        .ok()
-        .map(|id| land_record::tokened(&id))
-        .filter(|id| !id.is_empty());
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    let run = land_run::Run {
-        id: run_id(
-            aterm_uds::rand::hex_token::<16>(),
-            std::process::id(),
-            nanos,
-            &host,
-        ),
-        started: unix_now(),
-        host: host.clone(),
-        node,
-        session,
-        memory_mib: aterm_sysprobe::physical_memory_mib(),
-        cores: u32::try_from(aterm_sysprobe::cpu_layout().logical_cores())
-            .ok()
-            .filter(|cores| *cores > 0),
-    };
+    let hosting = crate::runs::ToInstance::from_env();
+    let branch = crate::judged::git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
+    let run = run_of(root, &host, node, branch.as_deref(), &hosting);
     Records {
         append: Box::new(|root, records, now| {
             crate::judged::append_land(root, REMOTE, records, now, crate::judged::deadline())
@@ -722,6 +752,7 @@ pub(super) fn live(root: &Path) -> Records<'static> {
         host,
         now: Box::new(unix_now),
         run,
+        hosting: Box::new(hosting),
         interrupt: Box::new(crate::exec::group::taken),
         tally: Tally::default(),
         lock: None,

@@ -890,8 +890,8 @@ impl PlaceRow {
 pub struct NeedEntry {
     /// The session.
     pub sid: TabId,
-    /// The need word (`frozen`, `stopped`, `stalled`, `login`, `memory`, `wall`, `ask`,
-    /// `approval`, `question`).
+    /// The need word (`frozen`, `stopped`, `stalled`, `login`, `memory`, `wall`,
+    /// `unsupervised`, `ask`, `approval`, `question`).
     pub word: Word,
     /// Whether the harness carries the session on by itself (`needs_by=harness`).
     pub harness: bool,

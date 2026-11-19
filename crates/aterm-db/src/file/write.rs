@@ -108,6 +108,11 @@ impl Target {
         let Some(file) = super::find(&name) else {
             return Err(usage(format!("{name}: no such shared file in this build")));
         };
+        Self::from_file(paths, file)
+    }
+
+    pub(super) fn from_file(paths: &Paths, file: &'static Type) -> Result<Self, Refusal> {
+        let name = file.file();
         // Each Mac states its own rows of a Mac file through its journal, each Mac's program
         // appends its own log entries, and nobody writes a view: no verb of a person's writes
         // either.
@@ -157,9 +162,7 @@ impl Target {
             ))
         };
         let bytes = self.held.baseline(rev).ok_or_else(stale)?;
-        let base = super::face::Baseline::decode(&bytes)
-            .ok_or_else(stale)?
-            .grid;
+        let base = super::face::Baseline::read_grid(&bytes).ok_or_else(stale)?;
         let collection = self
             .generation(&base.table)
             .and_then(|compiled| compiled.collection(&base.collection).ok())
@@ -318,7 +321,7 @@ pub(super) fn required(collection: &Collection, schema: &Column) -> bool {
 /// expects. `None` where no baseline reads there.
 pub(super) fn candidates_at(held: &File, rev: u64, edit: &Edit) -> Option<Vec<String>> {
     let bytes = held.baseline(rev)?;
-    let base = super::face::Baseline::decode(&bytes)?.grid;
+    let base = super::face::Baseline::read_grid(&bytes)?;
     let mut now = base
         .rows
         .iter()
@@ -350,7 +353,14 @@ fn follow(target: &Target, edits: &mut [Edit]) {
 pub(super) fn follow_at(held: &File, outbox: &Outbox, rev: u64, edits: &mut [Edit]) {
     // Only the frontier the snapshot at the baseline's revision was projected from says what
     // that baseline holds: a snapshot a pass wrote before its status is a later one.
-    let frontier = held.projected_at(rev);
+    follow_from(outbox, held.projected_at(rev).as_ref(), edits);
+}
+
+pub(super) fn follow_from(
+    outbox: &Outbox,
+    frontier: Option<&aterm_file::Frontier>,
+    edits: &mut [Edit],
+) {
     let same = |a: &Edit, b: &Edit| a.key == b.key && a.column == b.column && a.elem == b.elem;
     for edit in edits {
         let waiting = outbox
@@ -366,7 +376,7 @@ pub(super) fn follow_at(held: &File, outbox: &Outbox, rev: u64, edits: &mut [Edi
                 .filter(|done| {
                     // Settled with nothing signed: the snapshot holds what it left once a pass
                     // has run since (`seen`).
-                    !done.seen && (done.op.is_none() || !done.projected(frontier.as_ref()))
+                    !done.seen && (done.op.is_none() || !done.projected(frontier))
                 })
                 .find(|done| done.intent.edits.iter().any(|e| same(e, edit)))
                 .map(|done| done.intent.id.clone())
@@ -561,9 +571,12 @@ fn again(target: &Target, held: &aterm_file::Intent) -> Result<Draft, Refusal> {
     })
 }
 
-/// What a write verb did, as it prints.
-#[derive(Debug)]
-pub(super) enum Said {
+/// What a write verb did, as it prints: its one intent published (as the operation `op`, or
+/// with nothing signed where the table already said it), still queued or held, each by the
+/// intent's id and why; nothing queued, since the file already said what it asked; or a held
+/// intent dropped.
+#[derive(Clone, Debug)]
+pub enum Said {
     Published { id: String, op: Option<String> },
     Queued { id: String, why: String },
     Held { id: String, why: String },
@@ -580,6 +593,7 @@ pub struct Wrote {
     code: u8,
     id: Option<String>,
     unflushed: Option<String>,
+    said: Option<Said>,
 }
 
 impl Wrote {
@@ -596,6 +610,13 @@ impl Wrote {
         self.id.as_deref()
     }
 
+    /// What became of the verb's one intent, for a caller that answers in words of its own
+    /// (`aterm goals`); `None` for a face's commit, which queues one intent per row.
+    #[must_use]
+    pub const fn said(&self) -> Option<&Said> {
+        self.said.as_ref()
+    }
+
     /// What a face's `commit` or `edit` did: `text` and `code` over every intent it queued,
     /// which `text` names (no one [`Self::id`]; each intent's flush note is in `text`).
     pub(super) const fn of_face(text: String, code: u8) -> Self {
@@ -604,6 +625,7 @@ impl Wrote {
             code,
             id: None,
             unflushed: None,
+            said: None,
         }
     }
 
@@ -633,6 +655,7 @@ pub(super) fn answer(name: &Name, said: Said, unflushed: Option<&str>, json: boo
             Said::Unchanged => None,
         },
         unflushed: unflushed.map(str::to_owned),
+        said: Some(said.clone()),
     };
     wrote(printed(name, &said, unflushed, json))
 }
@@ -644,22 +667,8 @@ fn printed(name: &Name, said: &Said, unflushed: Option<&str>, json: bool) -> (St
     } else {
         exit::OK
     };
-    let (state, id, op, why) = match said {
-        Said::Published { id, op } => ("published", Some(id), op.as_ref(), None),
-        Said::Queued { id, why } => ("queued", Some(id), None, Some(why)),
-        Said::Held { id, why } => ("held", Some(id), None, Some(why)),
-        Said::Unchanged => ("unchanged", None, None, None),
-        Said::Dropped { id } => ("dropped", Some(id), None, None),
-    };
     if json {
-        let mut object = aterm_json::Map::new();
-        object.insert("file".to_owned(), Value::from(name.to_string()));
-        object.insert("state".to_owned(), Value::from(state));
-        object.insert("id".to_owned(), Value::from(id.map(String::as_str)));
-        object.insert("op".to_owned(), Value::from(op.map(String::as_str)));
-        object.insert("why".to_owned(), Value::from(why.map(String::as_str)));
-        object.insert("unflushed".to_owned(), Value::from(unflushed));
-        return (format!("{}\n", Value::Object(object)), code);
+        return (format!("{}\n", result_json(name, said, unflushed)), code);
     }
     let mut text = match said {
         Said::Published { op: Some(op), .. } => format!("published {op}\n"),
@@ -671,13 +680,37 @@ fn printed(name: &Name, said: &Said, unflushed: Option<&str>, json: bool) -> (St
         Said::Unchanged => format!("unchanged: {name} already says that\n"),
         Said::Dropped { id } => format!("dropped {id}: theirs kept\n"),
     };
-    if let (Some(why), Some(id)) = (unflushed, id) {
+    if let Some(why) = unflushed
+        && let Said::Queued { id, .. }
+        | Said::Held { id, .. }
+        | Said::Published { id, .. }
+        | Said::Dropped { id } = said
+    {
         text.push_str(&format!(
             "note: {id} is in the outbox, but its folder's flush failed ({why}); a power loss \
              before it is published may lose it\n"
         ));
     }
     (text, code)
+}
+
+/// One intent's structured result, shared by individual writes and a TSV import.
+pub(super) fn result_json(name: &Name, said: &Said, unflushed: Option<&str>) -> Value {
+    let (state, id, op, why) = match said {
+        Said::Published { id, op } => ("published", Some(id), op.as_ref(), None),
+        Said::Queued { id, why } => ("queued", Some(id), None, Some(why)),
+        Said::Held { id, why } => ("held", Some(id), None, Some(why)),
+        Said::Unchanged => ("unchanged", None, None, None),
+        Said::Dropped { id } => ("dropped", Some(id), None, None),
+    };
+    let mut object = aterm_json::Map::new();
+    object.insert("file".to_owned(), Value::from(name.to_string()));
+    object.insert("state".to_owned(), Value::from(state));
+    object.insert("id".to_owned(), Value::from(id.map(String::as_str)));
+    object.insert("op".to_owned(), Value::from(op.map(String::as_str)));
+    object.insert("why".to_owned(), Value::from(why.map(String::as_str)));
+    object.insert("unflushed".to_owned(), Value::from(unflushed));
+    Value::Object(object)
 }
 
 /// Give the publisher its bound for the intent `id`, and say what became of it.
@@ -707,16 +740,29 @@ pub(super) fn attempt_all(
             })
             .collect();
     }
-    let outcomes = offer(
-        paths,
-        config,
-        &target.name,
-        env.attempt,
-        env.now_ms,
-        env.journal,
-    );
+    // All markers, dequeues and the resulting materialization refresh one local TSV together.
+    let outcomes = target.held.batch_local_updates(|| {
+        offer(
+            paths,
+            config,
+            &target.name,
+            env.attempt,
+            env.now_ms,
+            env.journal,
+        )
+    });
+    let answers: BTreeMap<_, _> = outcomes
+        .iter()
+        .flat_map(|outcome| &outcome.intents)
+        .map(|(id, answer)| (id.as_str(), answer))
+        .collect();
+    let outbox = std::cell::OnceCell::new();
     ids.iter()
-        .map(|id| said_of(&target.held, &outcomes, id.clone()))
+        .map(|id| {
+            said_of(answers.get(id.as_str()).copied(), id.clone(), || {
+                outbox.get_or_init(|| target.held.outbox())
+            })
+        })
         .collect()
 }
 
@@ -734,26 +780,23 @@ pub(super) fn offered(
     journal: Option<&crate::alab::journal::Spool>,
 ) -> String {
     let held = File::at(&super::root(&generation::original(paths)), name);
-    let said = said_of(
-        &held,
-        &offer(paths, config, name, attempt, now_ms, journal),
-        id.to_owned(),
-    );
+    let outcomes = offer(paths, config, name, attempt, now_ms, journal);
+    let answer = outcomes.iter().find_map(|outcome| outcome.answer(id));
+    let outbox = std::cell::OnceCell::new();
+    let said = said_of(answer, id.to_owned(), || {
+        outbox.get_or_init(|| held.outbox())
+    });
     printed(name, &said, unflushed, false).0
 }
 
-/// What `outcomes`, a publisher pass's, say became of the intent `id` of `held`: where they say
-/// nothing of it, what its outbox says, since another pass may have settled it first.
-fn said_of(held: &File, outcomes: &[publish::Outcome], id: String) -> Said {
-    let answer = outcomes
-        .iter()
-        .find_map(|outcome| outcome.answer(&id).cloned());
-    match answer {
+/// A publisher outcome, or the local outbox if a racing pass settled this intent.
+fn said_of<'a>(answer: Option<&Answer>, id: String, outbox: impl FnOnce() -> &'a Outbox) -> Said {
+    match answer.cloned() {
         Some(Answer::Published { op }) => Said::Published { id, op },
         Some(Answer::Held { why }) => Said::Held { id, why },
         Some(Answer::Queued { why }) => Said::Queued { id, why },
         None => {
-            let outbox = held.outbox();
+            let outbox = outbox();
             if let Some(done) = outbox.done.iter().find(|done| done.intent.id == id) {
                 Said::Published {
                     op: done.op.clone(),
@@ -819,22 +862,32 @@ pub(super) fn offer(
 /// What `set <name> <row> <column> [<value>]`, or `set <name> <row> <column>=<value>…` with
 /// each cell of `cells`, queues as one intent, read against this Mac's last snapshot:
 /// `None` where every cell already says its value (no value: the cell is empty). The
-/// conformance test accepts it itself, so its accept is a step of its own.
+/// conformance test accepts it itself, so its accept is a step of its own. The verb drafts
+/// through [`draft_set_of`], against the one read of the file it already holds.
+#[cfg(test)]
 pub(crate) fn draft_set(
     paths: &Paths,
     name: &str,
     key: &str,
     cells: &[(&str, Option<&str>)],
 ) -> Result<Option<Draft>, Refusal> {
-    let target = Target::of(paths, name)?;
+    draft_set_of(&Target::of(paths, name)?, key, cells)
+}
+
+/// [`draft_set`] against `target`, the file as one read of this Mac's snapshot found it.
+fn draft_set_of(
+    target: &Target,
+    key: &str,
+    cells: &[(&str, Option<&str>)],
+) -> Result<Option<Draft>, Refusal> {
     let mut edits = Vec::new();
     for (column, value) in cells {
-        edits.extend(set(&target, key, column, *value)?);
+        edits.extend(set(target, key, column, *value)?);
     }
     if edits.is_empty() {
         return Ok(None);
     }
-    follow(&target, &mut edits);
+    follow(target, &mut edits);
     Ok(Some(Draft {
         born: false,
         revert: None,
@@ -847,7 +900,7 @@ pub(crate) fn draft_set(
 pub fn is_verb(word: &str) -> bool {
     matches!(
         word,
-        "set" | "add" | "rm" | "revert" | "resolve" | "commit" | "edit"
+        "set" | "add" | "rm" | "revert" | "resolve" | "commit" | "import" | "edit"
     )
 }
 
@@ -861,11 +914,39 @@ pub fn verb(
     words: &[String],
     env: &Env<'_>,
 ) -> Result<Wrote, Refusal> {
+    run(paths, config, words, env, None)
+}
+
+/// [`verb`]'s `set`, for a caller that read the row at revision `rev` of this Mac's snapshot
+/// and decided on what it read (`aterm goals claim` and `done`): refused, with nothing queued,
+/// where the snapshot here is no longer that revision. The write is then never read against a
+/// row its caller did not see, so what the caller saw is what the publisher compares.
+///
+/// # Errors
+/// As [`verb`]; and the snapshot moved since `rev`.
+pub(crate) fn set_seen(
+    paths: &Paths,
+    config: &Path,
+    words: &[String],
+    rev: u64,
+    env: &Env<'_>,
+) -> Result<Wrote, Refusal> {
+    run(paths, config, words, env, Some(rev))
+}
+
+/// [`verb`]; a `set` only at the snapshot revision `seen`, where its caller names one.
+fn run(
+    paths: &Paths,
+    config: &Path,
+    words: &[String],
+    env: &Env<'_>,
+    seen: Option<u64>,
+) -> Result<Wrote, Refusal> {
     #[expect(
         clippy::disallowed_methods,
-        reason = "the explicit `aterm file` verb: set, add, rm, revert, resolve, commit and edit \
-                  (this fn's own clippy.toml row lets only `aterm file`'s entry and `rename` run \
-                  it)"
+        reason = "the explicit `aterm file` verb: set, add, rm, revert, resolve, commit, import and edit \
+                  (the clippy.toml rows of `verb` and `set_seen`, this fn's two doors, let only \
+                  `aterm file`'s entry, `rename` and `aterm goals`' claim and done run it)"
     )]
     let act = OwnerAct::verb(env.by, env.session)
         .ok_or_else(|| usage("--by takes one word [a-z][a-z0-9-]{0,19}"))?;
@@ -878,7 +959,7 @@ pub fn verb(
     let word = |at: usize, what: &str| -> Result<&str, Refusal> {
         words.get(at).map(String::as_str).ok_or_else(|| usage(what))
     };
-    let verb = word(0, "set|add|rm|revert|resolve|commit|edit <name> ...")?;
+    let verb = word(0, "set|add|rm|revert|resolve|commit|import|edit <name> ...")?;
     let queued = |target: &Target, draft: Draft| -> Result<Wrote, Refusal> {
         let accepted = target
             .held
@@ -913,9 +994,16 @@ pub fn verb(
             let what = "set <name> <row> <column> [<value> | --stdin] | set <name> <row> \
                         <column>=<value>...";
             let target = Target::of(paths, word(1, what)?)?;
+            if seen.is_some_and(|rev| rev != target.rev) {
+                return Err(problem(format!(
+                    "{}: this machine's snapshot moved while the write was read, so nothing \
+                     was queued; run it again",
+                    target.name
+                )));
+            }
             let key = word(2, what)?;
             let cells = set_cells(&words[3..], env.stdin, what)?;
-            match draft_set(paths, target.file.name, key, &cells)? {
+            match draft_set_of(&target, key, &cells)? {
                 Some(draft) => queued(&target, draft),
                 None => Ok(answer(&target.name, Said::Unchanged, None, env.json)),
             }
@@ -1001,6 +1089,17 @@ pub fn verb(
                 _ => Err(usage(what)),
             }
         }
+        "import" => {
+            let what = "import <name> <file> [--apply]";
+            let target = Target::of(paths, word(1, what)?)?;
+            let source = Path::new(word(2, what)?);
+            let apply = match &words[3..] {
+                [] => false,
+                [flag] if flag == "--apply" => true,
+                _ => return Err(usage(what)),
+            };
+            super::face::import(paths, config, &target, &act, env, source, apply)
+        }
         "commit" => {
             let what = "commit <name>";
             let target = Target::of(paths, word(1, what)?)?;
@@ -1017,7 +1116,9 @@ pub fn verb(
             }
             edit(paths, config, &target, &act, env)
         }
-        _ => Err(usage("set|add|rm|revert|resolve|commit|edit <name> ...")),
+        _ => Err(usage(
+            "set|add|rm|revert|resolve|commit|import|edit <name> ...",
+        )),
     }
 }
 

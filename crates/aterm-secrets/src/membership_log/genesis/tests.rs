@@ -409,6 +409,7 @@ fn a_removed_listed_founder_stays_out_whatever_its_own_admits_name() {
                 parents: vec![*let_in.id()],
                 authored_ms: 5,
                 body,
+                statement: None,
             }
         } else {
             log(&store).draft(&L.id(), 5, body)
@@ -635,6 +636,7 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
                         },
                         evidence: Evidence::Phrase,
                     },
+                    statement: None,
                 }
                 .sign(&L.seed(), L.incarnation())
                 .unwrap();
@@ -650,6 +652,7 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
                         member: sybil_id,
                         cutoff: admit_sybil_id,
                     },
+                    statement: None,
                 }
                 .sign(&L.seed(), L.incarnation())
                 .unwrap();
@@ -674,6 +677,7 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
                         parents: vec![*let_in.id()],
                         authored_ms: 6,
                         body,
+                        statement: None,
                     }
                 } else {
                     log(&store).draft(&L.id(), 6, body)

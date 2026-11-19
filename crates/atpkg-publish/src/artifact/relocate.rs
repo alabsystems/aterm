@@ -240,9 +240,7 @@ pub fn relocate_with(
                 changed = true;
             } else {
                 let base = basename(dep);
-                let unresolved_in_payload =
-                    dep.starts_with("@rpath/") || is_shared_lib_basename(&base);
-                if !unresolved_in_payload || have.contains(&base) {
+                if !searches_for_library(dep) || have.contains(&base) {
                     continue;
                 }
                 if let Some(src) = find_in_donors(&base, &donors) {
@@ -261,7 +259,6 @@ pub fn relocate_with(
                         prescanned.remove(&dest);
                         queue.push(dest);
                     }
-                    changed = true;
                 } else if dep.starts_with("@rpath/") {
                     report.unresolved.push(format!(
                         "{}: {dep} is absent from the payload and declared donor libraries",
@@ -278,10 +275,11 @@ pub fn relocate_with(
             .filter(|r| !builder(r))
             .cloned()
             .collect();
-        let needs_vendor = vendored.is_dir()
-            && refs.needed.iter().any(|n| {
-                n.starts_with("@rpath/") || builder(n) || is_shared_lib_basename(&basename(n))
-            });
+        // Absolute system imports and direct loader-relative imports never search an rpath.
+        // A producer's system-only tool or in-payload driver keeps its existing signature.
+        let needs_vendor = refs.needed.iter().any(|dep| {
+            (searches_for_library(dep) || builder(dep)) && vendored.join(basename(dep)).is_file()
+        });
         if needs_vendor || !ml_rpaths.is_empty() {
             let mut dirs: Vec<&Path> = vec![obj.parent().unwrap_or(stage)];
             for alias in group {
@@ -293,7 +291,11 @@ pub fn relocate_with(
             let mut drop = ml_rpaths;
             for (i, dir) in dirs.iter().enumerate() {
                 let rel = origin_relative(backend.origin_token(), dir, &vendored);
-                if i > 0 && keep.contains(&rel) {
+                // Mach-O keeps the order of existing rpaths. ELF prepends the
+                // first origin, even when its previous entry was further down.
+                if keep.contains(&rel)
+                    && (i > 0 || (drop.is_empty() && backend.origin_token() == "@loader_path"))
+                {
                     continue;
                 }
                 if let Err(e) = backend.fix_rpaths(&obj, &rel, &keep, &drop) {
@@ -525,6 +527,10 @@ fn is_shared_lib_name(rel: &Path) -> bool {
 
 fn is_shared_lib_basename(name: &str) -> bool {
     name.ends_with(".dylib") || name.contains(".so.") || name.ends_with(".so")
+}
+
+fn searches_for_library(dep: &str) -> bool {
+    dep.starts_with("@rpath/") || (!dep.contains('/') && is_shared_lib_basename(dep))
 }
 
 /// Recursively collect regular files under `dir` (symlinks not followed), paths relative to `dir`,

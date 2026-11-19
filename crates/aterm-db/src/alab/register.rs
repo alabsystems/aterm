@@ -1115,22 +1115,14 @@ fn birth_record(
 ) -> Option<astream_wire::sync::Digest> {
     let own_pk = keys::machine_pk(uuid);
     let own = facts.rows.get(uuid)?;
-    view.ops
-        .iter()
-        .filter(|op| op.actor == own.actor && !view.quota.over.contains(&op.id))
-        .filter_map(|op| {
-            op.changes
-                .iter()
-                .find(|c| c.collection == MACHINE_FACTS.name && c.key == uuid)
-                .and_then(|c| c.value.as_ref())
-                .map(|row| (op, row))
+    view.state
+        .first
+        .get(&(own.actor, MACHINE_FACTS.name.to_owned(), uuid.to_owned()))
+        .filter(|first| {
+            first.row.get("n").and_then(Value::as_u64) == Some(1)
+                && text(&first.row, "mac") == Some(own_pk.as_str())
         })
-        .min_by_key(|(op, _)| op.sequence)
-        .filter(|(_, row)| {
-            row.get("n").and_then(Value::as_u64) == Some(1)
-                && text(row, "mac") == Some(own_pk.as_str())
-        })
-        .map(|(op, _)| op.id)
+        .map(|first| first.operation)
 }
 
 /// Whether the record that birthed `born`'s row ([`birth_record`]) had the facts row `facts`

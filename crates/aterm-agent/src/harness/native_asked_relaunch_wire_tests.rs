@@ -178,7 +178,7 @@ fn relaunch_wire_requires_one_complete_bounded_purpose() {
     for purpose in ["account", "input-lost"] {
         assert!(Request::parse(&field(&memory, "asked-relaunch", Some(purpose))).is_none());
     }
-    for ask in ["", "00", "0a", "ff"] {
+    for ask in ["", "00", "0a", "0d", "ff"] {
         assert!(Request::parse(&field(&memory, "asked-ask", Some(ask))).is_none());
     }
     assert!(Request::parse(&format!("{memory} asked-relaunch=input-lost")).is_none());

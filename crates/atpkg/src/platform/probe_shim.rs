@@ -207,7 +207,7 @@ impl Capture {
         let final_line = format!("exec {} \"$@\"\n", sh_shim_quote(&target));
         let mut body = ordinary.strip_suffix(final_line.as_str())?.to_string();
         if let Some(launch) = launch {
-            if is_link(&launch)? && executable(&launch)? {
+            if guarded_launch(&launch)? {
                 body.push_str(&self.forward(&launch, helper, depth)?.exec(&[]));
                 body.push('\n');
                 return Some(body);
@@ -379,6 +379,11 @@ fn regular(path: &Path) -> Option<bool> {
     }
 }
 
+/// The producer's `-L` and `-x` guard, including an unknown filesystem observation.
+pub(super) fn guarded_launch(path: &Path) -> Option<bool> {
+    Some(is_link(path)? && execute_access(path)?)
+}
+
 fn is_link(path: &Path) -> Option<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => Some(meta.file_type().is_symlink()),
@@ -390,9 +395,12 @@ fn is_link(path: &Path) -> Option<bool> {
 /// Kernel execute access to a regular file, following links; unread evidence or differing
 /// real and effective credentials leave the answer unknown.
 pub(crate) fn executable(path: &Path) -> Option<bool> {
-    if !regular(path)? {
-        return Some(false);
-    }
+    Some(regular(path)? && execute_access(path)?)
+}
+
+// The shell's `-x` also accepts search access to a directory. The guarded branch
+// then attempts to exec that directory and fails, without running the fallback.
+fn execute_access(path: &Path) -> Option<bool> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: the owned NUL-terminated path remains live; access only reads it. Probes run
     // without set-id credentials, so the shell's effective-user -x and access name one user.

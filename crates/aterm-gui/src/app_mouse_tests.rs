@@ -3268,6 +3268,53 @@ fn markdown_reader_pointer_keeps_source_composition_until_it_commits() {
 }
 
 #[test]
+fn pointer_move_by_key_reaches_a_wrapped_markdown_link() {
+    use super::{NativePointerTarget, PointerAt};
+    use crate::native_app::{AppKind, AppViewState};
+    use crate::{App, WindowId};
+
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("guide.md");
+    let label = "observations ".repeat(30);
+    let source = format!("Read [{label}here](#results).\n\n# Results\n");
+    std::fs::write(&path, &source).unwrap();
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.open_document_tab(AppKind::Markdown, &file_uri(&path))
+        .unwrap();
+    let (_, view) = app.active_native_view(wid).unwrap();
+    let key = "markdown/block/0/link/0";
+    let compiled = presented_native_ui(&mut app, wid);
+    assert!(
+        compiled
+            .hits
+            .iter()
+            .filter(|hit| hit.key.as_str() == key)
+            .count()
+            > 1,
+        "the link wraps onto several visible lines"
+    );
+
+    let cell = app
+        .pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+            key.into(),
+        )))
+        .unwrap();
+    assert!(
+        matches!(app.pointer_reply(cell), Ok(PointerAt::Native { key: Some(hit), .. }) if hit == key)
+    );
+    let _ = app.pointer_cmd(PointerAction::Click).unwrap();
+    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+        panic!("expected the Markdown workspace");
+    };
+    assert_eq!(
+        state.markdown.as_ref().unwrap().reader.source_anchor,
+        source.find("# Results").unwrap()
+    );
+}
+
+#[test]
 fn markdown_pointer_selects_the_exact_authored_block_through_semantic_hit_testing() {
     use crate::native_app::{AppKind, AppViewState};
     use crate::native_ui::UiContent;

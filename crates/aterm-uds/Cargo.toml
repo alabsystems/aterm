@@ -37,6 +37,8 @@ aterm-digest = { workspace = true }
 [target.'cfg(any(unix, windows))'.dependencies]
 # aterm-sysprobe: `procargs`, the workspace's one `KERN_PROCARGS2` reader and
 # parser, which this crate re-exports and its `process` reads argv with; the
+# process-tree reader (`procs::process_tree`) the progress probe
+# (`deadline::ProcessProgressProbe`) reads a child's descendants with; the
 # job probe's socket table decoders (`jobs::darwin::unix_listeners`, Linux's
 # socket dump `linux::unix_diag_listeners`, `parse_fd_link`), which the
 # listener-holder scan (`holders::scan_listener_holders`) reads the kernel's
@@ -102,6 +104,10 @@ aterm-spec = { workspace = true }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "row_watch"
+test = true
 
 [[test]]
 name = "tether_startup"

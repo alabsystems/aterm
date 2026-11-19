@@ -956,8 +956,10 @@ impl MarkReq {
 impl SessionLog {
     /// THE RECORD STREAM'S ONE WRITE ARM: a mark a harness record stands for, at `node` (the
     /// session with none). Every one is stamped here with all four of `holder=<the claim's
-    /// holder>`, `src=harness`, `conf=claim` and `by=<the tab's own session>`, so no writer of
-    /// a stream row can leave one out; a holder that is no ID writes nothing. It neither reads
+    /// holder>`, `src=harness`, `conf=claim` and `by=<the tab's own session>` by the one stamp
+    /// every stream row is built from ([`aterm_slog::HarnessStamp`], which the conversation
+    /// records' nodes use too), so no writer of a stream row can leave one out; a holder that
+    /// is no ID writes nothing. It neither reads
     /// nor spends the mark limiter: the stream's own bucket (`control_stream.rs`) is the only
     /// budget a record has, and a session's `mark` budget is not the harness's to use up.
     pub(crate) fn stream_mark(
@@ -969,10 +971,8 @@ impl SessionLog {
         by: Actor,
         at: Stamp,
     ) -> Option<u64> {
-        let fields = fields.id(Key::Holder, holder).ok()?;
-        let mut mark = Mark::new(kind, Src::Harness, aterm_slog::Conf::Claim)
-            .by(by)
-            .fields(fields);
+        let stamp = aterm_slog::HarnessStamp::new(holder, by, None)?;
+        let mut mark = stamp.mark(kind, fields).ok()?;
         if let Some(node) = node {
             mark = mark.at(node);
         }
@@ -991,10 +991,8 @@ impl SessionLog {
         by: Actor,
         at: Stamp,
     ) -> Option<Node> {
-        let fields = fields.id(Key::Holder, holder).ok()?;
-        let mut open = aterm_slog::Open::new(kind, Src::Harness, aterm_slog::Conf::Claim)
-            .by(by)
-            .fields(fields);
+        let stamp = aterm_slog::HarnessStamp::new(holder, by, None)?;
+        let mut open = stamp.open(kind, fields).ok()?;
         if let Some(parent) = parent.filter(|parent| self.log.is_open(*parent)) {
             open = open.under(parent);
         }
@@ -1010,14 +1008,10 @@ impl SessionLog {
         by: Actor,
         at: Stamp,
     ) -> Option<u64> {
-        let fields = fields.id(Key::Holder, holder).ok()?;
-        let close = aterm_slog::Close::new(
-            aterm_slog::Out::Step(aterm_slog::StepOut::Ok),
-            Src::Harness,
-            aterm_slog::Conf::Claim,
-        )
-        .by(by)
-        .fields(fields);
+        let stamp = aterm_slog::HarnessStamp::new(holder, by, None)?;
+        let close = stamp
+            .close(aterm_slog::Out::Step(aterm_slog::StepOut::Ok), fields)
+            .ok()?;
         self.log.close(node, close, at).ok()
     }
 

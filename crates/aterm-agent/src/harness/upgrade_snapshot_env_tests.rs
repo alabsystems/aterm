@@ -191,6 +191,7 @@ fn codex_snapshot_login_env_verifies_codex_home_and_self_claimed_auth_path() {
     snap.argv = vec![at!("/synthetic/codex").into()];
     snap.route = crate::harness::accounts::AuthRoute::Outside;
     snap.run = AgentRun::Codex(crate::harness::relaunch::CodexRun {
+        selected_default: false,
         home: "/synthetic/.codex".into(),
         home_env: Some("/synthetic/.codex".into()),
         self_claimed: Some(crate::harness::self_claimed::Resume {

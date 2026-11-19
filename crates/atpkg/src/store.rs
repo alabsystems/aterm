@@ -525,11 +525,34 @@ pub(crate) fn build_is_complete_on(
     build_dir: &Path,
     host: Option<aterm_toolchain::gnu_runtime::Host>,
 ) -> bool {
+    match read_build_completion(build_dir, host) {
+        Ok(complete) => complete,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::InvalidInput
+        ),
+    }
+}
+
+/// Positive completion evidence for a read-only package identity. An unreadable marker
+/// protects an install from garbage collection, but cannot identify a selected build.
+pub(crate) fn readably_complete(build_dir: &Path) -> bool {
+    aterm_toolchain::gnu_runtime::host()
+        .ok()
+        .is_some_and(|host| matches!(read_build_completion(build_dir, host), Ok(true)))
+}
+
+fn read_build_completion(
+    build_dir: &Path,
+    host: Option<aterm_toolchain::gnu_runtime::Host>,
+) -> std::io::Result<bool> {
     let Some(marker) = ready_marker_path(build_dir) else {
-        return false;
+        return Ok(false);
     };
     if is_provably_absent(build_dir) {
-        return false;
+        return Ok(false);
     }
     // A runtime this process cannot read, or one past the inspector's entry bound, is no
     // verdict: the marker, written only after a whole admission, answers for it as it does where
@@ -541,24 +564,10 @@ pub(crate) fn build_is_complete_on(
     if host.is_some_and(|host| {
         aterm_toolchain::gnu_runtime::admit_tree_on(&tree, host).is_err_and(|why| why.is_refusal())
     }) {
-        return false;
+        return Ok(false);
     }
-    match crate::metadata_io::read_bounded_regular_utf8(&marker, 4 * 1024 * 1024) {
-        Ok(text) => {
-            ready_text_accepts(&text, &running_platform())
-                && ready_contents_accept(&text, build_dir)
-        }
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
-            ) =>
-        {
-            false
-        }
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
-    }
+    let text = crate::metadata_io::read_bounded_regular_utf8(&marker, 4 * 1024 * 1024)?;
+    Ok(ready_text_accepts(&text, &running_platform()) && ready_contents_accept(&text, build_dir))
 }
 
 /// Whether `build_dir`'s ready record names a `bin/` tool that is provably gone, which makes
@@ -1906,7 +1915,10 @@ pub fn resolve_configured() -> Option<Layout> {
 }
 
 /// Resolve the same admitted prefix without configuration notices or host-log writes.
-pub(crate) fn resolve_for_lookup() -> Result<Option<Layout>, &'static str> {
+///
+/// # Errors
+/// Returns an error when the configuration cannot be read for a lookup.
+pub fn resolve_for_lookup() -> Result<Option<Layout>, &'static str> {
     let cfg = crate::config::load_for_lookup()?;
     let Some(home) = aterm_types::dirs::home_dir() else {
         return Ok(None);

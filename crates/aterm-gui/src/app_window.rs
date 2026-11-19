@@ -4140,7 +4140,8 @@ impl App {
         self.apply_dock_at(wid, cells, now, true)
     }
 
-    /// Reconcile the session panel's effective width without recording a person's Show or Hide.
+    /// Reconcile the session panel's width while preserving a person's explicit choice.
+    /// A default rise inside the held client leaves the terminal its preferred 80 columns.
     pub(crate) fn set_roster_dock_at(
         &mut self,
         wid: WindowId,
@@ -4148,6 +4149,20 @@ impl App {
         now: std::time::Instant,
     ) -> Result<(), DockRefusal> {
         self.claim_roster_dock(wid)?;
+        let dock = &self.windows[&wid].dock;
+        let explicit = dock.pref.is_some() && !dock.by_default;
+        if cells > dock.cells
+            && !explicit
+            && let Some(held) = self.held_inner_px(wid)
+            && held.width != 0
+            && held.height != 0
+        {
+            let has = self.grid_dims_for(wid, held).1.saturating_add(dock.cells);
+            let needs = DOCK_KEEPS_COLS.saturating_add(cells);
+            if has.saturating_sub(cells) < DOCK_KEEPS_COLS {
+                return Err(DockRefusal::TooNarrow { has, needs });
+            }
+        }
         self.apply_dock_at(wid, cells, now, false)
     }
 
@@ -4470,20 +4485,14 @@ impl App {
                     continue;
                 }
             }
-            let keeps = self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| ws.cols >= DOCK_KEEPS_COLS.saturating_add(cells));
             if roster {
-                let explicit =
-                    self.windows[&wid].dock.pref.is_some() && !self.windows[&wid].dock.by_default;
-                if (keeps || explicit) && self.set_roster_dock_at(wid, cells, now).is_ok() {
+                if self.set_roster_dock_at(wid, cells, now).is_ok() {
                     moved = true;
                 } else if let Some(mut ws) = self.windows.get_mut(&wid) {
                     ws.dock.owed = Owed::None;
                     ws.dock.retry_roster_on_resize = true;
                 }
-            } else if keeps {
+            } else if self.windows[&wid].cols >= DOCK_KEEPS_COLS.saturating_add(cells) {
                 match self.set_dock_at(wid, cells, now) {
                     Ok(()) => {
                         moved = true;

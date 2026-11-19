@@ -241,6 +241,94 @@ impl Rec {
     }
 }
 
+pub(crate) use records::{Log, LogChanges, LogRead};
+
+/// The log's records, apart, so nothing but [`Log`]'s own counted changes reaches them.
+mod records {
+    use super::Rec;
+
+    /// THE LOG'S RECORDS, by offset, changed only by an append or a cut ([`Log::push`],
+    /// [`Log::truncate`], [`Log::clear`], [`Log::take`]), each counted: a reader that read the log
+    /// at one count of each knows what changed since ([`Log::changes`]).
+    #[derive(Debug)]
+    pub(crate) struct Log {
+        recs: Vec<Rec>,
+        /// Appends and cuts made.
+        edits: u64,
+        /// Cuts made: while this stands, every record a reader read is still at its offset.
+        cuts: u64,
+    }
+
+    /// What a reader read of a [`Log`]: `(edits, cuts)` then.
+    pub(crate) type LogRead = (u64, u64);
+
+    /// What changed in a [`Log`] since a reader read it ([`Log::changes`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum LogChanges {
+        /// Nothing.
+        None,
+        /// Records appended, every one read still at its offset.
+        Appended,
+        /// A cut, perhaps followed by appends: a record at any offset may be another now.
+        Cut,
+    }
+
+    impl Log {
+        pub(crate) const fn new() -> Self {
+            Self {
+                recs: Vec::new(),
+                edits: 0,
+                cuts: 0,
+            }
+        }
+
+        pub(crate) fn push(&mut self, rec: Rec) {
+            self.edits += 1;
+            self.recs.push(rec);
+        }
+
+        pub(crate) fn truncate(&mut self, len: usize) {
+            self.edits += 1;
+            self.cuts += 1;
+            self.recs.truncate(len);
+        }
+
+        pub(crate) fn clear(&mut self) {
+            self.truncate(0);
+        }
+
+        /// Every record, the log left empty.
+        pub(crate) fn take(&mut self) -> Vec<Rec> {
+            self.edits += 1;
+            self.cuts += 1;
+            std::mem::take(&mut self.recs)
+        }
+
+        /// What a reader reads now, to ask [`Log::changes`] later.
+        pub(crate) const fn read(&self) -> LogRead {
+            (self.edits, self.cuts)
+        }
+
+        /// What changed since a reader read `then` ([`Log::read`]); a reader that never read it
+        /// is owed everything as a cut.
+        pub(crate) fn changes(&self, then: Option<LogRead>) -> LogChanges {
+            match then {
+                Some((edits, _)) if edits == self.edits => LogChanges::None,
+                Some((_, cuts)) if cuts == self.cuts => LogChanges::Appended,
+                _ => LogChanges::Cut,
+            }
+        }
+    }
+
+    impl std::ops::Deref for Log {
+        type Target = [Rec];
+
+        fn deref(&self) -> &[Rec] {
+            &self.recs
+        }
+    }
+}
+
 /// THE ESCALATION TABLE the model applies.
 #[derive(Clone, Debug)]
 pub(crate) struct Escalation {
@@ -529,7 +617,7 @@ pub(crate) struct State {
     pub(crate) generation: u64,
     /// `(generation, common)`, oldest first, at most [`astream_broker::Lineage::MAX`].
     pub(crate) lineage: Vec<(u64, u64)>,
-    pub(crate) log: Vec<Rec>,
+    pub(crate) log: Log,
     /// Every record below it is on stable media.
     pub(crate) durable: u64,
     /// WHERE THE LOG IS (critic item F07): the device its `Hello` names, a full flush that
@@ -1051,7 +1139,7 @@ impl Broker {
                 id: LOG_ID,
                 generation: 0,
                 lineage: Vec::new(),
-                log: Vec::new(),
+                log: Log::new(),
                 durable: 0,
                 device: OnDevice::default(),
                 settle_owed: false,
@@ -1460,7 +1548,7 @@ impl Broker {
             return None;
         }
         s.note_event(|| Event::RetireLog);
-        let before = std::mem::take(&mut s.log);
+        let before = s.log.take();
         let durable_before = s.durable;
         let generation_before = s.generation;
         s.durable = 0;
@@ -1523,7 +1611,7 @@ impl Broker {
             return None;
         }
         s.note_event(|| Event::LoseIdentity);
-        let before = s.log.clone();
+        let before = s.log.to_vec();
         let generation_before = s.generation;
         if s.mutant == ArmMutant::RemintForgetsTheRecords {
             s.log.clear();
@@ -1608,7 +1696,7 @@ impl Broker {
     ) -> Restart {
         let mut s = lock(&self.state);
         s.note_event(|| Event::Stop(stop));
-        let before = s.log.clone();
+        let before = s.log.to_vec();
         let durable_before = s.durable;
         let generation_before = s.generation;
         let tier = s.tier;
@@ -1779,6 +1867,19 @@ impl Broker {
                 .iter()
                 .any(|will| will.conn.is_some() && will.fired_at.is_none())
             && wills.iter().any(|will| will.fired_at.is_some())
+    }
+
+    /// Each record [`Broker::records`] answers at or past offset `from`, read where it lies:
+    /// its offset, subject and body.
+    pub(crate) fn each_visible_from(&self, from: u64, mut each: impl FnMut(u64, &str, &[u8])) {
+        let s = lock(&self.state);
+        let visible = usize::try_from(s.visible_head()).unwrap_or(usize::MAX);
+        let from = usize::try_from(from).unwrap_or(usize::MAX);
+        for (i, r) in s.log.iter().enumerate().take(visible).skip(from) {
+            if !r.hidden() {
+                each(i as u64, &r.subject, &r.body);
+            }
+        }
     }
 
     /// Every visible record, for the oracle.

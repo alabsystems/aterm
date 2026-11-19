@@ -28,6 +28,7 @@ use aterm_converge::{
     Class, Explain, FileJournal, Item, ItemReport, Layer, Mode, Outcome, Probe, Remedy, Scope,
     StoodAside,
 };
+use aterm_types::macos_setup::spotlight_scope;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -44,8 +45,8 @@ pub use cost::Spent;
 /// `sync.steward.server.standby`; 8: the steward's fleet item retired; 9: automatic signing;
 /// 10: the vault GitHub helper; 11: `sync.clone`; 12: `sync.clone-tuning`;
 /// 13: admitted repository prerequisites; 14: `sync.refresh`, the refresh of the checkouts
-/// already here, split from `sync.clone`'s acquisition).
-pub const SPEC: u32 = 14;
+/// already here, split from `sync.clone`'s acquisition; 15: `sync.spotlight`).
+pub const SPEC: u32 = 15;
 
 /// The pass's record, in `<state_dir>/converge` ([`FileJournal::DIR`]).
 pub const RECORD: &str = "aligned.json";
@@ -109,6 +110,10 @@ pub const RELEASE: &str = "sync.release";
 pub const FABRIC: &str = "sync.fabric";
 /// `sync.awake`: aCaffeine keeping this Mac awake, with no window open too.
 pub const AWAKE: &str = "sync.awake";
+/// `sync.spotlight`: the console account's own top-level home folders made since setup's
+/// password scoped the home (a checkout, a clone, an agent's worktree), excluded from Spotlight
+/// by the root LAN broker with no password ([`crate::init_spotlight::exclude_by_broker`]).
+pub const SPOTLIGHT: &str = "sync.spotlight";
 
 /// What every sync row says when `[swarm] enabled = false` turns swarm participation off.
 pub use aterm_secrets::swarm::SWARM_OFF;
@@ -1108,6 +1113,21 @@ pub trait Ports: Sync {
     /// (`aterm init --converge`'s hand-off), so the rows a held copy applies are the installed
     /// app's, as the window's are. `None` where this process is it, or none is found.
     fn installed_release_elsewhere(&self) -> Option<PathBuf>;
+    /// What the root LAN broker would exclude for this account's home, as the account reads
+    /// the broker's rules ([`crate::init_spotlight::broker_reading`]), or why it would leave the
+    /// folders as they are: `None` where this account has no home at this Mac's console, as off
+    /// macOS.
+    fn spotlight(
+        &self,
+    ) -> Option<Result<std::collections::BTreeSet<PathBuf>, spotlight_scope::Leave>> {
+        None
+    }
+    /// Ask the root LAN broker to exclude from Spotlight what [`Self::spotlight`] reads it
+    /// would take, and read the home again after its answer
+    /// ([`crate::init_spotlight::exclude_by_broker`]).
+    fn exclude_spotlight(&self) -> spotlight_scope::Pass {
+        spotlight_scope::Pass::Nothing
+    }
     /// Start `program` with `args` (the installed app's run of a held copy's pass), returning
     /// what waits for it to end ([`ElsewhereRun`]). Its starter waits for that on a thread of its
     /// own, beside the watch on its own starter (`aterm init --converge`'s hand-off), so it can
@@ -1165,6 +1185,7 @@ kinds! {
     Release => RELEASE,
     Fabric => FABRIC,
     Awake => AWAKE,
+    Spotlight => SPOTLIGHT,
 }
 
 /// Whether `id` is the id of one of this lane's own items ([`Kind`]), which a pass journals
@@ -1179,10 +1200,20 @@ pub fn own_item(id: &str) -> bool {
 impl Kind {
     /// Whether this kind rides the vault, so System State's hold on the vault holds it too
     /// ([`Ports::vault_held`]): every kind but the fabric, a message bus provisioned on this Mac
-    /// alone (design §8.5), and aCaffeine's keeping this Mac awake, which an aterm window keeps
-    /// whatever the vault does, so the subscriber's pass keeps it alike.
+    /// alone (design §8.5), aCaffeine's keeping this Mac awake, which an aterm window keeps
+    /// whatever the vault does, so the subscriber's pass keeps it alike, and Spotlight's
+    /// exclusion of this home's folders, which this Mac's root LAN broker makes.
     const fn rides_the_vault(self) -> bool {
-        !matches!(self, Self::Fabric | Self::Awake)
+        !matches!(self, Self::Fabric | Self::Awake | Self::Spotlight)
+    }
+
+    /// Whether `[swarm] enabled = false` turns this kind off ([`Ports::swarm_enabled`]): every
+    /// kind but Spotlight's exclusion of this home's folders, which is this Mac's own upkeep
+    /// with its root LAN broker, not swarm participation. The window and every automatic run of
+    /// `aterm init` leave a home this row would scope to it
+    /// ([`crate::init_spotlight::automatic_scope_owed`]), swarm on or off.
+    const fn rides_the_swarm(self) -> bool {
+        !matches!(self, Self::Spotlight)
     }
 }
 
@@ -1337,6 +1368,50 @@ fn not_applicable(why: impl Into<String>) -> Probe {
     Probe::NotApplicable { why: why.into() }
 }
 
+/// The most folder names `sync.spotlight`'s row names ([`Synced::spotlight_probe`]).
+const SPOTLIGHT_NAMES: usize = 6;
+
+impl Synced<'_> {
+    /// `sync.spotlight`'s reading ([`Ports::spotlight`]): a folder the root LAN broker would
+    /// exclude is a change it makes; a cause that keeps it from acting (no broker of this build
+    /// serves, a rule refuses the home, its receipt or share of it is full, or the broker already
+    /// left these folders as they are) is no work of this row's, so the pass completes and the
+    /// next pass reads it again. So is a reading of this Mac that did not answer (an indexing
+    /// state `mdutil` reports unknown, a mount table or a home listing unread): nothing says a
+    /// try on the clock would read it sooner, and one that lasts would be tried every five
+    /// minutes for good, so the next pass, at most the 30-minute recheck away, reads it again.
+    fn spotlight_probe(&self) -> Probe {
+        match self.ports.spotlight() {
+            None => not_applicable(
+                "this account has no home at this Mac's console for Spotlight to leave out",
+            ),
+            Some(Err(
+                spotlight_scope::Leave::Refused(why)
+                | spotlight_scope::Leave::Stands(why)
+                | spotlight_scope::Leave::Unread(why),
+            )) => not_applicable(why),
+            Some(Ok(folders)) if folders.is_empty() => Probe::Ok {
+                now: "the LAN broker would leave out no more of this home's folders".to_owned(),
+            },
+            Some(Ok(folders)) => {
+                let mut names: Vec<String> = folders
+                    .iter()
+                    .take(SPOTLIGHT_NAMES)
+                    .filter_map(|folder| folder.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .collect();
+                if folders.len() > SPOTLIGHT_NAMES {
+                    names.push(format!("{} more", folders.len() - SPOTLIGHT_NAMES));
+                }
+                Probe::Change {
+                    from: format!("indexed: {}", names.join(", ")),
+                    to: "excluded by the LAN broker".to_owned(),
+                }
+            }
+        }
+    }
+}
+
 const AWAKE_STARTUP_OFF_WHY: &str = "aCaffeine's Enable at Startup is off by your choice, so an \
      aterm window starts the mug, not this pass";
 
@@ -1387,7 +1462,8 @@ impl Item for Synced<'_> {
             | Kind::Requests
             | Kind::Release
             | Kind::Fabric
-            | Kind::Awake => Class::Relay,
+            | Kind::Awake
+            | Kind::Spotlight => Class::Relay,
             Kind::Peers
             | Kind::OwedClone
             | Kind::RefreshRepositories
@@ -1418,6 +1494,7 @@ impl Item for Synced<'_> {
             Kind::Fabric => "the message bus (fabric)",
             Kind::Awake if cfg!(target_os = "macos") => "aCaffeine keeping this Mac awake",
             Kind::Awake => "aCaffeine, which keeps a Mac awake",
+            Kind::Spotlight => "the home folders Spotlight leaves out",
         }
         .to_owned()
     }
@@ -1431,10 +1508,12 @@ impl Item for Synced<'_> {
         {
             return stale;
         }
-        match self.ports.swarm_enabled() {
-            Ok(true) => {}
-            Ok(false) => return not_applicable(SWARM_OFF),
-            Err(why) => return Probe::Unusable { why },
+        if self.kind.rides_the_swarm() {
+            match self.ports.swarm_enabled() {
+                Ok(true) => {}
+                Ok(false) => return not_applicable(SWARM_OFF),
+                Err(why) => return Probe::Unusable { why },
+            }
         }
         if self.kind.rides_the_vault()
             && let Some(why) = self.held.get_or_init(|| self.ports.vault_held())
@@ -1761,6 +1840,7 @@ impl Item for Synced<'_> {
                     AwakeRead::Asking(why) => Probe::Deferred { why },
                 })
             }
+            Kind::Spotlight => self.spotlight_probe(),
         }
     }
 
@@ -1978,6 +2058,53 @@ impl Item for Synced<'_> {
                     self.ports.retire_awake_old_jobs()?
                 }
             }
+            Kind::Spotlight => match self.ports.exclude_spotlight() {
+                spotlight_scope::Pass::Done(added) => {
+                    format!("the LAN broker excluded {added} of this home's folders from Spotlight")
+                }
+                spotlight_scope::Pass::More(added) => {
+                    self.stand_aside(StoodAside::Waiting(format!(
+                        "the LAN broker excluded {added} of this home's folders from Spotlight; \
+                         the next try takes the rest"
+                    )));
+                    return Ok(());
+                }
+                spotlight_scope::Pass::Busy => {
+                    self.stand_aside(StoodAside::Waiting(
+                        "the LAN broker could not take these folders just now: another Spotlight \
+                         edit held it off, root's lock was not taken for a cause that passes (a \
+                         full disk, no file descriptor free), its reading of this home did not \
+                         answer in time, or Spotlight rewrote its configuration under each of its \
+                         edits; the next try asks again"
+                            .to_owned(),
+                    ));
+                    return Ok(());
+                }
+                // A broker its reading said serves, restarting or adopting a build: the clock's
+                // next try may be served.
+                spotlight_scope::Pass::Unavailable(why) => {
+                    self.stand_aside(StoodAside::Waiting(format!(
+                        "{why}; the next try asks again"
+                    )));
+                    return Ok(());
+                }
+                // A definite answer, kept: the next try reads these folders left as they are
+                // (not applicable, so no pass waits on them), and a folder made since asks again.
+                spotlight_scope::Pass::Left(why) => {
+                    self.stand_aside(StoodAside::Waiting(format!(
+                        "{why}; these folders are not asked for again until another is made or \
+                         a day has passed"
+                    )));
+                    return Ok(());
+                }
+                spotlight_scope::Pass::Failed(why) => {
+                    return Err(format!(
+                        "{why}; these folders are not asked for again until another is made or \
+                         a day has passed"
+                    ));
+                }
+                spotlight_scope::Pass::Nothing => return Ok(()),
+            },
             // Report only: its probe never plans a change.
             Kind::Vault => return Ok(()),
         };
@@ -2037,6 +2164,8 @@ impl Item for Synced<'_> {
             Kind::Release => Remedy::None,
             Kind::Fabric => Remedy::Command("aterm fabric on".to_owned()),
             Kind::Awake => Remedy::Command("aterm acaffeine start".to_owned()),
+            // A person's own `aterm init` asks the broker first, and else the Mac password.
+            Kind::Spotlight => Remedy::Command("aterm init".to_owned()),
         };
         Explain { why, remedy }
     }
@@ -2302,11 +2431,27 @@ fn sync_items<'a>(
     refresh.repository_execution = execution;
     refresh.repository_work = work;
     repositories.push(Box::new(refresh));
+    // After the clones a pass makes, so a folder it made this pass leaves the index with it.
+    repositories.push(Box::new(Synced::new(Kind::Spotlight, ports, trigger, mode)));
     SyncItems {
         local: items,
         repositories,
         publication: vec![Box::new(Synced::new(Kind::Requests, ports, trigger, mode))],
     }
+}
+
+/// The row of `id` among a pass's own kinds ([`own_item`]) over `ports`: the seam a crate's
+/// test of one row's apply drives through the engine, as a pass runs it.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn row<'a>(
+    ports: &'a dyn Ports,
+    id: &str,
+    trigger: Trigger,
+    mode: Mode,
+) -> Option<Box<dyn Item + 'a>> {
+    let kind = Kind::ALL.iter().copied().find(|kind| kind.id() == id)?;
+    Some(Box::new(Synced::new(kind, ports, trigger, mode)))
 }
 
 /// Why a pass did not run ([`converge`]).

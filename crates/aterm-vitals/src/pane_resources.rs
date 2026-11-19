@@ -4,7 +4,6 @@
 //! Physical footprint and directional storage rates of the live processes owned by a local
 //! terminal session. A process sweep supplies the ownership, counters, and observation clock.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::delegated::ProcessKey;
@@ -200,7 +199,7 @@ impl State {
         s: &Sample,
         procs: &[ProcSample],
         owners: &[Membership],
-        pid_counts: &HashMap<u32, usize>,
+        pid_counts: &IdMap<u32, usize>,
         continuous: bool,
     ) {
         if s.machine_only {

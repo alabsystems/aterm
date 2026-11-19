@@ -65,12 +65,14 @@ pub const LIFTED: Version = Version(0, 146, 0);
 /// 0.202.0 build may still write them, and 0.203.0 is the first whose every build writes none.
 pub const NO_SECRET_FILE: Option<Version> = Some(Version(0, 203, 0));
 /// The first release that reads a table checkpoint (`ATCKP1`, aterm
-/// docs/DESIGN-table-checkpoint-2026-11-15.md §5, tracker LT-B10B). An older build reads one as a
-/// command it cannot decode and, once the bodies below a checkpoint go cold (LT-B10C), could no
-/// longer rebuild the table's cells. The workspace stood at 0.202.0 when checkpoints were first
-/// read, so a 0.202.0 build may not read them, and 0.203.0 is the first whose every build does
-/// (the reasoning of [`NO_SECRET_FILE`]).
-pub const READS_CHECKPOINTS: Version = Version(0, 203, 0);
+/// docs/DESIGN-table-checkpoint-2026-11-15.md §5, tracker LT-B10B) whose state is in format 3,
+/// the state a read folds from with its claims (tracker LT-B10D3). An older build reads a
+/// checkpoint as a command it cannot decode (before 0.203.0) or computes its state in an earlier
+/// format and seconds no share of format 3, so no Mac signs one until every member runs a build
+/// that reads it. The workspace stood at 0.208.0 when format 3 landed, so a 0.208.0 build may
+/// compute format 2, and 0.209.0 is the first whose every build computes format 3 (the reasoning
+/// of [`NO_SECRET_FILE`]).
+pub const READS_CHECKPOINTS: Version = Version(0, 209, 0);
 /// Exact wire size of a signed [`report`].
 pub const REPORT_LEN: usize = 4 + 12 + 64;
 const REPORT_DOMAIN: &[u8] = b"aterm/commons/version-report/1\0";
@@ -389,6 +391,125 @@ pub const FENCE: Floor = Floor {
     version: READS_FORMAT,
     unheard_passes: true,
 };
+
+/// How long [`FENCE`] holds on a Mac without a break before that Mac signs its vault's first
+/// format-2 record (`docs/DESIGN-vault-log-2026-11-14.md` step 4, FL-D25): any seated member may
+/// sign it, an admin seat or not, once its own judgment of the floor held this long
+/// ([`FenceWatch`]).
+pub const FIRST_WRITE: u64 = 14 * DAY_MS;
+
+const FENCE_MAGIC: &str = "aterm-commons-fence 1";
+
+/// The third line of a fence file that records a break ([`FenceWatch::write`] of `None`).
+const FENCE_BROKEN: &str = "broken";
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT: a break of the fence watch unlinks its file, unflushed, and records nothing.
+    pub(crate) static UNLINK_BREAK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long this device judged [`FENCE`] to hold without a break: from `since` to its latest
+/// judgment, `through`, each judgment that held within [`GAP`] of the one before, as the
+/// [`Ledger`]'s watch is kept. A judgment that does not hold, a gap past [`GAP`] or a clock that
+/// went back starts it again. Kept beside the ledger ([`Bootstrap::fence_file`]) under its trust
+/// context; no file is a watch that has not begun. Only a Mac whose build reads format 2 judges
+/// the floor (`crate::client::format_two`), so no running build keeps the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FenceWatch {
+    /// When the unbroken run of judgments that held began (Unix milliseconds).
+    pub since: u64,
+    /// Its latest judgment (Unix milliseconds).
+    pub through: u64,
+}
+
+impl FenceWatch {
+    /// The watch after a judgment at `now_ms` that the floor `holds`, following `before`.
+    #[must_use]
+    pub fn observe(before: Option<Self>, holds: bool, now_ms: u64) -> Option<Self> {
+        if !holds {
+            return None;
+        }
+        Some(match before {
+            Some(watch) if watch.through <= now_ms && now_ms - watch.through <= GAP => Self {
+                since: watch.since,
+                through: now_ms,
+            },
+            _ => Self {
+                since: now_ms,
+                through: now_ms,
+            },
+        })
+    }
+
+    /// Whether the floor has held for [`FIRST_WRITE`] without a break, as judged at `now_ms`:
+    /// the watch's latest judgment is within [`GAP`] of `now_ms`, and not after it.
+    #[must_use]
+    pub fn held(&self, now_ms: u64) -> bool {
+        self.through <= now_ms
+            && now_ms - self.through <= GAP
+            && self.since.saturating_add(FIRST_WRITE) <= self.through
+    }
+
+    /// The watch kept beside `bootstrap`'s journal: `None` for no file, a break
+    /// ([`FENCE_BROKEN`]), or one that is unsafe, unreadable, malformed or of another trust
+    /// context.
+    #[must_use]
+    pub fn read(bootstrap: &Bootstrap) -> Option<Self> {
+        let bytes = fsx::read_private(&bootstrap.fence_file(), 1024).ok()??;
+        let text = std::str::from_utf8(bytes.as_slice()).ok()?;
+        let mut lines = text.lines();
+        if lines.next()? != FENCE_MAGIC || lines.next()? != pins(bootstrap.trust()) {
+            return None;
+        }
+        let (since, through) = lines.next()?.split_once(' ')?;
+        let watch = Self {
+            since: since.parse().ok()?,
+            through: through.parse().ok()?,
+        };
+        (lines.next().is_none() && watch.since <= watch.through).then_some(watch)
+    }
+
+    /// Keep `watch` beside `bootstrap`'s journal, durably: a watch as its two times, and `None`,
+    /// a break, as a third line of [`FENCE_BROKEN`], which [`FenceWatch::read`] reads as no
+    /// watch. A break is written, not unlinked: a power cut can take back an unlink whose
+    /// directory was not flushed, and the watch it ended would then count across the break,
+    /// while [`fsx::write_atomic`] flushes the file and its directory before it returns.
+    ///
+    /// # Errors
+    /// The file cannot be written.
+    pub fn write(watch: Option<Self>, bootstrap: &Bootstrap) -> Result<()> {
+        #[cfg(test)]
+        if watch.is_none() && UNLINK_BREAK.get() {
+            return match std::fs::remove_file(bootstrap.fence_file()) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(Error::new(e.to_string()))
+                }
+                _ => Ok(()),
+            };
+        }
+        let times = watch.map_or_else(
+            || FENCE_BROKEN.to_owned(),
+            |watch| format!("{} {}", watch.since, watch.through),
+        );
+        fsx::write_atomic(
+            &bootstrap.fence_file(),
+            format!("{FENCE_MAGIC}\n{}\n{times}\n", pins(bootstrap.trust())).as_bytes(),
+            0o600,
+        )
+    }
+}
+
+/// A trust context as the `heard` ledger's second line names it.
+fn pins(trust: Trust) -> String {
+    let hex = aterm_codec::hex::encode_lower;
+    format!(
+        "{} {} {}",
+        hex(&trust.network),
+        hex(&trust.authority),
+        hex(&trust.genesis)
+    )
+}
 
 /// The gate a registry secret's put into the vault waits on (tracker LT-04B): every current
 /// member heard within [`RECENT`] reporting `release` or later, where `release` is the first

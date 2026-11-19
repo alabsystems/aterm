@@ -13,7 +13,7 @@ use super::{
     cell::{self, CellValue, Cells, Projection},
     owned::Op,
 };
-use astream_wire::sync::{Digest, Index};
+use astream_wire::sync::{Actor, Digest, Index};
 use aterm_digest::Sha256;
 use aterm_json::Value;
 #[cfg(any(unix, test))]
@@ -331,10 +331,376 @@ pub(crate) fn merge_claims(into: &mut CarriedClaims, next: CarriedClaims) -> cra
     Ok(())
 }
 
+/// One claimed collection's claims at a cut, as the state at a floor holds them (design §5, "The
+/// state at F serves every registry reader", tracker LT-B10D3): what a read of the records above
+/// the floor takes in place of every claim and lifecycle write at or below it.
+///
+/// It keeps, per claimed coordinate, the cut's latest writes to it (the cell's candidates there)
+/// with their values and (writer, sequence) and the starts of the tenure each began or
+/// continued; per row, the latest lifecycle writes with the row's activity there, the activity
+/// at each kept claim write, and the proofs carried lifecycle values held; the claim evidence
+/// carried values held (their contexts, epochs and carriers); and the coordinates a reactivation
+/// reasserted. A tenure that began below the floor is kept as its starts, never as its history,
+/// so the floor is bounded by the claims open at the cut.
+///
+/// A record above the floor that names a record at or below it takes that record's frontier of a
+/// coordinate from the kept writes it is or observes, and its activity from the kept lifecycle
+/// writes it is or observes, joined. A writer whose head at the floor's cut observes the cut's
+/// latest writes (every writer that heard the cut) reads above it exactly as a read of every
+/// record does; one whose head observes none of a coordinate's kept writes begins a new tenure
+/// there.
+///
+/// What the floor holds stays as the cut made it: nothing above the floor re-judges a kept
+/// write's starts or activity (design §5, "Nothing above S changes what S's state holds"), so a
+/// carry above the floor that contradicts a carried proof or context below it makes the carried
+/// evidence invalid from there on and leaves the kept writes as the cut judged them. A roll's
+/// restatement from the floor ([`snapshot`]) attests, as each start's past, the kept writes and
+/// the records above the floor it observes, not the writes below the floor nothing keeps.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Floor {
+    writes: BTreeMap<Coordinate, BTreeMap<Digest, Kept>>,
+    lifecycle: activity::Kept,
+    evidence: BTreeMap<(Coordinate, Digest), (Provenance, BTreeSet<Digest>)>,
+    epochs: BTreeMap<(Coordinate, Digest), activity::Proof>,
+    implicit: BTreeSet<Coordinate>,
+}
+
+/// One latest write of a claimed coordinate a [`Floor`] keeps.
+#[derive(Clone, Debug, PartialEq)]
+struct Kept {
+    actor: Actor,
+    sequence: u64,
+    /// The value a read takes: a compensation's restored one where it restores one.
+    value: Value,
+    /// Whether a compensation restored it ([`restored_cells`]).
+    restored: bool,
+    /// The starts of the tenure it began or continued for its own claimed value.
+    starts: Option<BTreeSet<Digest>>,
+}
+
+/// The claims of a table's claimed collections at one cut ([`Floor`]), and the cut: each writer's
+/// newest sequence in it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Floors {
+    pub(crate) frontier: BTreeMap<Actor, u64>,
+    pub(crate) collections: BTreeMap<&'static str, Floor>,
+}
+
+/// A read of one collection's claims from a [`Floor`]: the records at or below the floor are
+/// those within its writers' sequences, and only the floor's writes stand for them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Below<'a> {
+    floor: &'a Floor,
+    frontier: &'a BTreeMap<Actor, u64>,
+}
+
+impl Below<'_> {
+    /// Whether `id` is at or below the floor: within its writer's sequence there, or a record
+    /// the index holds on a checkpoint's word.
+    fn holds(&self, index: &Index, id: &Digest) -> bool {
+        index.get(id).map_or_else(
+            || index.floor().contains_key(id),
+            |header| {
+                self.frontier
+                    .get(&header.actor)
+                    .is_some_and(|sequence| header.sequence <= *sequence)
+            },
+        )
+    }
+}
+
+impl Floors {
+    /// A read of `collection`'s claims from this floor; `None` where it claims nothing.
+    pub(crate) fn below(&self, collection: &str) -> Option<Below<'_>> {
+        Some(Below {
+            floor: self.collections.get(collection)?,
+            frontier: &self.frontier,
+        })
+    }
+
+    /// Feed these claims, in their one encoding, to `hash`: every part in its sorted order,
+    /// every length explicit, each value as canonical JSON.
+    ///
+    /// # Errors
+    /// A value does not encode.
+    pub fn digest_into(&self, hash: &mut Sha256) -> crate::Result<()> {
+        use super::state::{put_len, put_text};
+        put_len(hash, self.frontier.len());
+        for (actor, sequence) in &self.frontier {
+            hash.update(actor);
+            hash.update(sequence.to_le_bytes());
+        }
+        put_len(hash, self.collections.len());
+        for (name, floor) in &self.collections {
+            put_text(hash, name);
+            floor.digest_into(hash)?;
+        }
+        Ok(())
+    }
+}
+
+impl Floor {
+    /// `collection`'s claims at the cut a read of `operations` (the cut's records within their
+    /// writers' quota) over `index` makes.
+    #[must_use]
+    pub fn at(
+        collection: &Collection,
+        operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
+        index: &Index,
+    ) -> Self {
+        let operations: Vec<_> = operations.collect();
+        let operations: Vec<&Op> = operations.iter().map(std::borrow::Borrow::borrow).collect();
+        let (history, causal) = context(collection, operations.iter().copied(), index, None);
+        let mut restored = BTreeSet::new();
+        for operation in &operations {
+            for change in &operation.changes {
+                if restored_value(collection, operation, change).is_some() {
+                    restored.insert((
+                        (change.collection.clone(), change.key.clone()),
+                        operation.id,
+                    ));
+                }
+            }
+        }
+        let mut memo = Tenures::new();
+        let mut writes = BTreeMap::new();
+        for (coordinate, all) in &history {
+            let mut kept = BTreeMap::new();
+            for id in latest_writes(all, index, &causal.order, None) {
+                let Some(header) = index.get(&id) else {
+                    continue;
+                };
+                let value = all[&id].clone();
+                let starts = claimed_text(&value).and_then(|wanted| {
+                    tenure(coordinate, id, &wanted, &history, &causal, &mut memo)
+                });
+                kept.insert(
+                    id,
+                    Kept {
+                        actor: header.actor,
+                        sequence: header.sequence,
+                        value,
+                        restored: restored.contains(&(coordinate.clone(), id)),
+                        starts,
+                    },
+                );
+            }
+            writes.insert(coordinate.clone(), kept);
+        }
+        let claims: Vec<(String, Digest)> = writes
+            .iter()
+            .filter_map(|(coordinate, kept)| {
+                let pk = cell::CellKey::parse(&coordinate.1).ok()?.pk.to_owned();
+                Some(kept.keys().map(move |id| (pk.clone(), *id)))
+            })
+            .flatten()
+            .collect();
+        let lifecycle = causal.activity.kept(
+            collection,
+            &operations,
+            index,
+            &causal.order,
+            claims.into_iter(),
+        );
+        Self {
+            writes,
+            lifecycle,
+            evidence: causal.evidence.clone(),
+            epochs: causal.epochs.clone(),
+            implicit: causal.implicit.clone(),
+        }
+    }
+
+    /// Every record the floor keeps a write of, in digest order: none of a coordinate's or a
+    /// row's kept writes observes another, so a walk takes them in any order.
+    fn ids(&self) -> BTreeSet<Digest> {
+        self.writes
+            .values()
+            .flat_map(BTreeMap::keys)
+            .chain(self.lifecycle.rows.values().flat_map(BTreeMap::keys))
+            .copied()
+            .collect()
+    }
+
+    /// `cells` with each candidate a kept compensation wrote taking the value it restores, as
+    /// [`restored_cells`] gives it from the compensation's record.
+    fn restore(&self, cells: &mut Cow<'_, Cells>) {
+        for (coordinate, kept) in &self.writes {
+            for (id, kept) in kept.iter().filter(|(_, kept)| kept.restored) {
+                let held = cells.get(coordinate).is_some_and(|cell| {
+                    cell.candidates.iter().any(|candidate| {
+                        candidate.operation == *id && cell::carried_refs(&candidate.value).is_some()
+                    })
+                });
+                if !held {
+                    continue;
+                }
+                for candidate in &mut cells.to_mut().get_mut(coordinate).unwrap().candidates {
+                    if candidate.operation == *id {
+                        candidate.value = kept.value.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    fn digest_into(&self, hash: &mut Sha256) -> crate::Result<()> {
+        use super::state::{put_len, put_text, put_value};
+        let put_coordinate = |hash: &mut Sha256, (collection, key): &Coordinate| {
+            put_text(hash, collection);
+            put_text(hash, key);
+        };
+        let put_set = |hash: &mut Sha256, set: &BTreeSet<Digest>| {
+            put_len(hash, set.len());
+            for id in set {
+                hash.update(id);
+            }
+        };
+        let put_epochs = |hash: &mut Sha256, epochs: &activity::Epochs| {
+            put_len(hash, epochs.len());
+            for epoch in epochs {
+                match epoch {
+                    None => hash.update([0]),
+                    Some(id) => {
+                        hash.update([1]);
+                        hash.update(id);
+                    }
+                }
+            }
+        };
+        let put_state = |hash: &mut Sha256, state: &activity::State| {
+            hash.update([u8::from(state.live)]);
+            match &state.epochs {
+                None => hash.update([0]),
+                Some(epochs) => {
+                    hash.update([1]);
+                    put_epochs(hash, epochs);
+                }
+            }
+        };
+        let put_proof = |hash: &mut Sha256, proof: &activity::Proof| match proof {
+            activity::Proof::Unknown => hash.update([0]),
+            activity::Proof::Invalid => hash.update([1]),
+            activity::Proof::Known(epochs) => {
+                hash.update([2]);
+                put_epochs(hash, epochs);
+            }
+        };
+        let Self {
+            writes,
+            lifecycle,
+            evidence,
+            epochs,
+            implicit,
+        } = self;
+        put_len(hash, writes.len());
+        for (coordinate, kept) in writes {
+            put_coordinate(hash, coordinate);
+            put_len(hash, kept.len());
+            for (id, kept) in kept {
+                let Kept {
+                    actor,
+                    sequence,
+                    value,
+                    restored,
+                    starts,
+                } = kept;
+                hash.update(id);
+                hash.update(actor);
+                hash.update(sequence.to_le_bytes());
+                put_value(hash, value)?;
+                hash.update([u8::from(*restored)]);
+                match starts {
+                    None => hash.update([0]),
+                    Some(starts) => {
+                        hash.update([1]);
+                        put_set(hash, starts);
+                    }
+                }
+            }
+        }
+        let activity::Kept { rows, at, proofs } = lifecycle;
+        put_len(hash, rows.len());
+        for (pk, writes) in rows {
+            put_text(hash, pk);
+            put_len(hash, writes.len());
+            for (id, write) in writes {
+                hash.update(id);
+                put_value(hash, &write.value)?;
+                hash.update([u8::from(write.reverted)]);
+                put_state(hash, &write.state);
+            }
+        }
+        put_len(hash, at.len());
+        for (pk, states) in at {
+            put_text(hash, pk);
+            put_len(hash, states.len());
+            for (id, state) in states {
+                hash.update(id);
+                put_state(hash, state);
+            }
+        }
+        put_len(hash, proofs.len());
+        for ((pk, origin), proof) in proofs {
+            put_text(hash, pk);
+            hash.update(origin);
+            put_proof(hash, proof);
+        }
+        put_len(hash, evidence.len());
+        for ((coordinate, origin), (provenance, carriers)) in evidence {
+            put_coordinate(hash, coordinate);
+            hash.update(origin);
+            match provenance {
+                Provenance::Unknown => hash.update([0]),
+                Provenance::Invalid => hash.update([1]),
+                Provenance::Known(starts) => {
+                    hash.update([2]);
+                    put_len(hash, starts.len());
+                    for (start, past) in starts {
+                        hash.update(start);
+                        put_set(hash, past);
+                    }
+                }
+            }
+            put_set(hash, carriers);
+        }
+        put_len(hash, epochs.len());
+        for ((coordinate, origin), proof) in epochs {
+            put_coordinate(hash, coordinate);
+            hash.update(origin);
+            put_proof(hash, proof);
+        }
+        put_len(hash, implicit.len());
+        for coordinate in implicit {
+            put_coordinate(hash, coordinate);
+        }
+        Ok(())
+    }
+}
+
+/// The claimed text `value` asserts: its own, or the one every origin a carried value holds
+/// asserts ([`matches_value`]).
+fn claimed_text(value: &Value) -> Option<String> {
+    let text = match cell::carried_refs(value) {
+        Some(origins) => CellValue::decode(origins.first()?.1)
+            .ok()?
+            .x
+            .as_str()?
+            .to_owned(),
+        None => CellValue::decode(value).ok()?.x.as_str()?.to_owned(),
+    };
+    matches_value(value, &text).then_some(text)
+}
+
 struct Causality<'a> {
     index: &'a Index,
+    /// The records a walk takes, in causal order: every ordered record, or, from a floor, the
+    /// records it keeps and those above it.
     order: Vec<Digest>,
-    provenance: BTreeMap<(Coordinate, Digest), Provenance>,
+    /// The floor the read starts from ([`Below`]), if any.
+    below: Option<Below<'a>>,
+    /// The claim evidence carried values held, before it is laid out below.
+    evidence: BTreeMap<(Coordinate, Digest), (Provenance, BTreeSet<Digest>)>,
     carriers: BTreeMap<Digest, BTreeSet<Digest>>,
     past: BTreeMap<Digest, BTreeSet<Digest>>,
     activity: activity::Activity,
@@ -441,19 +807,66 @@ fn context<'a>(
     collection: &Collection,
     operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
     index: &'a Index,
+    below: Option<Below<'a>>,
 ) -> (History, Causality<'a>) {
     #[cfg(test)]
     CONTEXTS.with_borrow_mut(|counts| *counts.entry(collection.name).or_default() += 1);
     let operations: Vec<_> = operations.collect();
     let operations: Vec<&Op> = operations.iter().map(std::borrow::Borrow::borrow).collect();
-    let (activity, order) = {
-        let projection = index.project();
-        let activity = activity::Activity::read(collection, &operations, index, &projection);
-        (activity, projection.ordered)
+    let projection = index.project();
+    let (activity, order) = match below {
+        None => {
+            let activity = activity::Activity::read_from(
+                collection,
+                &operations,
+                index,
+                &projection,
+                &projection.ordered,
+                None,
+            );
+            (activity, projection.ordered)
+        }
+        Some(below) => {
+            // The floor's kept writes stand for every record at or below it.
+            let order: Vec<Digest> = below
+                .floor
+                .ids()
+                .into_iter()
+                .chain(
+                    projection
+                        .ordered
+                        .iter()
+                        .filter(|id| !below.holds(index, id))
+                        .copied(),
+                )
+                .collect();
+            let holds = |id: &Digest| below.holds(index, id);
+            let seed = activity::Seed {
+                kept: &below.floor.lifecycle,
+                below: &holds,
+            };
+            let activity = activity::Activity::read_from(
+                collection,
+                &operations,
+                index,
+                &projection,
+                &order,
+                Some(&seed),
+            );
+            (activity, order)
+        }
     };
     let mut history = History::new();
-    let mut evidence = BTreeMap::<(Coordinate, Digest), (Provenance, BTreeSet<Digest>)>::new();
-    let mut epochs = BTreeMap::<(Coordinate, Digest), activity::Proof>::new();
+    let mut evidence = below.map_or_else(BTreeMap::new, |below| below.floor.evidence.clone());
+    let mut epochs = below.map_or_else(BTreeMap::new, |below| below.floor.epochs.clone());
+    if let Some(below) = below {
+        for (coordinate, kept) in &below.floor.writes {
+            let held = history.entry(coordinate.clone()).or_default();
+            for (id, kept) in kept {
+                held.insert(*id, kept.value.clone());
+            }
+        }
+    }
     for operation in operations {
         for change in &operation.changes {
             if change.collection != collection.name {
@@ -501,7 +914,7 @@ fn context<'a>(
                 .insert(operation.id, value);
         }
     }
-    let mut implicit = BTreeSet::new();
+    let mut implicit = below.map_or_else(BTreeSet::new, |below| below.floor.implicit.clone());
     for id in &order {
         let Some(pks) = activity.reentries.get(id) else {
             continue;
@@ -553,26 +966,27 @@ fn context<'a>(
     let mut causal = Causality {
         index,
         order,
-        provenance: BTreeMap::new(),
+        below,
+        evidence: BTreeMap::new(),
         carriers: BTreeMap::new(),
         past: BTreeMap::new(),
         activity,
         epochs,
         implicit,
     };
-    for (key, (provenance, carriers)) in evidence {
-        causal.carriers.entry(key.1).or_default().extend(&carriers);
-        if let Provenance::Known(starts) = &provenance {
+    for (key, (provenance, carriers)) in &evidence {
+        causal.carriers.entry(key.1).or_default().extend(carriers);
+        if let Provenance::Known(starts) = provenance {
             for (start, past) in starts {
                 causal.past.entry(*start).or_default().extend(past);
                 // Observing this signed carry also observes the ancestry it attests.
                 for id in std::iter::once(start).chain(past) {
-                    causal.carriers.entry(*id).or_default().extend(&carriers);
+                    causal.carriers.entry(*id).or_default().extend(carriers);
                 }
             }
         }
-        causal.provenance.insert(key, provenance);
     }
+    causal.evidence = evidence;
     (history, causal)
 }
 
@@ -637,7 +1051,7 @@ pub(crate) fn interpreted_cells<'a>(
     let operations: Vec<_> = operations.collect();
     let refs = || operations.iter().map(std::borrow::Borrow::borrow);
     let mut cells = restored_cells(collection, cells, refs());
-    let (history, causal) = context(collection, refs(), index);
+    let (history, causal) = context(collection, refs(), index, None);
     activate_cells(&mut cells, &history, &causal);
     cells
 }
@@ -651,11 +1065,15 @@ pub(crate) fn snapshot(
     cells: &Cells,
     operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
     index: &Index,
+    below: Option<Below<'_>>,
 ) -> crate::Result<CarriedClaims> {
     let operations: Vec<_> = operations.collect();
     let refs = || operations.iter().map(std::borrow::Borrow::borrow);
     let mut cells = restored_cells(collection, cells, refs());
-    let (history, causal) = context(collection, refs(), index);
+    if let Some(below) = below {
+        below.floor.restore(&mut cells);
+    }
+    let (history, causal) = context(collection, refs(), index, below);
     activate_cells(&mut cells, &history, &causal);
     let mut memo = Tenures::new();
     let projected = cell::project(collection, &cells);
@@ -764,8 +1182,9 @@ pub(crate) fn project(
     cells: &Cells,
     operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
     causal: &Index,
+    below: Option<Below<'_>>,
 ) -> Projection {
-    judged(collection, cells, operations, causal, None)
+    judged(collection, cells, operations, causal, below, None)
 }
 
 /// [`project`], and how each of the collection's claimed columns settled there
@@ -776,6 +1195,7 @@ pub(crate) fn settled(
     cells: &Cells,
     operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
     causal: &Index,
+    below: Option<Below<'_>>,
 ) -> (Projection, Settlements) {
     let mut settlements = Settlements::new();
     let projected = judged(
@@ -783,6 +1203,7 @@ pub(crate) fn settled(
         cells,
         operations,
         causal,
+        below,
         Some(&mut settlements),
     );
     (projected, settlements)
@@ -794,6 +1215,7 @@ fn judged(
     cells: &Cells,
     operations: impl Iterator<Item = impl std::borrow::Borrow<Op>>,
     causal: &Index,
+    below: Option<Below<'_>>,
     mut keep: Option<&mut Settlements>,
 ) -> Projection {
     #[cfg(any(test, debug_assertions))]
@@ -805,7 +1227,10 @@ fn judged(
     let operations: Vec<_> = operations.collect();
     let refs = || operations.iter().map(std::borrow::Borrow::borrow);
     let mut cells = restored_cells(collection, cells, refs());
-    let (history, causal) = context(collection, refs(), causal);
+    if let Some(below) = below {
+        below.floor.restore(&mut cells);
+    }
+    let (history, causal) = context(collection, refs(), causal, below);
     activate_cells(&mut cells, &history, &causal);
     let mut projected = cell::project(collection, &cells);
     let mut tenures = Tenures::new();
@@ -1251,18 +1676,23 @@ fn tenure_inner(
     memo: &mut Tenures,
 ) -> Option<BTreeSet<Digest>> {
     let writes = history.get(coordinate)?;
-    let carried = |origin: &Digest| match causal.provenance.get(&(coordinate.clone(), *origin))? {
+    let carried = |origin: &Digest| match &causal.evidence.get(&(coordinate.clone(), *origin))?.0 {
         Provenance::Unknown | Provenance::Invalid => None,
         Provenance::Known(starts) => Some(starts.keys().copied().collect::<BTreeSet<_>>()),
     };
     if !writes.contains_key(&operation) {
         return carried(&operation);
     }
+    // The writes a floor keeps of this coordinate, each with its tenure's starts.
+    let kept = causal
+        .below
+        .and_then(|below| below.floor.writes.get(coordinate));
     if writes.len() == 1
         && writes.get(&operation).is_some_and(|value| {
             cell::carried_refs(value).is_none() && matches_value(value, wanted)
         })
         && causal.index.get(&operation).is_some()
+        && kept.is_none_or(|kept| !kept.contains_key(&operation))
     {
         let key = cell::CellKey::parse(&coordinate.1).ok()?;
         let state = causal.activity.at(key.pk, &operation);
@@ -1278,11 +1708,34 @@ fn tenure_inner(
     let mut frontiers = BTreeMap::<Digest, std::sync::Arc<BTreeSet<Digest>>>::new();
     let empty = std::sync::Arc::new(BTreeSet::new());
     for id in &causal.order {
+        if let Some(held) = kept.and_then(|kept| kept.get(id)) {
+            let starts = held
+                .starts
+                .clone()
+                .filter(|_| matches_value(&held.value, wanted));
+            memo.insert((coordinate.clone(), *id, wanted.to_owned()), starts);
+            frontiers.insert(*id, std::sync::Arc::new(BTreeSet::from([*id])));
+            continue;
+        }
         let Some(header) = causal.index.get(id) else {
             continue;
         };
         let mut inherited = Vec::new();
         for parent in &header.parents {
+            if !frontiers.contains_key(parent)
+                && let Some(below) = causal.below
+                && below.holds(causal.index, parent)
+            {
+                // A record at or below the floor it does not keep: the kept writes it is or
+                // observes, none of which observes another.
+                let frontier = kept
+                    .into_iter()
+                    .flat_map(BTreeMap::keys)
+                    .filter(|write| *write == parent || causal.index.observes(parent, write))
+                    .copied()
+                    .collect();
+                frontiers.insert(*parent, std::sync::Arc::new(frontier));
+            }
             if let Some(frontier) = frontiers.get(parent)
                 && !frontier.is_empty()
                 && !inherited

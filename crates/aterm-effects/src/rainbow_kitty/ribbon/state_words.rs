@@ -8,8 +8,9 @@
 //! its own ([`BedInkLut::state_words`]).
 
 use super::{
-    BED_INK_LUT_LEN, BedInkLut, Cell, Cohort, LastWalk, Lift, ReleaseClock, ReleasePart, Relocate,
-    Revive, RewrapStart, Ribbon, RunOrigin, Seam, ShortReanchorProof, SoftWrap, SplitOff, WalkPos,
+    BED_INK_LUT_LEN, BedInkKey, BedInkLut, Cell, Cohort, LastWalk, Lift, ReleaseClock, ReleasePart,
+    Relocate, Revive, RewrapStart, Ribbon, RunOrigin, Seam, ShortReanchorProof, SoftWrap, SplitOff,
+    WalkPos,
 };
 use crate::state_words::{Fold, Words};
 use aterm_time::Instant;
@@ -146,11 +147,10 @@ impl Ribbon {
 }
 
 impl BedInkLut {
-    /// The `(theme_fg, theme_bg, dark_theme, ribbon_tall)` the table was built for, `None` before
-    /// the first sync.
+    /// The page the table was built for ([`BedInkKey`]), `None` before the first sync.
     #[inline]
     #[must_use]
-    pub const fn key(&self) -> Option<(u32, u32, bool, bool)> {
+    pub const fn key(&self) -> Option<BedInkKey> {
         self.key
     }
 
@@ -172,11 +172,10 @@ impl BedInkLut {
     /// (`lab trail-diff`'s dump folds them as its `bed` word).
     #[inline]
     pub fn state_words(&self, w: &mut impl Words) {
-        w.opt("bed.key", self.key, |f, (fg, bg, dark, tall)| {
-            f.put("fg", u64::from(fg));
-            f.put("bg", u64::from(bg));
-            f.flag("dark", dark);
-            f.flag("tall", tall);
+        w.opt("bed.key", self.key, |f, key| {
+            f.put("fg", u64::from(key.0));
+            f.put("bg", u64::from(key.1));
+            f.flag("dark", key.2);
         });
         w.list("bed.lut", self.lut, |f, ink| f.put("ink", u64::from(ink)));
         w.list("bed.seen", self.seen, |f, seen| f.f32("seen", seen));

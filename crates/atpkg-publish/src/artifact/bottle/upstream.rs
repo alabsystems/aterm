@@ -342,6 +342,7 @@ pub fn pack(ctx: &Ctx, request: &Request) -> Result<BottleOutcome> {
             })?;
             return super::pinned::pack(ctx, request, recipe);
         }
+        crate::programs::BottleOrigin::Agit => return Err(Error::cannot_run(super::agit::SOURCE)),
         crate::programs::BottleOrigin::Reference(_) => {
             return Err(Error::cannot_run(
                 "source-derived references use pack-bottle --install-tree with their qualified build and corresponding source",
@@ -381,6 +382,7 @@ pub(crate) fn can_build(program: &str, triple: Triple) -> Result<()> {
     let (_, definition) = super::bottle_row(program, triple)?;
     match definition.origin {
         crate::programs::BottleOrigin::Pinned(recipe) => super::pinned::can_pack(recipe, triple),
+        crate::programs::BottleOrigin::Agit => Err(Error::cannot_run(super::agit::SOURCE)),
         crate::programs::BottleOrigin::Reference(_) => Err(Error::cannot_run(
             "source-derived references require a separately qualified install tree",
         )),

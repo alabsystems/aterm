@@ -3811,7 +3811,7 @@ fn fx_carried_state_desk() -> FxDesk {
         fx_session(1, "zsh", fx_shell(ROWS, COLS, 40, cwd, 3)),
         worker,
     ];
-    for local_id in 3..=8 {
+    for local_id in 3..=9 {
         let flavour = u8::try_from(local_id).unwrap();
         sessions.push(fx_session(
             local_id,
@@ -4092,6 +4092,7 @@ fn fx_carried_state_desk() -> FxDesk {
             home: None,
             login: None,
             run: Some(RunRestore::Codex(CodexRestore {
+                selected_default: false,
                 home: "/home/dev/.codex-work".to_string(),
                 home_env: Some("/home/dev/.codex-work".to_string()),
                 embedded: true,
@@ -4129,6 +4130,38 @@ fn fx_carried_state_desk() -> FxDesk {
             })),
             "muse",
         )));
+    });
+    // A restart picked the default Codex login and is still waiting for the shell at handoff.
+    let default_owed = leaf_of(9, "zsh", &|leaf| {
+        let thread = "019a4c2e-7d10-7c3a-9e51-3f2b6d8a0c49";
+        let mut agent = fx_agent(
+            48_909,
+            "codex-alab",
+            Some(thread),
+            Some(RunRestore::Codex(CodexRestore {
+                selected_default: true,
+                home: "/home/dev/.codex".into(),
+                home_env: None,
+                embedded: true,
+                started_ms: 0,
+                alab: Some(AlabRestore {
+                    argv: vec![
+                        "/home/dev/.local/bin/codex-alab".into(),
+                        "resume".into(),
+                        thread.into(),
+                    ],
+                    session: thread.into(),
+                    codex_home: None,
+                    codex_auth_path: None,
+                    cwd: Some(cwd.into()),
+                }),
+                carried: None,
+            })),
+            "codex",
+        );
+        agent.cause = Some("asked".into());
+        agent.tab = Some(sessions[9].record.sid.clone());
+        leaf.agent = Some(Box::new(agent));
     });
     let agy = leaf_of(4, "zsh", &|leaf| {
         leaf.agent = Some(Box::new(fx_agent(
@@ -4259,6 +4292,7 @@ fn fx_carried_state_desk() -> FxDesk {
             pair(muse, agy),
             pair(plain, asked),
             fx_tab(on_token),
+            fx_tab(default_owed),
         ],
     );
     front.inner_px = inner_px;

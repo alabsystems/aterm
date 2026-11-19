@@ -182,7 +182,9 @@ pub fn refused_marker(file: &Path) -> PathBuf {
 
 /// Whether the login file `file` was refused: its marker ([`refused_marker`]) is there and not
 /// older than it. A login written after the marker (grok's own sign-in, or this gate's) is not.
-fn refused(file: &Path) -> bool {
+/// The credential facts of a Grok row read it as grok's refusal of that very login
+/// ([`super::login_token::read`]).
+pub(super) fn refused(file: &Path) -> bool {
     let Ok(marker) = std::fs::symlink_metadata(refused_marker(file))
         .ok()
         .filter(std::fs::Metadata::is_file)

@@ -2325,6 +2325,44 @@ struct Committed<'a> {
     root: &'a Path,
     path: std::ffi::OsString,
     tools: Toolchain,
+    /// The working tree's graph and the inputs it was read from ([`graph_inputs`]): the
+    /// selections made while those hold share it, as a round's three do.
+    graph: std::cell::RefCell<Option<(GraphInputs, std::rc::Rc<Graph>)>>,
+}
+
+/// What `targo tree` reads of a working tree: the bytes of each manifest, lock, Cargo config
+/// and toolchain file, and the path of every file, by which Cargo finds each package's targets.
+type GraphInputs = Vec<(String, Option<Vec<u8>>)>;
+
+/// The [`GraphInputs`] of the working tree at `root`, its `.git` aside.
+fn graph_inputs(root: &Path) -> GraphInputs {
+    fn walk(root: &Path, dir: &Path, config: bool, inputs: &mut GraphInputs) {
+        for entry in std::fs::read_dir(dir).expect("a fixture folder") {
+            let path = entry.expect("a fixture entry").path();
+            let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+            let kind = std::fs::symlink_metadata(&path).expect("a fixture file");
+            if kind.is_dir() {
+                if name != ".git" {
+                    walk(root, &path, config || name == ".cargo", inputs);
+                }
+                continue;
+            }
+            let read = config
+                || matches!(
+                    name,
+                    "Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml"
+                );
+            let at = path.strip_prefix(root).expect("under the root");
+            inputs.push((
+                at.to_string_lossy().into_owned(),
+                read.then(|| std::fs::read(&path).expect("a fixture input")),
+            ));
+        }
+    }
+    let mut inputs = Vec::new();
+    walk(root, root, false, &mut inputs);
+    inputs.sort();
+    inputs
 }
 
 /// A workspace-wide config obligation from an octopus already selects every crate.
@@ -2412,6 +2450,7 @@ impl<'a> Committed<'a> {
             root,
             path: std::env::var_os("PATH").unwrap_or_default(),
             tools,
+            graph: std::cell::RefCell::new(None),
         };
         committed.git(&["init", "-q"]);
         committed.git(&["add", "-A"]);
@@ -2458,12 +2497,25 @@ impl<'a> Committed<'a> {
         out
     }
 
+    /// The working tree's graph as it is now: the one read before while its inputs are the
+    /// same ([`graph_inputs`]), else a new one.
+    fn graph(&self) -> std::rc::Rc<Graph> {
+        let inputs = graph_inputs(self.root);
+        let mut held = self.graph.borrow_mut();
+        if let Some((known, graph)) = held.as_ref()
+            && *known == inputs
+        {
+            return graph.clone();
+        }
+        let graph = std::rc::Rc::new(Graph::new(self.root, &self.tools, &self.path));
+        *held = Some((inputs, graph.clone()));
+        graph
+    }
+
     /// What [`resolve`] selects with each repo-relative file of `files` holding its text; the
     /// files are restored after.
     fn change(&self, files: &[(&str, &str)]) -> Selection {
-        self.written(files, || {
-            resolve(self.root, &self.tools, &self.path, "base")
-        })
+        self.written(files, || resolve_in(&self.graph(), "base"))
     }
 
     /// What [`resolve_paths`] selects for the same change gathered from no one tree, as
@@ -2471,7 +2523,7 @@ impl<'a> Committed<'a> {
     fn gathered(&self, files: &[(&str, &str)]) -> Selection {
         let paths = files.iter().map(|(file, _)| (*file).to_string()).collect();
         self.written(files, || {
-            resolve_paths(self.root, &self.tools, &self.path, "base", paths, None)
+            resolve_paths_in(&self.graph(), "base", paths, None)
         })
     }
 
@@ -2480,7 +2532,7 @@ impl<'a> Committed<'a> {
         for file in files {
             std::fs::remove_file(self.root.join(file)).expect("the deletion");
         }
-        let selection = resolve(self.root, &self.tools, &self.path, "base");
+        let selection = resolve_in(&self.graph(), "base");
         self.git(&["checkout", "-q", "--", "."]);
         selection
     }
@@ -2545,10 +2597,8 @@ impl<'a> Committed<'a> {
         readers: &[&str],
         mechanical: bool,
     ) -> Selection {
-        resolve_round(
-            self.root,
-            &self.tools,
-            &self.path,
+        resolve_round_in(
+            &self.graph(),
             tip,
             &Round {
                 judged: judged.to_owned(),

@@ -227,10 +227,70 @@ fn build_configs(run: &atpkg_publish::artifact::tools::Run) -> Vec<String> {
         .collect()
 }
 
+fn data_recipe(w: &World, list: &[u8]) -> String {
+    put(&w.checkout.join("resources/package-files.txt"), list);
+    put(
+        &w.checkout.join("resources/schema/input.txt"),
+        b"  exact bytes\n\n",
+    );
+    put(
+        &w.checkout.join("resources/executable.txt"),
+        b"file mode control",
+    );
+    super::fixture::git(&w.checkout, &["add", "resources"]);
+    super::fixture::git(
+        &w.checkout,
+        &["update-index", "--chmod=+x", "resources/executable.txt"],
+    );
+    super::fixture::git(&w.checkout, &["commit", "-q", "-m", "pack data"]);
+    metadata_json(&w.checkout, &["ay"], &["ay-helper"], &[], false).replacen(
+        "\"expose\":",
+        "\"data-files\":\"resources/package-files.txt\",\"expose\":",
+        1,
+    )
+}
+
+#[test]
+fn invalid_data_is_refused_before_the_build_or_signing() {
+    for (list, diagnostic) in [
+        ("bin\nschema/input.txt\n", "must be under share/ay"),
+        ("share/ay\n../Cargo.toml\n", "invalid or duplicate"),
+        (
+            "share/ay\nschema/input.txt\nschema/input.txt\n",
+            "invalid or duplicate",
+        ),
+        (
+            "share/ay\nschema/input.txt\nSchema/other.txt\n",
+            "conflicting atpkg data paths",
+        ),
+        ("share/ay\nabsent.txt\n", "missing atpkg data file"),
+        (
+            "share/ay\nexecutable.txt\n",
+            "committed regular non-executable file",
+        ),
+    ] {
+        let w = world("pack-invalid-data");
+        let meta = data_recipe(&w, list.as_bytes());
+        let t = tools(&w, "aarch64-apple-darwin", meta, linux_ay());
+        let err = pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t)
+            .expect_err("bad declaration is refused");
+        assert!(err.to_string().contains(diagnostic), "{err}");
+        assert!(t.runs_of("build").is_empty());
+        assert!(w.written("toml").is_empty());
+    }
+}
+
 #[test]
 fn a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root() {
     let w = world("pack-signed");
-    let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
+    let meta = data_recipe(&w, b"share/ay/data\nschema/input.txt\n");
+    put(
+        &w.checkout.join("resources/schema/input.txt"),
+        b"uncommitted bytes",
+    );
+    let mut bins = linux_ay();
+    bins.push(("ay-helper", bin_bytes(elf(EM_X86_64, 2, 1), "ay helper")));
+    let t = tools(&w, "aarch64-apple-darwin", meta, bins);
     let out = pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t).expect("packed");
     assert_eq!(out.build, 9);
     assert_eq!(out.version, "0.2.0");
@@ -261,6 +321,11 @@ fn a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root() {
     .expect("extracts");
     assert_eq!(atpkg::tree_root(&x).expect("root"), row.tree_root);
     assert!(x.join("bin/ay").is_file());
+    assert!(x.join("bin/ay-helper").is_file());
+    assert_eq!(
+        std::fs::read(x.join("share/ay/data/schema/input.txt")).expect("data extracted"),
+        b"  exact bytes\n\n"
+    );
 
     let meta = &t.runs_of("metadata")[0];
     assert_eq!(meta.program, w.bin.join("targo"));

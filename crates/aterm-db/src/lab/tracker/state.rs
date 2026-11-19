@@ -19,7 +19,8 @@
 //!   `dropped` with a reason; `running` or `blocked` back to `ready` (a claim released, a block
 //!   lifted). Nothing else: a `done` that saw `ready` does not count, nor one that cites
 //!   nothing; `dropped` is left only through a reason; and no write of a state leaves `done`,
-//!   a revert of the done included (a wrong done is withdrawn by an approved change, TK-15).
+//!   a revert of the done included, unless it lands an approved change of the package's state
+//!   ([`super::frozen`]): that is the only way a wrong done is withdrawn (TK-15).
 //!   A write that restores the cell's absence (a revert of the package's birth) leaves the
 //!   package with no state, and the next state it is given is a first state again.
 //! - **A change that does not count changes nothing.** The package reads as it did before it,
@@ -39,8 +40,12 @@
 //! the cell alone shows the conflict's first word by the same order, which is the state that
 //! stands only where every change counted; a reader of the tracker takes it from here
 //! ([`States::over`]).
+//!
+//! The same read settles a package's frozen columns, its `exit` and `outcome`, from the same
+//! records ([`super::frozen`], [`States::frozen`]).
 
 use super::checks::Finding;
+use super::frozen::{self, Edits, Frozen};
 use super::tables::{PACKAGE, PACKAGE_STATE_FIRST};
 use crate::database::Change;
 use crate::said::Said;
@@ -56,7 +61,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The package columns the rule reads.
 const STATE: &str = "state";
-const CLAIM: &str = "claim";
+pub(super) const CLAIM: &str = "claim";
 
 /// One write of a package's state, as its record made it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +173,12 @@ pub fn writes<'a>(
 /// A package's state as the rule settles it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settled {
+    /// The writes that froze the package: each that counts to `running` (a claim) or `done`.
+    /// Once one has, the package's frozen columns change only by an approved change
+    /// ([`super::frozen`]).
+    pub freezes: Vec<Digest>,
+    /// The writes that stated the package's first state (a birth, an import), which saw none.
+    pub stated: Vec<Digest>,
     /// The state that stands; none where the package holds no state this build reads (its
     /// latest writes restored the cell's absence, or wrote a newer build's word).
     pub state: Option<&'static str>,
@@ -192,8 +203,9 @@ impl Settled {
             .collect()
     }
 
-    /// One package's writes, settled.
-    fn of(mut writes: Vec<Write>) -> Self {
+    /// One package's writes, settled. `withdraws` says whether a write that saw `done` lands
+    /// an approved change that withdraws the done writes it saw stand.
+    fn of(mut writes: Vec<Write>, withdraws: impl Fn(&Write, &[&Write]) -> bool) -> Self {
         let held: BTreeSet<Digest> = writes.iter().map(|write| write.operation).collect();
         for write in &mut writes {
             write.saw.retain(|earlier| held.contains(earlier));
@@ -204,6 +216,7 @@ impl Settled {
         // The writes whose change counts, and the ones the state they saw does not allow.
         let mut counted: Vec<usize> = Vec::new();
         let mut refused: BTreeSet<Digest> = BTreeSet::new();
+        let mut stated: Vec<Digest> = Vec::new();
         for (at, write) in writes.iter().enumerate() {
             let Some(to) = write.state else {
                 // No state of the tracker's: the package holds none from here, and the next
@@ -216,12 +229,25 @@ impl Settled {
                 .copied()
                 .filter(|&earlier| write.saw.contains(&writes[earlier].operation))
                 .collect();
-            match standing(&writes, &seen).0 {
+            let (saw, stood) = standing(&writes, &seen);
+            match saw {
                 // The package's first state is as it is stated.
-                None => counted.push(at),
+                None => {
+                    stated.push(write.operation);
+                    counted.push(at);
+                }
                 // Saying the state it saw again changes nothing, and is no one's change.
                 Some(saw) if saw == to => {}
                 Some(saw) if write.allowed(saw, to) => counted.push(at),
+                // The one way out of done: an approved change.
+                Some("done")
+                    if withdraws(
+                        write,
+                        &stood.iter().map(|&at| &writes[at]).collect::<Vec<_>>(),
+                    ) =>
+                {
+                    counted.push(at);
+                }
                 Some(_) => {
                     refused.insert(write.operation);
                 }
@@ -236,6 +262,13 @@ impl Settled {
         };
         Self {
             state,
+            freezes: counted
+                .iter()
+                .map(|&at| &writes[at])
+                .filter(|write| matches!(write.state, Some("running" | "done")))
+                .map(|write| write.operation)
+                .collect(),
+            stated,
             lost: writes
                 .iter()
                 .filter(unseen)
@@ -276,10 +309,12 @@ fn standing(writes: &[Write], counted: &[usize]) -> (Option<&'static str>, Vec<u
     (state, by)
 }
 
-/// Every package's state as the rule settles it, by the package's key.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Every package's state as the rule settles it, by the package's key, and its frozen columns.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct States {
     pub packages: BTreeMap<String, Settled>,
+    /// Each package's `exit` and `outcome` as the frozen rule settles them.
+    pub frozen: Frozen,
 }
 
 impl States {
@@ -289,8 +324,9 @@ impl States {
     }
 
     /// Give `packages`, a projection of the package table, each row's settled state as the
-    /// value its `state` column shows ([`crate::typed::cell::Row::get`]). The candidates stay
-    /// in the row's fields as they were written.
+    /// value its `state` column shows ([`crate::typed::cell::Row::get`]), and each frozen
+    /// column its settled value ([`Frozen::over`]). The candidates stay in the row's fields as
+    /// they were written.
     pub fn over(&self, packages: &mut Projection) {
         for (pk, settled) in &self.packages {
             if let (Some(row), Some(state)) = (packages.rows.get_mut(pk), settled.state) {
@@ -298,11 +334,13 @@ impl States {
                     .insert(STATE.to_owned(), Some(Value::from(state)));
             }
         }
+        self.frozen.over(packages);
     }
 
     /// What the rule found: a package with a change settling passed over (`state-outranked`),
-    /// and one with a change that does not count (`state-not-allowed`). A finding names the
-    /// package, never a state or a writer; [`Settled`] holds those.
+    /// one with a change that does not count (`state-not-allowed`), and one with an edit of a
+    /// frozen column that does not count (`frozen-edit`, [`Frozen::findings`]). A finding names
+    /// the package, never a state or a writer; [`Settled`] holds those.
     pub fn findings(&self) -> Vec<Finding> {
         let mut found = Vec::new();
         for (pk, settled) in &self.packages {
@@ -319,18 +357,27 @@ impl States {
                 }
             }
         }
+        found.extend(self.frozen.findings());
         found
     }
 }
 
-/// Settle every package's state from the writes of it ([`writes`]).
-pub fn settle(writes: BTreeMap<String, Vec<Write>>) -> States {
-    States {
-        packages: writes
-            .into_iter()
-            .map(|(pk, of)| (pk, Settled::of(of)))
-            .collect(),
-    }
+/// Settle every package's state from the writes of it ([`writes`]), a done withdrawn only by
+/// an approved change among `edits`' approvals and the change rows `cells` hold, then each
+/// package's frozen columns from `edits` by the states settled ([`Frozen::settle`]).
+pub fn settle(writes: BTreeMap<String, Vec<Write>>, edits: &Edits, cells: &Cells) -> States {
+    let asked = frozen::asked(cells);
+    let packages: BTreeMap<String, Settled> = writes
+        .into_iter()
+        .map(|(pk, of)| {
+            let settled = Settled::of(of, |write, stood| {
+                edits.withdraws(&asked, &pk, write, stood)
+            });
+            (pk, settled)
+        })
+        .collect();
+    let frozen = Frozen::settle(edits, &asked, &packages);
+    States { packages, frozen }
 }
 
 /// Every finding over `table`'s cells collections ([`super::checks::tracker`]) with the state
@@ -346,7 +393,9 @@ pub fn findings(
         !matches!(
             finding,
             check::Finding::Conflict { collection, pk, column }
-                if collection == PACKAGE.name && column == STATE && states.state(pk).is_some()
+                if collection == PACKAGE.name
+                    && ((column == STATE && states.state(pk).is_some())
+                        || states.frozen.settles(pk, column))
         )
     });
     found.extend(states.findings());
@@ -366,7 +415,7 @@ pub(super) fn sentence(kind: &str) -> Option<&'static str> {
             "A change to a package's state is not one the state it saw allows, so it does not \
              count and the package reads as it did before. State it again to settle it"
         }
-        _ => return None,
+        _ => return frozen::sentence(kind),
     })
 }
 
@@ -375,12 +424,12 @@ pub(super) fn heading(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "state-outranked" => "State changed twice at once",
         "state-not-allowed" => "State change does not count",
-        _ => return None,
+        _ => return frozen::heading(kind),
     })
 }
 
-/// One read of the tracker with every package's state settled: the table's view, and the
-/// states the rule reads from the same log. The records past a writer's quota project nothing,
+/// One read of the tracker with every package's state and frozen columns settled: the table's
+/// view, and the states the rules read from the same log. The records past a writer's quota project nothing,
 /// so they are no write of a state either. The log is this generation's: `lab/tracker` has
 /// one, and a roll into a second restates a register with no writer, reason or evidence, so
 /// the package that declares one settles over the records the roll keeps (TK-31).
@@ -389,20 +438,25 @@ pub(super) fn heading(kind: &str) -> Option<&'static str> {
 /// As [`crate::att::Handle::view`].
 #[cfg(unix)]
 pub fn read(handle: &crate::att::Handle) -> crate::Result<(crate::att::View, States)> {
-    let (view, _, mut found) = handle.usage_with(|_, log| {
-        writes(
-            log.eligible_iter().filter_map(|(operation, command)| {
+    let (view, _, (mut found, mut edits)) = handle.usage_with(|_, log| {
+        let records: Vec<_> = log
+            .eligible_iter()
+            .filter_map(|(operation, command)| {
                 Some((operation.header.id, command.changes()?, command.said()))
-            }),
-            |later, earlier| log.observes(later, earlier),
-        )
+            })
+            .collect();
+        let observes = |later: &Digest, earlier: &Digest| log.observes(later, earlier);
+        let found = writes(records.iter().copied(), observes);
+        let edits = Edits::of(records.iter().copied(), &found, observes);
+        (found, edits)
     })?;
     if !view.quota.over.is_empty() {
         for of in found.values_mut() {
             of.retain(|write| !view.quota.over.contains(&write.operation));
         }
         found.retain(|_, of| !of.is_empty());
+        edits.retain(|operation| !view.quota.over.contains(operation));
     }
-    let states = settle(found);
+    let states = settle(found, &edits, &view.cells);
     Ok((view, states))
 }

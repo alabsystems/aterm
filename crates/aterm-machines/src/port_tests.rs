@@ -19,6 +19,36 @@ fn live_exclusive_guards_serialize_independent_opens_and_preserve_the_inode() {
     assert_eq!(live.file_id(&path).unwrap(), identity);
 }
 
+/// Root's lock is held only on root's own file, its owner read from the open descriptor: an
+/// ordinary account's open makes the file its own, so its hold is refused, while root's holds
+/// it; and a link at the path is never followed.
+/// NEGATIVE CONTROL: a hold that reads no owner holds a file an ordinary account owns.
+#[test]
+fn live_root_lock_is_held_only_on_roots_own_file() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("spotlight-scope.lock");
+    let live = Live::new();
+    let held = live.hold_root_lock(&path, Duration::ZERO, "held");
+    if live.euid() == 0 {
+        assert!(held.is_ok(), "{held:?}");
+    } else {
+        assert_eq!(
+            held.map(drop).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+    let link = dir.path().join("link.lock");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    // The link's own open is refused (ELOOP): a hold that followed it would fail too, on the
+    // target's owner, so only the error says the link was not followed.
+    let followed = live.hold_root_lock(&link, Duration::ZERO, "held");
+    assert_eq!(
+        followed.map(drop).unwrap_err().raw_os_error(),
+        Some(libc::ELOOP),
+        "a link was followed"
+    );
+}
+
 #[test]
 fn a_fake_exclusive_guard_excludes_until_drop_without_blocking_other_paths() {
     let sys = Fake::default();

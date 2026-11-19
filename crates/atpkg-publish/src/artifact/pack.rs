@@ -20,6 +20,7 @@ use crate::identity::MachineKey;
 use crate::programs::{self, Harness, Shape};
 use crate::triple::{Os, Triple};
 
+mod data;
 mod diagnostics;
 
 /// The plain-program packer.
@@ -159,6 +160,8 @@ pub struct Metadata {
     pub expose: Vec<String>,
     /// `bundle`: shipped, not shimmed.
     pub bundle: Vec<String>,
+    /// Checkout-relative manifest of committed data to ship under `share/<program>`.
+    pub data_files: Option<String>,
     /// `build-args`.
     pub build_args: Vec<String>,
     /// `bundle-only`: a sysroot program this lane cannot describe.
@@ -227,6 +230,7 @@ fn package_recipe(recipe: &aterm_json::Value, program: &str) -> Result<Metadata>
     Ok(Metadata {
         expose,
         bundle: own_strings("bundle")?,
+        data_files: data::declaration(Some(recipe))?,
         build_args: own_strings("build-args")?,
         bundle_only,
         ..Metadata::default()
@@ -284,6 +288,7 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
         Metadata {
             expose: declared("expose"),
             bundle: declared("bundle"),
+            data_files: data::declaration(ws)?,
             build_args: strings(ws.and_then(|a| a.get("build-args"))),
             bundle_only: workspace_bundle_only,
             ..Metadata::default()
@@ -326,6 +331,11 @@ pub fn held_to_harness(program: &str, h: Harness, mut meta: Metadata) -> Result<
              [workspace.metadata.atpkg] bundles {} besides",
             h.tool,
             meta.bundle.join(" ")
+        )));
+    }
+    if meta.data_files.is_some() {
+        return Err(Error::refused(format!(
+            "{program} is a harness: its recipe cannot declare atpkg data-files"
         )));
     }
     if !meta.expose.is_empty() && meta.expose != [h.tool] {
@@ -1337,6 +1347,9 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         }
     };
     pkgdoc::check_exposes(program, &meta.expose)?;
+    if let Some(manifest) = &meta.data_files {
+        data::stage(program, &request.checkout, manifest, &stage_root)?;
+    }
     let harness_version = harness_id.as_ref().map(|id| id.version.as_str());
     let exes = build(
         tools,

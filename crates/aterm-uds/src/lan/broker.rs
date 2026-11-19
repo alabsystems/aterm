@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::wire::{self, Advert, Event, Frame, Reader, Request, SpotlightStores, Target};
-use super::{ConnectOptions, LanError, UdpOptions, Unavailable};
+use super::{ConnectOptions, LanError, ScopeAnswer, UdpOptions, Unavailable};
 use crate::CtlStream;
 
 /// How long the broker's socket may take to accept: a hang detector, as it answers at once.
@@ -72,7 +72,8 @@ enum Absent {
     /// a LAN use.
     Direct,
     /// Reads why no broker answers ([`super::absent`]): a question about the broker itself
-    /// ([`super::Arrivals`], [`consider`]) or one only root can answer ([`spotlight_stores`]),
+    /// ([`super::Arrivals`], [`consider`]) or one only root can answer ([`spotlight_stores`],
+    /// [`scope_home`]),
     /// which this process's own server cannot.
     NotInstalled,
 }
@@ -479,6 +480,40 @@ pub fn any_protocol(heard: Result<BrokerHello, LanError>) -> Result<BrokerHello,
             })
         }
         heard => heard,
+    }
+}
+
+/// How long the broker may take to answer a [`Request::ScopeHome`]: a hang detector over its
+/// wait for the minute between `mds` restarts, its `mdutil` reading and its edit's runs.
+const SCOPE_HANG: Duration = Duration::from_secs(240);
+
+/// [`super::scope_home`] through the broker at [`super::dialled_socket`], never this process's
+/// own server, which has no Spotlight duty: an absent broker, a refusal of this process's
+/// code, another protocol, an exchange that failed, and a broker that closes after its hello
+/// (one older than the request, whose wire does not read it) are each
+/// [`ScopeAnswer::Unserved`], naming why.
+#[must_use]
+pub fn scope_home() -> ScopeAnswer {
+    scope_home_at(&super::dialled_socket(), super::protocol())
+}
+
+fn scope_home_at(path: &Path, ours: u32) -> ScopeAnswer {
+    let mut session = match open_at(Some(&Request::ScopeHome), path, ours, Absent::NotInstalled) {
+        Ok(session) => session,
+        Err(why) => return ScopeAnswer::Unserved(why.to_string()),
+    };
+    let build = session.broker.build.clone();
+    let deadline = Instant::now() + SCOPE_HANG;
+    match session.reader.frame(&session.stream, Some(deadline)) {
+        Ok(Some(Frame::Scoped { added })) => ScopeAnswer::Excluded(added),
+        Ok(Some(Frame::Error { code, words })) => ScopeAnswer::of_error(code, words),
+        Ok(Some(other)) => ScopeAnswer::Unserved(format!(
+            "the LAN broker (build {build}) answered out of turn: {other:?}"
+        )),
+        Ok(None) => ScopeAnswer::Unserved(format!(
+            "the LAN broker (build {build}) predates this request"
+        )),
+        Err(error) => ScopeAnswer::Unserved(format!("the LAN broker (build {build}): {error}")),
     }
 }
 

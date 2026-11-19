@@ -35,6 +35,7 @@
 //!   rows and the journal's `seen` events for every reader that says so.
 
 pub mod account_names;
+pub mod account_status;
 pub mod checks;
 #[cfg(unix)]
 pub mod command;
@@ -45,6 +46,7 @@ pub mod history;
 pub mod import;
 #[cfg(unix)]
 pub mod journal;
+pub mod link;
 pub mod mail;
 pub mod merge;
 pub mod observe;

@@ -253,6 +253,7 @@ pub(super) fn self_claimed_plan(
         // Older self-claimed records stored only a nonempty home string.
         (!st.resume_home.is_empty()).then_some(st.resume_home.as_str())
     });
+    let home = home.filter(|value| !st.selected_codex_default || !value.is_empty());
     let env: Vec<(&str, &str)> = home
         .into_iter()
         .map(|value| (ca::HOME_ENV, value))
@@ -262,14 +263,26 @@ pub(super) fn self_claimed_plan(
                 .map(|value| (ca::AUTH_PATH_ENV, value)),
         )
         .collect();
-    let line = upgrade::relaunch_line_env(
-        dialect,
-        heal.as_deref(),
-        cd.as_deref(),
-        &env,
-        Path::new(exe),
-        flags,
-    )
+    let line = if st.selected_codex_default {
+        upgrade::relaunch_line_env_clear(
+            dialect,
+            heal.as_deref(),
+            cd.as_deref(),
+            &env,
+            &super::super::relaunch::codex_resume_unset(st.codex_auth_path.as_deref(), home),
+            Path::new(exe),
+            flags,
+        )
+    } else {
+        upgrade::relaunch_line_env(
+            dialect,
+            heal.as_deref(),
+            cd.as_deref(),
+            &env,
+            Path::new(exe),
+            flags,
+        )
+    }
     .map_err(|e| NoPlan::Refused {
         why: format!("line:{e}"),
         what: "line".to_string(),
@@ -333,6 +346,9 @@ pub(super) fn self_claimed_after_exit(
     let Some(run) = snap.codex() else {
         return said(r, "refused:not-codex");
     };
+    // A named login moving to the default must lose that login even when its parent
+    // shell still exports it. An ordinary restart keeps the captured environment.
+    let selected_codex_default = run.selected_default && resume.codex_auth_path.is_none();
     if let Err(why) = resume.validate_structural() {
         return said(r, format!("refused:{why}"));
     }
@@ -372,6 +388,7 @@ pub(super) fn self_claimed_after_exit(
             && st.cwd == want_cwd
             && st.codex_home_env == resume.codex_home
             && st.codex_auth_path == resume.codex_auth_path
+            && (!selected_codex_default || st.selected_codex_default)
             && (st.resume_start.is_empty() || st.resume_start == snap.start)
         {
             st.resume_start.clone_from(&snap.start);
@@ -412,6 +429,7 @@ pub(super) fn self_claimed_after_exit(
         codex_home: home.to_string_lossy().into_owned(),
         codex_home_env: resume.codex_home.clone(),
         codex_auth_path: resume.codex_auth_path.clone(),
+        selected_codex_default,
         argv: snap.argv.clone(),
         cwd: resume.cwd.clone().unwrap_or_else(|| snap.cwd.clone()),
         twin,
@@ -1070,6 +1088,7 @@ pub(super) fn snapshot_with_claim(
             home,
             home_env: args.env_var(ca::HOME_ENV).map(str::to_owned),
             self_claimed: primary.cloned(),
+            selected_default: false,
         }),
         dialect: (shell != NO_SHELL)
             .then(|| shell_dialect(shell, k, Vec::new))

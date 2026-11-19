@@ -20,7 +20,7 @@ use aterm_core::terminal::{ClockReading, Rgb, Terminal};
 use aterm_effects::cursor_fx::TrailColor;
 use aterm_effects::kitty_pet::{PetInputKind, art_cols, head_law};
 use aterm_effects::pipeline::EffectsPipeline;
-use aterm_render::{Renderer, Theme};
+use aterm_render::{Frame, Renderer, Theme, WindowCpu};
 
 pub const ROWS: u16 = 14;
 pub const COLS: u16 = 72;
@@ -335,6 +335,74 @@ impl LetterPlan {
     }
 }
 
+/// `input` drawn by `rend` through the damage cache `wc` (`Renderer::render_input_cached`), as the
+/// GUI's CPU path draws a window's frames: only the rows that changed since `wc`'s last frame are
+/// repainted. Settled as `Renderer::render_input` settles its snapshot: a fallback face's parse in
+/// flight is waited for, and the frame drawn again while the glyph routing's epoch
+/// (`Renderer::font_epoch`) moved during the pass, at most `Renderer::SNAPSHOT_SETTLE_PASSES`
+/// times. The epoch, not whether a parse was left in flight, is what ends it: a parse that lands
+/// in the middle of a draw (a later cell's probe polls it in) moves the epoch with no parse left
+/// for the settling to find, and the cells drawn before it keep the old routing
+/// ([`a_replay_draws_the_snapshot_s_frame`]). That the damaged path paints what a full repaint
+/// paints is aterm-render's own law (`damage_differential`, `scroll_blit`, `row_overshoot`).
+fn drawn_through(rend: &mut Renderer, wc: &mut WindowCpu, input: &RenderInput) -> Frame {
+    let mut pass = 1;
+    loop {
+        let epoch = rend.font_epoch();
+        let view = rend.render_input_cached(wc, input);
+        let _ = rend.settle_in_flight_fallback_parses();
+        if rend.font_epoch() == epoch || pass == Renderer::SNAPSHOT_SETTLE_PASSES {
+            return Frame {
+                width: view.width(),
+                height: view.height(),
+                pixels: view.pixels().to_vec(),
+            };
+        }
+        pass += 1;
+    }
+}
+
+/// A REPLAY DRAWS THE SNAPSHOT'S FRAME: [`drawn_through`], through a damage cache, draws the frame
+/// `Renderer::render_input` draws on a fresh renderer's first frame of Claude Code's composer
+/// glyphs and a CJK word, which the window's face lacks, each fallback face's parse landing in the
+/// middle of the draw (`Renderer::debug_land_lazy_parses_on_poll`: a parse a cell's probe starts
+/// lands at the next cell's probe). Negative control (macOS, 2026-11-18): [`drawn_through`] ended
+/// where the settling finds no parse in flight, as it was, returns the frame with the glyphs drawn
+/// before the parse landed in the old routing, 251 px apart.
+#[test]
+fn a_replay_draws_the_snapshot_s_frame() {
+    let mut term = Terminal::new(2, 24);
+    term.process(
+        "\u{23fa} \u{23bf} \u{273b} \u{276f} \u{2500} \u{23f5}\r\n\u{6f22}\u{5b57}".as_bytes(),
+    );
+    let input: RenderInput = term.cell_frame(2, 24);
+    let fresh = || {
+        let mut rend = Renderer::from_system(GALLERY_PX, Theme::default())
+            .expect("no font: build with aterm-render's default embedded-font feature");
+        rend.debug_land_lazy_parses_on_poll(true);
+        rend
+    };
+    let mut drawn_once = fresh();
+    let epoch = drawn_once.font_epoch();
+    let _ = drawn_once.render_input_cached(&mut WindowCpu::new(), &input);
+    assert!(
+        drawn_once.font_epoch() > epoch,
+        "fixture: no fallback face's parse landed in the draw"
+    );
+    let snapshot = fresh().render_input(&input);
+    let drawn = drawn_through(&mut fresh(), &mut WindowCpu::new(), &input);
+    let apart = drawn
+        .pixels
+        .iter()
+        .zip(&snapshot.pixels)
+        .filter(|(d, s)| d != s)
+        .count();
+    assert!(
+        (drawn.width, drawn.height) == (snapshot.width, snapshot.height) && apart == 0,
+        "the replay's frame is not the snapshot's: {apart} px apart"
+    );
+}
+
 /// A frame with no effect drawn and what it was drawn from: the terminal's
 /// `screen_mutations` and caret, its pixels, and the plan of each cell its letters have been
 /// read in, by `(row, col, span)` ([`LetterPlan`], `None` for a blank cell). The plans read
@@ -416,8 +484,8 @@ pub struct Judged {
     /// luminance, when the replay reads them ([`Replay::air`]).
     pub air: usize,
     /// The light below the caret's row, column by column from the window's left edge to
-    /// the caret's, or to where a companion's drawn box meets the band (the underline cat
-    /// stands on its rail's head, its body over it): each column's greatest channel lift
+    /// the caret's, or to where a companion's drawn box meets the band: each column's greatest
+    /// channel lift
     /// over the clean frame in the [`RAIL_BAND`] px under the row's bottom, when the replay
     /// reads it ([`Replay::rail`]).
     pub rail: Vec<u8>,
@@ -433,7 +501,7 @@ pub struct Judged {
 
 /// Where a frame's companion lay ([`Replay::coat`]): its drawn body (the knock layer's rects
 /// that meet the pet's box), against the letters' ink and the word icons.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Coat {
     /// The pet's drawn box, frame px `(x0, x1, y0, y1)`.
     pub pet: Option<(i32, i32, i32, i32)>,
@@ -541,8 +609,13 @@ pub struct Replay {
     /// share of its strength, then the SDR crown at the default boost. Like the bloom, a frame
     /// nothing reads is not drawn and takes none.
     pub post: bool,
-    /// Whether each frame reads where the companion's body lies ([`Judged::coat`]).
+    /// Whether each frame reads where the companion's body lies ([`Judged::coat`]). A replay that
+    /// reads nothing else is made one with [`Replay::read_only_the_coat`], which draws its lights
+    /// without the letter guard.
     pub coat: bool,
+    /// Whether [`Replay::read_only_the_coat`] drew this replay's lights without the letter guard:
+    /// [`Replay::present`] holds it to reading nothing but the coat.
+    unguarded_coat: bool,
     /// Whether a frame whose bloom keeps off its letters by a mask leaves the blur out: the
     /// mask's zero covers every lettered cell the blur can reach and the ring the judge reads
     /// round it ([`spared_letters_in_reach`], asserted on each such frame), so no judged letter
@@ -572,6 +645,10 @@ pub struct Replay {
     /// Where the frames [`Replay::keep`] names go instead of [`Replay::kept`], each as it is
     /// drawn: a replay that reads every frame of a scene against another's holds two at a time.
     pub keep_to: Option<std::sync::mpsc::SyncSender<Kept>>,
+    /// The damage caches the clean twin and the frames the effects drew are drawn through
+    /// ([`drawn_through`]), one each, as the GUI keeps one per window.
+    clean_cpu: WindowCpu,
+    drawn_cpu: WindowCpu,
 }
 
 /// A frame a replay kept ([`Replay::keep`]): its time, its pixels (`0x00RRGGBB`) as the glass
@@ -727,28 +804,22 @@ pub fn lays_the_bundled_cell() -> bool {
     gallery_cell() == BUNDLED_CELL
 }
 
-/// What a replay's `style` word asks for: a `cursor_trail_style`, the pet beside it, and the
-/// rainbow's ribbon body.
+/// What a replay's `style` word asks for: a `cursor_trail_style` and the pet beside it.
 ///
-/// The word is `[underline |flat ]<cursor_trail_style>[ + <cursor_pet>]`: a walker (`cat`,
-/// `dog`) or a flier (`flying cat`, carried as `flier`). `rainbow` is the
-/// shipped theme, the tall body (its band behind the words, its rail under them), and
-/// `rainbow + cat` the shipped default beside its pet. `underline` and `flat` name the two
-/// ribbon bodies no built-in theme picks ([`EffectsPipeline::set_ribbon_shape`]): the replays
-/// keep judging them while the engine keeps them.
+/// The word is `<cursor_trail_style>[ + <cursor_pet>]`: a walker (`cat`, `dog`) or a flier
+/// (`flying cat`, carried as `flier`). `rainbow` is the shipped theme (its band behind the
+/// words, its rail under them), and `rainbow + cat` the shipped default beside its pet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spec<'a> {
     pub trail: &'a str,
     pub pet: Option<aterm_effects::kitty_pet::PetSpecies>,
     /// The flier the pet word names (`flying cat`): the replay flies it as the window does.
     pub flier: Option<aterm_effects::kitty_pet::PetSpecies>,
-    pub tall: bool,
-    pub flat: bool,
 }
 
 impl<'a> Spec<'a> {
     pub fn of(word: &'a str) -> Self {
-        let (body, pet, flier) = match word.split_once(" + ") {
+        let (trail, pet, flier) = match word.split_once(" + ") {
             Some((body, pet)) => {
                 let row = aterm_effects::cursor_pet::row(pet)
                     .filter(|row| row.species.is_some() || row.flies.is_some())
@@ -757,24 +828,11 @@ impl<'a> Spec<'a> {
             }
             None => (word, None, None),
         };
-        let (trail, tall, flat) = if let Some(trail) = body.strip_prefix("underline ") {
-            (trail, false, false)
-        } else if let Some(trail) = body.strip_prefix("flat ") {
-            (trail, true, true)
-        } else {
-            (body, true, false)
-        };
         assert!(
             aterm_effects::cursor_glow::spellings::row(trail).is_some(),
             "{word:?}: {trail:?} is no cursor_trail_style"
         );
-        Self {
-            trail,
-            pet,
-            flier,
-            tall,
-            flat,
-        }
+        Self { trail, pet, flier }
     }
 }
 
@@ -799,7 +857,6 @@ pub fn set_glow(
         true,
         cursor,
     );
-    fx.set_ribbon_shape(spec.tall, spec.flat);
 }
 
 impl Replay {
@@ -889,6 +946,7 @@ impl Replay {
             caret: false,
             post: false,
             coat: false,
+            unguarded_coat: false,
             skip_spared_blur: false,
             spared: 0,
             keys_unnoted: false,
@@ -898,6 +956,8 @@ impl Replay {
             keep: Vec::new(),
             kept: Vec::new(),
             keep_to: None,
+            clean_cpu: WindowCpu::new(),
+            drawn_cpu: WindowCpu::new(),
         }
     }
 
@@ -984,6 +1044,11 @@ impl Replay {
     /// Present one frame and judge its letters.
     pub fn present(&mut self) -> Judged {
         assert!(
+            !self.unguarded_coat || self.reads_only_the_coat(),
+            "fixture: a replay drawn without the letter guard for its coat \
+             (`Replay::read_only_the_coat`) reads nothing but the coat"
+        );
+        assert!(
             !self.skip_spared_blur
                 || (self.letters
                     && self.dump.is_empty()
@@ -999,7 +1064,7 @@ impl Replay {
         if self.clean.as_ref().is_none_or(|c| c.at != key) {
             self.clean = Some(CleanFrame {
                 at: key,
-                px: self.rend.render_input(&input).pixels,
+                px: drawn_through(&mut self.rend, &mut self.clean_cpu, &input).pixels,
                 plans: Default::default(),
             });
         }
@@ -1025,7 +1090,8 @@ impl Replay {
             || self.rail
             || self.keep.contains(&self.ms)
             || self.dump.iter().any(|(at, _)| *at == self.ms);
-        let mut drawn = reads_frame.then(|| self.rend.render_input(&input));
+        let mut drawn =
+            reads_frame.then(|| drawn_through(&mut self.rend, &mut self.drawn_cpu, &input));
         if let Some(frame) = drawn.as_mut() {
             assert_eq!(
                 (frame.width, frame.height),
@@ -1420,6 +1486,34 @@ impl Replay {
             coat,
             trail: input.cursor_trail.len(),
         }
+    }
+
+    /// Whether every frame reads nothing but where the companion lies ([`Replay::coat`]): no
+    /// letter, caret, shade, air or rail, and no frame kept or dumped, so no frame the effects
+    /// drew is rendered ([`Replay::present`]).
+    fn reads_only_the_coat(&self) -> bool {
+        self.coat
+            && !(self.letters || self.caret || self.shade || self.air || self.rail)
+            && self.keep.is_empty()
+            && self.dump.is_empty()
+    }
+
+    /// Make this a replay that reads only where the companion lies ([`Replay::coat`]), its lights
+    /// drawn without the letter guard (`EffectsPipeline::set_letter_guard`), as the effects'
+    /// companion replays draw them. The guard shapes only the lights over the letters; the coat
+    /// reads the companion's box, alpha and fit, its knock layer, the word icons, the page's cells
+    /// and the clean twin; and the companion reads nothing of the guard: on a dark page
+    /// (`aterm_effects`'s `the_pet_reads_nothing_of_the_letter_guard`) and on paper
+    /// (`companion_off_letters`' `a_coat_on_paper_reads_nothing_of_the_letter_guard`). Weighing
+    /// every light against the letters was most of such a replay's cost. The guard is set off
+    /// here, as the test asks, and nowhere else: a guard the test sets after this call is the one
+    /// its frames are drawn with. [`Replay::present`] holds such a replay to reading nothing but
+    /// the coat ([`Replay::reads_only_the_coat`]): no letter, caret, shade, air or rail, and no
+    /// frame kept or dumped.
+    pub fn read_only_the_coat(&mut self) {
+        self.coat = true;
+        self.unguarded_coat = true;
+        self.fx.set_letter_guard(false);
     }
 
     /// Run `events` (`(ms, event)`, sorted) and `tail` ms after the last, presenting a frame every
@@ -1906,13 +2000,10 @@ pub fn worst(judged: &[Judged]) -> Option<(u64, Letter)> {
         .min_by(|a, b| a.1.judged().total_cmp(&b.1.judged()))
 }
 
-/// Every trail style a setting selects, and one row for each ribbon body only a seam lays
-/// (`EffectsPipeline::set_ribbon_shape`): the underline and the flat body, each beside the cat.
-pub const STYLES: [&str; 15] = [
+/// Every trail style a setting selects.
+pub const STYLES: [&str; 13] = [
     "rainbow + cat",
-    "underline rainbow + cat",
     "rainbow + dog",
-    "flat rainbow + cat",
     "rainbow",
     "fire + dog",
     "phaser",
@@ -2033,7 +2124,6 @@ fn replay_with(
             true,
             look.cursor,
         );
-        r.fx.set_ribbon_shape(spec.tall, spec.flat);
     }
     r.fx.set_letter_guard(guard);
     r.fx.set_bloom_spares_letters(spares);
@@ -2249,10 +2339,7 @@ fn pinned_unguarded(style: &'static str, look: Look, scene: Scene) -> Verdict {
 /// there; the rainbow's own colour draws it inside the block as a keyline, and unguarded the burst
 /// then keeps every letter (4.70:1 at worst on Dark), so the rainbow's row replays under a block
 /// the program pinned ([`pinned_unguarded`]): it buries 4 letters, `m` at 3.48:1 the worst
-/// (macOS, 2026-11-14). The flat ribbon's Enter on
-/// Default Light stood here until its paper Return came out from under the printed line instead
-/// of flaring across it (looks9 Q5, `rainbow_kitty::meteor`): unguarded it now keeps every letter
-/// at 7.28:1 or better, so it controls nothing.
+/// (macOS, 2026-11-14).
 ///
 /// Fire's is a defect of the host's Han face: unguarded, its spark buries macOS's `你` (2.78:1
 /// and 2.58:1) and no Latin letter in any scene or look, while under Windows' Han fallback
@@ -2607,11 +2694,8 @@ struct OwnShare {
 /// own lies over the grey's bar of 4.0, and 97% of one reading under that bar lies under it.
 ///
 /// The sweep judges an underlined line too ([`UNDERLINED_SCENES`], the underlined letters' review,
-/// 2026-11-06, measured on Linux arm64 in the bundled JetBrains Mono's 13 x 29 px cells). On
-/// Solarized Dark the underline cat laid a wash at the page's lightness in its own hue under
-/// the stroke, and the judge's channel medians read `h` at 4.14:1 of its own 4.58 (90.5%) in
-/// both lines where the guard, reading the stroke's grounds by luminance, saw no lift. Over the
-/// selected row every style but Fire and Laser laid light in the typed row's foot band against
+/// 2026-11-06, measured on Linux arm64 in the bundled JetBrains Mono's 13 x 29 px cells). Over
+/// the selected row every style but Fire and Laser laid light in the typed row's foot band against
 /// the stroke, its rails parted round the row's descenders alone, on both dim looks: the
 /// rainbow kitty pet's `h` at 1.08:1.
 ///
@@ -2635,13 +2719,15 @@ struct OwnShare {
 /// [`BAR_SCENES`] keeps 98.2% of its own or more (the least, Laser's `w` on Solarized Dark's Enter,
 /// 98.28%, Linux arm64, 2026-11-07). Windows' bundled Iosevka Term SemiBold replays the scene at
 /// [`RING_CONTROL_PX`], unmeasured on Windows. The underlined
-/// line's, on Solarized Dark in [`JETBRAINS_MONO`] at the gallery's size on every OS: read by its
-/// grounds' luminance (`set_letter_guard_channels(false)`), the underline cat's line keeps `h` at
-/// 90.5% of its own reading; the rails parted round no underline's stroke
-/// (`set_feet_deep_unread(true)`), the rainbow kitty pet's line over the selected row leaves `h`
-/// at 1.08:1 of its own 4.58 (both Linux arm64, 2026-11-06, as in the window's own face there).
-/// Another cell lays the stroke elsewhere: Iosevka Term SemiBold at 22 px, replayed here, bites
-/// neither, so both stay in the face they were measured in, unmeasured on macOS and Windows. A
+/// line's, on Solarized Dark in [`JETBRAINS_MONO`] at the gallery's size on every OS: the rails
+/// parted round no underline's stroke (`set_feet_deep_unread(true)`), the rainbow kitty pet's
+/// line over the selected row leaves `h` at 1.08:1 of its own 4.58 (Linux arm64, 2026-11-06, as
+/// in the window's own face there). Another cell lays the stroke elsewhere: Iosevka Term
+/// SemiBold at 22 px, replayed here, does not bite, so it stays in the face it was measured in,
+/// unmeasured on macOS and Windows. Read by its grounds' luminance
+/// (`set_letter_guard_channels(false)`), no style's underlined line holds a letter under 97% of
+/// its own reading (the least, Fire's `s` over the selected row on Solarized Dark, 98.8%, macOS,
+/// 2026-11-18): the channels' load there was the underline body's, removed with it. A
 /// rail's lane past a foot read by its glyph's raster alone (`set_lanes_deep_unread(true)`, the
 /// cursor-trail tree as it first met the deep feet) runs Phaser's rail at its whole light against
 /// the stroke over the selected row, in that face on Solarized Dark: 281 letters under the bar,
@@ -2838,20 +2924,8 @@ fn a_dim_letter_keeps_its_own_reading() {
         "control: read by its grounds' luminance at {px} px, {fire:?} still keeps 97% of every \
          dim letter's own reading"
     );
-    // The underlined lines' controls, in the face and cell they were measured in: a letter read
-    // by its solid ink against its grounds' least and greatest luminance, and the rails parting
+    // The underlined lines' control, in the face and cell it was measured in: the rails parting
     // round no underline's stroke.
-    let underlined = ("underline rainbow + cat", SOLARIZED_DARK, Scene::Underlined);
-    let luma = Knobs {
-        channels: false,
-        face: Some(JETBRAINS_MONO),
-        ..SHIPPED
-    };
-    assert!(
-        !under(&sweep(&[underlined], luma)).is_empty(),
-        "control: read by its grounds' luminance, {underlined:?} still keeps 97% of every dim \
-         letter's own reading"
-    );
     let over_selection = ("rainbow + cat", SOLARIZED_DARK, Scene::UnderlinedContext);
     let shallow = Knobs {
         feet_deep: false,
@@ -3875,12 +3949,12 @@ fn rail_dip(judged: &[Judged], floor: u8) -> Option<(f64, u64, u8)> {
 /// its own reading, and the letter guard cuts the lights on its row deep; a rail laid a
 /// hairline under the row, clear of the guard's ring round a descender's foot, lights no
 /// letter, and the guard cuts it only where it meets a dimmed cell's box. Typing, Classic in a
-/// chosen colour (`#d03a8c`), Comet and the underline cat keep their rail one stroke from its
-/// tail to the caret while the keys come: no column under the row falls under half the
-/// stroke's peak once the stroke has risen to it. Negative control: the guard feathering its cuts into the rail as
+/// chosen colour (`#d03a8c`) and Comet keep their rail one stroke from its tail to the caret
+/// while the keys come: no column under the row falls under half the stroke's peak once the
+/// stroke has risen to it. Negative control: the guard feathering its cuts into the rail as
 /// into any light, Classic's rail broke into a dash under the word gap, a gap under `fox`'s
 /// cut letters and the caret's foot (the gallery's `classic-pink/solarized-dark`, looks7 round
-/// 2), and the underline cat's warm stops sank to olive and brown under its cut letters.
+/// 2).
 #[test]
 fn a_dim_page_s_rail_is_one_stroke() {
     let read = |style: &'static str, color: TrailColor, scene: Scene, clear: bool| {
@@ -3899,7 +3973,6 @@ fn a_dim_page_s_rail_is_one_stroke() {
                 true,
                 SOLARIZED_DARK.cursor,
             );
-            r.fx.set_ribbon_shape(spec.tall, spec.flat);
         }
         r.fx.set_letter_guard_rails_clear(clear);
         r.rail = true;
@@ -3922,18 +3995,6 @@ fn a_dim_page_s_rail_is_one_stroke() {
     let jobs = [
         ("classic", pink, Scene::Typing, true),
         ("comet", TrailColor::Automatic, Scene::Typing, false),
-        (
-            "underline rainbow + cat",
-            TrailColor::Automatic,
-            Scene::Typing,
-            true,
-        ),
-        (
-            "underline rainbow + cat",
-            TrailColor::Automatic,
-            Scene::Burst,
-            true,
-        ),
     ];
     for (style, color, scene, controlled) in jobs {
         let Some((share, ms, peak)) = read(style, color, scene, true) else {
@@ -3961,9 +4022,8 @@ const RAIL_KEPT: f64 = 0.45;
 
 /// looks7 round 3, A DIM PAGE'S TRAIL SHOWS BELOW ITS LETTERS: on Solarized Dark a bed under
 /// the letters lays only its hue at the page's luminance, and Beam, Lumen and Comet drew
-/// nothing behind the caret while typing, each a bare glowing caret; the flat rainbow showed
-/// no rainbow past `jumps`. Each lays its light in the air a hairline below the row
-/// (`BedShape::on_lit_page`, the flat ribbon's soft rail): in the frame after the last key,
+/// nothing behind the caret while typing, each a bare glowing caret. Each lays its light in
+/// the air a hairline below the row (`BedShape::on_lit_page`): in the frame after the last key,
 /// more than half a cell's columns behind the caret (farther than a cell and a half from it,
 /// past the caret's own glow) are lit under the row (Comet's wedge is the shortest), at the
 /// gallery's size and where the window's face lays the gallery's row ([`gallery_row_px`]).
@@ -4004,13 +4064,13 @@ fn a_dim_page_s_trail_shows_below_its_letters() {
         sizes.push(row_px);
     }
     for px in sizes {
-        for style in ["beam", "lumen", "comet", "flat rainbow + cat"] {
+        for style in ["beam", "lumen", "comet"] {
             let (on, cw) = lit(style, px, true);
             assert!(
                 on > cw / 2,
                 "{style} at {px} px: only {on} columns behind the caret lit below the row"
             );
-            if style != "flat rainbow + cat" && px == row_px {
+            if px == row_px {
                 let (off, _) = lit(style, px, false);
                 assert!(
                     off <= cw / 4,

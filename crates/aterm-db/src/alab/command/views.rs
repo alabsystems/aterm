@@ -166,7 +166,8 @@ const USAGE: &str = "aterm db emails|computers|phones|ai-accounts — the owner'
                     hold yet. `ai-accounts` adds seen_on, the Macs a tab ran it on in the last
                     two hours, and last_seen, from every Mac's account-obs rows and the
                     journal's seen events; a pending account a Mac runs reads `signed in · on
-                    <mac>`, and a paused, broken or banned one `<status> · signed in on <mac>`.
+                    <mac>`, and a held one (paused, broken, banned, suspended, cancelled)
+                    `<status> · signed in on <mac>`.
                     `computers` adds each live seat no machine row binds
   aterm db <table> --edit
                     the table in the amacs grid (in an aterm tab, in an Editor tab beside it);
@@ -622,7 +623,7 @@ fn shown_seen(rows: &mut [Value], seen: &BTreeMap<String, SeenOn>, now_ms: u64) 
         };
         // A Mac running the account now is an observation, and the status says it where the
         // owner's word does not already: a pending (or unset) account reads as signed in there;
-        // a held one (paused, broken, banned: always a person's word, which bars sign-ins) keeps
+        // a held one (any word `account_status::usable` refuses, which bars sign-ins) keeps
         // that word first, since a Mac running it anyway is what the owner needs to see, not a
         // reason to drop the hold; an active one already says it serves.
         let running = held.and_then(|held| held.macs.keys().next());
@@ -630,7 +631,7 @@ fn shown_seen(rows: &mut [Value], seen: &BTreeMap<String, SeenOn>, now_ms: u64) 
             let status = fields.get("status").and_then(Value::as_str);
             let shown = match status {
                 None | Some("pending") => Some(format!("signed in \u{b7} on {mac}")),
-                Some(hold @ ("paused" | "broken" | "banned")) => {
+                Some(hold) if !crate::alab::account_status::usable(true, Some(hold)) => {
                     Some(format!("{hold} \u{b7} signed in on {mac}"))
                 }
                 Some(_) => None,

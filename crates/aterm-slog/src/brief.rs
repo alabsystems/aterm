@@ -331,6 +331,8 @@ const fn mark_worth_a_line(k: Kind) -> bool {
             | Kind::Tab
             | Kind::Desc
             | Kind::Refused
+            | Kind::Msg
+            | Kind::Diff
     )
 }
 

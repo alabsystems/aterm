@@ -351,3 +351,118 @@ fn a_reference_mirror_carries_native_evidence_and_refuses_its_absence() {
     assert_eq!(public_receipt.status, "native-pass");
     assert_eq!(public_receipt.archive_sha256, f.receipt.archive_sha256);
 }
+
+#[test]
+fn agit_signing_requires_matching_native_evidence_for_every_composed_target() {
+    use crate::artifact::sign;
+    use std::sync::Arc;
+
+    let work = aterm_tempfile::tempdir().unwrap();
+    let manifest = work.path().join("pkg-agit-1.toml");
+    let version = "2.56.1.agit.1";
+    let header = format!(
+        "schema = 1\nprogram = \"agit\"\nversion = \"{version}\"\nbuild_number = 1\nexposes = [\"agit\"]\n"
+    );
+    let host = Arc::new(crate::host::fake::FakeHost::new());
+    let keys = crate::testkit::Keys::mint("m3", &[]);
+    let ctx = keys.ctx(work.path(), host.clone());
+    keys.publish_quad(
+        &host,
+        &ctx.index_slug(),
+        41,
+        &keys.index_toml(41, &[("agit", "agit")], &[("agit", 1)]),
+    );
+    let authority = sign::authority(&ctx).unwrap();
+    let key = crate::identity::MachineKey::load(&ctx, &ctx.identity.key).unwrap();
+    let source = |fork: &str| {
+        aterm_json::json!({
+            "product": "agit", "upstream_version": "2.56.1", "runtime_prefix": true,
+            "fork_commit": fork.repeat(40), "upstream_commit": "a".repeat(40)
+        })
+    };
+    let mut composed = header;
+    let mut receipts = vec![];
+    for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        let asset = format!("agit-{target}.tar.zst");
+        let payload = format!("a qualified archive fixture for {target}").into_bytes();
+        let digest = atpkg::tree::sha256_bytes(&payload);
+        let root = "f".repeat(64);
+        let size = payload.len();
+        composed += &format!(
+            "\n[[artifact]]\ntarget = \"{target}\"\nkind = \"binary\"\nprotocol = \"github-release\"\nasset = \"{asset}\"\nsha256 = \"{digest}\"\ntree_root = \"{root}\"\nsize = {size}\n"
+        );
+        std::fs::write(work.path().join(&asset), payload).unwrap();
+        receipts.push((
+            sidecar(&manifest, &asset).unwrap(),
+            Receipt {
+                schema: 1,
+                evidence: "operator-native-runtime-observation".into(),
+                status: "native-pass".into(),
+                native_host: Some(target.into()),
+                native_translation: Some("native".into()),
+                control_count: agit::CONTROLS.len(),
+                controls: agit::CONTROLS.iter().map(|s| (*s).to_owned()).collect(),
+                target: target.into(),
+                manifest_sha256: atpkg::tree::sha256_bytes(composed.as_bytes()),
+                qualified_manifest: composed.clone(),
+                archive: asset,
+                archive_sha256: digest,
+                archive_size: size as u64,
+                tree_root: root.clone(),
+                source_cohort: source("b"),
+            },
+        ));
+    }
+    let manifest_bytes = composed.as_bytes();
+    std::fs::write(&manifest, manifest_bytes).unwrap();
+    let save = |index: usize, r: &Receipt| {
+        std::fs::write(&receipts[index].0, aterm_json::to_vec(r).unwrap()).unwrap();
+    };
+    save(0, &receipts[0].1);
+    assert!(sign::sign_checked(&key, manifest_bytes, &authority).is_err());
+    assert!(sign::sign_all(&ctx, std::slice::from_ref(&manifest)).is_err());
+    let mut wrong_host = receipts[1].1.clone();
+    wrong_host.native_host = Some(TARGET.to_string());
+    save(1, &wrong_host);
+    assert!(sign::sign_all(&ctx, std::slice::from_ref(&manifest)).is_err());
+    let mut other_fork = receipts[1].1.clone();
+    other_fork.source_cohort = source("c");
+    save(1, &other_fork);
+    assert!(sign::sign_all(&ctx, std::slice::from_ref(&manifest)).is_err());
+    assert!(!sign::sig_path(&manifest).exists());
+    save(1, &receipts[1].1);
+    let signed = sign::sign_all(&ctx, std::slice::from_ref(&manifest)).unwrap();
+    authority
+        .verify_pkg(manifest_bytes, &std::fs::read(&signed[0]).unwrap())
+        .unwrap();
+    let names = receipt_names(manifest_bytes).unwrap();
+    assert_eq!(names.len(), 2);
+    // The per-target pack passes its own asset. A merged upload must preserve both
+    // qualified archives and both observations before the ready manifest.
+    let reserved = crate::artifact::upload::reserve_pack_version(
+        host.as_ref(),
+        &ctx.staging_slug("agit"),
+        "atpkg-agit-1",
+        &manifest,
+        &[
+            work.path().join(&receipts[1].1.archive),
+            signed[0].clone(),
+            manifest.clone(),
+        ],
+        "agit fixture",
+    )
+    .unwrap();
+    let files: Vec<_> = reserved
+        .files()
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        files.last().unwrap(),
+        manifest.file_name().unwrap().to_str().unwrap()
+    );
+    for ((_, receipt), name) in receipts.iter().zip(names) {
+        assert!(files.contains(&receipt.archive));
+        assert!(files.contains(&name));
+    }
+}

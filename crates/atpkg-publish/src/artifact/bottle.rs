@@ -23,6 +23,7 @@ use crate::triple::{
     X86_64_UNKNOWN_LINUX_GNU,
 };
 
+mod agit;
 mod git_text;
 mod macos;
 mod pinned;
@@ -961,7 +962,7 @@ fn check_stage_tree(
             break;
         }
         if arch::read(&path).is_some() {
-            if matches!(program, "git" | "openssl-signing") {
+            if matches!(program, "git" | "openssl-signing" | "agit") {
                 let bytes = crate::identity::read_regular_bytes(&path, 64 * 1024 * 1024)
                     .map_err(|error| Error::io(format!("read {}", path.display()), &error))?;
                 macos::check(&bytes, program)
@@ -1024,6 +1025,9 @@ pub fn pack_bottle_with(
     if matches!(bottle_def.origin, programs::BottleOrigin::Reference(_)) {
         reference::check_request(request)?;
     }
+    if matches!(bottle_def.origin, programs::BottleOrigin::Agit) {
+        agit::check_request(request)?;
+    }
     let (input, directory) = match &request.input {
         BottleInput::Archive(path) => (path, false),
         BottleInput::InstallTree(path) => (path, true),
@@ -1056,10 +1060,13 @@ pub fn pack_bottle_with(
         ctx.identity.store = None;
     }
     let ctx = &ctx;
-    let deferred_reference_signing = request.signing == Signing::MachineKey
-        && matches!(bottle_def.origin, programs::BottleOrigin::Reference(_));
+    let deferred_native_signing = request.signing == Signing::MachineKey
+        && matches!(
+            bottle_def.origin,
+            programs::BottleOrigin::Reference(_) | programs::BottleOrigin::Agit
+        );
     let signer = match request.signing {
-        Signing::MachineKey if deferred_reference_signing => None,
+        Signing::MachineKey if deferred_native_signing => None,
         Signing::MachineKey => Some(pack::Signer::load(ctx)?),
         Signing::Unsigned => None,
     };
@@ -1225,7 +1232,13 @@ pub fn pack_bottle_with(
     let self_check = Scratch::new("bottle-check")?;
     let check_dir = self_check
         .path()
-        .join("store")
+        .join(
+            if matches!(bottle_def.origin, programs::BottleOrigin::Agit) {
+                "store with spaces"
+            } else {
+                "store"
+            },
+        )
         .join(program)
         .join(request.build.to_string());
     atpkg::verify_for_publication(
@@ -1251,11 +1264,22 @@ pub fn pack_bottle_with(
             artifact,
             native_controls,
         )?;
-        if deferred_reference_signing {
-            signature = super::sign::sign_all(ctx, std::slice::from_ref(&manifest))?
-                .into_iter()
-                .next();
+    }
+    if matches!(bottle_def.origin, programs::BottleOrigin::Agit) {
+        let origin = agit::qualify(&check_dir, &version, request.triple)?;
+        let after = atpkg::tree::tree_root(&check_dir)
+            .map_err(|e| Error::io("rehash qualified agit tree", &e))?;
+        if after != artifact.tree_root {
+            return Err(Error::refused(
+                "agit archive tree changed during qualification",
+            ));
         }
+        reference::qualification::write_agit(&origin, &manifest, &manifest_bytes, artifact)?;
+    }
+    if deferred_native_signing {
+        signature = super::sign::sign_all(ctx, std::slice::from_ref(&manifest))?
+            .into_iter()
+            .next();
     }
 
     let mut uploaded = false;

@@ -48,6 +48,8 @@ impl Vendors for Harness {
         };
         match read_sheet_cell(column, cell, notes) {
             SheetCell::Absent => Mark::Absent,
+            SheetCell::Zero => Mark::Zero,
+            SheetCell::No => Mark::No,
             SheetCell::Member(vendor) => Mark::Member(terms(vendor)),
             SheetCell::Disqualified(vendor) => Mark::Paused(terms(vendor)),
             SheetCell::Held => Mark::Held,

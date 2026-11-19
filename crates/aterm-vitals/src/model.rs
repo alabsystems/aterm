@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::explain::{IdMap, IdSet};
 use crate::history::{self, Filling, FreeHistory, FreeWeeks, Rates};
 use crate::net_counter::{ByteCounter, ByteDelta, ByteSample, DeltaError, byte_delta};
 use crate::peaks::{DailyMax, NET_LEARN_S, PROC_LEARN_S, Peaks, TOKENS_LEARN_S};
@@ -3276,7 +3277,7 @@ impl MemoryOwners {
         owners
     }
 
-    fn of(rows: &[ProcView], truncated: bool, ownership_incomplete: bool) -> Self {
+    fn of(rows: &[RowKey], truncated: bool, ownership_incomplete: bool) -> Self {
         let mut result = Self {
             truncated,
             ownership_incomplete,
@@ -3942,9 +3943,9 @@ struct Rows {
     cores_at: Option<Stamp>,
     sweep_at: Option<Stamp>,
     /// Each process of the last sweep: its start and cumulative bytes read (`None` unread).
-    read_bytes: HashMap<u32, (Option<u64>, Option<u64>)>,
+    read_bytes: IdMap<u32, (Option<u64>, Option<u64>)>,
     /// Each process of the last sweep: its start and cumulative bytes written (`None` unread).
-    written: HashMap<u32, (Option<u64>, Option<u64>)>,
+    written: IdMap<u32, (Option<u64>, Option<u64>)>,
     /// Cached hardware processor brand once supplied by the host.
     cpu_brand: Option<String>,
     /// Whether the last sweep read the whole process table (not stopped at its cap).
@@ -4029,17 +4030,17 @@ pub struct Vitals {
     mem_history: History,
     last_counters: Option<(u64, MemCounters)>,
     last_sweep_at: Option<u64>,
-    last_cpu: HashMap<u32, ProcessCpuCounter>,
-    last_energy: HashMap<u32, ProcessCpuCounter>,
-    last_runnable: HashMap<u32, u64>,
-    last_read_at: HashMap<u32, u64>,
+    last_cpu: IdMap<u32, ProcessCpuCounter>,
+    last_energy: IdMap<u32, ProcessCpuCounter>,
+    last_runnable: IdMap<u32, u64>,
+    last_read_at: IdMap<u32, u64>,
     global_foot: Trend,
     app_footprint: Trend,
     last_app_footprint_at: Option<u64>,
     aterm: ScopeState,
     shared: ScopeState,
     /// Live process origin keyed by PID and kernel start, retained across reparenting.
-    origins: HashMap<crate::delegated::ProcessKey, Origin>,
+    origins: IdMap<crate::delegated::ProcessKey, Origin>,
     origins_incomplete: bool,
     tabs: HashMap<u64, ScopeState>,
     detector: crate::events::Detector,
@@ -4378,16 +4379,16 @@ impl Vitals {
             mem_history: Default::default(),
             last_counters: None,
             last_sweep_at: None,
-            last_cpu: HashMap::new(),
-            last_energy: HashMap::new(),
-            last_runnable: HashMap::new(),
-            last_read_at: HashMap::new(),
+            last_cpu: IdMap::default(),
+            last_energy: IdMap::default(),
+            last_runnable: IdMap::default(),
+            last_read_at: IdMap::default(),
             global_foot: Default::default(),
             app_footprint: Default::default(),
             last_app_footprint_at: None,
             aterm: Default::default(),
             shared: Default::default(),
-            origins: HashMap::new(),
+            origins: IdMap::default(),
             origins_incomplete: false,
             tabs: HashMap::new(),
             detector: Default::default(),
@@ -4954,7 +4955,7 @@ impl Vitals {
         let s = if !s.ownership_incomplete
             && (self.origins_incomplete
                 || s.procs.as_ref().is_some_and(|procs| {
-                    let unread: HashSet<_> = procs
+                    let unread: IdSet<_> = procs
                         .iter()
                         .filter(|p| p.start.is_none())
                         .map(|p| p.pid)
@@ -5594,7 +5595,7 @@ impl Vitals {
         };
         let procs = s.procs.as_deref().unwrap_or(&[]);
         // This index provides names only; it cannot establish group membership or custody.
-        let mut names = HashMap::with_capacity(procs.len());
+        let mut names = IdMap::with_capacity_and_hasher(procs.len(), Default::default());
         for p in procs {
             if let Some(start) = p.start {
                 names
@@ -5750,13 +5751,14 @@ impl Vitals {
             .filter(|&t| s.at_ns > t)
             .map(|t| s.at_ns - t);
         self.last_sweep_at = Some(s.at_ns);
-        let mut next_cpu = HashMap::with_capacity(procs.len());
-        let mut next_energy = HashMap::with_capacity(procs.len());
-        let mut next_runnable = HashMap::with_capacity(procs.len());
-        let mut next_read_at = HashMap::with_capacity(procs.len());
+        let mut next_cpu = IdMap::with_capacity_and_hasher(procs.len(), Default::default());
+        let mut next_energy = IdMap::with_capacity_and_hasher(procs.len(), Default::default());
+        let mut next_runnable = IdMap::with_capacity_and_hasher(procs.len(), Default::default());
+        let mut next_read_at = IdMap::with_capacity_and_hasher(procs.len(), Default::default());
         let mut rates: Vec<ProcRates> = Vec::with_capacity(procs.len());
         let mut common_cores = Vec::with_capacity(procs.len());
-        let mut pid_counts = HashMap::<u32, usize>::with_capacity(procs.len());
+        let mut pid_counts =
+            IdMap::<u32, usize>::with_capacity_and_hasher(procs.len(), Default::default());
         for p in procs {
             *pid_counts.entry(p.pid).or_default() += 1;
         }
@@ -5890,7 +5892,7 @@ impl Vitals {
         }
         let (mut others, mut services, mut unknown_owner_reported) = (0.0f32, 0.0f32, 0.0f32);
         let (mut others_gpu, mut services_gpu) = (0.0f32, 0.0f32);
-        let mut rows: Vec<ProcView> = Vec::with_capacity(procs.len());
+        let mut rows: Vec<RowKey> = Vec::with_capacity(procs.len());
         let mut job_acc: Vec<ScopeAcc> = vec![ScopeAcc::default(); s.delegated.len()];
         let mut top: Vec<TopProc> = Vec::with_capacity(TOP_PROCS + 1);
         let mut writers: Vec<Writer> = Vec::new();
@@ -6029,28 +6031,12 @@ impl Vitals {
                 }
                 _ => {}
             }
-            rows.push(ProcView {
-                group: group_keys[index],
-                energy_mw: r.energy_mw,
-                energy_read_span_ns: r.energy_read_span_ns,
-                scheduling: p.scheduling,
-                cpu_accounting: CpuAccounting::from(p),
-                pid: p.pid,
-                ppid: p.ppid,
-                pgid: p.pgid,
-                name: p.name.clone(),
+            rows.push(RowKey {
                 cores: r.cores,
-                cpu_read_span_ns: r.cpu_read_span_ns,
-                wait: r.wait,
                 footprint: p.footprint,
-                peak: p.peak,
-                read_bps: r.read_bps,
-                write_bps: r.write_bps,
-                state: p.state,
+                pid: p.pid,
                 scope: row_scope,
-                refused: p.cpu_ns.is_none(),
                 gpu: r.gpu,
-                birth_ms: p.birth_ms,
             });
         }
         global.top = global_acc.top.clone();
@@ -6113,6 +6099,17 @@ impl Vitals {
                 procs: acc.procs,
             })
             .collect();
+        let kept = keep_rows(&rows)
+            .into_iter()
+            .map(|index| {
+                proc_view(
+                    &procs[index],
+                    &rates[index],
+                    group_keys[index],
+                    rows[index].scope,
+                )
+            })
+            .collect();
         ProcPass {
             group_keys,
             rates,
@@ -6133,7 +6130,7 @@ impl Vitals {
                 s.procs_truncated,
                 s.native_incomplete || s.ownership_incomplete || !s.unproved_tabs.is_empty(),
             )),
-            rows: keep_rows(rows),
+            rows: kept,
             programs: keep_programs(programs),
             split_parts: Some((
                 aterm_cores,
@@ -6159,23 +6156,23 @@ impl Vitals {
 /// its life's writes, not the window's. One the last sweep read with no counter, or whose start
 /// only one of the two reads knew, counts nothing until the next.
 fn window_writes(
-    last: &HashMap<u32, (Option<u64>, Option<u64>)>,
+    last: &IdMap<u32, (Option<u64>, Option<u64>)>,
     last_whole: bool,
     procs: &[ProcSample],
     sweep_dt: Option<f64>,
-) -> HashMap<u32, u64> {
+) -> IdMap<u32, u64> {
     window_counter(last, last_whole, procs, sweep_dt, |p| p.disk_written)
 }
 
 fn window_counter(
-    last: &HashMap<u32, (Option<u64>, Option<u64>)>,
+    last: &IdMap<u32, (Option<u64>, Option<u64>)>,
     last_whole: bool,
     procs: &[ProcSample],
     sweep_dt: Option<f64>,
     field: impl Fn(&ProcSample) -> Option<u64>,
-) -> HashMap<u32, u64> {
+) -> IdMap<u32, u64> {
     if sweep_dt.is_none() {
-        return HashMap::new();
+        return IdMap::default();
     }
     let newest = last.values().filter_map(|r| r.0).max();
     procs
@@ -6227,7 +6224,55 @@ fn mem_rates(then: MemCounters, now: MemCounters, window_ns: u64) -> Option<MemR
     })
 }
 
-fn busiest_first(a: &ProcView, b: &ProcView) -> std::cmp::Ordering {
+/// What [`keep_rows`] and [`MemoryOwners::of`] read of one swept process's row: its order's
+/// keys, its scope and its GPU share. A reading takes one for every process and builds the whole
+/// row ([`proc_view`]) only for those [`keep_rows`] keeps.
+#[derive(Clone, Copy, Debug)]
+struct RowKey {
+    cores: Option<f32>,
+    footprint: Option<u64>,
+    pid: u32,
+    scope: RowScope,
+    gpu: Option<f32>,
+}
+
+/// `p`'s row in [`Snapshot::procs`], at its rates `r`, its group and its scope.
+fn proc_view(
+    p: &ProcSample,
+    r: &ProcRates,
+    group: Option<crate::groups::GroupKey>,
+    scope: RowScope,
+) -> ProcView {
+    #[cfg(test)]
+    ROWS_BUILT.with(|n| n.set(n.get() + 1));
+    ProcView {
+        group,
+        energy_mw: r.energy_mw,
+        energy_read_span_ns: r.energy_read_span_ns,
+        scheduling: p.scheduling,
+        cpu_accounting: CpuAccounting::from(p),
+        pid: p.pid,
+        ppid: p.ppid,
+        pgid: p.pgid,
+        name: p.name.clone(),
+        cores: r.cores,
+        cpu_read_span_ns: r.cpu_read_span_ns,
+        wait: r.wait,
+        footprint: p.footprint,
+        peak: p.peak,
+        read_bps: r.read_bps,
+        write_bps: r.write_bps,
+        state: p.state,
+        scope,
+        refused: p.cpu_ns.is_none(),
+        gpu: r.gpu,
+        birth_ms: p.birth_ms,
+    }
+}
+
+fn busiest_first(a: &RowKey, b: &RowKey) -> std::cmp::Ordering {
+    #[cfg(test)]
+    ROW_COMPARES.with(|n| n.set(n.get() + 1));
     b.cores
         .unwrap_or(-1.0)
         .total_cmp(&a.cores.unwrap_or(-1.0))
@@ -6235,57 +6280,131 @@ fn busiest_first(a: &ProcView, b: &ProcView) -> std::cmp::Ordering {
         .then(a.pid.cmp(&b.pid))
 }
 
-fn keep_rows(rows: Vec<ProcView>) -> Vec<ProcView> {
-    let (mut mine, mut rest): (Vec<ProcView>, Vec<ProcView>) =
-        rows.into_iter().partition(|r| r.scope.in_aterm());
-    mine.sort_by(busiest_first);
-    if mine.len() > ATERM_ROWS {
-        let mut by_foot = mine.split_off(ATERM_ROWS / 2);
-        by_foot.sort_by_key(|p| std::cmp::Reverse(p.footprint.unwrap_or(0)));
-        by_foot.truncate(ATERM_ROWS - mine.len());
-        mine.extend(by_foot);
+#[cfg(test)]
+thread_local! {
+    /// [`busiest_first`]'s calls on this thread: the row comparisons [`keep_rows`] makes.
+    static ROW_COMPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// [`proc_view`]'s calls on this thread: the rows a reading builds.
+    static ROWS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`Snapshot::procs`]' bound, as indices into `rows` in its order, busiest first
+/// ([`busiest_first`]): every aterm and tab row up to [`ATERM_ROWS`] (half busiest and half
+/// largest when over the cap), and of the machine's others the [`TOP_ROWS`] busiest, the
+/// [`TOP_ROWS`] largest of the rest and every other one that holds a GPU share.
+///
+/// Of the others it selects the busiest and the largest instead of sorting them all: each order
+/// is a stable sort's, spelled as a total order on its key and then the row's index, so the
+/// first [`TOP_ROWS`] it selects and sorts are the rows, in the order, that a stable sort of
+/// every row gives.
+fn keep_rows(rows: &[RowKey]) -> Vec<usize> {
+    let busiest = |a: &usize, b: &usize| busiest_first(&rows[*a], &rows[*b]).then(a.cmp(b));
+    let largest = |a: &usize, b: &usize| {
+        rows[*b]
+            .footprint
+            .unwrap_or(0)
+            .cmp(&rows[*a].footprint.unwrap_or(0))
+            .then_with(|| busiest(a, b))
+    };
+    let (mut kept, mut rest): (Vec<usize>, Vec<usize>) =
+        (0..rows.len()).partition(|&i| rows[i].scope.in_aterm());
+    kept.sort_unstable_by(busiest);
+    if kept.len() > ATERM_ROWS {
+        let mut by_foot = kept.split_off(ATERM_ROWS / 2);
+        by_foot.sort_unstable_by(largest);
+        by_foot.truncate(ATERM_ROWS - kept.len());
+        kept.extend(by_foot);
     }
-    rest.sort_by(busiest_first);
-    let mut kept: Vec<ProcView> = rest.iter().take(TOP_ROWS).cloned().collect();
-    let mut by_foot: Vec<&ProcView> = rest.iter().skip(TOP_ROWS).collect();
-    by_foot.sort_by_key(|p| std::cmp::Reverse(p.footprint.unwrap_or(0)));
-    let mut by_foot = by_foot.into_iter();
-    kept.extend(by_foot.by_ref().take(TOP_ROWS).cloned());
-    kept.extend(by_foot.filter(|p| p.gpu.is_some_and(|g| g > 0.0)).cloned());
-    mine.extend(kept);
-    mine.sort_by(busiest_first);
-    mine
+    let busy = first_by(&mut rest, TOP_ROWS, busiest);
+    kept.extend_from_slice(&rest[..busy]);
+    let rest = &mut rest[busy..];
+    let large = first_by(rest, TOP_ROWS, largest);
+    kept.extend_from_slice(&rest[..large]);
+    let mut gpu: Vec<usize> = rest[large..]
+        .iter()
+        .copied()
+        .filter(|&i| rows[i].gpu.is_some_and(|g| g > 0.0))
+        .collect();
+    gpu.sort_unstable_by(largest);
+    kept.extend(gpu);
+    kept.sort_by(|a, b| busiest_first(&rows[*a], &rows[*b]));
+    kept
+}
+
+/// Puts the first `n` of `v` under `order`, a total order, at its front, sorted, and the rest
+/// after them in no order; returns how many it put there (`n`, or all of `v` where it is
+/// shorter).
+fn first_by(
+    v: &mut [usize],
+    n: usize,
+    mut order: impl FnMut(&usize, &usize) -> std::cmp::Ordering,
+) -> usize {
+    if v.len() > n {
+        v.select_nth_unstable_by(n, &mut order);
+    }
+    let n = n.min(v.len());
+    v[..n].sort_unstable_by(order);
+    n
 }
 
 fn busiest_program_first(a: &ProgramGroup, b: &ProgramGroup) -> std::cmp::Ordering {
+    #[cfg(test)]
+    PROGRAM_COMPARES.with(|n| n.set(n.get() + 1));
     b.cores
         .total_cmp(&a.cores)
         .then(b.footprint.unwrap_or(0).cmp(&a.footprint.unwrap_or(0)))
         .then(a.name.cmp(&b.name))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The comparisons [`keep_programs`] makes on this thread: [`busiest_program_first`]'s calls
+    /// and its footprint order's (a footprint tie counts twice, as that order then calls
+    /// [`busiest_program_first`]).
+    static PROGRAM_COMPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// [`Snapshot::programs`]' bound, as [`keep_rows`] bounds the rows: every aterm and tab group
 /// up to [`ATERM_ROWS`] (half busiest and half largest when over the cap), and of the machine's
-/// others the [`TOP_ROWS`] busiest and the [`TOP_ROWS`] largest of the rest.
+/// others the [`TOP_ROWS`] busiest and the [`TOP_ROWS`] largest of the rest, busiest first
+/// ([`busiest_program_first`]).
+///
+/// As [`keep_rows`] does, it orders indices, never groups, and of the others selects the
+/// busiest and the largest instead of sorting them all: each order is a stable sort's, spelled
+/// as a total order on its key and then the group's index (busiest: [`busiest_program_first`]
+/// then index; largest: footprint descending, then busiest), so the groups it keeps, and the
+/// sequence its last stable sort orders, are those of a stable sort of every group.
 fn keep_programs(groups: Vec<ProgramGroup>) -> Vec<ProgramGroup> {
-    let (mut kept, mut rest): (Vec<ProgramGroup>, Vec<ProgramGroup>) = groups
-        .into_iter()
-        .partition(|g| g.scope != ProcScope::Other);
-    kept.sort_by(busiest_program_first);
+    let busiest =
+        |a: &usize, b: &usize| busiest_program_first(&groups[*a], &groups[*b]).then(a.cmp(b));
+    let largest = |a: &usize, b: &usize| {
+        #[cfg(test)]
+        PROGRAM_COMPARES.with(|n| n.set(n.get() + 1));
+        groups[*b]
+            .footprint
+            .unwrap_or(0)
+            .cmp(&groups[*a].footprint.unwrap_or(0))
+            .then_with(|| busiest(a, b))
+    };
+    let (mut kept, mut rest): (Vec<usize>, Vec<usize>) =
+        (0..groups.len()).partition(|&i| groups[i].scope != ProcScope::Other);
+    kept.sort_unstable_by(busiest);
     if kept.len() > ATERM_ROWS {
         let mut by_foot = kept.split_off(ATERM_ROWS / 2);
-        by_foot.sort_by_key(|g| std::cmp::Reverse(g.footprint.unwrap_or(0)));
+        by_foot.sort_unstable_by(largest);
         by_foot.truncate(ATERM_ROWS - kept.len());
         kept.extend(by_foot);
     }
-    rest.sort_by(busiest_program_first);
-    let mut by_foot = rest.split_off(rest.len().min(TOP_ROWS));
-    by_foot.sort_by_key(|g| std::cmp::Reverse(g.footprint.unwrap_or(0)));
-    by_foot.truncate(TOP_ROWS);
-    kept.extend(rest);
-    kept.extend(by_foot);
-    kept.sort_by(busiest_program_first);
-    kept
+    let busy = first_by(&mut rest, TOP_ROWS, busiest);
+    kept.extend_from_slice(&rest[..busy]);
+    let rest = &mut rest[busy..];
+    let large = first_by(rest, TOP_ROWS, largest);
+    kept.extend_from_slice(&rest[..large]);
+    kept.sort_by(|a, b| busiest_program_first(&groups[*a], &groups[*b]));
+    let mut groups: Vec<Option<ProgramGroup>> = groups.into_iter().map(Some).collect();
+    kept.into_iter()
+        .filter_map(|index| groups[index].take())
+        .collect()
 }
 
 impl Rows {
@@ -7253,7 +7372,7 @@ impl Vitals {
     /// sweep can use one; absent rows in a truncated sweep do not discard the proof.
     pub fn restore_process_origins(&mut self, origins: &[ProcessOrigin]) {
         self.origins_incomplete |= origins.len() > PROCESS_ORIGIN_CAP;
-        let mut rejected = HashSet::new();
+        let mut rejected = IdSet::default();
         for origin in origins.iter().take(PROCESS_ORIGIN_CAP) {
             if rejected.contains(&origin.process) {
                 continue;
@@ -7289,8 +7408,8 @@ impl Vitals {
         procs: &[ProcSample],
     ) -> (Vec<Membership>, Vec<Option<usize>>) {
         let current = attribute(procs, s.self_pid, &s.tabs);
-        let mut roots = HashMap::new();
-        let mut native = HashMap::new();
+        let mut roots = IdMap::default();
+        let mut native = IdMap::default();
         for root in &s.native_roots {
             native
                 .entry(root.process)
@@ -7364,7 +7483,7 @@ impl Vitals {
         let origins = membership.clone();
         let (membership, owners) = attribute_delegated(procs, &s.tabs, &s.delegated, membership);
         if !s.procs_truncated {
-            let present: HashMap<_, _> = procs.iter().map(|p| (p.pid, p.start)).collect();
+            let present: IdMap<_, _> = procs.iter().map(|p| (p.pid, p.start)).collect();
             self.origins.retain(|key, _| {
                 present
                     .get(&key.pid)
@@ -7416,7 +7535,7 @@ impl Vitals {
                 start: p.start?,
             })
         };
-        let mut by_pid = HashMap::with_capacity(procs.len());
+        let mut by_pid = IdMap::with_capacity_and_hasher(procs.len(), Default::default());
         for (index, p) in procs.iter().enumerate() {
             by_pid
                 .entry(p.pid)
@@ -7425,7 +7544,7 @@ impl Vitals {
         }
         let mut resolved = vec![false; procs.len()];
         let mut groups = vec![None; procs.len()];
-        let coalitions: HashSet<_> = s
+        let coalitions: IdSet<_> = s
             .coalitions
             .as_ref()
             .into_iter()
@@ -7537,17 +7656,17 @@ impl Vitals {
 /// Attribute each process in `procs` to `aterm` (`self_pid` tree + tab trees) and its nearest tab.
 #[must_use]
 pub fn attribute(procs: &[ProcSample], self_pid: u32, tabs: &[TabRoot]) -> Vec<Membership> {
-    attribute_roots(procs, self_pid, tabs, HashMap::new())
+    attribute_roots(procs, self_pid, tabs, IdMap::default())
 }
 
 fn attribute_roots(
     procs: &[ProcSample],
     self_pid: u32,
     tabs: &[TabRoot],
-    mut memo: HashMap<u32, Membership>,
+    mut memo: IdMap<u32, Membership>,
 ) -> Vec<Membership> {
-    let starts: HashMap<_, _> = procs.iter().map(|p| (p.pid, p.start)).collect();
-    let parent: HashMap<u32, u32> = procs
+    let starts: IdMap<_, _> = procs.iter().map(|p| (p.pid, p.start)).collect();
+    let parent: IdMap<u32, u32> = procs
         .iter()
         .map(|p| {
             // A sweep is not atomic: an old parent may exit and its PID name a newer process by
@@ -7559,7 +7678,7 @@ fn attribute_roots(
             (p.pid, if reused { 1 } else { p.ppid })
         })
         .collect();
-    let shells: HashMap<u32, usize> = tabs
+    let shells: IdMap<u32, usize> = tabs
         .iter()
         .enumerate()
         .filter(|(_, t)| t.shell_pid != 0)
@@ -7582,7 +7701,7 @@ fn attribute_delegated(
     jobs: &[DelegatedJob],
     mut membership: Vec<Membership>,
 ) -> (Vec<Membership>, Vec<Option<usize>>) {
-    let mut claims = HashMap::new();
+    let mut claims = IdMap::default();
     for (index, job) in jobs.iter().enumerate() {
         for &key in &job.members {
             claims
@@ -7616,9 +7735,9 @@ fn attribute_delegated(
 fn resolve(
     pid: u32,
     self_pid: u32,
-    parent: &HashMap<u32, u32>,
-    shells: &HashMap<u32, usize>,
-    memo: &mut HashMap<u32, Membership>,
+    parent: &IdMap<u32, u32>,
+    shells: &IdMap<u32, usize>,
+    memo: &mut IdMap<u32, Membership>,
 ) -> Membership {
     let mut path = Vec::new();
     let mut cur = pid;

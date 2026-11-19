@@ -34,6 +34,34 @@ pub(crate) enum Mutant {
     /// Reconcile the control journal by range alone on `atdb/8`, with no update chain agreed by
     /// its frontier first, as a store with no causal chains does.
     ControlRangesOnly,
+    /// State a records bound of format 2 on the frontier wires wherever this Mac's build reads
+    /// format 2, whether or not its format mark is stored.
+    StatesFormatUnmarked,
+    /// State a records bound of a later format to any peer, with no evidence that it reads one.
+    StatesFormatBlind,
+    /// Read a records bound of a later format in a peer's frame on a Mac that states format 1.
+    ReadsFormatUngated,
+    /// Exchange with a peer whose bound differs from this Mac's only in its format, so the
+    /// peer's records, not its bound, are what this Mac refuses.
+    FormatUnjudgedAtBound,
+    /// Read a record a root of this Mac's log dropped as one it does not hold: a push that
+    /// brings it is not complete, and a reconciliation does not name it.
+    DroppedUnheld,
+    /// Serve no root on the records wire: a peer behind a cut is sent records alone.
+    ServesNoRoot,
+    /// Serve a rooted log's roots to every peer of format 2, whatever its reconciled set holds.
+    ServesAtTheCut,
+    /// Settle a served batch the peer took none of as a refused round of records.
+    RefusedRootStrikes,
+    /// Set the served bit in every batch header, whatever its format and whether a frame
+    /// follows.
+    ServedBitUngated,
+    /// Read the served bit in a batch header that ends with no format trailer, as one that
+    /// says a frame follows.
+    ServedBitUnread,
+    /// Serve a rooted log's roots again in the session after the peer took nothing of them,
+    /// under the same views.
+    ServesRefusedRoot,
 }
 
 thread_local! {

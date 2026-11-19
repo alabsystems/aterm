@@ -134,6 +134,8 @@ pub enum BottleOrigin {
     Formula,
     /// A shared pinned upstream archive or native source build.
     Pinned(&'static aterm_uds::host::upstream::PinnedTool),
+    /// A source-built agit distribution produced by the Git fork itself.
+    Agit,
     /// An independently qualified local source build with its corresponding source.
     Reference(&'static aterm_uds::host::upstream::ReferenceTool),
 }
@@ -354,6 +356,19 @@ pub static PROGRAMS: &[ProgramDef] = &[
             darwin: DUAL_DARWIN,
             linux: &[X86_64_UNKNOWN_LINUX_GNU, AARCH64_UNKNOWN_LINUX_GNU],
             origin: BottleOrigin::Formula,
+        }),
+    },
+    ProgramDef {
+        name: "agit",
+        repo: "agit",
+        group: None,
+        system: None,
+        unavailable_hint: None,
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["agit"],
+            darwin: DUAL_DARWIN,
+            linux: &[X86_64_UNKNOWN_LINUX_GNU, AARCH64_UNKNOWN_LINUX_GNU],
+            origin: BottleOrigin::Agit,
         }),
     },
     ProgramDef {

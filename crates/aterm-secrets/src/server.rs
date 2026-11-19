@@ -31,6 +31,10 @@ mod fence_tests;
 mod follow_tests;
 
 #[cfg(test)]
+#[path = "server/served_root_tests.rs"]
+mod served_root_tests;
+
+#[cfg(test)]
 #[path = "server/takes_over_tests.rs"]
 mod takes_over_tests;
 
@@ -959,6 +963,12 @@ impl Running {
     pub(crate) fn records_gets(&self) -> usize {
         self.shared.records_gets.load(Ordering::SeqCst)
     }
+
+    /// The records GETs since the start that asked for a served frame.
+    #[cfg(test)]
+    pub(crate) fn records_served_gets(&self) -> usize {
+        self.shared.records_served_gets.load(Ordering::SeqCst)
+    }
 }
 
 /// Start serving on `listener` in background threads (no mDNS, no caffeinate).
@@ -1166,6 +1176,8 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         #[cfg(test)]
         records_gets: AtomicUsize::new(0),
         #[cfg(test)]
+        records_served_gets: AtomicUsize::new(0),
+        #[cfg(test)]
         record_wakes: AtomicUsize::new(0),
         #[cfg(test)]
         record_looks: AtomicUsize::new(0),
@@ -1344,13 +1356,17 @@ struct RecordSlot {
     store: crate::membership_log::Store,
     /// The records file as this server last read or wrote it (`docs/DESIGN-fluid-swarm-
     /// 2026-10-28.md` §4.1 F23, rule 2): a look that finds the same stamp reads nothing
-    /// ([`look_at_records`]). `None` until this server read, wrote or was refused one.
+    /// ([`look_at_records`]). `None` until this server read, wrote or was refused one. At a
+    /// rewritten entry it is the stamp of the data file its pin selects, and a rewrite to a
+    /// new generation starts from exactly the file of this stamp ([`persist_stored`]).
     stamp: Option<fsx::FileStamp>,
     /// `Some(n)` when the file holds exactly the records of the log's first `n` (as a set: a
     /// reload may order them otherwise), so what the log holds past them can go on its end. It
     /// held them in the forms the log held them then: a whole version-2 record that has since
     /// taken its shed frame's place among them is not on the file, which a write finds by the
-    /// file's length ([`persist_records`]).
+    /// file's length ([`persist_records`]). A rewritten file holds the frame of its log's roots
+    /// before them, which the count leaves out: the file's length is the frame's and theirs,
+    /// and a write finds a frame the log no longer has by comparing it ([`persist_stored`]).
     on_file: Option<usize>,
     /// A record application is writing the file ([`apply_records`], [`Writing`]): a look reads nothing, since
     /// what the file holds past the stamp may not be durable yet, and reading it would take
@@ -1499,6 +1515,10 @@ struct Shared {
     /// GETs of a vault's records (`/v1/<name>/records`, long-polls among them) since the start.
     #[cfg(test)]
     records_gets: AtomicUsize,
+    /// The records GETs among them that asked for a served frame
+    /// ([`crate::transport::RECORDS_SERVED_HEADER`]).
+    #[cfg(test)]
+    records_served_gets: AtomicUsize,
     /// The records long-polls an application woke ([`apply_records`]) since the start.
     #[cfg(test)]
     record_wakes: AtomicUsize,
@@ -1614,10 +1634,12 @@ impl Shared {
     }
 
     /// [`fsx::write_atomic_stamped_with`] of an application's held records ([`apply_records`]),
-    /// which a test's disk refuses having touched nothing while `writes_fail` is set.
+    /// after `frame` where it is a rewritten file's frame of roots ([`persist_stored`]), which a
+    /// test's disk refuses having touched nothing while `writes_fail` is set.
     fn write_records(
         &self,
         path: &Path,
+        frame: Option<&[u8]>,
         accepted: &crate::membership_log::Store,
     ) -> crate::Result<Option<fsx::FileStamp>> {
         #[cfg(test)]
@@ -1625,6 +1647,9 @@ impl Shared {
             return Err(Error::new("the test's disk refused the whole write"));
         }
         fsx::write_atomic_stamped_with(path, 0o600, |writer| {
+            if let Some(frame) = frame {
+                writer.write_all(frame)?;
+            }
             write_held_buffered(writer, accepted, 0)
         })
     }
@@ -2036,6 +2061,46 @@ fn records_reading_in(store: &Path, name: &str) -> crate::Result<crate::membersh
     crate::membership_log::follow::reading(&format_mark_in(store, name))
 }
 
+/// Finish or undo a storage transition of the records entry at `entry` that a writer left cut
+/// short, for a server that reads its records at `reading`. A server that reads format 2 (its
+/// mark names it, on a build that reads it: [`records_reading_in`]) recovers a rewrite too
+/// (`records_storage::rewrite::recover`, by the pin, under the entry's writer lock); every other
+/// server recovers the first transition alone ([`crate::records_storage::recover_pending`]),
+/// which refuses a rewritten layout as its readers do.
+///
+/// # Errors
+/// As the recovery it runs.
+fn recover_records_entry(
+    entry: &Path,
+    reading: crate::membership_log::Reading,
+) -> crate::Result<()> {
+    if reading.admits_two() {
+        if crate::records_storage::absent(entry)? {
+            return Ok(());
+        }
+        return crate::records_storage::rewrite::recover(entry);
+    }
+    crate::records_storage::recover_pending(entry)
+}
+
+/// The data file of the records entry at `entry` that a server reading its records at `reading`
+/// reads: a server that reads format 2 selects a rewritten layout's pinned generation
+/// (`records_storage::rewrite::data_path`); every other server selects as format 1 does
+/// ([`crate::records_storage::data_path`]), which refuses a rewritten layout, so no frame of
+/// roots is ever read as records.
+///
+/// # Errors
+/// As the selection it runs.
+fn records_data_path(
+    entry: &Path,
+    reading: crate::membership_log::Reading,
+) -> crate::Result<PathBuf> {
+    if reading.admits_two() {
+        return Ok(crate::records_storage::rewrite::data_path(entry)?.path);
+    }
+    crate::records_storage::data_path(entry)
+}
+
 /// Read the store: every `<name>.vault` that parses and verifies, and every `<name>.joins` line
 /// that parses and has not expired.
 #[cfg(test)]
@@ -2088,7 +2153,14 @@ fn load_with_pins(store: &Path, now: u64, pins: &[(String, [u8; 32])]) -> crate:
                 ));
                 continue;
             }
-            if let Err(error) = crate::records_storage::recover_pending(&path) {
+            let reading = records_reading_in(store, name);
+            let recovered = recover_records_entry(
+                &path,
+                reading
+                    .as_ref()
+                    .map_or(crate::membership_log::Reading::ONE, |reading| *reading),
+            );
+            if let Err(error) = recovered {
                 note(&format!("{file}: storage recovery refused: {error}"));
                 continue;
             }
@@ -2096,11 +2168,9 @@ fn load_with_pins(store: &Path, now: u64, pins: &[(String, [u8; 32])]) -> crate:
                 pins.iter()
                     .find_map(|(v, key)| (v == name).then(|| vec![*key]))
             });
-            let looked = records_reading_in(store, name)
-                .map_err(fsx::Unread::Failed)
-                .and_then(|reading| {
-                    look_at_records(&mut state, name, &path, keys.as_deref(), reading)
-                });
+            let looked = reading.map_err(fsx::Unread::Failed).and_then(|reading| {
+                look_at_records(&mut state, name, &path, keys.as_deref(), reading)
+            });
             if let Err(unread) = looked {
                 note(&format!("{file}: skipped: {}", unread.into_error()));
             }
@@ -3393,6 +3463,39 @@ fn records_admission(
     Ok(Admission::Take(reading))
 }
 
+/// The refusal of a records GET of `name`, whose records this server states as `own`, where
+/// its format mark names a later format than this build reads them at: such a build reads the
+/// marked file as the records before its first version-2 one, and an answer of those would
+/// state a heads digest and a want (`X-Aterm-Records-Need`) of a log it does not hold whole, so
+/// a puller would take it for the server's newest records. A `500`, as its POST answers
+/// ([`records_admission`]), until aterm is updated. `None` for a server whose mark names format
+/// 1, which reads nothing more to say so, and for one whose build reads its mark's format.
+fn unread_format(shared: &Shared, name: &str, own: crate::crossing::RecordsBound) -> Option<Reply> {
+    if own.format == crate::crossing::FORMAT_ONE {
+        return None;
+    }
+    match shared.records_reading(name) {
+        Ok(reading) if reading == crate::membership_log::Reading::Format(own.format) => None,
+        Ok(_) => Some(Reply::text(
+            500,
+            format!(
+                "this server's membership records are in format {}, which this build of aterm \
+                 does not read: it serves no record until aterm is updated",
+                own.format
+            ),
+        )),
+        Err(e) => {
+            note(&format!(
+                "{name}: could not read the records format mark: {e}"
+            ));
+            Some(Reply::text(
+                500,
+                "the server could not read which format its records are in",
+            ))
+        }
+    }
+}
+
 fn answer(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Request) -> Reply {
     let path = std::mem::take(&mut request.path);
     let Some(route) = route(&path) else {
@@ -4257,11 +4360,22 @@ fn look_for_records(shared: &Shared, state: &mut State, name: &str) -> Result<()
 /// store reads another format (its mark was stored since it read the file) reads the file
 /// again whatever its stamp.
 ///
+/// **A rewritten file** (`crate::membership_log::stored`): only where `reading` admits format
+/// 2, which it does only on a build that reads it for a server whose mark names it, is the
+/// entry selected as a reader of format 2 selects it ([`records_data_path`]), and a file that
+/// begins with a frame of roots read whole into a store rooted as the frame says
+/// ([`crate::membership_log::Store::recovering_stored`]). A slot that held records before
+/// keeps those of them the rooted store takes (one a root dropped it does not), as a flat
+/// file's records are taken into it in place, and `on_file` counts the records after the
+/// frame where the file holds exactly the frame and them. At format 1 the entry is selected
+/// and read exactly as before: a rewritten layout is refused by that selection.
+///
 /// # Errors
 /// [`fsx::Unread::Refused`]: the read refuses the file (past the bound, an owner or mode it
-/// refuses, a symlink); the slot remembers its stamp anyway, so it is not read again until it
-/// changes. [`fsx::Unread::Failed`]: the read failed (too many open files, an I/O error), or
-/// the descriptor changed during the read, or `name`'s store cannot be made
+/// refuses, a symlink, a frame of roots that does not read); the slot remembers its stamp
+/// anyway, so it is not read again until it changes. [`fsx::Unread::Failed`]: the read failed
+/// (too many open files, an I/O error), or the descriptor changed during the read, or the
+/// entry selected another file once it was read, or `name`'s store cannot be made
 /// ([`crate::membership_log::Store::for_vault`]); nothing is
 /// remembered, so the next look reads again.
 #[cfg_attr(
@@ -4294,7 +4408,7 @@ fn look_at_records_with(
         return Ok(());
     }
     let entry = path;
-    let data_path = crate::records_storage::data_path(path).map_err(fsx::Unread::Failed)?;
+    let data_path = records_data_path(path, reading).map_err(fsx::Unread::Failed)?;
     let path = data_path.as_path();
     let Some(seen) = fsx::stamp(path) else {
         return Ok(());
@@ -4317,6 +4431,34 @@ fn look_at_records_with(
         // What a store of this server's format holds (the storage class of byte bound): the
         // prefix the decoder reads, and the most the file may be.
         let capacity = reading.capacity();
+        // A rewritten file of a rooted log, read only by a server that reads format 2.
+        if reading.admits_two() && begins_with_frame(reader.file(), path)? {
+            let (bytes, more) = read_within(reader.file(), path, capacity)?;
+            after_decode();
+            reader.check_unchanged_classified()?;
+            if records_data_path(entry, reading).map_err(fsx::Unread::Failed)? != path {
+                return Err(fsx::Unread::Failed(Error::new(format!(
+                    "{}: the records entry selected another file while it was read",
+                    path.display()
+                ))));
+            }
+            if more {
+                return Err(fsx::Unread::Refused(Error::new(format!(
+                    "{}: larger than {capacity} bytes",
+                    path.display(),
+                ))));
+            }
+            let store =
+                crate::membership_log::Store::for_vault(name).map_err(fsx::Unread::Failed)?;
+            let rooted = follow_held(store, keys)
+                .read_at(reading)
+                .recovering_stored(&bytes)
+                .map_err(fsx::Unread::Refused)?;
+            return Ok(Some((
+                reader.stamp(),
+                FileRead::Rooted(rooted, bytes.len()),
+            )));
+        }
         let decoded = crate::membership_log::Store::read_records(reader.file(), limit, reading)
             .map_err(fsx::Unread::Failed)?;
         after_decode();
@@ -4336,14 +4478,14 @@ fn look_at_records_with(
             }
         };
         reader.check_unchanged_classified()?;
-        crate::records_storage::data_path(entry).map_err(fsx::Unread::Failed)?;
+        records_data_path(entry, reading).map_err(fsx::Unread::Failed)?;
         if more {
             return Err(fsx::Unread::Refused(Error::new(format!(
                 "{}: larger than {capacity} bytes",
                 path.display(),
             ))));
         }
-        Ok(Some((reader.stamp(), decoded)))
+        Ok(Some((reader.stamp(), FileRead::Flat(decoded))))
     })();
     let read = match read {
         Ok(None) => return Ok(()),
@@ -4362,7 +4504,7 @@ fn look_at_records_with(
     let Some(slot) = state.records.get_mut(name) else {
         return Ok(());
     };
-    let (stamp, decoded) = match read {
+    let (stamp, read) = match read {
         Ok(read) => read,
         Err(e) => {
             slot.stamp = Some(seen);
@@ -4372,14 +4514,32 @@ fn look_at_records_with(
     };
     let was_empty = slot.store.is_empty();
     let heads = slot.store.log().map(crate::membership_log::Log::heads);
-    let bytes_read = decoded.bytes_read();
-    let store = follow_held(std::mem::take(&mut slot.store), keys).read_at(reading);
-    slot.store = decoded.apply_rooted(store);
+    let (lead, bytes_read) = match read {
+        FileRead::Flat(decoded) => {
+            let bytes_read = decoded.bytes_read();
+            let store = follow_held(std::mem::take(&mut slot.store), keys).read_at(reading);
+            slot.store = decoded.apply_rooted(store);
+            (0, bytes_read)
+        }
+        FileRead::Rooted(mut rooted, file_len) => {
+            // The records the slot held that the rooted store takes: a flat file's records are
+            // taken into the slot's store in place, and this is the same union.
+            let held = std::mem::take(&mut slot.store);
+            rooted.insert_many(
+                held.inventory()
+                    .iter()
+                    .filter_map(|id| held.record(id).cloned()),
+            );
+            let lead = usize::try_from(rooted.file_lead()).unwrap_or(usize::MAX);
+            slot.store = rooted;
+            (lead, file_len)
+        }
+    };
     slot.stamp = Some(stamp);
     slot.on_file = slot
         .store
         .log()
-        .filter(|log| was_empty && log.held_bytes() == bytes_read)
+        .filter(|log| was_empty && lead.checked_add(log.held_bytes()) == Some(bytes_read))
         .map(crate::membership_log::Log::held_count);
     if let Some(log) = slot.store.log()
         && Some(log.heads()) != heads
@@ -4387,6 +4547,53 @@ fn look_at_records_with(
         slot.wake.notify_all();
     }
     Ok(())
+}
+
+/// What [`look_at_records`] read of a records file.
+enum FileRead {
+    /// Its records' stream, decoded frame by frame: every file a server that reads format 1
+    /// reads, and a file with no frame of roots at format 2.
+    Flat(crate::membership_log::store::framed::DecodedRecords),
+    /// A rewritten file's store, rooted as its frame says, and the file's length.
+    Rooted(crate::membership_log::Store, usize),
+}
+
+/// Whether the file `file` (at `path`) begins with a rooted log's frame
+/// ([`crate::membership_log::stored::KEPT_MAGIC`]); it is read again from its start after.
+///
+/// # Errors
+/// The read or the seek back fails.
+fn begins_with_frame(file: &mut std::fs::File, path: &Path) -> Result<bool, fsx::Unread> {
+    use std::io::Seek as _;
+    let magic = crate::membership_log::stored::KEPT_MAGIC;
+    let failed =
+        |error: io::Error| fsx::Unread::Failed(Error::new(format!("{}: {error}", path.display())));
+    let mut began = Vec::with_capacity(magic.len());
+    Read::by_ref(file)
+        .take(magic.len() as u64)
+        .read_to_end(&mut began)
+        .map_err(failed)?;
+    file.seek(io::SeekFrom::Start(0)).map_err(failed)?;
+    Ok(began == magic)
+}
+
+/// Every byte of `file` (at `path`) up to `capacity`, and whether it holds more.
+///
+/// # Errors
+/// The read fails.
+fn read_within(
+    file: &mut std::fs::File,
+    path: &Path,
+    capacity: usize,
+) -> Result<(zeroize::Zeroizing<Vec<u8>>, bool), fsx::Unread> {
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    Read::by_ref(file)
+        .take(capacity as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| fsx::Unread::Failed(Error::new(format!("{}: {error}", path.display()))))?;
+    let more = bytes.len() > capacity;
+    bytes.truncate(capacity);
+    Ok((bytes, more))
 }
 
 /// Load a records file through the server's real cold path, without listeners or preload.
@@ -4495,8 +4702,9 @@ fn records_digest_of(state: &State, name: &str) -> [u8; 32] {
 /// What a records GET naming `have` is sent under `cap`: with a served frame where it takes one
 /// (`served`) and the store is rooted at a final checkpoint whose cut `have` does not show
 /// ([`crate::membership_log::Store::missing_served`]), records alone otherwise. Only a puller
-/// that reads format 2 asks for a frame (`crate::transport::Pull::takes_served`), and no
-/// server's store is rooted (its peer pull takes no root), so every reply is records alone.
+/// that reads format 2 asks for a frame (`crate::transport::Pull::takes_served`), and a
+/// server's store is rooted only where it reads format 2 and took a served root
+/// ([`apply_records`], [`persist_stored`]).
 fn missing_of(
     store: &crate::membership_log::Store,
     have: &[crate::membership_log::RecordId],
@@ -4552,6 +4760,10 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
         local,
         stated,
     } = get;
+    #[cfg(test)]
+    if served {
+        shared.records_served_gets.fetch_add(1, Ordering::SeqCst);
+    }
     let have = match have_query(query) {
         Ok(have) => have,
         Err(reply) => return reply,
@@ -4593,7 +4805,9 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
                     None,
                 );
             }
-            if let Some(reply) = records_fence(own, stated) {
+            if let Some(reply) =
+                records_fence(own, stated).or_else(|| unread_format(shared, name, own))
+            {
                 return reply;
             }
         }
@@ -4653,7 +4867,7 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
     let lacks = server_lacks_have(&state, name, &have);
     // The records may have crossed while it waited: what came may be a crossed log's.
     let fence = match shared.records_here(&mut state, name) {
-        Ok(own) => records_fence(own, stated),
+        Ok(own) => records_fence(own, stated).or_else(|| unread_format(shared, name, own)),
         Err(failed) => Some(failed),
     };
     let reply = if let Some(fence) = fence {
@@ -4725,19 +4939,30 @@ fn post_records_stating(
 
 /// A completed peer response keeps its original frame metadata through both candidates.
 /// Selection does not bypass the current-state checks in the common application path, which
-/// takes them as from a poster stating what the peer `stated` of its records.
+/// takes them as from a poster stating what the peer `stated` of its records. The roots the
+/// peer served after its records go with the whole answer alone: a part that a `400` leaves is
+/// offered as records.
 fn apply_pulled_records(
     shared: &Shared,
     name: &str,
-    received: crate::membership_log::untaken::ReceivedFrames,
+    mut received: crate::membership_log::untaken::ReceivedFrames,
     stated: Option<crate::crossing::RecordsBound>,
 ) -> (crate::membership_log::untaken::Sent, Reply) {
-    let length = received.byte_len();
-    let mut reply = match received.whole() {
+    let served = received.take_served();
+    let whole = received.whole();
+    // The records' bytes, which a served frame after them is not.
+    let length = match (&served, &whole) {
+        (Some(_), Some(records)) => records
+            .iter()
+            .map(crate::membership_log::Record::wire_len)
+            .sum(),
+        _ => received.byte_len(),
+    };
+    let mut reply = match whole {
         Some(records) => apply_records(
             shared,
             name,
-            records_input::StagedRecords::from_verified(records),
+            records_input::StagedRecords::from_verified(records, served),
             false,
             stated,
         ),
@@ -4753,7 +4978,7 @@ fn apply_pulled_records(
             reply = apply_records(
                 shared,
                 name,
-                records_input::StagedRecords::from_verified(part),
+                records_input::StagedRecords::from_verified(part, None),
                 false,
                 stated,
             );
@@ -4809,9 +5034,15 @@ struct PersistFailure {
 /// Persist only the accepted Store's complete prefix. The caller owns record_writes and
 /// the Writing fence, and publishes the Store only after this operation succeeds.
 ///
-/// `on_file` is how many of the store's first records the file at `stamp` was known to hold.
-/// The records past them go on the file's end only where the file is as long as those first
-/// records are in `accepted`; any other file is replaced by the store's complete records.
+/// `on_file` is how many of the store's first records the file at `stamp` was known to hold,
+/// after the frame of roots a rewritten file begins with. The records past them go on the
+/// file's end only where the file is as long as that frame and those first records are in
+/// `accepted`; any other file is replaced by the store's complete records.
+///
+/// A store that reads format 2 whose log is rooted, or whose entry a rewrite made, is written
+/// as a rewritten file is ([`persist_stored`]); no store of a server whose build reads no
+/// format 2, or whose mark names none, reads format 2, so every such store is written here
+/// exactly as before.
 fn persist_records(
     shared: &Shared,
     name: &str,
@@ -4819,6 +5050,9 @@ fn persist_records(
     stamp: Option<fsx::FileStamp>,
     on_file: Option<usize>,
 ) -> Result<Option<fsx::FileStamp>, Box<PersistFailure>> {
+    if let Stored::Written(written) = persist_stored(shared, name, accepted, stamp, on_file)? {
+        return Ok(written);
+    }
     let path = (|| {
         let crossed = shared.crossing_mark(name).stored()?;
         let large = accepted
@@ -4830,52 +5064,247 @@ fn persist_records(
             stamp,
         )
     })()
-    .map_err(|error| {
-        Box::new(PersistFailure {
-            error,
-            append_left: None,
-        })
-    })?;
-    // An append is planned by bytes: only onto a file as long as the store's first `from`
-    // records are now. A whole version-2 record that took its shed frame's place among them
-    // made them longer than the file, which holds the frame: that file is written whole.
+    .map_err(PersistFailure::of)?;
+    write_onto(shared, &path, accepted, stamp, on_file, None)
+}
+
+/// Make the file at `path`, which `stamp` named when it was known to hold `frame` (a rewritten
+/// file's frame of roots, or nothing) and then `accepted`'s first `on_file` records, hold
+/// exactly `frame` and then `accepted`'s complete records: the rest on its end where it is as
+/// long as those are now, the file whole otherwise. The caller holds the entry's writer lock.
+fn write_onto(
+    shared: &Shared,
+    path: &Path,
+    accepted: &crate::membership_log::Store,
+    stamp: Option<fsx::FileStamp>,
+    on_file: Option<usize>,
+    frame: Option<&[u8]>,
+) -> Result<Option<fsx::FileStamp>, Box<PersistFailure>> {
+    let lead = frame.map_or(0, <[u8]>::len);
+    // An append is planned by bytes: only onto a file as long as the frame and the store's
+    // first `from` records are now. A whole version-2 record that took its shed frame's place
+    // among them made them longer than the file, which holds the frame: that file is written
+    // whole.
     let tail = match (on_file, stamp) {
         (Some(from), Some(stamp))
             if accepted
                 .held_len_to(from)
+                .and_then(|bytes| bytes.checked_add(lead))
                 .is_some_and(|bytes| bytes as u64 == stamp.len) =>
         {
             Some(AppendAttempt {
                 stamp,
                 from,
-                len: accepted.held_len_from(from).map_err(|error| {
-                    Box::new(PersistFailure {
-                        error: Error::new(error.to_string()),
-                        append_left: None,
-                    })
-                })?,
+                len: accepted
+                    .held_len_from(from)
+                    .map_err(|error| PersistFailure::of(Error::new(error.to_string())))?,
             })
         }
         _ => None,
     };
     let appended = tail
         .as_ref()
-        .and_then(|plan| shared.append_records(&path, accepted, plan).ok());
+        .and_then(|plan| shared.append_records(path, accepted, plan).ok());
     match appended {
         Some(left) => Ok(Some(left)),
-        None => shared.write_records(&path, accepted).map_err(|error| {
-            // Observe a torn append before releasing the shared writer lock. A successor
-            // may change this same inode as soon as the failed persistence returns.
-            let append_left = tail.and_then(|attempted| {
-                fsx::stamp(&path).filter(|now| {
-                    (now.dev, now.ino) == (attempted.stamp.dev, attempted.stamp.ino)
-                        && now.len > attempted.stamp.len
-                        && now.len <= attempted.stamp.len.saturating_add(attempted.len as u64)
-                })
-            });
-            Box::new(PersistFailure { error, append_left })
-        }),
+        None => shared
+            .write_records(path, frame, accepted)
+            .map_err(|error| {
+                // Observe a torn append before releasing the shared writer lock. A successor
+                // may change this same inode as soon as the failed persistence returns.
+                let append_left = tail.and_then(|attempted| {
+                    fsx::stamp(path).filter(|now| {
+                        (now.dev, now.ino) == (attempted.stamp.dev, attempted.stamp.ino)
+                            && now.len > attempted.stamp.len
+                            && now.len <= attempted.stamp.len.saturating_add(attempted.len as u64)
+                    })
+                });
+                Box::new(PersistFailure { error, append_left })
+            }),
     }
+}
+
+impl PersistFailure {
+    /// A failure before any byte of the file was written.
+    fn of(error: Error) -> Box<Self> {
+        Box::new(Self {
+            error,
+            append_left: None,
+        })
+    }
+}
+
+/// What [`persist_stored`] did.
+enum Stored {
+    /// Nothing: the ordinary writer writes the store.
+    Ordinary,
+    /// It wrote the store, and the stamp of the file it left, where it knows it.
+    Written(Option<fsx::FileStamp>),
+}
+
+/// Write `accepted`, which reads format 2, to `name`'s records entry where the ordinary writer
+/// does not ([`persist_records`]): a store whose log is rooted at a final checkpoint, or any
+/// store at an entry a rewrite made. [`Stored::Ordinary`] where neither holds (a whole log at
+/// an entry never rewritten), and for every store that reads another format: before any I/O,
+/// so a server whose mark names no format 2, or whose build reads none, writes as before.
+///
+/// - Where the entry's file begins with the frame `accepted`'s log is rooted by (or with none,
+///   for a whole log at a rewritten entry), the store goes to that file as a records file's
+///   does ([`write_onto`]), under the entry's writer lock, only while the entry is of the
+///   generation selected (`records_storage::rewrite::write_path`) and its file still has the
+///   slot's `stamp`.
+/// - Where the store took a root its file does not hold (a served root,
+///   [`crate::membership_log::Store::ingest_served`]), the entry is rewritten to it
+///   (`records_storage::rewrite::rewrite`, as the prune at that root): from exactly the bytes
+///   the file holds under the slot's `stamp`, every record of which the store holds or
+///   dropped, so a record another writer put there since is never dropped unseen. An entry
+///   that holds nothing is first written empty, which the rewrite then replaces. The file it
+///   leaves is stamped only where it is still exactly what the rewrite wrote.
+///
+/// Its file is the frame and the store's complete records, as a server's file holds its
+/// complete records alone.
+///
+/// # Errors
+/// The entry cannot be recovered, selected or read; its file changed since the slot read it, or
+/// holds a record the store neither holds nor dropped, or a frame of roots a whole store lacks
+/// (read it again); the file would pass the format's capacity; or the write or the rewrite
+/// fails, leaving the entry what its pin says.
+fn persist_stored(
+    shared: &Shared,
+    name: &str,
+    accepted: &crate::membership_log::Store,
+    stamp: Option<fsx::FileStamp>,
+    on_file: Option<usize>,
+) -> Result<Stored, Box<PersistFailure>> {
+    use crate::membership_log::stored::KEPT_MAGIC;
+    use crate::records_storage::rewrite;
+    if accepted.reading() != crate::membership_log::Reading::Format(crate::crossing::FORMAT_TWO) {
+        return Ok(Stored::Ordinary);
+    }
+    let entry = shared.records_path(name);
+    let changed = || {
+        PersistFailure::of(Error::new(
+            "the records changed since this writer read them; retry after reading",
+        ))
+    };
+    let frame = accepted.kept_frame().map_err(PersistFailure::of)?;
+    let absent = crate::records_storage::absent(&entry).map_err(PersistFailure::of)?;
+    if !absent {
+        rewrite::recover(&entry).map_err(PersistFailure::of)?;
+    }
+    let generation = if absent {
+        0
+    } else {
+        rewrite::data_path(&entry)
+            .map_err(PersistFailure::of)?
+            .generation
+    };
+    if frame.is_none() && generation == 0 {
+        return Ok(Stored::Ordinary);
+    }
+    let lead = frame.as_ref().map_or(0, Vec::len);
+    let capacity = accepted.capacity();
+    let held = accepted
+        .held_len_from(0)
+        .map_err(|error| PersistFailure::of(Error::new(error.to_string())))?;
+    if lead.checked_add(held).is_none_or(|len| len > capacity) {
+        return Err(PersistFailure::of(Error::new(
+            "this server's membership records and their roots pass what a records file holds",
+        )));
+    }
+    if generation > 0 {
+        let target = rewrite::write_path(&entry, generation).map_err(PersistFailure::of)?;
+        if fsx::stamp_if_present(&target).map_err(PersistFailure::of)? != stamp {
+            return Err(changed());
+        }
+        let began = read_lead(&target, lead.max(KEPT_MAGIC.len())).map_err(PersistFailure::of)?;
+        let same = match &frame {
+            Some(frame) => began == *frame,
+            None => !began.starts_with(KEPT_MAGIC),
+        };
+        if same {
+            return write_onto(shared, &target, accepted, stamp, on_file, frame.as_deref())
+                .map(Stored::Written);
+        }
+    }
+    let Some(root) = accepted
+        .log()
+        .and_then(crate::membership_log::Log::newest_root)
+        .map(|root| root.id)
+        .filter(|_| frame.is_some())
+    else {
+        return Err(PersistFailure::of(Error::new(
+            "this server's membership records file holds roots its store was read without; \
+             read it again",
+        )));
+    };
+    // The bytes the rewrite replaces: the file the slot read, as it read it.
+    let expected = if absent {
+        let target = crate::records_storage::write_path_if_unchanged(&entry, false, None)
+            .map_err(PersistFailure::of)?;
+        fsx::write_atomic_stamped_with(&target, 0o600, |_| Ok(())).map_err(PersistFailure::of)?
+    } else {
+        stamp
+    };
+    let from = rewrite::data_path(&entry).map_err(PersistFailure::of)?;
+    let Some(mut reader) = fsx::open_owned_reader(&from.path).map_err(PersistFailure::of)? else {
+        return Err(changed());
+    };
+    if Some(reader.stamp()) != expected {
+        return Err(changed());
+    }
+    let (before, more) = read_within(reader.file(), &from.path, capacity)
+        .map_err(|unread| PersistFailure::of(unread.into_error()))?;
+    reader.check_unchanged().map_err(PersistFailure::of)?;
+    if more {
+        return Err(PersistFailure::of(Error::new(
+            "this server's membership records file passes what a records file holds",
+        )));
+    }
+    let on_disk = shared
+        .records_store(name)
+        .and_then(|store| store.recovering_stored(before.as_slice()))
+        .map_err(PersistFailure::of)?;
+    let known =
+        |id: &crate::membership_log::RecordId| accepted.log().is_some_and(|log| log.knows(id));
+    if !on_disk
+        .log()
+        .is_none_or(|log| log.records().all(|record| known(record.id())))
+    {
+        return Err(PersistFailure::of(Error::new(
+            "this server's membership records file holds a record its store was read without; \
+             read it again",
+        )));
+    }
+    let rewritten = rewrite::rewrite(
+        &entry,
+        rewrite::Predecessor::of(before.as_slice()),
+        rewrite::What::Checkpoint(root),
+        &|out| {
+            if let Some(frame) = &frame {
+                out.write_all(frame)?;
+            }
+            accepted.write_held_from(0, out)
+        },
+    )
+    .map_err(PersistFailure::of)?;
+    Ok(Stored::Written(
+        fsx::stamp(&rewritten.path).filter(|now| now.len == rewritten.len as u64),
+    ))
+}
+
+/// The first `len` bytes of the file at `path`, or as many as it holds.
+fn read_lead(path: &Path, len: usize) -> crate::Result<Vec<u8>> {
+    let Some(mut reader) = fsx::open_owned_reader(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut began = Vec::with_capacity(len);
+    reader
+        .file()
+        .take(len as u64)
+        .read_to_end(&mut began)
+        .map_err(|e| Error::new(format!("membership record read failed: {e}")))?;
+    Ok(began)
 }
 
 /// Take strictly staged records into `name`'s store and its file
@@ -4981,8 +5410,11 @@ fn apply_records(
                 .record_writes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Err(error) = crate::records_storage::recover_pending(&shared.records_path(name))
-            {
+            // A server that reads format 2 recovers a rewrite too ([`recover_records_entry`]).
+            let reading = shared
+                .records_reading(name)
+                .unwrap_or(crate::membership_log::Reading::ONE);
+            if let Err(error) = recover_records_entry(&shared.records_path(name), reading) {
                 return Reply::text(500, error.to_string());
             }
         }
@@ -4991,11 +5423,14 @@ fn apply_records(
     }
     // Whether the store holds each staged record as it was sent: its id, and not as the shed
     // frame of a whole version-2 record the poster brings, which the store still takes.
+    // Roots a peer served bring what no record does: a record the store holds waiting on one
+    // a root dropped is complete once the root is taken.
     let brings_nothing = |store: &crate::membership_log::Store| {
-        staged
-            .records()
-            .iter()
-            .all(|record| store.contains(record.id()) && !store.lacks_whole(record))
+        staged.served().is_none()
+            && staged
+                .records()
+                .iter()
+                .all(|record| store.contains(record.id()) && !store.lacks_whole(record))
     };
     {
         let mut state = shared.lock_server_state();
@@ -5099,18 +5534,34 @@ fn apply_records(
     {
         return reply;
     }
-    let mut records = staged.into_records();
+    let (mut records, served) = staged.into_parts();
     // A record the copy holds complete is not offered again, but for a whole version-2 record
     // of which it holds the shed frame: the copy takes that in the frame's place.
     records.retain(|record| !copy.holds(record.id()) || copy.lacks_whole(record));
     let refusal = match admission {
         Admission::Take(_) => {
-            let added = match copy.ingest_records(records) {
+            let inputs = copy.reading().admits_two().then(|| copy.prune_inputs());
+            // Roots a peer served go in with its records, or nothing does
+            // ([`crate::membership_log::Store::ingest_served`]); with none, the records alone.
+            let added = match copy.ingest_served(records, served.as_ref()) {
                 Ok(added) => added,
                 Err(e) => return Reply::text(400, e.to_string()),
             };
             if added == 0 {
                 return Reply::empty(204);
+            }
+            // A copy that reads format 2 (none on a build whose `READS_FORMAT` names no
+            // release: its mark is never stored) is pruned at each final checkpoint, as a Mac's
+            // pass prunes (`crate::membership_log::pass`): the prune is computed from the
+            // records' frames, and the server signs no share. It is judged only after a take
+            // that changed what a prune turns on (`Store::prune_inputs`), not at every take.
+            // `take_copy` writes the rooted copy by a rewrite. A prune that leaves the complete
+            // part as it was is not taken here: the slot would hold it with no write.
+            if inputs.is_some_and(|before| before != copy.prune_inputs())
+                && let Ok(Some((pruned, _))) = copy.adopt_final()
+                && complete_part(&pruned) != taking.complete_before
+            {
+                copy = pruned;
             }
             return take_copy(shared, name, copy, &taking);
         }
@@ -5124,7 +5575,7 @@ fn apply_records(
     // record, nothing is taken, no mark is stored, and the answer is the fence's.
     let mark = shared.format_mark(name);
     let Ok(Some(followed)) =
-        crate::membership_log::follow::follow_records(&mark, &copy, records, None)
+        crate::membership_log::follow::follow_records(&mark, &copy, records, served.as_ref())
     else {
         return refusal;
     };
@@ -7289,7 +7740,18 @@ fn pull_endpoints(
         let pulled = pull(*at, url);
         all.stored += pulled.stored;
         all.whole |= pulled.whole;
-        all.later.extend(pulled.later);
+        // One peer refused at several of its endpoints is one server to ask again, at each of
+        // them in turn until one answers ([`follow_later_peers`]).
+        for refused in pulled.later {
+            match all
+                .later
+                .iter_mut()
+                .find(|peer| peer.vault == refused.vault)
+            {
+                Some(peer) => peer.endpoints.extend(refused.endpoints),
+                None => all.later.push(refused),
+            }
+        }
         if !pulled.silent {
             all.silent = false;
             break;
@@ -7380,8 +7842,9 @@ struct PeerPull {
 struct LaterPeer {
     /// The vault.
     vault: String,
-    /// Where the pull asked: `http://<address>/v1/<vault>`.
-    url: String,
+    /// Each endpoint of the server that refused, and the URL the pull asked there
+    /// (`http://<address>/v1/<vault>`), in the order they were tried ([`pull_endpoints`]).
+    endpoints: Vec<(SocketAddr, String)>,
 }
 
 /// Pull from the server at `url` what `wants` names of each vault: a newer envelope
@@ -7538,6 +8001,14 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
                 whole = false;
                 continue;
             };
+            // A server whose mark names a format its build does not read pulls nothing: it
+            // takes no record ([`records_admission`]) and serves none ([`unread_format`]).
+            if own.format != crate::crossing::FORMAT_ONE
+                && reading != crate::membership_log::Reading::Format(own.format)
+            {
+                whole = false;
+                continue;
+            }
             let answer = match crate::transport::fetch_record_frames_with_known(
                 &vault_url,
                 &have_records,
@@ -7561,7 +8032,7 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
                     {
                         later.push(LaterPeer {
                             vault: vault_name.to_owned(),
-                            url: vault_url,
+                            endpoints: vec![(at, vault_url)],
                         });
                     }
                     shared.counts.add(Count::RecordsUnanswered);
@@ -7644,11 +8115,15 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
 /// records pull of this pass beside a bound stating a later format than this server's
 /// (`crate::membership_log::follow`). It runs once every pull of the pass has ended, so the
 /// log the evidence is judged on holds what the pass's other servers sent, a `Remove` of the
-/// signing seat among it. Each is asked again stating format 2, with no mark stored, for what
-/// it holds past this server's store; its frames are read as a follow copy reads them, and
-/// [`apply_records`] takes them only on a seat's signed version-2 record, format mark first.
-/// A server whose answer holds no such record is refused as before, and no mark is stored.
-/// Returns how many servers' answers this server followed or took records from.
+/// signing seat among it. Each server is asked again stating format 2, with no mark stored, for
+/// what it holds past this server's store, at its endpoints in turn until one answers: one
+/// server refused at several endpoints is asked once. Its frames, and the roots it serves after
+/// them, are read as a follow copy reads them, and [`apply_records`] takes them only on a
+/// seat's signed version-2 record, format mark first. A server whose answer holds no such
+/// record is refused as before, and no mark is stored. An answer this server judged whole (it
+/// brought nothing, or its records got a `204` or `400` verdict) proves the digest the server
+/// stated ([`prove`]), as a pull's does. Returns how many servers' answers this server followed
+/// or took records from.
 ///
 /// It asks nothing on a build that reads no format 2
 /// ([`crate::crossing::FormatMark::follows`]): `later` is empty there ([`pull_from_peer`]),
@@ -7662,58 +8137,69 @@ fn follow_later_peers(shared: &Shared, later: &[LaterPeer]) -> usize {
             continue;
         }
         let _slot = shared.records_pulls.take();
-        let have = {
-            let mut state = shared.lock_server_state();
-            take_records_from_store(shared, &mut state, vault);
-            state
-                .records
-                .get(vault)
-                .map_or_else(Vec::new, |slot| slot.store.have())
-        };
-        // A vault another server of this pass already moved into format 2 is pulled at that
-        // format by the next pass, as any vault is.
-        let Ok(own) = shared.records_bound_here(vault) else {
-            continue;
-        };
-        if own.format != FORMAT_ONE {
-            continue;
-        }
-        let Ok(answer) = crate::transport::fetch_record_frames_with_known(
-            &peer.url,
-            &have,
-            None,
-            shared.tuning.peer_pull,
-            None,
-            own.at_format(FORMAT_TWO),
-            crate::membership_log::Reading::Follow,
-            |id| records_input::known_record(shared, vault, id),
-        ) else {
-            shared.counts.add(Count::RecordsUnanswered);
-            continue;
-        };
-        shared.counts.add(Count::RecordsFetches);
-        if answer.received.byte_len() == 0 {
-            continue;
-        }
-        let before_len = shared
-            .lock_server_state()
-            .records
-            .get(vault)
-            .map_or(0, |slot| slot.store.len());
-        let stated = answer.bound.stated();
-        let (_, reply) = apply_pulled_records(shared, vault, answer.received, stated);
-        if reply.status == 204 {
-            let after_len = shared
+        for (at, url) in &peer.endpoints {
+            let have = {
+                let mut state = shared.lock_server_state();
+                take_records_from_store(shared, &mut state, vault);
+                state
+                    .records
+                    .get(vault)
+                    .map_or_else(Vec::new, |slot| slot.store.have())
+            };
+            // A vault another server of this pass already moved into format 2 is pulled at
+            // that format by the next pass, as any vault is.
+            let Ok(own) = shared.records_bound_here(vault) else {
+                break;
+            };
+            if own.format != FORMAT_ONE {
+                break;
+            }
+            let Ok(answer) = crate::transport::fetch_record_frames_with_known(
+                url,
+                &have,
+                None,
+                shared.tuning.peer_pull,
+                None,
+                own.at_format(FORMAT_TWO),
+                crate::membership_log::Reading::Follow,
+                |id| records_input::known_record(shared, vault, id),
+            ) else {
+                shared.counts.add(Count::RecordsUnanswered);
+                continue;
+            };
+            shared.counts.add(Count::RecordsFetches);
+            let heads = answer.heads;
+            let whole = !answer.more;
+            if answer.received.byte_len() == 0 {
+                if whole {
+                    prove(shared, vault, *at, heads);
+                }
+                break;
+            }
+            let before_len = shared
                 .lock_server_state()
                 .records
                 .get(vault)
                 .map_or(0, |slot| slot.store.len());
-            if after_len > before_len {
-                shared
-                    .counts
-                    .add_n(Count::RecordsStored, after_len - before_len);
-                stored += 1;
+            let stated = answer.bound.stated();
+            let (_, reply) = apply_pulled_records(shared, vault, answer.received, stated);
+            if whole && matches!(reply.status, 204 | 400) {
+                prove(shared, vault, *at, heads);
             }
+            if reply.status == 204 {
+                let after_len = shared
+                    .lock_server_state()
+                    .records
+                    .get(vault)
+                    .map_or(0, |slot| slot.store.len());
+                if after_len > before_len {
+                    shared
+                        .counts
+                        .add_n(Count::RecordsStored, after_len - before_len);
+                    stored += 1;
+                }
+            }
+            break;
         }
     }
     stored

@@ -1135,18 +1135,34 @@ pub(crate) struct ChildRunner {
 }
 
 /// What hands a survey's answer to this process's fleet tables (`aterm_db::fleet`), which are
-/// unix's: elsewhere nothing takes it.
+/// unix's, having installed this Mac's own reading as theirs ([`own_reading`]; the first
+/// install wins): elsewhere nothing takes either.
 pub(crate) fn tables_sink() -> fn(Option<(&str, u64)>) {
     #[cfg(unix)]
-    return offer_sightings;
+    let sink: fn(Option<(&str, u64)>) = {
+        let _ = aterm_db::fleet::folder().install_own_reader(Box::new(own_reading));
+        offer_sightings
+    };
     #[cfg(not(unix))]
-    return |_| {};
+    let sink: fn(Option<(&str, u64)>) = |_| {};
+    sink
 }
 
 /// Hand one fleet read to this process's fleet tables ([`offer_sightings_to`]).
 #[cfg(unix)]
 fn offer_sightings(answer: Option<(&str, u64)>) {
     offer_sightings_to(aterm_db::fleet::folder(), answer);
+}
+
+/// This Mac's own reading for the fleet tables: the newest vitals reading at its own time,
+/// a machine-only one the probe makes while no deck is in view included ([`own::own_of`]),
+/// from which its column is drawn, never from its answer's look (FP-10). The folder reads it
+/// at each fold ([`aterm_db::fleet::Folder::install_own_reader`]); a reading too old to draw
+/// leaves this Mac's figures unread.
+#[cfg(unix)]
+fn own_reading() -> Option<(aterm_db::fleet::read::Own, u64)> {
+    let held = crate::sys_host::SYS.latest_now()?;
+    Some((own::own_of(&held.snap), held.unix_ms))
 }
 
 /// Hand one fleet read to `folder`: its answer and when it came, or `None` for a read that gave
@@ -1930,6 +1946,8 @@ impl crate::App {
     }
 }
 
+#[cfg(unix)]
+mod own;
 #[cfg(unix)]
 mod sightings;
 #[cfg(unix)]

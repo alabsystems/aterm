@@ -1,0 +1,27 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h (D29, D30): a harness's `turn` record, applied by its stream, is the run's turn.
+# `started` opens it stamped as the harness's claim (src=harness conf=claim, by= the tab,
+# holder= the claim's holder, hseq= the record's seq), turn_by= naming who opened it; a repeated
+# `started` writes nothing, an end of another number ends nothing, and its own end closes it in
+# the same stamp. Beside it the screen's busy opens no turn and its rest arms no settle, and the
+# transcript's vendor turn names the stream's turn and closes nothing.
+stream started 1 by=person
+expect open t1 turn par=r1 src=harness conf=claim by=t0000000001 holder=claude-code-alab@4242 hseq=1 turn_by=person @0
+expect turn=t1
+at 100 see busy
+at 200 stream started 1 by=person
+at 300 see idle
+expect wake=none
+at 400 vendor-turn
+expect turn=t1
+at 5000 expect turn=t1
+stream ended 7 done
+expect turn=t1
+at 6000 stream ended 1 done
+expect close t1 turn out=done src=harness conf=claim by=t0000000001 holder=claude-code-alab@4242 hseq=4 @6000
+expect turn=none
+at 7000 see busy
+expect turn=none
+at 8000 see idle
+expect wake=none
+at 12000 expect turn=none

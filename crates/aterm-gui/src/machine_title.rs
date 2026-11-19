@@ -385,7 +385,7 @@ pub(crate) struct Asked {
 
 /// Rename This Mac…'s text, above its fields: why the last answer took no effect (`why`) first.
 pub(crate) fn rename_alert_body(why: Option<&str>) -> String {
-    let lead = "Choose a unique numeric ID and name. Display spelling is kept; matching ignores case and repeated spaces. macOS names are generated below. Empty fields keep their current values.";
+    let lead = "Choose a unique numeric ID and name. Names appear in title case, so blueHeron appears as Blue Heron. The preview shows the macOS names. Empty fields keep their current values.";
     match why {
         Some(why) => format!("{why}\n\n{lead}"),
         None => lead.to_owned(),

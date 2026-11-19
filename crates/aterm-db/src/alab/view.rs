@@ -153,13 +153,10 @@ pub struct Account {
 
 impl Account {
     /// Whether a roster may gain a row for it unasked: a live row whose status lets a sign-in be
-    /// tried. A paused, broken or banned account keeps any row a Mac already has, and gains none.
+    /// tried ([`super::account_status::usable`]). A held account (paused, broken, banned,
+    /// suspended or cancelled) keeps any row a Mac already has, and gains none.
     pub fn joinable(&self) -> bool {
-        self.live
-            && self
-                .status
-                .as_deref()
-                .is_none_or(|status| matches!(status, "pending" | "active"))
+        super::account_status::usable(self.live, self.status.as_deref())
     }
 }
 

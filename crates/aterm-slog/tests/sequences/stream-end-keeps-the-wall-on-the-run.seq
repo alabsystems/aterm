@@ -1,0 +1,21 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h: the stream's end closes its turn whatever the screen shows. A wall the screen shows
+# under it closes with the turn (out=gone, in the stream's stamp) and opens again on the run,
+# continuing it (cont=), as the settle's does, so its need holds until the screen's next word
+# lifts it. No settle runs while the stream feeds the turns.
+stream started 1 by=harness
+see wall:usage-session 3:15pm
+expect open p1 wall par=t1 src=screen wall=usage-session detail=3:15pm
+expect need=wall:usage-session
+expect wake=none
+at 2000 expect turn=t1
+at 3000 stream ended 1 walled
+expect close p1 wall out=gone src=harness @3000
+expect close t1 turn out=wall src=harness conf=claim hseq=2 @3000
+expect open p2 wall par=r1 src=screen wall=usage-session detail=3:15pm cont=p1 @3000
+expect need=wall:usage-session
+expect turn=none
+at 4000 see busy
+expect close p2 wall out=passed
+expect need=none
+expect turn=none

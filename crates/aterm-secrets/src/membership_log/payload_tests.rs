@@ -85,6 +85,7 @@ fn a_draft_can_replace_copied_payload_bytes_without_changing_signed_records() {
             parents: original.header.parents.clone(),
             authored_ms: original.header.authored_ms,
             body,
+            statement: None,
         };
         let unchanged = make_draft(original.body().clone())
             .sign(&A.seed(), A.incarnation())
@@ -140,6 +141,7 @@ fn ciphertext_payloads_keep_signature_truncation_and_length_refusals() {
             parents: original.header.parents.clone(),
             authored_ms: original.header.authored_ms,
             body,
+            statement: None,
         };
         assert!(draft.sign(&A.seed(), A.incarnation()).is_err());
     }

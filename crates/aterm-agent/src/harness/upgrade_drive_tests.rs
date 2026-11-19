@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::relaunch::{
-    Adopted, AtPrompt, CARRIED_DONE, CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CONTINUE_FENCE_TRIES,
-    EXIT_LOOK, ExitRecord, MODEL_WAIT, NOBODY_ASKED, PERSON_FIRST, RELAUNCH_FENCE_TRIES,
-    RelaunchLineError, Restart, RestartAsk, STALE_S, Snapshot, after_exit, after_host_ended,
-    after_host_ended_from, await_new, carry_on_with_tab_probe, continuation_session, exit_record,
-    follow, line_for, look_at_exit, owed, relaunch_by_parent, restart_from, resume, resume_as,
-    resume_at_point, resumed_prompt, shell_dialect, type_relaunch_line,
+    Adopted, CARRIED_DONE, CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CONTINUE_FENCE_TRIES, EXIT_LOOK,
+    ExitRecord, MODEL_WAIT, NOBODY_ASKED, PERSON_FIRST, Restart, RestartAsk, STALE_S, Snapshot,
+    after_exit, after_host_ended, after_host_ended_from, await_new, carry_on_with_tab_probe,
+    continuation_session, exit_record, follow, line_for, look_at_exit, owed, relaunch_by_parent,
+    restart_from, resume, resume_as, resume_at_point, resumed_prompt, shell_dialect,
+};
+use super::super::relaunch_type::{
+    AtPrompt, RELAUNCH_FENCE_TRIES, RelaunchLineError, type_relaunch_line,
 };
 use super::super::upgrade::Dialect;
 use super::*;
@@ -2682,7 +2684,7 @@ fn a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again() {
 
 /// The tab every stand-in agent names: no instance has it, and every test here
 /// points its sweep at a socket that does not exist, so nothing can be typed.
-const TAB: &str = "s-feedfacefeedfacefeed";
+const TAB: &str = "tfeedfaceed";
 /// No process has this pid: a relaunch line's shell that the bash probe
 /// (`caller_shell::process_args`) cannot read, so the line is typed as a fenced turn whatever
 /// runs on the host. A small made-up pid can name a live bash there.
@@ -10669,7 +10671,7 @@ fn a_conversation_resumed_in_another_tab_is_retabbed_at_the_attach() {
     let dir = scratch("behind-retab");
     let opts = drive(&dir);
     let sf = register(&opts.home, std::process::id(), SESSION);
-    let elsewhere = "s-0123456789abcdef0123";
+    let elsewhere = "t0123456789";
     let waiting = |phase: Phase, to: &str| St {
         phase,
         from: "1.0.0".to_string(),
@@ -32996,7 +32998,7 @@ fn an_agent_whose_records_a_worktree_split_waits_and_is_asked_nothing() {
 #[cfg(unix)]
 #[test]
 fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
-    const OTHER_TAB: &str = "s-0123456789abcdef0123";
+    const OTHER_TAB: &str = "t0123456789";
     let dir = scratch("cli-sweep-two-instances");
     let mut socks = Vec::new();
     let mut instances = Vec::new();

@@ -1793,7 +1793,7 @@ fn refine(
         let restart = bus::Restart {
             stop: Stop::PowerLoss,
             tier,
-            before: s.log.clone(),
+            before: s.log.to_vec(),
             durable_before: s.durable,
             kept: 0,
             generation_before: s.generation,

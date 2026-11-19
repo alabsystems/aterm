@@ -38,16 +38,17 @@ fn vendor(region: Option<Region>, flow: Option<Flow>) -> accounts::Vendor {
 
 /// Each provider cell reads as the harness reads the sheet: Kimi Code's bare `1` is held and its
 /// vendor words name a region, Codex's and Grok Build's name a flow, `claude` takes only `1`, a
-/// value no column takes is unread, and a disqualifying note drops Claude Code whatever it names
-/// but any other vendor only when it names that one or none. For every pooled CLI the members,
-/// their vendor keys and the held rows agree with [`parse_accounting_csv_for`] on the same sheet.
+/// value no column takes is unread, `0` reads as zero (a banned account), and a disqualifying
+/// note drops Claude Code whatever it names but any other vendor only when it names that one or
+/// none. For every pooled CLI the members, their vendor keys and the held rows agree with
+/// [`parse_accounting_csv_for`] on the same sheet.
 /// NEGATIVE CONTROL: with `read_sheet_cell` reading Kimi Code's held cell as a member with no
 /// region (`Member::Held => SheetCell::Member(accounts::Vendor::default())`), a5's Kimi cell reads
 /// as a member and the explicit table fails: `` left: Member(Vendor { region: None, flow: None })
 /// right: Held ``.
 #[test]
 fn lab_cells_read_as_the_harness_reads_the_sheet() {
-    use SheetCell::{Absent, Disqualified, Held, Member, Unread};
+    use SheetCell::{Absent, Disqualified, Held, Member, Unread, Zero};
     let plain = vendor(None, None);
     let expected = [
         // claude, codex, google, meta, kimi, grok
@@ -68,7 +69,7 @@ fn lab_cells_read_as_the_harness_reads_the_sheet() {
             Absent,
         ],
         [
-            Absent,
+            Zero,
             Unread,
             Disqualified(plain),
             Absent,
@@ -92,7 +93,7 @@ fn lab_cells_read_as_the_harness_reads_the_sheet() {
             Absent,
             Absent,
         ],
-        [Unread, Absent, Absent, Absent, Absent, Absent],
+        [Unread, Zero, Absent, Absent, Absent, Absent],
     ];
     for (row, want) in rows().iter().zip(expected) {
         for ((column, at), want) in COLUMNS.iter().zip(want) {
@@ -121,7 +122,7 @@ fn lab_cells_read_as_the_harness_reads_the_sheet() {
             match read {
                 Member(vendor) => assert_eq!(member, Some(vendor), "{} {cli:?}", row[0]),
                 Held => assert!(held && member.is_none(), "{} {cli:?}", row[0]),
-                Absent | Unread | Disqualified(_) => {
+                Absent | Zero | SheetCell::No | Unread | Disqualified(_) => {
                     assert!(!held && member.is_none(), "{} {cli:?}", row[0]);
                 }
             }

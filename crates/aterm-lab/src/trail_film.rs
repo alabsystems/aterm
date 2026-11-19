@@ -465,7 +465,9 @@ impl Turns {
         }
     }
 
-    /// Pixel `i` reads `v` at `ms`.
+    /// Pixel `i` reads `v` at `ms`. With a positive swing, a pixel that reads again the value it
+    /// read last changes nothing and turns nothing, so a reader may skip the pixels a frame kept
+    /// (as [`Flicker::frame`] does).
     pub fn see(&mut self, i: usize, v: f64, ms: u32) {
         let (lo, hi) = (self.lo[i], self.hi[i]);
         let turned = match self.dir[i] {

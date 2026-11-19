@@ -13,7 +13,8 @@ pub use spawn::{OwnedSpawnFailure, OwnedWorker};
 #[path = "codex_source_owned_service.rs"]
 mod service;
 pub use service::{
-    OwnedService, OwnedServiceFailure, PreparedServiceAttachment, ServiceFrontend, ServiceIdentity,
+    OwnedService, OwnedServiceFailure, PreparedServiceAttachment, PreparedServicePacket,
+    ServiceFrontend, ServiceIdentity, ServicePacketKind,
 };
 
 #[path = "codex_source_backend_start.rs"]

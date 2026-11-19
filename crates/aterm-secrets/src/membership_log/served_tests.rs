@@ -13,8 +13,8 @@ use crate::membership_log::checkpoint::tests::{
 };
 use crate::membership_log::checkpoint::{DAY_MS, MIN_AGE_MS, propose};
 use crate::membership_log::rooted::tests::{
-    SEEDS, assert_evaluates_as, carry_of_dropped, common, entry, evaluated, random_vault, side_b,
-    sleeper, store_of,
+    Evaluation, SEEDS, assert_evaluates_as, carry_of_dropped, common, entry, evaluated,
+    random_vault, side_b, sleeper, store_of,
 };
 use crate::membership_log::store::{REPLY_CAP, read_reply};
 use crate::membership_log::{
@@ -76,6 +76,9 @@ pub(crate) struct PrunedVault {
     pub(crate) dropped: RecordId,
     /// A record a seat signs after the prune, which the peer does not hold yet.
     pub(crate) next: Record,
+    /// A record seat A signs after `next`, which follows `next` alone: what waits at a holder
+    /// of the peer's store until `next` comes.
+    pub(crate) after_next: Record,
     /// A record seat B signed on what the Mac behind the cut holds, which the peer never
     /// took: what another writer of that Mac's records file appends to it.
     pub(crate) stray: Record,
@@ -86,6 +89,17 @@ pub(crate) fn pruned_vault() -> PrunedVault {
     let world = behind();
     let next = one(
         draft(&world.peer, A, T + MIN_AGE_MS + 2 * HOUR, name("next")),
+        A,
+    );
+    let mut with_next = world.peer.clone();
+    hold(&mut with_next, next.clone());
+    let after_next = one(
+        draft(
+            &with_next,
+            A,
+            T + MIN_AGE_MS + 2 * HOUR + 1,
+            name("after next"),
+        ),
         A,
     );
     let stray = one(draft(&world.behind, B, T + DAY_MS, name("stray")), B);
@@ -105,6 +119,7 @@ pub(crate) fn pruned_vault() -> PrunedVault {
         slept: world.slept,
         dropped: world.dropped,
         next,
+        after_next,
         stray,
     }
 }
@@ -1687,6 +1702,7 @@ fn serves_twice_pruned(
             hold(&mut at_first, record.clone());
         }
     }
+    let evaluation = Evaluation::of(whole);
     for behind in [Log::new(whole.genesis().clone()).unwrap(), at_first] {
         let receiver = catch_up(&twice, &behind)
             .unwrap_or_else(|e| panic!("seed {seed} ({case}): a Mac behind catches up: {e}"));
@@ -1696,7 +1712,7 @@ fn serves_twice_pruned(
             holding(&twice),
             "seed {seed} ({case}): the Mac holds what its peer holds"
         );
-        assert_evaluates_as(seed, case, log, whole);
+        assert_evaluates_as(seed, case, log, &evaluation);
     }
     Some(earlier)
 }

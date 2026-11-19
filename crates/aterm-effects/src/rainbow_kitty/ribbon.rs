@@ -90,27 +90,11 @@ pub const DN_FLOOR_CH: f32 = 0.25;
 /// The downward reach at full momentum, in `ch`.
 pub const DN_TOP_CH: f32 = DN_FLOOR_CH + WAVE_AMP_CELLS;
 
-/// The underline spelling's reach above the spine, in `ch`: the row's foot
-/// band, under the letters' baseline (a 26 px row's letters end on its 21st
-/// pixel row). Reaching `1.0 - DN_TOP_CH` (0.64 ch) it washed the letters'
-/// lower half and read as the pet's ribbon cut short, not a thin rainbow
-/// under the words (looks10 L3).
-pub const UNDERLINE_UP_CH: f32 = 0.20;
-
-/// The underline spelling's reach below the spine at the hand, in `ch`: the
-/// melt's floor ([`DN_FLOOR_CH`]) at every momentum, where the pet's comet
-/// body opens to [`COMET_DN_HAND_CH`], so the underline stays a thin band
-/// over its rail (looks10 L3).
-pub const UNDERLINE_DN_CH: f32 = DN_FLOOR_CH;
-
 /// The leading's half-thickness in `ch`.
 pub const LEAD_CH: f32 = 0.11;
 
 /// The tall highlighter's shoulder.
 pub const SHOULDER_TALL: f32 = 1.0;
-
-/// The underline spelling's quieter glyph-band wash.
-pub const SHOULDER_UNDERLINE: f32 = 0.55;
 
 /// The 0.75-cycle wave's amplitude in cells at full spine (about 2 px at `ch 18`).
 pub const WAVE_AMP_CELLS: f32 = 0.110;
@@ -163,7 +147,7 @@ pub const GLASS_EDGE_PX: f32 = 2.5;
 pub const GLASS_MIN_PX: f32 = 2.0;
 
 /// The glass's ceiling (§15.2 1.7): it lays whole opacity hot and [`BODY_COLD_SHARE`] of it cold,
-/// where main's paper bed lays its role's cap ([`light_role`]).
+/// where main's paper bed lays its role's cap ([`LIGHT_ROLE`]).
 pub const GLASS_ALPHA: f32 = 255.0;
 
 /// The largest walk step a glass boundary lerps across (§2.2 Seams): one cell's at the walk's
@@ -192,19 +176,6 @@ pub const WRAP_SINK_S: f32 = 0.40;
 /// hand-row inset, WRAP_HAND_TOP_PX): the glass reaches at most a cell less this up its row.
 pub const WRAP_HAND_TOP_PX: f32 = 3.0;
 
-/// The flat ribbon's reach above its spine on paper, as a share of the pet's body's.
-pub const FLAT_PAPER_UP_SHARE: f32 = 0.72;
-
-/// The flat ribbon's full-strength plateau on paper, as a share of its
-/// reach, as it was laid (the glow [`FLAT_PAPER_GAIN`] replaced).
-pub const FLAT_PAPER_CORE_SHARE: f32 = 0.85;
-
-/// The flat ribbon's body on paper: a soft even band, as its rail is on a
-/// dim page (looks8 K3), at this share of the pet's light, with no lit
-/// plateau or lift. Laid as the pet's glow, its plateau near its top, it
-/// read as the pet's ribbon without the rail, a near twin at 1x (looks9 Q6).
-pub const FLAT_PAPER_GAIN: f32 = 0.62;
-
 /// The rail's ink luminance floor on a dark page, where a deeper blue or violet would sink
 /// into the page.
 pub const RAIL_LUMA_FLOOR: f32 = 0.20;
@@ -231,21 +202,6 @@ pub const RAIL_GAIN: f32 = 1.0;
 
 /// The rail's full-strength plateau as a share of its reach.
 pub const RAIL_CORE_SHARE: f32 = aterm_render::RIBBON_CORE_SHARE;
-
-/// The share of its reach the flat ribbon's rail on a dim page holds at
-/// full strength ([`Ribbon::flat_dim`]): none. Its band is as deep as a
-/// rail may reach everywhere along the run (an even height, where the pet's
-/// rail follows its body's wave) and falls off from its top with no
-/// plateau, so the flat spelling keeps its own signature on the dim page:
-/// with a fifth of its reach at full strength and the pet's own
-/// coverage it read as the pet's rail (lift 74.6 against the pet's 74.8 on
-/// Solarized Dark, looks7 final).
-pub const FLAT_DIM_RAIL_CORE: f32 = 0.0;
-
-/// The flat ribbon's rail coverage on a dim page as a share of the pet's
-/// ([`RAIL_GAIN`]): about half the pet's peak, a soft band of the
-/// rainbow's light below the letters, not the pet's lit under-edge.
-pub const FLAT_DIM_RAIL_GAIN: f32 = 0.5;
 
 /// The from-the-hand attack's duration, seconds.
 pub const ATTACK_WIPE_S: f32 = 0.040;
@@ -382,12 +338,8 @@ enum Lay {
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
-    static BODY_BAND_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(any(test, debug_assertions))]
-thread_local! {
     static FEATHER_BY_ROOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ROW_RAIL_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A test's negative control: `f` run with the head feather laid finely only in a frame under
@@ -406,19 +358,19 @@ pub fn with_head_feather_by_room<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// A test's negative control: `f` run with the underline's body laid whole in its row's foot
-/// band under a parted rail, as it was: its light lay in every gap the rail leaves round a
-/// descender and before a thin caret. Debug and test builds only; the flag is this thread's
-/// and is put back as it was when `f` returns or panics.
+/// A test's negative control: `f` run with the rail in its row's foot band laid whole, parted
+/// round no ink and no thin caret: its light lies in every gap the rail leaves round a
+/// descender and before a bar or an underline caret. Debug and test builds only; the flag is
+/// this thread's and is put back as it was when `f` returns or panics.
 #[cfg(any(test, debug_assertions))]
-pub fn with_body_band_whole<R>(f: impl FnOnce() -> R) -> R {
+pub fn with_row_rail_whole<R>(f: impl FnOnce() -> R) -> R {
     struct Back(bool);
     impl Drop for Back {
         fn drop(&mut self) {
-            BODY_BAND_WHOLE.with(|c| c.set(self.0));
+            ROW_RAIL_WHOLE.with(|c| c.set(self.0));
         }
     }
-    let _back = Back(BODY_BAND_WHOLE.with(|c| c.replace(true)));
+    let _back = Back(ROW_RAIL_WHOLE.with(|c| c.replace(true)));
     f()
 }
 
@@ -498,9 +450,6 @@ pub const PAPER_WEIGHT: f32 = 0.24;
 
 /// The light bed's bar on a theme whose own text sits under the body's (Solarized Light's `#586e75` on `#fdf6e3` is 4.97:1).
 pub const PAPER_BAR_THEME_SHARE: f32 = 0.8;
-
-/// The leading-only body's weight (the underline spelling, [`InkRole::Leading`]).
-pub const PAPER_WEIGHT_LEADING: f32 = 0.30;
 
 /// The least contrast the caret block keeps against a light page
 /// ([`paper_caret_ink`]): the caret law's 4.5:1, as every effect-owned
@@ -1212,19 +1161,28 @@ impl Band {
     }
 }
 
-/// The two profiles, one emitter.
+/// A body's profile: its reach above and below the spine, its full-strength plateau and its
+/// shoulder.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BodyProfile {
     pub up_ch: f32,
     pub dn_ch: f32,
     pub core_up_ch: f32,
     pub shoulder: f32,
-    /// The tall ribbon's profile; the underline's when false.
-    pub tall: bool,
 }
 
+/// The ribbon's body (§4): its band behind the typed words, [`TALL_UP_CH`] above the spine with
+/// [`TALL_CORE_CH`] of it at full strength, and the comet's [`COMET_DN_HAND_CH`] below it at the
+/// hand.
+pub const TALL_BODY: BodyProfile = BodyProfile {
+    up_ch: TALL_UP_CH,
+    dn_ch: COMET_DN_HAND_CH,
+    core_up_ch: TALL_CORE_CH,
+    shoulder: SHOULDER_TALL,
+};
+
 /// The light glass's body (`docs/design/PRISM-GLASS.md` §2.2, §15.2 1.7), what a frame the
-/// bed draws by its glass lays in place of [`Ribbon::body_profile`]'s: standing on its row's
+/// bed draws by its glass lays in place of [`TALL_BODY`]: standing on its row's
 /// bottom with no reach below it, [`GLASS_UP_CH`] tall at the hand (easing to
 /// [`GLASS_TAIL_UP_CH`] over [`COMET_TAPER_CELLS`] on the comet), its core half its reach, and
 /// its top a [`GLASS_EDGE_PX`] melt (`aterm_render::glass_profile`) with no shoulder.
@@ -1233,8 +1191,6 @@ pub const GLASS_BODY: BodyProfile = BodyProfile {
     dn_ch: 0.0,
     core_up_ch: GLASS_CORE_SHARE * GLASS_UP_CH,
     shoulder: 1.0,
-    // The glass lights only the tall spelling (`glass_table`).
-    tall: true,
 };
 
 #[derive(Clone, Debug)]
@@ -1663,9 +1619,9 @@ const fn dark_hue_bent(rgb: u32) -> u32 {
 #[cfg(test)]
 #[inline]
 #[must_use]
-pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
+pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
-    let theme = PaperTheme::new(table, fg, bg, role);
+    let theme = PaperTheme::new(table, fg, bg);
     paper_ink_with_theme(table, rgb, &theme)
 }
 
@@ -1695,25 +1651,18 @@ impl PaperTheme {
         table: &crate::color_math::RelativeLuminanceTable,
         fg: u32,
         bg: u32,
-        role: InkRole,
     ) -> Self {
         let bg = bg & 0x00FF_FFFF;
-        let cap = (role.alpha_cap() / 255.0).clamp(0.0, 1.0);
+        let cap = (LIGHT_ROLE.alpha_cap() / 255.0).clamp(0.0, 1.0);
         let y_fg = crate::color_math::relative_luminance_with(table, fg);
-        let (weight, bar) = match role {
-            InkRole::OverText => {
-                let y_bg = crate::color_math::relative_luminance_with(table, bg);
-                let ratio_bg_fg = (y_bg.max(y_fg) + 0.05) / (y_bg.min(y_fg) + 0.05);
-                (
-                    PAPER_WEIGHT,
-                    Some(
-                        (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
-                            .min(PAPER_BAR_THEME_SHARE * ratio_bg_fg),
-                    ),
-                )
-            }
-            InkRole::Leading => (PAPER_WEIGHT_LEADING, None),
-        };
+        let y_bg = crate::color_math::relative_luminance_with(table, bg);
+        let ratio_bg_fg = (y_bg.max(y_fg) + 0.05) / (y_bg.min(y_fg) + 0.05);
+        let (weight, bar) = (
+            PAPER_WEIGHT,
+            Some(
+                (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD).min(PAPER_BAR_THEME_SHARE * ratio_bg_fg),
+            ),
+        );
         Self {
             bg,
             bg_lab: oklab(bg),
@@ -2162,16 +2111,8 @@ const fn rail_ink_over(rgb: u32, floor: f32) -> u32 {
     }
 }
 
-/// The light theme's compositing role for the body (§3.3, L6).
-#[inline]
-#[must_use]
-pub(crate) const fn light_role(cfg: &Config) -> InkRole {
-    if cfg.ribbon_tall {
-        InkRole::OverText
-    } else {
-        InkRole::Leading
-    }
-}
+/// The light theme's compositing role for the body (§3.3, L6): it lies over the text.
+pub(crate) const LIGHT_ROLE: InkRole = InkRole::OverText;
 
 /// The ceiling a body's coverage is planned under: [`GLASS_ALPHA`] on a frame the bed draws by
 /// its `glass` (§15.2 1.7), main's [`cov_cap`] on every other.
@@ -2187,7 +2128,7 @@ const fn cov_cap(cfg: &Config) -> f32 {
     if cfg.dark_theme {
         UNDER_COV_CAP
     } else {
-        light_role(cfg).alpha_cap()
+        LIGHT_ROLE.alpha_cap()
     }
 }
 
@@ -2311,21 +2252,26 @@ const fn dark_seen_common_lut(bg: u32) -> Option<&'static [f32; BED_INK_LUT_LEN]
     None
 }
 
-/// The bed's ink table for one theme, rebuilt only when the theme or spelling changes.
+/// The bed's ink table for one theme, rebuilt only when the theme changes.
 ///
-/// Under Prism Glass's glass (`docs/design/PRISM-GLASS.md` §15.2 1.5: `glass_lit`, a light frame's
-/// tall spelling on a page whose solved palette has headroom) the bed draws by that palette's
+/// Under Prism Glass's glass (`docs/design/PRISM-GLASS.md` §15.2 1.5: `glass_lit`, a light frame
+/// on a page whose solved palette has headroom) the bed draws by that palette's
 /// glass129 instead ([`Self::glass`]), filled when the glass lights or the page changes. Main's
 /// own table is still built for the theme beside it, byte for byte, and is what [`Self::key`],
 /// [`Self::lut`] and [`Self::seen`] read on every frame.
 #[derive(Clone, Copy, Debug)]
 pub struct BedInkLut {
-    key: Option<(u32, u32, bool, bool)>,
+    key: Option<BedInkKey>,
     lut: [u32; BED_INK_LUT_LEN],
     seen: [f32; BED_INK_LUT_LEN],
     /// The glass table the bed draws by under `glass_lit`; `None` on every other frame.
     glass: Option<GlassBed>,
 }
+
+/// The page a [`BedInkLut`] was built for: its `(theme_fg, theme_bg, dark_theme)`, and a fourth
+/// word the state words fold (`bed.key`'s `tall`), true on every table: the one body is the tall
+/// one (CT-18).
+pub type BedInkKey = (u32, u32, bool, bool);
 
 /// A light page's glass129 as the bed draws it (§15.2 1.5), light only, and the lip129 its rail
 /// is laid in.
@@ -2346,34 +2292,16 @@ struct GlassBed {
     lip_snaps: [Option<u8>; 2],
 }
 
-#[cfg(test)]
-thread_local! {
-    /// A negative control's seam: the flat spelling lights the glass as the comet does, as it
-    /// did from §15.2 1.5 until composed O11(a) ([`glass_table`]).
-    static FLAT_GLASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// The glass129 the bed draws a frame by (`glass_lit`, §15.0.4, §15.2 1.5): on a light frame
-/// whose light draws glass, the tall comet spelling, a page whose palette `palettes` holds solved
-/// (the frame advances a pending solve by its counted units) and which has headroom. A dark
-/// frame, the underline and flat spellings and a light below the glass level never ask the
-/// cache, so no solve unit runs there.
-///
-/// The flat spelling keeps main's paper bed, its soft even band (looks9 Q6), as the underline
-/// spelling does (composed O11(a)): under the glass it laid the comet's own body at the comet's
-/// height and colours, its taper the only difference (§15.2 1.7: 0.96 ch against 0.86 ch twelve
-/// cells back), and on GitHub Light 969 px of the ribbon's box told the two apart where looks10's
-/// paper told 7684.
+/// whose light draws glass, a page whose palette `palettes` holds solved (the frame advances a
+/// pending solve by its counted units) and which has headroom. A dark frame and a light below
+/// the glass level never ask the cache, so no solve unit runs there.
 #[inline]
 fn glass_table<'p>(
     cfg: &Config,
     palettes: &'p mut PaletteCache,
 ) -> Option<&'p super::prism_glass::Palette> {
-    #[cfg(test)]
-    let flat = cfg.ribbon_flat && !FLAT_GLASS.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    let flat = cfg.ribbon_flat;
-    if !cfg.light.glass() || !cfg.ribbon_tall || flat || cfg.dark_theme {
+    if !cfg.light.glass() || cfg.dark_theme {
         return None;
     }
     palettes
@@ -2399,17 +2327,15 @@ impl BedInkLut {
 
     #[inline]
     fn sync(&mut self, cfg: &Config) {
-        let key = (cfg.theme_fg, cfg.theme_bg, cfg.dark_theme, cfg.ribbon_tall);
-        if let Some((fg, bg, dark, tall)) = self.key
+        let key: BedInkKey = (cfg.theme_fg, cfg.theme_bg, cfg.dark_theme, true);
+        if let Some((fg, bg, dark, _)) = self.key
             && fg == key.0
             && bg == key.1
             && dark == key.2
-            && tall == key.3
         {
             return;
         }
         let budget = bed_luma_budget(cfg.theme_fg);
-        let role = light_role(cfg);
         let dark_max = if cfg.dark_theme && (budget - BED_LUMA_MAX).abs() == 0.0 {
             Some(dark_bed_max_lut())
         } else {
@@ -2432,7 +2358,7 @@ impl BedInkLut {
         let paper_theme = if cfg.dark_theme {
             PaperTheme::ZERO
         } else {
-            PaperTheme::new(table, cfg.theme_fg, bg_masked, role)
+            PaperTheme::new(table, cfg.theme_fg, bg_masked)
         };
         let mut i = 0;
         while i < BED_INK_LUT_LEN {
@@ -2455,7 +2381,7 @@ impl BedInkLut {
                             & 0x00FF_FFFF,
                         bg_lin,
                     );
-                    if cfg.ribbon_tall && !shows {
+                    if !shows {
                         crate::cursor_glow::light_body_ink(arc, cfg.theme_fg, cfg.theme_bg, light_a)
                     } else {
                         paper
@@ -3470,16 +3396,6 @@ pub struct Ribbon {
     /// Test-only: leave a run the hand has left square-cut at its head end (no [`Ribbon::head_feather`]), the negative control of the feather's test.
     #[cfg(test)]
     head_square: bool,
-    /// Test-only: lift the underline off a last or held row's floor by its
-    /// reach below, as the tall ribbon is lifted, as it was (looks10 L3's
-    /// negative control).
-    #[cfg(test)]
-    underline_lifted: bool,
-    /// Test-only: ease the underline off the letters that land on the row
-    /// below with the row's hold, as the tall ribbon eases, as it did
-    /// (looks10 round 3's negative control).
-    #[cfg(test)]
-    underline_eases_off_letters: bool,
     /// Test-only: keep the hot edge on a run the hand has left, the negative
     /// control of the hot edge's hand test.
     #[cfg(test)]
@@ -3548,15 +3464,6 @@ pub struct Ribbon {
     thin_caret: bool,
     /// The in-row rail's vertices laid finely ([`part_row_rail`]).
     parted: Vec<RibbonVertex>,
-    /// Test-only: draw the pet's and the flat ribbon alike on paper (no
-    /// rail, one body), the negative control of their reading apart there.
-    #[cfg(test)]
-    paper_alike: bool,
-    /// Test-only: lay the flat ribbon's body on paper as the pet's glow, its
-    /// lit plateau and its light following each cell's (looks9 Q6's
-    /// negative control, [`FLAT_PAPER_GAIN`]).
-    #[cfg(test)]
-    flat_paper_glow: bool,
     /// Test-only: leave each row's hold behind when a scroll or a band move
     /// carries its line away, the negative control of the carried hold.
     #[cfg(test)]
@@ -3828,10 +3735,6 @@ impl Ribbon {
             #[cfg(test)]
             head_square: false,
             #[cfg(test)]
-            underline_lifted: false,
-            #[cfg(test)]
-            underline_eases_off_letters: false,
-            #[cfg(test)]
             hot_edge_left_lit: false,
             #[cfg(test)]
             feather_coarse: false,
@@ -3863,10 +3766,6 @@ impl Ribbon {
             parted: Vec::new(),
             #[cfg(test)]
             row_rail_parted: false,
-            #[cfg(test)]
-            paper_alike: false,
-            #[cfg(test)]
-            flat_paper_glow: false,
             #[cfg(test)]
             holds_left_behind: false,
             holds: Vec::new(),
@@ -4073,72 +3972,6 @@ impl Ribbon {
     #[cfg(test)]
     pub const fn caret(&self) -> Option<(u16, u16)> {
         self.caret
-    }
-
-    /// The two profiles (§4).
-    #[inline]
-    #[must_use]
-    pub const fn body_profile(cfg: &Config) -> BodyProfile {
-        let dn_ch = if !cfg.ribbon_tall {
-            UNDERLINE_DN_CH
-        } else if Self::comet(cfg) {
-            COMET_DN_HAND_CH
-        } else {
-            DN_TOP_CH
-        };
-        if cfg.ribbon_tall {
-            BodyProfile {
-                up_ch: TALL_UP_CH,
-                dn_ch,
-                core_up_ch: TALL_CORE_CH,
-                shoulder: SHOULDER_TALL,
-                tall: true,
-            }
-        } else {
-            BodyProfile {
-                up_ch: UNDERLINE_UP_CH,
-                dn_ch,
-                core_up_ch: LEAD_CH,
-                shoulder: SHOULDER_UNDERLINE,
-                tall: false,
-            }
-        }
-    }
-
-    /// Whether the comet body and the from-the-hand attack apply (`RAINBOW-KITTY-V2.md` §30).
-    #[inline]
-    #[must_use]
-    pub const fn comet(cfg: &Config) -> bool {
-        !cfg.ribbon_flat
-    }
-
-    /// Whether the vivid rail is drawn: under the comet body on either
-    /// page, so the pet's ribbon keeps its under-edge on paper too, where
-    /// without it the pet's and the flat ribbon read alike.
-    #[inline]
-    #[must_use]
-    pub const fn rail_lit(cfg: &Config) -> bool {
-        Self::comet(cfg)
-    }
-
-    /// Whether the flat ribbon lies on a dim theme's page ([`dim_theme`]):
-    /// its body there lays only its hue at the page's luminance
-    /// ([`dim_page_bed`]), and the warm half of the rainbow, at a luminance
-    /// that low, is the page's own teal or olive (Solarized Dark's flat
-    /// rainbow showed no rainbow past `jumps`, looks7 round 3). It lays a
-    /// soft rail in the air below its letters ([`FLAT_DIM_RAIL_CORE`]).
-    #[inline]
-    #[must_use]
-    pub const fn flat_dim(cfg: &Config) -> bool {
-        !Self::comet(cfg) && cfg.dark_theme && dim_theme(cfg.theme_fg, cfg.theme_bg)
-    }
-
-    /// Whether a rail is drawn under the body ([`Self::rail_lit`],
-    /// [`Self::flat_dim`]).
-    #[inline]
-    #[must_use]
-    pub const fn rail_drawn(cfg: &Config) -> bool {
-        Self::rail_lit(cfg) || Self::flat_dim(cfg)
     }
 
     /// The frame's rails laid clear of their row's ring, as `[from, to)`
@@ -7288,7 +7121,7 @@ impl Ribbon {
         } else {
             0.0
         };
-        self.wedge_px = (Self::body_profile(ctx.cfg).dn_ch - DN_FLOOR_CH).max(0.0) * self.cell_h;
+        self.wedge_px = (TALL_BODY.dn_ch - DN_FLOOR_CH).max(0.0) * self.cell_h;
         self.advance_swoosh(ctx);
         self.retire(ctx);
         if let Some(s) = self.seam
@@ -7679,14 +7512,9 @@ impl Ribbon {
 
     #[inline]
     const fn slabs_for(ctx: &Ctx<'_>, cells: usize) -> usize {
-        let prof = Self::body_profile(ctx.cfg);
         let ch = ctx.geom.ch as f32;
-        let body = ((prof.up_ch + DN_TOP_CH) * ch).ceil().max(1.0) + 2.0;
-        let rail = if Self::rail_drawn(ctx.cfg) {
-            (DN_TOP_CH * ch).ceil() + 1.0
-        } else {
-            0.0
-        };
+        let body = ((TALL_BODY.up_ch + DN_TOP_CH) * ch).ceil().max(1.0) + 2.0;
+        let rail = (DN_TOP_CH * ch).ceil() + 1.0;
         let rows = body + rail;
         let cells = cells + 1;
         let per_slab = (cells as f32 * rows).max(1.0);
@@ -7729,13 +7557,13 @@ impl Ribbon {
             }
         }
         // One answer per row (its runs share seams, so they share a floor).
-        let mut held_row: Option<(u16, usize, (f32, bool))> = None;
+        let mut held_row: Option<(u16, usize, f32)> = None;
         let chf = ctx.geom.ch as f32;
         let pane_bot = self.pane_bot(ctx, chf);
         let mut s = 0usize;
         while s < sorted.len() {
             let row = sorted[s].0;
-            let (row_end, (hold, letters_below)) = match held_row {
+            let (row_end, hold) = match held_row {
                 Some((r, end, hold)) if r == row => (end, hold),
                 _ => {
                     let mut end = s + 1;
@@ -7785,7 +7613,6 @@ impl Ribbon {
                     };
                     let previous = self.previous_hold(row, row_cells);
                     let hold = self.ease_hold(ctx, row, held, previous);
-                    let hold = (hold, held == Some(true) && floor < pane_bot);
                     held_row = Some((row, end, hold));
                     (end, hold)
                 }
@@ -7846,7 +7673,7 @@ impl Ribbon {
                 Some(e + 1),
                 sorted[e].1.checked_add(1),
             );
-            self.plan_run(ctx, &sorted[s..=e], seam, right, (hold, letters_below));
+            self.plan_run(ctx, &sorted[s..=e], seam, right, hold);
             s = e + 1;
         }
         mem::swap(&mut self.holds, &mut self.holds_next);
@@ -8059,14 +7886,11 @@ struct RunSample {
     settle: f32,
     settle_scale: f32,
     breath_scale: f32,
-    comet: bool,
     fx_top: f32,
     pane_bot: f32,
     free_last_row: bool,
     held_last_row: bool,
     hold: f32,
-    /// The row below holds letters this frame ([`Ribbon::inked_below`]).
-    letters_below: bool,
     phase_rad: f32,
     /// How far the run's row has sunk ([`GlassWrap`]), on glass only; `0` elsewhere.
     sunk: f32,
@@ -8082,17 +7906,11 @@ impl Ribbon {
         ctx: &Ctx<'_>,
         row: u16,
         coh: Option<&Cohort>,
-        (hold, letters_below): (f32, bool),
+        hold: f32,
         (settle, breath): (f32, f32),
     ) -> RunSample {
         let chf = ctx.geom.ch as f32;
-        let prof = Self::body_profile(ctx.cfg);
-        #[cfg(test)]
-        let prof = if self.underline_lifted {
-            BodyProfile { tall: true, ..prof }
-        } else {
-            prof
-        };
+        let prof = TALL_BODY;
         let reduced = ctx.cfg.reduced_motion;
         let disp = clamp01(ctx.disp);
         let room = (DN_TOP_CH - DN_FLOOR_CH) * chf;
@@ -8104,7 +7922,6 @@ impl Ribbon {
         let dn_floor = DN_FLOOR_CH * chf;
         let settle_scale = 1.0 - FLOW_SETTLE_SHARE * settle;
         let breath_scale = 1.0 - breath;
-        let comet = Self::comet(ctx.cfg);
         let fx_top = ctx.geom.fx_top() as f32;
         let pane_bot = self.pane_bot(ctx, chf);
         let dn_thresh = prof.dn_ch * chf;
@@ -8123,13 +7940,11 @@ impl Ribbon {
             settle,
             settle_scale,
             breath_scale,
-            comet,
             fx_top,
             pane_bot,
             free_last_row,
             held_last_row,
             hold,
-            letters_below,
             phase_rad,
             sunk: 0.0,
             glass_cap: f32::INFINITY,
@@ -8174,14 +7989,10 @@ impl Ribbon {
         let wave_pos = wave.max(0.0);
         let wave_neg = wave.min(0.0);
         let spine_raw = row_bot + wave;
-        let comet_up_ch = if rs.comet {
-            prof.up_ch
-                * (1.0
-                    - (1.0 - COMET_UP_TAIL_CH / TALL_UP_CH)
-                        * smoothstep01(behind * (1.0 / COMET_TAPER_CELLS)))
-        } else {
-            prof.up_ch
-        };
+        let comet_up_ch = prof.up_ch
+            * (1.0
+                - (1.0 - COMET_UP_TAIL_CH / TALL_UP_CH)
+                    * smoothstep01(behind * (1.0 / COMET_TAPER_CELLS)));
         // The body over a floor at `pane_bot`: a held row's floor is its own
         // bottom, where it is laid as a last row is.
         #[inline]
@@ -8200,24 +8011,6 @@ impl Ribbon {
             let dn = (rs.dn_floor + (dn - rs.dn_floor) * rs.settle_scale) * rs.breath_scale;
             let up_ch = if last_row { rs.prof.up_ch } else { comet_up_ch };
             let up = (up_ch * rs.chf + wave_neg).max(0.0) * rs.settle_scale * rs.breath_scale;
-            if !rs.prof.tall {
-                // The underline keeps to its row's foot band over a floor:
-                // lifted by its reach below, as the tall ribbon is, it lay
-                // across the lower half of a last or held row's letters
-                // (looks10 L3: the dim Solarized `c` of an Enter at the
-                // bottom row at 96.9% of its own reading). Its reach below
-                // ends at the floor instead.
-                let spine = spine_raw.min(pane_bot).max(rs.fx_top);
-                let room = pane_bot - spine;
-                let dn = if dn < room {
-                    dn
-                } else if room > 0.0 {
-                    room
-                } else {
-                    0.0
-                };
-                return (spine, up, dn);
-            }
             let spine = spine_raw.min(pane_bot - dn).max(rs.fx_top);
             (spine, up, dn)
         }
@@ -8227,19 +8020,6 @@ impl Ribbon {
         }
         let pane_bot = rs.pane_bot;
         let hold = rs.hold;
-        // The underline settles at once off the letters that land on the
-        // row below: eased in with the row's hold ([`HOLD_EASE_S`]), its
-        // reach below lay over the new letters' tops for the ease (the
-        // settings card's Return on GitHub Light: the `p` of `[main 4f2c9e1]`
-        // read 4.45:1 on its tinted ground, looks10 round 3). Kept to its
-        // floor (looks10 L3) the underline's spine does not move, as the tall
-        // body's does, so only its reach below changes; it lets go of the row
-        // as it did ([`HOLD_RELEASE_S`]), over a row whose letters are gone.
-        #[cfg(test)]
-        let settles = rs.letters_below && !self.underline_eases_off_letters;
-        #[cfg(not(test))]
-        let settles = rs.letters_below;
-        let hold = if settles && !rs.prof.tall { 1.0 } else { hold };
         let (spine, up, dn) = if hold <= 0.0 || pane_bot <= row_bot {
             shape_at(
                 (pane_bot, rs.free_last_row),
@@ -8322,13 +8102,8 @@ impl Ribbon {
         let chf = rs.chf;
         let disp = rs.disp;
         let behind = sp * rs.span;
-        let reach_ch = if rs.comet {
-            GLASS_UP_CH
-                - (GLASS_UP_CH - GLASS_TAIL_UP_CH)
-                    * smoothstep01(behind * (1.0 / COMET_TAPER_CELLS))
-        } else {
-            GLASS_UP_CH
-        };
+        let reach_ch = GLASS_UP_CH
+            - (GLASS_UP_CH - GLASS_TAIL_UP_CH) * smoothstep01(behind * (1.0 / COMET_TAPER_CELLS));
         let wave = if rs.reduced || disp <= 0.0 || rs.settle >= 1.0 || sp <= 0.0 {
             0.0
         } else {
@@ -8548,11 +8323,7 @@ impl Ribbon {
     #[inline]
     fn wipe_state(&self, ctx: &Ctx<'_>, cell: &Cell) -> Option<(f32, f32, f32)> {
         // Typed cells only: a wake's cells share one birth instant, so wiping each from its own edge would print a comb; its lay sweep is its attack.
-        if !cell.typing
-            || !Self::comet(ctx.cfg)
-            || ctx.cfg.reduced_motion
-            || ctx.now < cell.attack_at
-        {
+        if !cell.typing || ctx.cfg.reduced_motion || ctx.now < cell.attack_at {
             return None;
         }
         let age = ctx
@@ -8717,7 +8488,7 @@ impl Ribbon {
         run: &[(u16, u16, u32)],
         seam: Option<Segment>,
         right_nb: Option<Cell>,
-        (hold, letters_below): (f32, bool),
+        hold: f32,
     ) {
         #[inline]
         const fn cell_at<'a>(
@@ -8832,7 +8603,7 @@ impl Ribbon {
         } else {
             (0.0, 0.0)
         };
-        let rs = self.run_sample(ctx, row, coh, (hold, letters_below), flow_settle);
+        let rs = self.run_sample(ctx, row, coh, hold, flow_settle);
         let glass = self.ink.glass_lit();
         // On glass (§2.4) a row the hand has left sinks, and the hand's row of a multi-row set
         // keeps its inset; main's row hold moves main's body only, so each row's glass has one
@@ -9166,18 +8937,13 @@ impl Ribbon {
         if glass {
             self.glass_drew = Some(ctx.now);
         }
-        let prof = Self::body_profile(ctx.cfg);
+        let prof = TALL_BODY;
         let shoulder = prof.shoulder;
-        #[cfg(test)]
-        let alike = self.paper_alike && !ctx.cfg.dark_theme;
-        #[cfg(not(test))]
-        let alike = false;
-        let flat_dim = Self::flat_dim(ctx.cfg);
         #[cfg(test)]
         let rail_off = self.rail_off;
         #[cfg(not(test))]
         let rail_off = false;
-        let rail = (Self::rail_lit(ctx.cfg) || flat_dim) && !alike && !rail_off;
+        let rail = !rail_off;
         #[cfg(test)]
         let line_whole = self.line_whole;
         #[cfg(not(test))]
@@ -9192,7 +8958,7 @@ impl Ribbon {
         } else if ctx.cfg.dark_theme {
             BODY_FRAME_TOP
         } else {
-            light_role(ctx.cfg).alpha_cap()
+            LIGHT_ROLE.alpha_cap()
         };
         let fx_top = ctx.geom.fx_top() as f32;
         let clip = ctx.geom.beam_clip();
@@ -9244,16 +9010,16 @@ impl Ribbon {
         let row_rail_parted = self.row_rail_parted;
         #[cfg(not(test))]
         let row_rail_parted = false;
+        #[cfg(any(test, debug_assertions))]
+        let row_rail_whole = ROW_RAIL_WHOLE.with(std::cell::Cell::get);
+        #[cfg(not(any(test, debug_assertions)))]
+        let row_rail_whole = false;
         #[cfg(test)]
         let held_rail_off = self.held_rail_off;
         #[cfg(not(test))]
         let held_rail_off = false;
         #[cfg(any(test, debug_assertions))]
         let feather_by_room = FEATHER_BY_ROOM.with(std::cell::Cell::get);
-        #[cfg(any(test, debug_assertions))]
-        let body_band_whole = BODY_BAND_WHOLE.with(std::cell::Cell::get);
-        #[cfg(not(any(test, debug_assertions)))]
-        let body_band_whole = false;
         let mut parted = mem::take(&mut self.parted);
         // A bar or an underline caret's cell, which the in-row rail of its row ends before.
         let caret_gap = if self.thin_caret {
@@ -9271,13 +9037,6 @@ impl Ribbon {
         let plan = &self.plan;
         let ink = &self.ink;
         let keep_out_ease = KEEP_OUT_EASE_CELLS * ctx.geom.cw as f32;
-        // The flat ribbon on paper lies flatter than the pet's comet body:
-        // lower, and a soft even band ([`FLAT_PAPER_GAIN`]).
-        let flat_paper = !ctx.cfg.dark_theme && !Self::comet(ctx.cfg) && !alike && !glass;
-        #[cfg(test)]
-        let flat_even = flat_paper && !self.flat_paper_glow;
-        #[cfg(not(test))]
-        let flat_even = flat_paper;
         #[cfg(test)]
         let coarse = self.feather_coarse;
         let roomy = (self.plan.len() as f32) * FEATHER_ROOM_ROWS * chf
@@ -9446,20 +9205,14 @@ impl Ribbon {
                 if rail_layer {
                     let gap = if in_row { gap } else { None };
                     // The rail is the leading's line ([`InkRole::Leading`]): on paper it lays the
-                    // body's share of the body's ceiling at the leading's own, so the line under
-                    // the tall body's over-text wash is the line under the underline's body.
+                    // body's share of the body's ceiling at the leading's own.
                     let rail_cap = if glass || ctx.cfg.dark_theme {
                         1.0
                     } else {
                         InkRole::Leading.alpha_cap() / cov_cap(ctx.cfg)
                     };
                     let rail_scale = RAIL_GAIN * (1.0 - hold) * rail_cap;
-                    let flat_dim_scale = FLAT_DIM_RAIL_GAIN * (1.0 - hold);
-                    let rail_core = if flat_dim {
-                        FLAT_DIM_RAIL_CORE
-                    } else {
-                        RAIL_CORE_SHARE
-                    };
+                    let rail_core = RAIL_CORE_SHARE;
                     // Beside a foot the in-row rail dips under the row, into
                     // the row below's blank top, as far as it would have
                     // parted ([`ROW_RAIL_DIP_GAP_PX`]), a pixel thinner there
@@ -9508,8 +9261,6 @@ impl Ribbon {
                         };
                         let dn = if in_row {
                             row_rail + (dip_rail - row_rail) * dipped
-                        } else if flat_dim {
-                            rail_reach_max
                         } else {
                             (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max)
                         };
@@ -9525,14 +9276,7 @@ impl Ribbon {
                             core_up: 0.0,
                             core_dn: dn * rail_core,
                             color: ink.rail_at(seg.t),
-                            // The flat rail on a dim page holds about half the
-                            // pet's peak: its coverage is capped at that share
-                            // of whole, since the body's own runs past it.
-                            cov: if flat_dim {
-                                feather_cov.min(255.0) * flat_dim_scale
-                            } else {
-                                feather_cov * rail_scale
-                            } * foot,
+                            cov: feather_cov * rail_scale * foot,
                             lift: 0.0,
                             lift_span: 0.0,
                         };
@@ -9576,7 +9320,7 @@ impl Ribbon {
                         verts.push(v);
                         prev_t = Some(seg.t);
                     });
-                    if inked || gap.is_some() {
+                    if (inked || gap.is_some()) && !row_rail_whole {
                         let ring = crate::cursor_glow::LETTER_GUARD_RING as f32;
                         let clear = FOOT_CLEAR_PX;
                         let reach = clear + ROW_RAIL_INK_EASE_PX;
@@ -9669,26 +9413,15 @@ impl Ribbon {
                         if i == head_rel {
                             head_rev = verts.len();
                         }
-                        let (cov, strip) = if flat_even {
-                            (seg.cov * FLAT_PAPER_GAIN * head_feather_of.at(seg.x), 0.0)
-                        } else {
-                            let cov = seg.cov * head_feather_of.at(seg.x);
-                            (cov, (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0))
-                        };
+                        let cov = seg.cov * head_feather_of.at(seg.x);
+                        let strip = (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0);
                         let up = self.kept_up(
                             (seg.x, seg.spine, seg.up),
                             row_top,
                             keep_out_ease,
                             (has_ceiling, box_top),
                         );
-                        let (up, core) = if flat_even {
-                            (up * FLAT_PAPER_UP_SHARE, 0.0)
-                        } else if flat_paper {
-                            let up = up * FLAT_PAPER_UP_SHARE;
-                            (up, up * FLAT_PAPER_CORE_SHARE)
-                        } else {
-                            (up, core_up.min(up))
-                        };
+                        let core = core_up.min(up);
                         verts.push(RibbonVertex {
                             x: seg.x,
                             spine: seg.spine,
@@ -9704,57 +9437,6 @@ impl Ribbon {
                             lift_span: lift_span.min((seg.spine - box_top).max(0.0)),
                         });
                     });
-                    // The underline's body on a row that keeps its line in its own foot band
-                    // is a band there too ([`UNDERLINE_UP_CH`]), under the rail: it parts
-                    // where the rail does, by the row's share, round the ink of a foot the
-                    // face named and before a thin caret. Left whole, it lay in the gaps the
-                    // rail leaves (a bottom prompt's `q` on GitHub Light stood in a mint band
-                    // that touched its ink, and the band ran on to the bar caret). The tall
-                    // body is a wash behind its row's letters, not a band under them, and a
-                    // filled row's rail keeps its cell-wide parting: both are left as laid.
-                    let share = if prof.tall || over_fill || body_band_whole {
-                        0.0
-                    } else {
-                        row_share
-                    };
-                    let inked = share > 0.0 && self.keep_out.inks_row(row_top_i);
-                    let gap = if share > 0.0 { gap } else { None };
-                    if inked || gap.is_some() {
-                        let reach = FOOT_CLEAR_PX + ROW_RAIL_INK_EASE_PX;
-                        let caret_reach = CARET_CLEAR_PX + CARET_EASE_PX;
-                        let keep_out = &self.keep_out;
-                        head_rev = part_row_rail(
-                            &mut verts,
-                            &mut parted,
-                            head_rev,
-                            |lo, hi| {
-                                (inked && keep_out.ink_near((lo, hi), row_top_i, reach))
-                                    || matches!(gap, Some((x0, x1))
-                                        if x0 - caret_reach <= hi && lo <= x1 + caret_reach)
-                            },
-                            |mut v| {
-                                let mut keep = if inked {
-                                    keep_out
-                                        .foot_gap(
-                                            v.x,
-                                            row_top_i,
-                                            (FOOT_CLEAR_PX, ROW_RAIL_INK_EASE_PX),
-                                        )
-                                        .keep
-                                } else {
-                                    1.0
-                                };
-                                if let Some((x0, x1)) = gap {
-                                    let d = (x0 - v.x).max(v.x - x1) - CARET_CLEAR_PX;
-                                    keep *= smoothstep01(d * (1.0 / CARET_EASE_PX));
-                                }
-                                let keep = 1.0 - share * (1.0 - keep);
-                                v.cov *= keep;
-                                v.lift *= keep;
-                                v
-                            },
-                        );
-                    }
                 }
                 let start = out.mark();
                 let lay = if rail_layer {

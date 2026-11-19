@@ -2634,13 +2634,11 @@ pub(crate) struct CoalProbe {
     pub(crate) self_check: fn(u32) -> Result<u64, &'static str>,
     /// The process sweep, each process's coalition and pid version read in
     /// it where the options ask, the coalition kept by pid under that
-    /// version in the ids passed ([`aterm_sysprobe::processes_keeping`]):
-    /// the kernel's in every arm, so a test's stand-in can count what a
-    /// reading asks.
-    pub(crate) sweep: fn(
-        aterm_sysprobe::SweepOpts,
-        &mut aterm_sysprobe::coalitions::CoalitionIds,
-    ) -> Option<aterm_sysprobe::Sweep>,
+    /// version in the ids passed, and the read of the whole table it made
+    /// where it made one ([`aterm_sysprobe::processes_keeping_table`]): the
+    /// kernel's in every arm, so a test's stand-in can count what a reading
+    /// asks.
+    pub(crate) sweep: SweepFn,
     /// Every coalition's counters ([`aterm_sysprobe::coalitions::coalitions`]), read at every
     /// reading while the lane is on: the start counter's, and on split ticks the split's too.
     pub(crate) coalitions: fn() -> Option<aterm_sysprobe::coalitions::CoalitionRead>,
@@ -2652,7 +2650,7 @@ pub(crate) struct CoalProbe {
     pub(crate) birth: fn(u32) -> Option<(String, i64)>,
     /// Every process's, by pid, in one read of the table
     /// ([`aterm_sysprobe::kproc::records`]): cheaper than [`Self::birth`]
-    /// past [`BIRTHS_AT_ONCE`] pids.
+    /// past [`BIRTHS_AT_ONCE`] pids, where the reading's sweep read no table.
     pub(crate) births: fn() -> Option<Births>,
     /// A process's image and signature ([`aterm_sysprobe::identity::identity`]).
     pub(crate) identity: fn(u32) -> Option<aterm_sysprobe::identity::Identity>,
@@ -2670,7 +2668,7 @@ impl CoalProbe {
     /// The kernel's readers.
     pub(crate) const KERNEL: Self = Self {
         self_check: aterm_sysprobe::coalitions::self_check,
-        sweep: aterm_sysprobe::processes_keeping,
+        sweep: aterm_sysprobe::processes_keeping_table,
         coalitions: aterm_sysprobe::coalitions::coalitions,
         forks: aterm_sysprobe::Probe::forks,
         birth: |pid| aterm_sysprobe::kproc::record(pid).and_then(name_and_birth),
@@ -2691,7 +2689,7 @@ impl CoalProbe {
     /// The inert arm: no OS lane, nothing read but the sweep.
     pub(crate) const INERT: Self = Self {
         self_check: |_| Err("unsupported"),
-        sweep: aterm_sysprobe::processes_keeping,
+        sweep: aterm_sysprobe::processes_keeping_table,
         coalitions: || None,
         forks: |_| None,
         birth: |_| None,
@@ -2710,10 +2708,11 @@ impl CoalProbe {
 pub(crate) const PROCS_WAIT: Duration = Duration::from_millis(400);
 
 /// The process sweep's reader ([`CoalProbe::sweep`]).
-pub(crate) type SweepFn = fn(
-    aterm_sysprobe::SweepOpts,
-    &mut aterm_sysprobe::coalitions::CoalitionIds,
-) -> Option<aterm_sysprobe::Sweep>;
+pub(crate) type SweepFn =
+    fn(
+        aterm_sysprobe::SweepOpts,
+        &mut aterm_sysprobe::coalitions::CoalitionIds,
+    ) -> Option<(aterm_sysprobe::Sweep, Option<aterm_sysprobe::kproc::Table>)>;
 
 /// What a reading asks of the process reads: a sweep (none for a machine-only reading) with the
 /// coalition ids it keeps, and the pid lists' counts for real user `uid`.
@@ -2772,6 +2771,8 @@ impl OwnershipAsk {
 /// What the process reads answered.
 pub(crate) struct ProcsAnswer {
     sweep: Option<aterm_sysprobe::Sweep>,
+    /// The read of the whole table the sweep made, where it made one.
+    table: Option<aterm_sysprobe::kproc::Table>,
     ids: aterm_sysprobe::coalitions::CoalitionIds,
     /// Every process and this user's, from the pid lists ([`aterm_sysprobe::pid_counts`]).
     pids: (Option<u64>, Option<u64>),
@@ -2786,7 +2787,10 @@ fn read_procs(ask: ProcsAsk) -> ProcsAnswer {
         .sweep
         .is_some()
         .then(|| crate::vitals_host::memory::Pending::begin(ask.memory, ask.observed_at));
-    let mut sweep = ask.sweep.and_then(|(sweep, opts)| sweep(opts, &mut ids));
+    let (mut sweep, table) = ask
+        .sweep
+        .and_then(|(sweep, opts)| sweep(opts, &mut ids))
+        .unzip();
     let memory = memory
         .zip(sweep.as_ref())
         .map(|(pending, sweep)| pending.finish(sweep));
@@ -2796,6 +2800,7 @@ fn read_procs(ask: ProcsAsk) -> ProcsAnswer {
         .map(|(sweep, ownership)| ownership.read(sweep));
     ProcsAnswer {
         sweep,
+        table: table.flatten(),
         ids,
         pids: aterm_sysprobe::pid_counts(ask.uid),
         ownership,
@@ -2807,6 +2812,9 @@ fn read_procs(ask: ProcsAsk) -> ProcsAnswer {
 struct ProcReads {
     /// The sweep, where one was asked and answered.
     sweep: Option<aterm_sysprobe::Sweep>,
+    /// The read of the whole table the sweep made, where it made one: the reading's births read
+    /// there ([`SplitReader::births`]).
+    table: Option<aterm_sysprobe::kproc::Table>,
     /// Every process and this user's, from the pid lists.
     pids: (Option<u64>, Option<u64>),
     /// The lanes the reading found stalled.
@@ -2909,6 +2917,15 @@ pub(crate) const BIRTHS_AT_ONCE: usize = 12;
 
 /// Each process's kernel `p_comm` and start (unix ms) by pid.
 pub(crate) type Births = HashMap<u32, (String, i64)>;
+
+/// The births of `wanted`'s processes in `table`, each read as [`CoalProbe::births`] reads it
+/// from a table of its own.
+fn births_in(table: &aterm_sysprobe::kproc::Table, wanted: &IdSet<u32>) -> Births {
+    table
+        .records_of(|pid| wanted.contains(&pid))
+        .filter_map(|r| Some((r.pid, name_and_birth(r)?)))
+        .collect()
+}
 
 fn name_and_birth(r: aterm_sysprobe::kproc::Record) -> Option<(String, i64)> {
     let ms = i64::try_from(r.start_s)
@@ -3041,11 +3058,22 @@ impl SplitReader {
 
     /// Each swept process's birth where the sweep gave none (macOS, whose
     /// sweep start is Mach time): kept under its name and kernel start (or
-    /// pid version), else read from its kernel record, or from the whole
-    /// table past [`BIRTHS_AT_ONCE`] unread. Run on every whole reading (one
-    /// with a sweep), not only on split ticks, so a program's age
-    /// ([`aterm_vitals::model::ProgramGroup`]) needs no coalitions lane.
-    pub(crate) fn births(&mut self, sample: &mut Sample, now: Instant) {
+    /// pid version), else read from `swept`, the read of the whole table the
+    /// reading's sweep made, where it made one; else from its kernel record,
+    /// or from a read of the whole table past [`BIRTHS_AT_ONCE`] unread. Run
+    /// on every whole reading (one with a sweep), not only on split ticks, so
+    /// a program's age ([`aterm_vitals::model::ProgramGroup`]) needs no
+    /// coalitions lane. A record in `swept` is the one the kernel held as the
+    /// sweep ended, before the reading's other reads, where one read here is
+    /// read after them: a process that exits, starts another program or gives
+    /// its pid to a new process in between takes the sweep's record, as its
+    /// row is the sweep's.
+    pub(crate) fn births(
+        &mut self,
+        sample: &mut Sample,
+        now: Instant,
+        swept: Option<&aterm_sysprobe::kproc::Table>,
+    ) {
         let Some(procs) = sample.procs.as_mut() else {
             return;
         };
@@ -3056,8 +3084,8 @@ impl SplitReader {
             self.births.clear();
         }
         self.births_at = Some(now);
-        let swept: IdSet<u32> = procs.iter().map(|p| p.pid).collect();
-        self.births.retain(|pid, _| swept.contains(pid));
+        let present: IdSet<u32> = procs.iter().map(|p| p.pid).collect();
+        self.births.retain(|pid, _| present.contains(pid));
         let mut unread = Vec::new();
         for (i, p) in procs.iter_mut().enumerate() {
             if p.birth_ms.is_none() {
@@ -3067,9 +3095,15 @@ impl SplitReader {
                 unread.push(i);
             }
         }
-        let table = (unread.len() > BIRTHS_AT_ONCE)
-            .then(self.probe.births)
-            .flatten();
+        let table = match swept {
+            Some(swept) => {
+                let wanted: IdSet<u32> = unread.iter().map(|&i| procs[i].pid).collect();
+                Some(births_in(swept, &wanted))
+            }
+            None => (unread.len() > BIRTHS_AT_ONCE)
+                .then(self.probe.births)
+                .flatten(),
+        };
         for i in unread {
             procs[i].birth_ms = self.read_birth(&procs[i], table.as_ref());
         }
@@ -3081,6 +3115,7 @@ impl SplitReader {
         read: aterm_sysprobe::coalitions::CoalitionRead,
         now: Instant,
         details: bool,
+        swept: Option<&aterm_sysprobe::kproc::Table>,
     ) {
         if sample.procs.is_none() {
             return;
@@ -3091,7 +3126,7 @@ impl SplitReader {
         {
             self.idents.clear();
         }
-        self.births(sample, now);
+        self.births(sample, now, swept);
         let procs = sample.procs.as_deref().unwrap_or_default();
         let born: IdMap<u32, (i64, Option<i32>)> = procs
             .iter()
@@ -3936,18 +3971,19 @@ impl Reader {
             memory: self.memory_probes,
             observed_at: self.observed_at,
         };
-        let (sweep, pids, procs, ownership, memory) = match self.procs.read(ask) {
+        let (sweep, table, pids, procs, ownership, memory) = match self.procs.read(ask) {
             Ok(answer) => {
                 self.split.coalition_ids = answer.ids;
                 (
                     answer.sweep,
+                    answer.table,
                     answer.pids,
                     None,
                     answer.ownership,
                     answer.memory,
                 )
             }
-            Err(stall) => (None, (None, None), stall, None, None),
+            Err(stall) => (None, None, (None, None), stall, None, None),
         };
         match (procs, self.procs_stalled) {
             (Some(stall), None) => {
@@ -3970,6 +4006,7 @@ impl Reader {
             .collect();
         ProcReads {
             sweep,
+            table,
             pids,
             stalled,
             ownership,
@@ -4076,6 +4113,7 @@ impl Reader {
         let scheduling = self.sweep_reads_scheduling(req);
         let ProcReads {
             sweep,
+            table,
             pids,
             stalled,
             ownership,
@@ -4169,16 +4207,19 @@ impl Reader {
         if let Some(CoalRead { read, .. }) =
             coalitions.filter(|_| live_accounting && sweep.is_some())
         {
-            self.split.fill(&mut sample, read, now, split);
+            self.split
+                .fill(&mut sample, read, now, split, table.as_ref());
         } else {
             // Every whole reading, a jobs-only edge's too: `sys` answers a
             // pull from whichever whole reading is fresh, so one read without
             // births would leave its ages unread on macOS.
-            self.split.births(&mut sample, now);
+            self.split.births(&mut sample, now, table.as_ref());
             if req.deck {
                 sample.timeline = self.split.timeline();
             }
         }
+        // The births were the table's one reader.
+        drop(table);
         // Preserve the existing core/process capture window: optional native
         // discovery can be slow, so it runs only after those readings finish.
         self.attach_hardware(&mut sample, req);

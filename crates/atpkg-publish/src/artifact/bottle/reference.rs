@@ -196,7 +196,7 @@ fn native_plan(request: &BottleRequest, host: Option<Triple>) -> Result<bool> {
     ))
 }
 
-fn native_host() -> Option<Triple> {
+pub(super) fn native_host() -> Option<Triple> {
     (aterm_uds::process::translation() == aterm_uds::process::Translation::Native)
         .then(Triple::host)
         .flatten()

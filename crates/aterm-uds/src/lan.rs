@@ -28,12 +28,14 @@ pub mod broker;
 mod classify;
 pub mod direct;
 pub mod here;
+pub mod scope;
 pub mod wire;
 
 #[cfg(target_os = "macos")]
 pub use arrivals::Arrivals;
 pub use broker::{BrokerHello, Events, Registration};
 pub use classify::{is_local_name, is_local_network, on_attached_subnet};
+pub use scope::{SCOPE_PACE, ScopeAnswer, ScopeDuty, ScopePlan};
 pub use wire::{Advert, Event, Instance, SpotlightStores, StoreBound, StoreVolume, Target};
 
 pub mod install;
@@ -472,6 +474,20 @@ pub fn spotlight_stores() -> Result<SpotlightStores, LanError> {
             std::io::ErrorKind::Unsupported,
             "Spotlight's stores exist on macOS only",
         )))
+    }
+}
+
+/// Ask the root LAN broker to exclude from Spotlight this account's own top-level home folders
+/// that setup excludes and root's receipt does not name yet ([`wire::Request::ScopeHome`]): on
+/// macOS the broker at [`dialled_socket`], never this process's own direct path; elsewhere
+/// [`ScopeAnswer::Unserved`], Spotlight being macOS's. The broker decides everything from what
+/// root reads (`docs/DESIGN-lan-broker-2026-11-05.md` §2), so the request names nothing.
+#[must_use]
+pub fn scope_home() -> ScopeAnswer {
+    if cfg!(target_os = "macos") {
+        broker::scope_home()
+    } else {
+        ScopeAnswer::Unserved("Spotlight is macOS's".to_owned())
     }
 }
 

@@ -13,9 +13,11 @@
 //! resumed here as a launch resumes it, offering nothing again, at the screen, holding the window
 //! lock so the job gives way at its next stage boundary. A take-up that ends with the same run
 //! still owed waits the run's own pause (`aterm_cli::macos_doctor::PASS_RETRY_SCHEDULE`), longer
-//! after each in a row, so nothing spins and nothing is given up. It raises nothing a launch would
+//! after each in a row. A read that fails is checked again on the first pause of that schedule,
+//! while any pause before resuming the same run still holds. It raises nothing a launch would
 //! not: no window, no offer, no prompt.
 
+use aterm_cli::macos_doctor::PASS_RETRY_SCHEDULE;
 use std::time::{Duration, Instant};
 
 /// What the window reads and does, which a test fakes.
@@ -41,8 +43,8 @@ pub(super) trait TakeUp {
 /// The longest wait between two looks with no change in the records heard.
 pub(super) const LOOK_AGAIN: Duration = Duration::from_secs(60 * 60);
 
-/// What the take-ups left: the run the last one left still owed, how many in a row did so, and
-/// when the next of that run may go.
+/// What the take-ups left: the last attempted revision whose completion is unconfirmed, the
+/// number of attempts in a row, and when the next of that run may go.
 #[derive(Debug, Default)]
 pub(super) struct Taken {
     revision: Option<u64>,
@@ -57,6 +59,7 @@ pub(super) fn look(host: &mut impl TakeUp, taken: &mut Taken) -> Duration {
     if host.setup_here() {
         return LOOK_AGAIN;
     }
+    let read_again = PASS_RETRY_SCHEDULE.after(1);
     let revision = match host.resumable() {
         Ok(Some(revision)) => revision,
         Ok(None) => {
@@ -66,9 +69,10 @@ pub(super) fn look(host: &mut impl TakeUp, taken: &mut Taken) -> Duration {
         Err(why) => {
             host.say(format!(
                 "first-run setup: this window could not read whether a run is owed: {why}; it \
-                 reads again at the records' next change"
+                 reads again within {}s",
+                read_again.as_secs()
             ));
-            return LOOK_AGAIN;
+            return read_again;
         }
     };
     let now = host.now();
@@ -83,28 +87,38 @@ pub(super) fn look(host: &mut impl TakeUp, taken: &mut Taken) -> Duration {
          here"
     ));
     host.resume();
-    match host.resumable() {
-        Ok(Some(after)) if after == revision => {
-            taken.tries = if taken.revision == Some(revision) {
-                taken.tries.saturating_add(1)
-            } else {
-                1
-            };
-            taken.revision = Some(revision);
-            let pause = aterm_cli::macos_doctor::PASS_RETRY_SCHEDULE.after(taken.tries);
-            taken.due = Some(host.now() + pause);
-            host.say(format!(
-                "first-run setup: run {revision} still owes a pass after this window took it up; \
-                 it goes on here again in {}s at the soonest",
-                pause.as_secs()
-            ));
-            pause
-        }
-        _ => {
+    let unread = match host.resumable() {
+        Ok(Some(after)) if after == revision => None,
+        Ok(after) => {
             *taken = Taken::default();
-            LOOK_AGAIN
+            // A newer revision already owes a pass. Its notification may have coalesced
+            // into the one that woke this look.
+            return after.map_or(LOOK_AGAIN, |_| Duration::ZERO);
         }
+        Err(why) => Some(why),
+    };
+    taken.tries = if taken.revision == Some(revision) {
+        taken.tries.saturating_add(1)
+    } else {
+        1
+    };
+    taken.revision = Some(revision);
+    let pause = PASS_RETRY_SCHEDULE.after(taken.tries);
+    taken.due = Some(host.now() + pause);
+    if let Some(why) = unread {
+        host.say(format!(
+            "first-run setup: this window could not confirm the outcome of run {revision}: \
+             {why}; it reads again within {}s",
+            read_again.as_secs()
+        ));
+        return read_again;
     }
+    host.say(format!(
+        "first-run setup: run {revision} still owes a pass after this window took it up; \
+         it goes on here again in {}s at the soonest",
+        pause.as_secs()
+    ));
+    pause
 }
 
 /// The window's take-up: a [`look`] at once, then after every change of the records heard and at
@@ -118,7 +132,7 @@ pub(super) fn take_up_with(host: &mut impl TakeUp) -> ! {
         host.wait(if watching {
             within
         } else {
-            within.min(aterm_cli::macos_doctor::PASS_RETRY_SCHEDULE.after(1))
+            within.min(PASS_RETRY_SCHEDULE.after(1))
         });
     }
 }

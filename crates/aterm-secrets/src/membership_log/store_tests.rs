@@ -133,6 +133,7 @@ fn byte_counters_at_a_full_held_store() {
             body: Body::Name {
                 name: format!("w{i}"),
             },
+            statement: None,
         }
         .sign(&w_junk, inc_junk)
         .expect("signed")
@@ -263,6 +264,7 @@ fn stream_codec_and_store_converge_across_orders_and_refuse_corruption() {
         body: Body::Name {
             name: "squatter".to_owned(),
         },
+        statement: None,
     }
     .sign(&w_other, inc_other)
     .expect("signed");
@@ -312,6 +314,7 @@ fn stream_codec_and_store_converge_across_orders_and_refuse_corruption() {
         body: Body::Name {
             name: "forger".to_owned(),
         },
+        statement: None,
     }
     .sign(&w_other, inc_other)
     .expect("signed");
@@ -336,6 +339,7 @@ fn unseated(network: RecordId, tag: u8, i: usize) -> Record {
         body: Body::Name {
             name: format!("junk-{i}"),
         },
+        statement: None,
     }
     .sign(&[tag; 32], [tag; 16])
     .expect("signed")
@@ -496,6 +500,7 @@ fn a_peer_stream_with_a_record_this_store_refuses_still_brings_the_rest() {
         body: Body::Name {
             name: "stray".to_owned(),
         },
+        statement: None,
     }
     .sign(&wx, incx)
     .expect("signed");
@@ -663,6 +668,7 @@ fn the_frontier_lists_the_deepest_head_first() {
                 body: Body::Name {
                     name: "fork".to_owned(),
                 },
+                statement: None,
             }
             .sign(&w2, inc2)
             .expect("fork")
@@ -783,6 +789,7 @@ fn missing_parents_at_a_full_held_store() {
                 body: Body::Name {
                     name: format!("junk-{i}"),
                 },
+                statement: None,
             }
             .sign(&w_junk, inc_junk)
             .expect("signed")
@@ -849,6 +856,7 @@ fn only_causally_complete_records_travel() {
         body: Body::Name {
             name: "orphan".to_owned(),
         },
+        statement: None,
     }
     .sign(&w_junk, inc_junk)
     .expect("signed");
@@ -894,6 +902,7 @@ fn waiting_records_stop_at_max_waiting() {
             body: Body::Name {
                 name: format!("host-{i}"),
             },
+            statement: None,
         };
         let record = draft.sign(&w1, inc1).expect("signed");
         assert_eq!(
@@ -910,6 +919,7 @@ fn waiting_records_stop_at_max_waiting() {
         body: Body::Name {
             name: "overflow".to_owned(),
         },
+        statement: None,
     }
     .sign(&w1, inc1)
     .expect("signed");
@@ -1034,6 +1044,7 @@ fn complete_inventory_and_complete_bytes_omit_waiting_and_unrooted_records() {
         body: Body::Name {
             name: "orphan".to_owned(),
         },
+        statement: None,
     }
     .sign(&w_junk, inc_junk)
     .expect("signed");
@@ -1127,6 +1138,7 @@ fn oversized_waiting_records_stay_within_stream_bound_and_yield_to_complete_reco
                     salt: [i as u8; 32],
                     ciphertext: ciphertext.clone().into(),
                 },
+                statement: None,
             }
             .sign(&w_junk, inc_junk)
             .expect("waiting put")
@@ -1377,6 +1389,7 @@ fn the_readable_part_of_a_stream_leaves_out_what_descends_from_a_record_this_bui
         body: Body::Name {
             name: "y".to_owned(),
         },
+        statement: None,
     }
     .sign(&writer, incarnation)
     .expect("signed");

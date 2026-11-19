@@ -64,7 +64,7 @@ fn glow_cfg_words_hashes_every_field() {
     } else {
         crate::cursor_glow::GlowStyle::Fire
     };
-    let mutants: [(&str, GlowConfig); 18] = [
+    let mutants: [(&str, GlowConfig); 16] = [
         (
             "enabled",
             GlowConfig {
@@ -167,20 +167,6 @@ fn glow_cfg_words_hashes_every_field() {
             "head_dx",
             GlowConfig {
                 head_dx: base.head_dx + 0.25,
-                ..base
-            },
-        ),
-        (
-            "ribbon_tall",
-            GlowConfig {
-                ribbon_tall: !base.ribbon_tall,
-                ..base
-            },
-        ),
-        (
-            "ribbon_flat",
-            GlowConfig {
-                ribbon_flat: !base.ribbon_flat,
                 ..base
             },
         ),

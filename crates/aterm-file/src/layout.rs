@@ -73,6 +73,18 @@ impl Root {
         self.face_dir(name).join(format!("{}.{ext}", name.leaf()))
     }
 
+    /// The generated TSV that includes this machine's queued and held writes.
+    #[must_use]
+    pub fn local_tsv(&self, name: &Name) -> PathBuf {
+        self.face(name, "local.tsv")
+    }
+
+    /// The refresh lock doubles as the durable request to maintain the local TSV.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn local_lock(&self, name: &Name) -> PathBuf {
+        self.sidecar(name, "local.lock")
+    }
+
     /// The folder `name`'s state is in.
     #[must_use]
     pub fn state_dir(&self, name: &Name) -> PathBuf {

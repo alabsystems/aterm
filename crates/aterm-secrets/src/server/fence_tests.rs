@@ -262,7 +262,21 @@ fn vault_fence_format_two_and_format_one_exchange_nothing() {
         crate::transport::fetch_records_sync(&url(&running), &[], None, HANG, None, one).is_err(),
         "a format-1 puller of this build takes nothing from it"
     );
+    // A build that reads no format 2 serves no record of a marked store, whatever is asked
+    // (`server::unread_format`); one that reads it serves a format-2 GET its base.
+    let refused = get(&running, &[], Some(&two.value()));
+    assert_eq!(refused.status, 500, "{}", refused.head);
+    assert!(refused.records().is_empty());
+    let mark = format_mark_in(root.path());
+    inject(
+        mark.path(),
+        Faults {
+            follows: true,
+            ..Faults::default()
+        },
+    );
     let served = get(&running, &[], Some(&two.value()));
+    inject(mark.path(), Faults::default());
     assert_eq!(served.status, 200, "control: {}", served.head);
     assert_eq!(served.records().len(), fixture::BASE, "control");
     assert_eq!(held(&running), fixture::BASE, "nothing posted was taken");
@@ -365,8 +379,10 @@ fn vault_fence_a_dark_build_states_version_one_byte_for_byte() {
     format_mark_in(root.path())
         .store(FORMAT_TWO)
         .expect("the server's mark");
+    // Its build reads no format 2, so it serves no record of the marked store (a `500`), and
+    // states the mark's format beside the refusal.
     let marked = get(&running, &[], Some(&marked.value()));
-    assert_eq!(marked.status, 200, "{}", marked.head);
+    assert_eq!(marked.status, 500, "{}", marked.head);
     assert!(
         marked
             .header(crate::transport::RECORDS_BOUND_HEADER)

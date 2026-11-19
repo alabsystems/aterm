@@ -444,7 +444,7 @@ impl Default for SupervisorConfig {
             memory_ceiling: MemoryCeiling::Auto,
             upgrade: true,
             upgrade_ask: false,
-            human_grace_s: 120,
+            human_grace_s: DEFAULT_HUMAN_GRACE_S,
             occupancy: Occupancy::Observe,
             facts: true,
             stuck_break_note: true,
@@ -1812,6 +1812,9 @@ pub fn switch_word(value: &str) -> Option<bool> {
 
 /// `[harness] autocompact_offer`'s default size, in kilo-tokens.
 pub const AUTOCOMPACT_DEFAULT_K: u32 = 400;
+
+/// `[harness] human_grace_s`'s default: two minutes.
+pub const DEFAULT_HUMAN_GRACE_S: u32 = 120;
 
 fn autocompact_size(value: &str) -> Option<Option<u32>> {
     let v = value.trim().to_ascii_lowercase();

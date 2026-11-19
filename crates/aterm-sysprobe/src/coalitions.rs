@@ -3,7 +3,7 @@
 
 //! macOS kernel resource coalitions: each process's coalition id, and every coalition's counters.
 
-use std::collections::HashMap;
+use aterm_hash::FxHashMap;
 
 use crate::procs::ticks_to_ns;
 
@@ -144,12 +144,12 @@ pub fn decode_footprint(raw: &[u64; USAGE_WORDS]) -> Option<u64> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoalitionIds {
     /// Each pid's kept id: the version it was read under, the id, and the sweep that last asked.
-    kept: HashMap<u32, (i32, u64, u64)>,
+    kept: FxHashMap<u32, (i32, u64, u64)>,
     /// Each pid's kept whole name ([`Self::name`]).
-    names: HashMap<u32, KeptName>,
+    names: FxHashMap<u32, KeptName>,
     /// Each pid's kept generation facts ([`Self::generation`]): the version they were read under,
     /// the facts, and the sweep that kept them.
-    generations: HashMap<u32, (i32, Generation, u64)>,
+    generations: FxHashMap<u32, (i32, Generation, u64)>,
     /// The sweeps begun.
     sweep: u64,
 }

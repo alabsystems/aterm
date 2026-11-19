@@ -1527,11 +1527,7 @@ impl Registry {
             appended.insert(request, (receipt.id, command));
             rolled.records += 1;
         }
-        if old_view.ops.iter().any(|op| {
-            op.changes
-                .iter()
-                .any(|change| change.collection == typed::SCHEMA)
-        }) {
+        if old_view.state.schema_written {
             if rolled.records > 0 {
                 log = Log::read_with(&session, &store, to_descriptor.scope, to.decoder())?;
                 appended.clear();

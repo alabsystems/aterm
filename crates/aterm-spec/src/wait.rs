@@ -78,8 +78,8 @@ pub enum Unanswered {
     Guard,
 }
 
-/// How often [`within_while_working`] reads the process tree: a sweep of the process table,
-/// so not once a poll.
+/// How often [`within_while_working`] reads the process tree: a read of each of its processes (a
+/// whole-table sweep off macOS, [`aterm_sysprobe::procs::process_tree`]), so not once a poll.
 const WORK_TICK: Duration = Duration::from_millis(500);
 
 /// Polls `probe` every `gap` until it returns `Some`, for as long as process `root` works:

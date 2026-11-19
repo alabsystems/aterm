@@ -189,9 +189,9 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "`hand=<turn:<id>[:<holder>]|lease:<holder>|driving:<sid>|-> hand_pid= \
                      level=<quiet|note|story|driving|driven|attention|limited|hold> story= why= \
-                     needs=<frozen|stopped|stalled|login|memory|wall|ask|approval|question|-> \
-                     needs_n= hold_by=<person|remote|local|bridge|-> typed_by=<pct|-> typed_ms= \
-                     path=<frozen|live>`",
+                     needs=<frozen|stopped|stalled|login|memory|wall|unsupervised|ask|approval|\
+                     question|-> needs_n= hold_by=<person|remote|local|bridge|-> typed_by=<pct|-> \
+                     typed_ms= path=<frozen|live>`",
                 ),
                 para(
                     "`needs_n=` counts a harness's needs (`meta set harness_needs`) and any its \
@@ -359,6 +359,16 @@ pub(crate) const PAGE: Page = Page {
                      that names none, `-` with no claim or a contract 4 claim granted nothing) and \
                      the claim's revision, which a scoped harness's `if-supervisor-revision=` names \
                      (`help key`)",
+                ),
+                row(
+                    "codex_adoption=",
+                    "A local instance reading a sampled, proven foreground Codex session gets \
+                     `codex_adoption=matched|differs|unknown`, `codex_running_build=`, \
+                     `codex_selected_build=` and `codex_sampled_ms=` (Unix milliseconds). \
+                     A dash means the corresponding package could not be identified. \
+                     After two minutes without a new sample, both builds read as unknown \
+                     and the timestamp identifies the last observation. \
+                     `timeline` records each changed observation as a codex-adoption row.",
                 ),
                 row(
                     "supervisor_act=",

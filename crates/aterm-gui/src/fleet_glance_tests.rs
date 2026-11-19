@@ -4,7 +4,7 @@
 //! Tests for the menu-bar fleet glance.
 
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 fn peer(label: &str, header: &[(&str, &str)], rows: &[&[(&str, &str)]]) -> String {
     let object = |pairs: &[(&str, &str)]| {
@@ -4438,4 +4438,208 @@ fn a_rows_activity_word_and_its_need_are_read_as_it_sent_them() {
     );
     let without = reply_with(&now, "session", "needs", None);
     assert_eq!(agent_of(&without).1, None, "no needs= key");
+}
+
+/// A deck's snapshot of a light Mac: 2.4 of 12 cores busy, 20000 of 65536 MiB in use, its GPU
+/// 5% busy of 38 cores, 253000 of a 953000 MiB home volume used, 81234 kbit/s in and 2345 out
+/// on a 10 Gbit/s link (the Network row's 10 s means; its last sample interval spiked far
+/// higher), a run queue of 3 threads, no swap traffic and no memory pressure, its disk watch
+/// cleaning below 30 GiB free.
+#[cfg(unix)]
+fn deck_snapshot() -> aterm_vitals::Snapshot {
+    use aterm_vitals::runq::{QueueBasis, RunQueue};
+    use aterm_vitals::{
+        DiskFacts, GpuView, LinkRates, LinkSample, MemSample, MemView, NetView, Pressure, Resource,
+        ResourceView, Series, Snapshot,
+    };
+    const MIB: f64 = 1_048_576.0;
+    let mut snap = Snapshot::default();
+    for (resource, now, capacity) in [
+        (Resource::Cpu, 2.4, 12.0),
+        (Resource::Gpu, 0.05, 1.0),
+        (Resource::Memory, 20_000.0 * MIB, 65_536.0 * MIB),
+        (Resource::Disk, 253_000.0 * MIB, 953_000.0 * MIB),
+    ] {
+        snap.resources[resource.index()] = ResourceView {
+            now: Some(now),
+            capacity: Some(capacity),
+            ..ResourceView::default()
+        };
+    }
+    snap.gpu = Some(GpuView {
+        cores: Some(38),
+        ..GpuView::default()
+    });
+    snap.mem = Some(MemView {
+        sample: MemSample {
+            pressure: Pressure::Normal,
+            ..MemSample::default()
+        },
+        ..MemView::default()
+    });
+    snap.resources[Resource::Network.index()] = ResourceView {
+        now: Some(81_234.0 * 1_000.0 / 8.0),
+        second: Some(Series {
+            now: Some(2_345.0 * 1_000.0 / 8.0),
+            ..Series::default()
+        }),
+        ..ResourceView::default()
+    };
+    snap.net = Some(NetView {
+        rates: Some(LinkRates {
+            rx_bps: 900_000_000.0,
+            tx_bps: 700_000_000.0,
+            ..LinkRates::default()
+        }),
+        ..NetView::default()
+    });
+    snap.facts.link = Some(LinkSample {
+        rate_bps: Some(10_000_000_000),
+        ..LinkSample::default()
+    });
+    snap.facts.load1 = Some(3.0);
+    snap.facts.queue = Some(RunQueue {
+        threads: 3.0,
+        basis: QueueBasis::Runnable,
+    });
+    snap.facts.swap_rate = Some(0.0);
+    snap.facts.disk = Some(DiskFacts {
+        floor: Some(30 << 30),
+        emergency: Some(5 << 30),
+        ..DiskFacts::default()
+    });
+    snap
+}
+
+/// FP-10: THIS MAC'S OWN READING IS ITS DECK'S ROWS, its load the deck's own dial, and a row the
+/// deck has not read is unread, never zero; folded, it is this Mac's column whatever its survey
+/// answer's look said. CONTROLS: a load or a pair read from a snapshot that holds none, a load
+/// from the GPU alone, a network rate from one sample interval and not the row's mean, a disk
+/// verdict left unread where only the emergency line is in force, and this Mac's column drawn
+/// from its answer.
+#[cfg(unix)]
+#[test]
+fn this_macs_own_reading_is_its_decks_rows_and_an_unread_row_is_unread_never_zero() {
+    use aterm_db::fleet::read::{Limits, Load};
+    use aterm_vitals::{Resource, ResourceView, Snapshot, Strain};
+
+    let snap = deck_snapshot();
+    let own = super::own::own_of(&snap);
+    let look = &own.look;
+    assert_eq!((look.cores, look.cpu_busy_x100), (Some(12), Some(240)));
+    assert_eq!(
+        (look.mem_used_mb, look.mem_total_mb),
+        (Some(20_000), Some(65_536))
+    );
+    assert_eq!((look.gpu_busy_pct, look.gpu_cores), (Some(5), Some(38)));
+    assert_eq!(
+        (look.disk_total_mb, own.home_free_mb),
+        (Some(953_000), Some(700_000))
+    );
+    assert_eq!(
+        (look.net_rx_kbps, look.net_tx_kbps, look.net_link_kbps),
+        (Some(81_234), Some(2_345), Some(10_000_000))
+    );
+    assert_eq!(
+        look.limits,
+        Limits {
+            cpu: Some(false),
+            mem: Some(false),
+            disk: Some(false),
+            gpu: Some(false),
+        }
+    );
+    let dial = Strain::of(&snap).level.expect("the dial reads");
+    assert_eq!(
+        look.load,
+        Some(Load {
+            level_x100: (f64::from(dial) * 100.0).round() as u64,
+            over_x100: Some(0),
+        })
+    );
+    assert_eq!(look.load.map(|load| load.level_x100), Some(20));
+
+    // No cleaning line in force on the home volume: the emergency line judges it.
+    let mut full = deck_snapshot();
+    full.resources[Resource::Disk.index()].now = Some(950_000.0 * 1_048_576.0);
+    if let Some(disk) = full.facts.disk.as_mut() {
+        disk.floor = None;
+    }
+    assert_eq!(
+        super::own::own_of(&full).look.limits.disk,
+        Some(true),
+        "3000 MiB under 5 GiB"
+    );
+
+    // Nothing read: every figure unread, no load, no verdict.
+    let empty = super::own::own_of(&Snapshot::default());
+    assert_eq!(empty.look.load, None);
+    assert_eq!(empty.look.limits, Limits::UNREAD);
+    assert_eq!(
+        (
+            empty.look.cores,
+            empty.look.cpu_busy_x100,
+            empty.look.mem_used_mb
+        ),
+        (None, None, None)
+    );
+    assert_eq!((empty.look.gpu_busy_pct, empty.home_free_mb), (None, None));
+    // The GPU alone read: its pair, and no load.
+    let mut gpu_alone = deck_snapshot();
+    gpu_alone.resources[Resource::Cpu.index()] = ResourceView::default();
+    let gpu_alone = super::own::own_of(&gpu_alone);
+    assert_eq!(gpu_alone.look.gpu_busy_pct, Some(5));
+    assert_eq!(
+        (gpu_alone.look.load, gpu_alone.look.cpu_busy_x100),
+        (None, None)
+    );
+
+    // Folded beside a read whose own answer says no look: this Mac's column is the deck's, read
+    // at each fold, so it lapses only where the deck stopped reading.
+    let folder = aterm_db::fleet::Folder::new();
+    let deck_at = Arc::new(AtomicU64::new(1_000));
+    let read_at = Arc::clone(&deck_at);
+    assert!(folder.install_own_reader(Box::new(move || {
+        Some((own.clone(), read_at.load(Ordering::SeqCst)))
+    })));
+    let own_answer =
+        peer("pid 1", &pairs(&header("own-node")), &[QUIET]).replace("\"fleet\":true,", "");
+    offer_sightings_to(&folder, Some((&format!("[{own_answer}]"), 1_000)));
+    let me_at = |now_ms: u64| {
+        let next = folder.fold_now(now_ms);
+        let tables = folder.tables().value;
+        let me = tables
+            .machines
+            .iter()
+            .find(|row| row.machine == "self")
+            .expect("this Mac is a row")
+            .clone();
+        (me, next)
+    };
+    let (me, next) = me_at(2_000);
+    assert_eq!(
+        me.load.map(|at| (at.v.level_x100, at.at_ms)),
+        Some((20, 1_000))
+    );
+    assert_eq!(me.cpu.used.map(|at| at.v), Some(240));
+    assert_eq!(me.disk_free_mb.map(|at| at.v), Some(700_000));
+    assert_eq!(
+        me.sessions.map(|at| at.v),
+        Some(1),
+        "its sessions are its answer's"
+    );
+    assert_eq!(
+        next,
+        Some(1_000 + 180_001),
+        "the fold names when the reading goes stale"
+    );
+    // At that instant a deck that stopped reading leaves the column unread; one that read again
+    // keeps it, with no offer between.
+    assert_eq!(me_at(181_001).0.load, None);
+    deck_at.store(181_000, Ordering::SeqCst);
+    assert_eq!(
+        me_at(181_001).0.load.map(|at| at.at_ms),
+        Some(181_000),
+        "the deck's newer reading"
+    );
 }

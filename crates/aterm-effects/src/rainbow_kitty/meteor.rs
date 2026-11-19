@@ -14,7 +14,7 @@ use aterm_render::{
     ribbon_beam_v,
 };
 
-use crate::cursor_glow::{BandPx, Geom, InkRole, band_row, night_rgb};
+use crate::cursor_glow::{BandPx, Geom, band_row, night_rgb};
 use crate::effect_util::{lerp_rgb, push_fx_quad, push_fx_rect, push_twinkle_star};
 use crate::spectrum::{
     SPECTRUM_STOPS, spectrum, spectrum_snap, spectrum_snap_index, spectrum_stop,
@@ -3052,12 +3052,7 @@ fn build_stations(
             (
                 Some(table),
                 0.0,
-                Some(PaperTheme::new(
-                    table,
-                    ctx.cfg.theme_fg,
-                    ctx.cfg.theme_bg,
-                    InkRole::OverText,
-                )),
+                Some(PaperTheme::new(table, ctx.cfg.theme_fg, ctx.cfg.theme_bg)),
             )
         }
     } else {

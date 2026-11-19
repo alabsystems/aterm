@@ -3965,7 +3965,7 @@ pub(crate) fn row_height() -> f32 {
 }
 
 /// How tall the grid's group line and its type line stand, over and under its header line.
-fn head_line() -> f32 {
+pub(crate) fn head_line() -> f32 {
     22.0 * scale().max(1.0)
 }
 
@@ -4104,7 +4104,7 @@ fn field(key: &str, label: &str, input: &TextInputState, view: &TablesViewState)
 }
 
 /// `n rows`, `1 row`, `n of m rows`.
-fn rows_words(shown: usize, all: usize) -> String {
+pub(crate) fn rows_words(shown: usize, all: usize) -> String {
     let rows = if all == 1 { "row" } else { "rows" };
     if shown == all {
         format!("{all} {rows}")

@@ -1228,6 +1228,7 @@ fn github_releases_block_applies() {
         name_skip: Some(("^api".into(), "i".into())),
         source: GhRelSource::TagName,
         pre_capture: None,
+        first_only: false,
         then: GhRelThen::Tr("-".into(), ".".into()),
         fallback_tag: None,
         blank_emit_local: false,
@@ -1974,6 +1975,175 @@ fn empty_edge_splits_are_pinned() {
     assert_eq!(
         extract_groups(&re, "154"),
         [Some("15".to_string()), Some("4".to_string())]
+    );
+}
+
+/// r494 fixtures: popo's JSONP dig match, hy-rpe2's
+/// scan-max optional date, and keychron's bracket
+/// hop final reduce to data.
+#[test]
+fn r494_page_json_dig_scanmax_bracket_hop() {
+    use crate::abrew::formula::{HopFinalPart, JsonKey, PageShape};
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    let spec = parse(
+        "cask \"popo\" do\n  arch arm: \"arm\", intel: \"intel\"\n\n  on_arm do\n    version \"4.37.1,1794497917623\"\n    sha256 \"e4843d9d6c35bdb0c7bc438bc7dc5ae69e299bee3dbd8ec1929252797b7504e5\"\n  end\n  on_intel do\n    version \"4.37.1,1794498421653\"\n    sha256 \"c0fae2575a5d687700c8986a306e6ab8a8ddad59dbf87eb2e9bddd06f6032cf8\"\n  end\n\n  url \"https://popo.netease.com/file/popomac/POPO-setup_#{version.csv.first}_#{arch}_prod_#{version.csv.second}.dmg\"\n  name \"NetEase POPO\"\n  desc \"Instant messaging platform\"\n  homepage \"https://popo.netease.com/\"\n\n  livecheck do\n    url \"https://popo.netease.com/api/open/jsonp/check_version?device=4&callback=callback\"\n    regex(/POPO[._-]setup[._-]v?(\\d+(?:\\.\\d+)+)[._-]#{arch}[._-]prod[._-](\\d+)\\.dmg/i)\n    strategy :page_match do |page, regex|\n      json_regex = /callback\\((.+)\\)/i\n\n      match = page.match(json_regex)\n      next if match.blank?\n\n      json = Homebrew::Livecheck::Strategy::Json.parse_json(match[1])\n      match = json.dig(\"data\", \"#{arch}Url\")&.match(regex)\n      next if match.blank?\n\n      \"#{match[1]},#{match[2]}\"\n    end\n  end\n\n  depends_on :macos\n\n  app \"popo_mac.app\"\n\n  uninstall quit: \"com.netease.game.popo\"\n\n  zap trash: [\n    \"~/Library/Application Support/com.netease.game.popo\",\n    \"~/Library/Application Support/Netease/Popo\",\n    \"~/Library/Caches/com.netease.game.popo\",\n    \"~/Library/Containers/com.netease.game.popo\",\n    \"~/Library/HTTPStorages/com.netease.game.popo\",\n    \"~/Library/Preferences/com.netease.game.popo.plist\",\n    \"~/Library/Saved Application State/com.netease.game.popo.savedState\",\n    \"~/Library/WebKit/com.netease.game.popo\",\n  ]\nend\n",
+    );
+    let PageShape::MatchJsonDigMatch {
+        cap, path, parts, ..
+    } = &spec.page_block.as_ref().unwrap().shape
+    else {
+        panic!("popo shape");
+    };
+    assert_eq!(*cap, 1);
+    assert_eq!(path.len(), 2);
+    assert!(matches!(path[0], JsonKey::Key(ref k) if k == "data"));
+    assert_eq!(
+        parts,
+        &[
+            HopFinalPart::Cap(1),
+            HopFinalPart::Lit(",".to_string()),
+            HopFinalPart::Cap(2)
+        ]
+    );
+    let spec = parse(
+        "cask \"hy-rpe2\" do\n  version \"1.2.9,2020\"\n  sha256 :no_check\n\n  url \"https://hy-plugins.com/wp-content/uploads#{\"/#{version.csv[1..].join(\"/\")}\" if version.csv.length > 1}/HY-RPE2.pkg.zip\"\n  name \"HY-RPE2\"\n  desc \"8 track midi sequencer plugin\"\n  homepage \"https://hy-plugins.com/product/hy-rpewin-mac/\"\n\n  livecheck do\n    url :homepage\n    regex(/v?(\\d+(?:\\.\\d+)+)\\s*\\(/i)\n    strategy :page_match do |page, regex|\n      # Find the highest version from the release notes\n      version = page.scan(regex)\n                    .map { |match| match[0] }\n                    .max_by { |v| Version.new(v) }\n      next unless version\n\n      # Match the date from the file path (if any)\n      path_date = page[%r{(?:/(\\d+(?:/\\d+)*))?/HY-RPE2\\.pkg\\.zip}i, 1]\n\n      path_date ? \"#{version},#{path_date.tr(\"/\", \",\")}\" : version\n    end\n  end\n\n  depends_on :macos\n\n  pkg \"HY-RPE2.pkg\"\n\n  uninstall pkgutil: [\n    \"com.hyplugins.pkg.HY-RPE2-au\",\n    \"com.hyplugins.pkg.HY-RPE2-presets\",\n    \"com.hyplugins.pkg.HY-RPE2-vst2\",\n    \"com.hyplugins.pkg.HY-RPE2-vst3\",\n  ]\n\n  zap trash: \"~/Library/Application Support/HY-Plugins/HY-RPE2.ini\",\n      rmdir: \"~/Library/Application Support/HY-Plugins\"\nend\n",
+    );
+    let PageShape::ScanMaxOptCap { cap, sep, tr, .. } = &spec.page_block.as_ref().unwrap().shape
+    else {
+        panic!("hy-rpe2 shape");
+    };
+    assert_eq!(*cap, 1);
+    assert_eq!(sep, ",");
+    assert_eq!(tr, &Some(("/".to_string(), ",".to_string())));
+    let spec = parse(
+        "cask \"keychron-assistant\" do\n  version \"1.1.6\"\n  sha256 \"19ff27030e2ab17810179931c9d848e039d066b629243b253d8f5ebf9d07040d\"\n\n  url \"https://launcher.keychron.com/static/assist/KeychronAssist-#{version}.dmg\"\n  name \"Keychron Assistant\"\n  desc \"Companion app for Keychron Launcher's Quick Start feature\"\n  homepage \"https://www.keychron.com/blogs/news/how-to-download-and-install-keychron-assist\"\n\n  livecheck do\n    url \"https://launcher.keychron.com/\"\n    regex(/keychronAssistVersion:\\s*[\"']v?(\\d+(?:\\.\\d+)+)[\"']/i)\n    strategy :page_match do |page, regex|\n      js_path = page[/src=[\"']?([^\"' >]*?main[._-]\\h+\\.js)[\"' >]/i, 1]\n      next unless js_path\n\n      js_page = Homebrew::Livecheck::Strategy.page_content(\n        URI.join(\"https://launcher.keychron.com/\", js_path).to_s,\n      )\n      next if (js_content = js_page[:content]).blank?\n\n      js_content[regex, 1]\n    end\n  end\n\n  depends_on :macos\n\n  app \"Keychron-Assistant.app\"\n\n  zap trash: [\n    \"~/Library/Application Support/com.keychron.assist\",\n    \"~/Library/Caches/com.keychron.assist\",\n    \"~/Library/Logs/com.keychron.assist\",\n    \"~/Library/Preferences/com.keychron.assist.plist\",\n  ]\nend\n",
+    );
+    let PageShape::HopScan(hop) = &spec.page_block.as_ref().unwrap().shape else {
+        panic!("keychron shape");
+    };
+    assert_eq!(
+        hop.final_match.as_deref(),
+        Some([HopFinalPart::Cap(1)].as_slice())
+    );
+    // The agreement gate's file URL: a quoted
+    // conditional string with nested interpolation.
+    let c = crate::abrew::tap::parse_cask_rb_as_data(
+        "cask \"x\" do\n  version \"1.2.9,2020\"\n  url \"https://e/uploads#{\"/#{version.csv[1..].join(\"/\")}\" if version.csv.length > 1}/X.zip\"\nend\n",
+        "x",
+    );
+    assert_eq!(c.url, "https://e/uploads/2020/X.zip");
+}
+
+/// r493 fixtures: turtl's multi-line x-mode regex
+/// with an each/break ghrel body and bambu's
+/// regex(on_system_conditional local) spec parse.
+#[test]
+fn r493_ghrel_each_first_and_regex_local() {
+    let spec = crate::abrew::tap::parse_livecheck_block("cask \"turtl\" do\n  version \"0.7.2.6-sqlite-fix\"\n  sha256 \"90085ffb3b97a3c5e6d01313fda6df4f74c7fe1b61b7c1388e54554db79c9a1a\"\n\n  url \"https://github.com/turtl/desktop/releases/download/v#{version}/turtl-osx.zip\"\n  name \"turtl\"\n  desc \"Secure collaborative notebook\"\n  homepage \"https://turtlapp.com/\"\n\n  # A tag using the stable version format is sometimes marked as \"Pre-release\"\n  # on the GitHub releases page, so we have to check releases instead of tags.\n  # Versions with suffixes like `0.7.2.6-sqlite-fix` are also a problem when\n  # using the `Git` strategy, as the suffix is compared alphabetically (so a\n  # newer version may wrongly appear to be older). Newer releases may not\n  # provide a macOS asset, so this uses the `GithubReleases` strategy until\n  # upstream consistently provides macOS files. The regex is currently very\n  # loose and ambiguous because it's not clear what the file name format will\n  # be going forward (after several years without a new version) but we should\n  # tighten it up if/when the format becomes more clear in the future.\n  livecheck do\n    url :url\n    regex(%r{\n      /v?(\\d+(?:\\.\\d+)+[^/]*)/\n      turtl(?:[._-]v?(\\d+(?:\\.\\d+)+.*?))?\n      (?:[._-](?:mac(?:os)?|osx)\\.zip|.*?\\.(?:dmg|pkg))\n    }ix)\n    strategy :github_releases do |json, regex|\n      version = nil\n      json.each do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        release[\"assets\"]&.each do |asset|\n          match = asset[\"browser_download_url\"]&.match(regex)\n          next if match.blank?\n\n          version = if match[2] && match[1] != match[2]\n            \"#{match[2]},#{match[1]}\"\n          else\n            match[1]\n          end\n          break\n        end\n        break if version\n      end\n\n      version\n    end\n  end\n\n  disable! date: \"2026-09-01\", because: :fails_gatekeeper_check\n\n  depends_on :macos\n\n  app \"Turtl.app\"\n\n  zap trash: [\n    \"~/Library/Application Support/Turtl\",\n    \"~/Library/Logs/Turtl\",\n    \"~/Library/Preferences/com.electron.turtl.helper.plist\",\n    \"~/Library/Preferences/com.electron.turtl.plist\",\n    \"~/Library/Saved Application State/com.electron.turtl.savedState\",\n  ]\n\n  caveats do\n    requires_rosetta\n  end\nend\n").unwrap();
+    let block = spec.ghrel_block.as_ref().expect("turtl ghrel");
+    assert!(block.first_only);
+    assert_eq!(spec.regex_flags, "ix");
+    let spec = crate::abrew::tap::parse_livecheck_block("cask \"bambu-studio@beta\" do\n  os macos: \"mac\", linux: \"ubu24\"\n  name_start = on_system_conditional macos: \"Bambu_Studio\", linux: \"BambuStudio\"\n  url_end = on_system_conditional macos: \"dmg\", linux: \"AppImage\"\n  livecheck_regex = on_system_conditional(\n    macos: %r{\n      /\\D*(\\d+(?:\\.\\d+)+[^/]*?)/\n      Bambu[._-]?Studio(?:[._-]mac)?[._-]\n      v?(\\d+(?:\\.\\d+)+)[._-](\\d+)\\.dmg\n    }ix,\n    linux: %r{\n      /\\D*(\\d+(?:\\.\\d+)+[^/]*?)/\n      Bambu[._-]?Studio[._-](?:ubu(?:ntu)?[._-]?(?:\\d+(?:\\.\\d+)*))[._-]\n      v?(\\d+(?:\\.\\d+)+)[._-](\\d+)\\.AppImage\n    }ix,\n  )\n\n  on_macos do\n    version \"02.09.01.70,20261103183404\"\n    sha256 \"e4f42ac1542cb107cb21cbf98717de7b17e735bdb46fd2a18249e30929e3310d\"\n\n    app \"BambuStudio.app\"\n\n    zap trash: [\n      \"/Library/Logs/DiagnosticsReports/BambuStudio*\",\n      \"~/Library/Application Support/BambuStudio\",\n      \"~/Library/Application Support/BambuStudioBeta\",\n      \"~/Library/Caches/com.bambulab.bambu-studio\",\n      \"~/Library/HTTPStorages/com.bambulab.bambu-studio.binarycookies\",\n      \"~/Library/Preferences/com.bambulab.bambu-studio.plist\",\n      \"~/Library/Saved Application State/com.bambulab.bambu-studio.savedState\",\n      \"~/Library/WebKit/com.bambulab.bambu-studio\",\n    ]\n  end\n  on_linux do\n    version \"02.09.01.70,20261103183404\"\n    sha256 \"668dabb1be53c758189ed6bc89935285dea5e0af46216546b1bafd6882e9aff0\"\n\n    depends_on arch: :x86_64\n\n    app_image \"#{name_start}_#{os}-v#{version.csv.first}-#{version.csv.second}.#{url_end}\",\n              target: \"BambuStudio.AppImage\"\n\n    zap trash: \"~/.config/BambuStudio\"\n  end\n\n  url \"https://github.com/bambulab/BambuStudio/releases/download/v#{version.csv.third || version.csv.first}/#{name_start}_#{os}-v#{version.csv.first}-#{version.csv.second}.#{url_end}\"\n  name \"Bambu Studio Beta\"\n  desc \"3D model slicing software for 3D printers, maintained by Bambu Lab\"\n  homepage \"https://bambulab.com/en/download/studio\"\n\n  livecheck do\n    url :url\n    regex(livecheck_regex)\n    strategy :github_releases do |json, regex|\n      json.flat_map do |release|\n        next if release[\"draft\"]\n\n        release[\"assets\"]&.map do |asset|\n          match = asset[\"browser_download_url\"]&.match(regex)\n          next if match.blank?\n\n          (match[2] == match[1]) ? \"#{match[2]},#{match[3]}\" : \"#{match[2]},#{match[3]},#{match[1]}\"\n        end\n      end.compact\n    end\n  end\n\n  conflicts_with cask: \"bambu-studio\"\nend\n").unwrap();
+    assert!(spec.ghrel_block.is_some(), "bambu ghrel");
+    assert_eq!(spec.regex_flags, "ix");
+    assert!(
+        spec.regex
+            .as_deref()
+            .is_some_and(|r| r.contains("Bambu[._-]?Studio")),
+        "bambu regex from local"
+    );
+}
+
+/// r492 fixtures: kdocs' JSON-in-JSON dig match
+/// and the grafx/platinum-notes/linqpad header
+/// hops reduce to data.
+#[test]
+fn r492_json_dig_parse_and_header_hops() {
+    use crate::abrew::formula::{HopPick, JsonKey, JsonShape, PageShape};
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    let spec = parse(
+        "cask \"kdocs\" do\n  version \"3.11.2,1001\"\n  sha256 \"9fe64f666405af7761e2858dcc486fbfb6a3ee58c242122155d989f5446de681\"\n\n  url \"https://qn.cache.wpscdn.cn/kdocs/apk/kdesktopmac/KDocs_#{version.csv.second}_v#{version.csv.first}.dmg\"\n  name \"金山文档\"\n  desc \"Online collaborate editor for Word, Excel and PPT documents\"\n  homepage \"https://www.kdocs.cn/\"\n\n  livecheck do\n    url \"https://www.kdocs.cn/kdg/api/v1/configure?idList=appOfficial\"\n    regex(/kdocs[._-](\\d+(?:\\.\\d+)*)[._-]v?(\\d+(?:\\.\\d+)+)\\.dmg/i)\n    strategy :json do |json, regex|\n      json_string = json.dig(\"data\", \"appOfficial\")\n      next if json_string.blank?\n\n      app_json = Homebrew::Livecheck::Strategy::Json.parse_json(json_string)\n      match = app_json.dig(\"kdesktopMacOfficial\", 0, \"url\")&.match(regex)\n      next if match.blank?\n\n      \"#{match[2]},#{match[1]}\"\n    end\n  end\n\n  depends_on :macos\n\n  app \"金山文档.app\"\n\n  zap trash: [\n    \"~/Library/Preferences/com.kingsoft.kdocs.mac.plist\",\n    \"~/Library/Saved Application State/com.kingsoft.kdocs.mac.savedState\",\n  ]\n\n  caveats do\n    requires_rosetta\n  end\nend\n",
+    );
+    let JsonShape::DigParseMatch { outer, inner, .. } = &spec.json_block.as_ref().unwrap().shape
+    else {
+        panic!("kdocs shape");
+    };
+    assert_eq!(
+        outer,
+        &[
+            JsonKey::Key("data".to_string()),
+            JsonKey::Key("appOfficial".to_string())
+        ]
+    );
+    assert_eq!(
+        inner,
+        &[
+            JsonKey::Key("kdesktopMacOfficial".to_string()),
+            JsonKey::Idx(0),
+            JsonKey::Key("url".to_string())
+        ]
+    );
+    for (text, per_set, lit) in [
+        (
+            "cask \"grafx\" do\n  version \"2.8.3174,71\"\n  sha256 \"b0207e50bddf10e289d03ba2dd52e7fe1c5c5ee32293cc2441eb9e0aac536891\"\n\n  url \"https://pulkomandy.tk/projects/GrafX#{version.major}/downloads/#{version.csv.second}\"\n  name \"GrafX2\"\n  desc \"256 colour painting program\"\n  homepage \"https://pulkomandy.tk/projects/GrafX#{version.major}\"\n\n  # Upstream lists a number of files for macOS on the download page\n  # (https://pulkomandy.tk/projects/GrafX2/downloads) but it's not clear which\n  # variant we should use. The homepage links to grafx2.eu as the \"Main website\"\n  # and its download page links to a specific download for macOS, so we check\n  # that instead. The full version isn't listed on the page, so we have to check\n  # the filename in the `Content-Disposition` header of the download response.\n  # NOTE: The grafx2.eu download page uses an iframe from grafx2.chez.com for\n  # the page content, so we're checking the iframe URL.\n  livecheck do\n    url \"http://grafx2.chez.com/index.php?static3/downloads\"\n    regex(%r{Mac\\s*OS.*?href=.*?/projects/GrafX#{version.major}/downloads/(\\d+)/?[\"' >]}im)\n    strategy :page_match do |page, regex|\n      # Match the ID for the macOS download\n      download_id = page.scan(regex).flatten.max_by { |v| Version.new(v) }\n      next unless download_id\n\n      # Fetch the headers for the download URL\n      merged_headers = Homebrew::Livecheck::Strategy.page_headers(\n        \"https://pulkomandy.tk/projects/GrafX#{version.major}/downloads/#{download_id}\",\n      ).reduce(&:merge)\n\n      # Match the version from the filename in the `Content-Disposition` header\n      version = merged_headers[\"content-disposition\"]&.[](/Grafx\\d+\\.app.*?v?(\\d+(?:\\.\\d+)+)/i, 1)\n      next unless version\n\n      \"#{version},#{download_id}\"\n    end\n  end\n\n  disable! date: \"2026-09-01\", because: :fails_gatekeeper_check\n\n  depends_on :macos\n\n  app \"Grafx#{version.major}.app\"\n\n  zap trash: \"~/Library/Preferences/com.googlecode.grafx2\"\n\n  caveats do\n    requires_rosetta\n  end\nend\n",
+            false,
+            true,
+        ),
+        (
+            "cask \"platinum-notes\" do\n  version \"10.5.0.1256,57\"\n  sha256 :no_check\n\n  url \"https://builds.mixedinkey.com/download/#{version.csv.second}/release/latest?key=public\"\n  name \"Platinum Notes\"\n  desc \"Improve audio quality of music files\"\n  homepage \"https://mixedinkey.com/platinum-notes/\"\n\n  # The version for the latest file can only be found by checking the headers\n  # (`Location` or `Content-Disposition`) of the unversioned URL for the latest\n  # file. This URL includes a numeric ID that varies based on major version and\n  # platform (Mac, Windows).\n  livecheck do\n    url \"https://mixedinkey.com/platinum-notes/download/\"\n    regex(/Platinum(?:%2B|[+._-])Notes(?:%2B|[+._-])v?(\\d+(?:\\.\\d+)+)/i)\n    strategy :page_match do |page, regex|\n      download_id = page[%r{href=\"https://builds\\.mixedinkey\\.com/download/(\\d+)/[^\"]+\">Download for Mac}i, 1]\n      next if download_id.blank?\n\n      Homebrew::Livecheck::Strategy.page_headers(\n        \"https://builds.mixedinkey.com/download/#{download_id}/release/latest?key=public\",\n      )&.map do |headers|\n        match = (headers[\"location\"] || headers[\"content-disposition\"])&.match(regex)\n        next if match.blank?\n\n        \"#{match[1]},#{download_id}\"\n      end\n    end\n  end\n\n  auto_updates true\n  depends_on :macos\n\n  app \"Platinum Notes #{version.major}.app\"\n\n  uninstall quit: \"com.mixedinkey.PlatinumNotes\"\n\n  zap trash: [\n    \"~/Library/Application Support/com.mixedinkey.PlatinumNotes\",\n    \"~/Library/Application Support/Mixedinkey\",\n    \"~/Library/Caches/com.mixedinkey.PlatinumNotes\",\n    \"~/Library/HTTPStorages/com.mixedinkey.PlatinumNotes\",\n    \"~/Library/Preferences/com.mixedinkey.PlatinumNotes.plist\",\n  ]\nend\n",
+            true,
+            false,
+        ),
+        (
+            "cask \"linqpad\" do\n  version \"9.12.5.315170\"\n  sha256 \"7b67e8affbc3c5375dc5aa4a14f36e5a0024e21a595300a4d48af99116c4c9f6\"\n\n  url \"https://cdn.linqpad.net/public/LINQPad#{version.major}.dmg?cache=#{version}\"\n  name \"LINQPad\"\n  desc \".NET LINQ database query tool and code scratchpad\"\n  homepage \"https://www.linqpad.net/\"\n\n  livecheck do\n    url \"https://www.linqpad.net/Download.aspx\"\n    regex(/v?(\\d+(?:\\.\\d+)+)/i)\n    strategy :page_match do |page, regex|\n      file_url = page[/href=[\"']([^\"' >]*?LINQPad[._-]?v?\\d+(?:[._-]Beta)?\\.dmg)/i, 1]\n      next unless file_url\n\n      merged_headers = Homebrew::Livecheck::Strategy.page_headers(\n        URI.join(\"https://www.linqpad.net/\", file_url).to_s,\n      ).reduce(&:merge)\n\n      match = merged_headers[\"location\"]&.match(regex)\n      next if match.blank?\n\n      match[1]\n    end\n  end\n\n  auto_updates true\n  depends_on arch: :arm64\n  depends_on :macos\n\n  app \"LINQPad #{version.major}.app\"\n\n  zap trash: [\n    \"~/Library/Application Support/.LINQPad\",\n    \"~/Library/Application Support/LINQPad\",\n    \"~/Library/Caches/LINQPad#{version.major}.Beta.macos\",\n    \"~/Library/WebKit/LINQPad#{version.major}.Beta.macos\",\n    \"~/LINQPad/Settings\",\n  ]\n\n  caveats do\n    license \"https://www.linqpad.net/eula.txt\"\n  end\nend\n",
+            false,
+            false,
+        ),
+    ] {
+        let spec = parse(text);
+        let PageShape::HeaderHop(hop) = &spec.page_block.as_ref().unwrap().shape else {
+            panic!("header hop shape");
+        };
+        assert_eq!(hop.per_set, per_set);
+        assert_eq!(hop.lit_cap.is_some(), lit);
+    }
+    let spec = parse(
+        "cask \"grafx\" do\n  version \"2.8.3174,71\"\n  sha256 \"b0207e50bddf10e289d03ba2dd52e7fe1c5c5ee32293cc2441eb9e0aac536891\"\n\n  url \"https://pulkomandy.tk/projects/GrafX#{version.major}/downloads/#{version.csv.second}\"\n  name \"GrafX2\"\n  desc \"256 colour painting program\"\n  homepage \"https://pulkomandy.tk/projects/GrafX#{version.major}\"\n\n  # Upstream lists a number of files for macOS on the download page\n  # (https://pulkomandy.tk/projects/GrafX2/downloads) but it's not clear which\n  # variant we should use. The homepage links to grafx2.eu as the \"Main website\"\n  # and its download page links to a specific download for macOS, so we check\n  # that instead. The full version isn't listed on the page, so we have to check\n  # the filename in the `Content-Disposition` header of the download response.\n  # NOTE: The grafx2.eu download page uses an iframe from grafx2.chez.com for\n  # the page content, so we're checking the iframe URL.\n  livecheck do\n    url \"http://grafx2.chez.com/index.php?static3/downloads\"\n    regex(%r{Mac\\s*OS.*?href=.*?/projects/GrafX#{version.major}/downloads/(\\d+)/?[\"' >]}im)\n    strategy :page_match do |page, regex|\n      # Match the ID for the macOS download\n      download_id = page.scan(regex).flatten.max_by { |v| Version.new(v) }\n      next unless download_id\n\n      # Fetch the headers for the download URL\n      merged_headers = Homebrew::Livecheck::Strategy.page_headers(\n        \"https://pulkomandy.tk/projects/GrafX#{version.major}/downloads/#{download_id}\",\n      ).reduce(&:merge)\n\n      # Match the version from the filename in the `Content-Disposition` header\n      version = merged_headers[\"content-disposition\"]&.[](/Grafx\\d+\\.app.*?v?(\\d+(?:\\.\\d+)+)/i, 1)\n      next unless version\n\n      \"#{version},#{download_id}\"\n    end\n  end\n\n  disable! date: \"2026-09-01\", because: :fails_gatekeeper_check\n\n  depends_on :macos\n\n  app \"Grafx#{version.major}.app\"\n\n  zap trash: \"~/Library/Preferences/com.googlecode.grafx2\"\n\n  caveats do\n    requires_rosetta\n  end\nend\n",
+    );
+    let PageShape::HeaderHop(hop) = &spec.page_block.as_ref().unwrap().shape else {
+        unreachable!()
+    };
+    assert_eq!(hop.pick, HopPick::ScanMax);
+    assert_eq!(hop.header, "content-disposition");
+}
+
+/// r489 fixture: eclipse-ide's label-max page hop
+/// reduces to data.
+#[test]
+fn r489_json_list_max_page_hop() {
+    use crate::abrew::formula::{JsonHopPart, JsonKey, JsonShape};
+    let spec = crate::abrew::tap::parse_livecheck_block("cask \"eclipse-ide\" do\n  arch arm: \"aarch64\", intel: \"x86_64\"\n\n  version \"4.41,2026-09\"\n  sha256 arm:   \"940fa9fe7feee5d3cbb3aff3904944d81a5fadbefc48d069881f7e5073e5ebd1\",\n         intel: \"f23deb3cf27c1d636c2fc656c7addc4458c695be7d0dea5ab0c9c08369457f06\"\n\n  url \"https://www.eclipse.org/downloads/download.php?file=/technology/epp/downloads/release/#{version.csv.second}/R/eclipse-committers-#{version.csv.second}-R-macosx-cocoa-#{arch}.dmg&r=1\"\n  name \"Eclipse IDE for Eclipse Committers\"\n  desc \"Eclipse integrated development environment\"\n  homepage \"https://eclipse.org/\"\n\n  livecheck do\n    url \"https://download.eclipse.org/eclipse/downloads/data.json\"\n    regex(/href=.*?eclipse-committers-(\\d+-\\d+)-R-mac/i)\n    strategy :json do |json, regex|\n      versions = json[\"releases\"]&.filter_map { |release| release[\"label\"] }&.uniq\n      version = versions.max_by { |v| Version.new(v) }\n      next unless version\n\n      download_page = Homebrew::Livecheck::Strategy.page_content(\n        \"https://www.eclipse.org/downloads/packages/\",\n      )[:content]\n      next if download_page.blank?\n\n      date = download_page[regex, 1]\n      next unless date\n\n      \"#{version},#{date}\"\n    end\n  end\n\n  depends_on :macos\n\n  app \"Eclipse.app\"\n\n  zap trash: \"~/Library/Preferences/epp.package.committers.plist\"\nend\n").unwrap();
+    let JsonShape::ListMaxPageHop {
+        path,
+        key,
+        url,
+        cap,
+        parts,
+    } = &spec.json_block.as_ref().unwrap().shape
+    else {
+        panic!("eclipse shape");
+    };
+    assert_eq!(path, &[JsonKey::Key("releases".to_string())]);
+    assert_eq!(key, "label");
+    assert_eq!(url, "https://www.eclipse.org/downloads/packages/");
+    assert_eq!(*cap, 1);
+    assert_eq!(
+        parts,
+        &[
+            JsonHopPart::Max,
+            JsonHopPart::Lit(",".to_string()),
+            JsonHopPart::Date
+        ]
     );
 }
 

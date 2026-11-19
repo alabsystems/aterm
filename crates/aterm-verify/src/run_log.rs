@@ -502,10 +502,23 @@ impl Candidate {
         }
         let _ = std::fs::remove_file(events_path(&self.path));
         remove_samples(&self.path);
+        // The run record's archive and its kin companion, which the run's finish writes beside
+        // its log (`crate::runs::archive_path`), go with it.
+        let archive = crate::runs::archive_path(&self.path);
+        remove_regular(&crate::runs::kin_archive_path(&archive));
+        remove_regular(&archive);
         // The directory interlock still excludes an opener of this name, and custody is
         // retained until this candidate drops. Only an admitted generated log has this sidecar.
         let _ = std::fs::remove_file(sidecar(&self.path));
         true
+    }
+}
+
+/// Remove `path` where it is a regular file; anything else there (a link, a directory) is left
+/// as it is.
+fn remove_regular(path: &Path) {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
+        let _ = std::fs::remove_file(path);
     }
 }
 

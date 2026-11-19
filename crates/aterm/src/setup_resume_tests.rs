@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::{REPLACED, Resume, resume_with, stopped_by};
+use super::{REPLACED, Resume, resume_with, run_with_stop_waiter, stopped_by};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -53,6 +54,39 @@ fn after(tries: u32) -> String {
             .after(tries)
             .as_secs()
     )
+}
+
+#[test]
+fn an_unavailable_stop_waiter_leaves_setup_for_the_next_launchd_attempt() {
+    assert_eq!(
+        run_with_stop_waiter(
+            || false,
+            || panic!("setup records were reached without a stop waiter")
+        ),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn the_login_job_resumes_after_its_stop_waiter_starts() {
+    let started = Cell::new(false);
+    let mut host = Fake {
+        resumable: [Ok(Some(3)), Ok(None)].into(),
+        windows: [false].into(),
+        ..Fake::default()
+    };
+    let status = run_with_stop_waiter(
+        || {
+            started.set(true);
+            true
+        },
+        || {
+            assert!(started.get());
+            resume_with(&mut host)
+        },
+    );
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert_eq!(host.did, ["work 3", "end"]);
 }
 
 /// The job works the owed run while no window runs setup, waits while one does, goes on with

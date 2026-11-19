@@ -416,7 +416,8 @@ impl Reply {
             return None;
         }
         let line = text.strip_suffix('\n')?;
-        if line.contains(['\n', '\r', '\0', '\t']) {
+        if crate::harness::native_act::holds_a_terminator(line) || line.as_bytes().contains(&b'\t')
+        {
             return None;
         }
         let mut words = line.split(' ');
@@ -491,7 +492,7 @@ impl Reply {
     /// the same validation as `decode` and accepts no embedded terminator.
     #[must_use]
     pub fn decode_line(line: &str) -> Option<Self> {
-        if line.len() >= MAX_REPLY || line.contains(['\r', '\n', '\0']) {
+        if line.len() >= MAX_REPLY || crate::harness::native_act::holds_a_terminator(line) {
             return None;
         }
         let mut wire = String::with_capacity(line.len() + 1);

@@ -29,6 +29,15 @@
 //! ask's verdict, or moot behind its answer), so the next bridge hands no moot one and marks an
 //! answer after a standing one late; a build before it reads the body alone.
 //!
+//! AN ASK NAMES THE POST WHOSE LANDING IT IS (ATERM-KI-1116-7314): a recipient or a deadline a
+//! landing notes carries the post's in-flight sequence in its record's tail (`seq=<n>`,
+//! [`Frame::AskedAt`], [`Frame::DeadlineAt`]), so an attach that lands the post again elsewhere
+//! (`Bridge::note_relanded_ask`) finds the first landing's deadline, or its settle while its
+//! recipient stands, where a log move did not forget it, and arms no second one. Every build
+//! before it reads the body alone (its tail parse reads a settle's verdict and nothing else),
+//! and a rewrite of its own writes the rows with no sequence, which this build reads as naming
+//! no landing.
+//!
 //! FOR A BUILD BEFORE THE JOURNAL, which reads [`ASKED`] and [`DEADLINES`] and nothing here: a
 //! stop writes the index back as those two files ([`super::StateDir::hand_asks_to_files`]),
 //! each opened by a line that names the hand-off ([`legacy_text`], `handed=<n>`) and that such a
@@ -88,6 +97,37 @@ pub(crate) enum Frame {
     Handed(u64),
     /// An open took the tables in as they stood ([`Index::take_in`]).
     Took(Took),
+    /// [`Frame::Asked`] noted at a landing of the post in flight at sequence `seq`
+    /// ([`Index::landings`], ATERM-KI-1116-7314): its record [`Frame::Asked`]'s, the sequence in
+    /// its tail (`seq=<n>`), which every build before it skips, reading the record as the
+    /// recipient alone.
+    AskedAt {
+        /// The ask's recipient.
+        asked: Asked,
+        /// The in-flight sequence whose landing noted it.
+        seq: u64,
+    },
+    /// [`Frame::Deadline`] noted at a landing of the post in flight at sequence `seq`, as
+    /// [`Frame::AskedAt`] is.
+    DeadlineAt {
+        /// The deadline.
+        deadline: Deadline,
+        /// The in-flight sequence whose landing noted it.
+        seq: u64,
+    },
+}
+
+/// A landing's sequence as a record's tail words ([`Frame::AskedAt`], [`Frame::DeadlineAt`]).
+fn seq_words(seq: u64) -> String {
+    format!("seq={seq}")
+}
+
+/// The sequence a record's tail names (`seq=<n>`, alone), `None` for any other tail.
+fn seq_of_words(tail: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(tail).ok()?;
+    let mut words = text.split_ascii_whitespace();
+    let seq = number(words.next()?.strip_prefix("seq=")?)?;
+    words.next().is_none().then_some(seq)
 }
 
 /// WHAT THIS NODE'S `expired` OF AN ASK IS (ATERM-KI-1115-7889), as the bridge judged it once
@@ -196,8 +236,10 @@ impl Frame {
     #[cfg(test)]
     pub(crate) const fn written_file(&self) -> Option<&'static str> {
         match self {
-            Self::Asked(_) => Some(ASKED),
-            Self::Deadline(_) | Self::DeadlineGone { .. } => Some(DEADLINES),
+            Self::Asked(_) | Self::AskedAt { .. } => Some(ASKED),
+            Self::Deadline(_) | Self::DeadlineAt { .. } | Self::DeadlineGone { .. } => {
+                Some(DEADLINES)
+            }
             Self::Handed(_) | Self::Took(_) => None,
         }
     }
@@ -254,31 +296,47 @@ impl Record for Frame {
 
     fn body(&self) -> String {
         match self {
-            Self::Asked(asked) => format!("asked {}", asked.render()),
-            Self::Deadline(deadline) => format!("deadline {}", deadline.render()),
+            Self::Asked(asked) | Self::AskedAt { asked, .. } => format!("asked {}", asked.render()),
+            Self::Deadline(deadline) | Self::DeadlineAt { deadline, .. } => {
+                format!("deadline {}", deadline.render())
+            }
             Self::DeadlineGone { off, sid, .. } => format!("gone {off} {sid}"),
             Self::Handed(n) => format!("handed {n}"),
             Self::Took(took) => format!("took {} {}", took.asked, took.deadlines),
         }
     }
 
-    /// A settle's verdict ([`Frame::DeadlineGone`]'s `how`); no other fact has more than its
-    /// body says.
+    /// A settle's verdict ([`Frame::DeadlineGone`]'s `how`), and the landing's sequence of a
+    /// recipient or a deadline noted at one ([`Frame::AskedAt`], [`Frame::DeadlineAt`]); no
+    /// other fact has more than its body says.
     fn tail(&self) -> String {
         match self {
             Self::DeadlineGone { how: Some(how), .. } => how.words(),
+            Self::AskedAt { seq, .. } | Self::DeadlineAt { seq, .. } => seq_words(*seq),
             _ => String::new(),
         }
     }
 
-    /// Its body, and a settle's verdict where its tail names one; a tail this build cannot read
-    /// adds nothing.
+    /// Its body, a settle's verdict where its tail names one, and a recipient's or a deadline's
+    /// landing where its tail names that; a tail this build cannot read adds nothing.
     fn of_record(body: &[u8], tail: &[u8]) -> Option<Self> {
-        let mut frame = Self::parse(body)?;
-        if let Self::DeadlineGone { how, .. } = &mut frame {
-            *how = Verdict::of_words(tail);
-        }
-        Some(frame)
+        let frame = Self::parse(body)?;
+        Some(match frame {
+            Self::DeadlineGone { off, sid, .. } => Self::DeadlineGone {
+                off,
+                sid,
+                how: Verdict::of_words(tail),
+            },
+            Self::Asked(asked) => match seq_of_words(tail) {
+                Some(seq) => Self::AskedAt { asked, seq },
+                None => Self::Asked(asked),
+            },
+            Self::Deadline(deadline) => match seq_of_words(tail) {
+                Some(seq) => Self::DeadlineAt { deadline, seq },
+                None => Self::Deadline(deadline),
+            },
+            frame => frame,
+        })
     }
 }
 
@@ -305,6 +363,13 @@ pub(crate) struct Index {
     /// A fact was recorded after the last hand-off and the last taking-in, which a build before
     /// the journal that ran since never saw.
     pub(crate) noted: bool,
+    /// WHICH POST'S LANDING EACH ASK IS (ATERM-KI-1116-7314): the in-flight sequence whose
+    /// landing noted the recipient or the deadline at an offset ([`Frame::AskedAt`],
+    /// [`Frame::DeadlineAt`]), kept while [`Index::asked`] or [`Index::deadlines`] holds the
+    /// offset, so past the ask's settle while its recipient stands, and written again with them
+    /// at every rewrite. A row noted with none (a build before it, a table taken in) names none,
+    /// and takes out what it replaces.
+    pub(crate) landings: BTreeMap<u64, u64>,
 }
 
 impl Replay for Index {
@@ -313,23 +378,34 @@ impl Replay for Index {
     fn apply(&mut self, frame: Frame) {
         match frame {
             Frame::Asked(Asked { off, to }) => {
-                self.asked.insert(off, to);
-                while self.asked.len() > ASKED_KEEP {
-                    self.asked.pop_first();
+                if self.asked.get(&off) != Some(&to) {
+                    self.landings.remove(&off);
                 }
-                self.noted = true;
+                self.ask(off, to);
+            }
+            Frame::AskedAt {
+                asked: Asked { off, to },
+                seq,
+            } => {
+                self.landings.insert(off, seq);
+                self.ask(off, to);
             }
             Frame::Deadline(deadline) => {
-                self.gone.remove(&deadline.off);
-                self.deadlines.insert(deadline.off, deadline);
-                while self.deadlines.len() > DEADLINES_KEEP {
-                    self.deadlines.pop_first();
+                if self.deadlines.get(&deadline.off) != Some(&deadline) {
+                    self.landings.remove(&deadline.off);
                 }
-                self.noted = true;
+                self.arm(deadline);
+            }
+            Frame::DeadlineAt { deadline, seq } => {
+                self.landings.insert(deadline.off, seq);
+                self.arm(deadline);
             }
             Frame::DeadlineGone { off, sid, how } => {
                 if self.deadlines.get(&off).is_some_and(|d| d.sid == sid) {
                     self.deadlines.remove(&off);
+                    if !self.asked.contains_key(&off) {
+                        self.landings.remove(&off);
+                    }
                 }
                 // A settle that names no verdict keeps the one a settle of the same ask named.
                 let how = how.or_else(|| {
@@ -366,11 +442,54 @@ impl Index {
         handed: None,
         took: None,
         noted: false,
+        landings: BTreeMap::new(),
     };
+
+    /// The ask at `off` went to `to`, the lowest offsets going past [`ASKED_KEEP`], each with
+    /// its landing where no deadline holds that offset.
+    fn ask(&mut self, off: u64, to: String) {
+        self.asked.insert(off, to);
+        while self.asked.len() > ASKED_KEEP {
+            if let Some((trimmed, _)) = self.asked.pop_first() {
+                if !self.deadlines.contains_key(&trimmed) {
+                    self.landings.remove(&trimmed);
+                }
+            }
+        }
+        self.noted = true;
+    }
+
+    /// `deadline` armed, the lowest offsets going past [`DEADLINES_KEEP`], each with its landing
+    /// where no recipient holds that offset.
+    fn arm(&mut self, deadline: Deadline) {
+        self.gone.remove(&deadline.off);
+        self.deadlines.insert(deadline.off, deadline);
+        while self.deadlines.len() > DEADLINES_KEEP {
+            if let Some((trimmed, _)) = self.deadlines.pop_first() {
+                if !self.asked.contains_key(&trimmed) {
+                    self.landings.remove(&trimmed);
+                }
+            }
+        }
+        self.noted = true;
+    }
 
     /// Whether the deadline of `sid`'s ask at `off` is remembered settled.
     pub(crate) fn settled(&self, off: u64, sid: &str) -> bool {
         self.gone.get(&off).is_some_and(|(asker, _)| asker == sid)
+    }
+
+    /// EVERY OTHER LANDING OF THE POST IN FLIGHT AT SEQUENCE `seq` THE JOURNAL HOLDS AN ASK OF
+    /// (ATERM-KI-1116-7314, [`Index::landings`]): each offset at or above `floor`, but `off`,
+    /// whose recipient or deadline a landing of that sequence noted, lowest first. A keyed
+    /// re-post shares its key's sequence with every re-post of the key, each published below
+    /// the next one's own head, so `floor`, that head, leaves the earlier ones' out.
+    pub(crate) fn landed_elsewhere(&self, seq: u64, floor: u64, off: u64) -> Vec<u64> {
+        self.landings
+            .range(floor..)
+            .filter(|&(&at, &of)| of == seq && at != off)
+            .map(|(&at, _)| at)
+            .collect()
     }
 
     /// Every verdict of this node's `expired` the settles name, oldest ask first: `(ask, asker,
@@ -408,6 +527,7 @@ impl Index {
         self.asked.retain(|off, _| kept(*off));
         self.deadlines.retain(|off, _| kept(*off));
         self.gone.retain(|off, _| kept(*off));
+        self.landings.retain(|off, _| kept(*off));
         for (_, how) in self.gone.values_mut() {
             let past = how.is_some_and(|verdict| match verdict {
                 Verdict::Moot { at, by } => !kept(at) || !kept(by),
@@ -448,6 +568,9 @@ impl Index {
         if let (Some(word), Some(text)) = (deadlines_word, deadlines) {
             self.take_deadlines(text, word);
         }
+        let (recipients, armed) = (&self.asked, &self.deadlines);
+        self.landings
+            .retain(|off, _| recipients.contains_key(off) || armed.contains_key(off));
         self.apply(Frame::Took(Took {
             asked: digest(asked.unwrap_or_default()),
             deadlines: digest(deadlines.unwrap_or_default()),
@@ -520,8 +643,19 @@ impl Index {
     /// A record that would not read back, or one past a step record's payload cap
     /// ([`journal::encode`]).
     pub(crate) fn encode(&self) -> io::Result<(Vec<u8>, u64)> {
-        let asked = self.asked_rows().into_iter().map(Frame::Asked);
-        let deadlines = self.deadlines.values().cloned().map(Frame::Deadline);
+        let asked =
+            self.asked_rows()
+                .into_iter()
+                .map(|asked| match self.landings.get(&asked.off) {
+                    Some(&seq) => Frame::AskedAt { asked, seq },
+                    None => Frame::Asked(asked),
+                });
+        let deadlines = self.deadlines.values().cloned().map(|deadline| {
+            match self.landings.get(&deadline.off) {
+                Some(&seq) => Frame::DeadlineAt { deadline, seq },
+                None => Frame::Deadline(deadline),
+            }
+        });
         let gone = self
             .gone
             .iter()

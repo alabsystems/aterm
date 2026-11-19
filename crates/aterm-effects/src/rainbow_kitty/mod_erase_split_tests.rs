@@ -49,8 +49,6 @@ fn paper() -> Config {
         dark_theme: false,
         intensity: 1.0,
         duration: Duration::from_millis(260),
-        ribbon_tall: true,
-        ribbon_flat: false,
         theme_fg: PAPER.0,
         theme_bg: PAPER.1,
         reduced_motion: false,

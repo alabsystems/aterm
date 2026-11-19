@@ -161,7 +161,7 @@ fn setup_io_keeps_restore_error_tail_work_and_releases_unwound_operations() {
     let _globals = globals();
     {
         let io = TestIo::install();
-        change(|script| script.bring_forward_hold = true);
+        change(|script| script.restore_preflight_hold = true);
         let busy = take_initial_setup_slot().unwrap();
         let (ended, done) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -173,7 +173,7 @@ fn setup_io_keeps_restore_error_tail_work_and_releases_unwound_operations() {
         });
         wait_until(
             "the failed restore reaches its follow-up after releasing busy",
-            || script().bring_forward_reads == 1,
+            || script().restore_preflight_reads == 1,
         );
         assert!(!INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire));
         assert!(

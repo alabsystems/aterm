@@ -185,8 +185,12 @@ impl UsageReader for Hooked<'_> {
 
 /// A USABLE ROW NEVER TAKEN IS READ BY RUNGS, NOT AT EACH ASK: its client asks every five seconds
 /// for as long as its wall stands. With `work` never taken, an hour of asks reads the session's
-/// login and `work` four times, at 0, 60, 360 and 2160 s, and a day of them fifty times. CONTROL:
-/// the same asks, each of a process that has read nothing, read at every one.
+/// login and `work` four times, at 0, 60, 360 and 2160 s, and a day of them fifty times. The rest
+/// of the day is asked every half minute, one series still ([`ASKING_S`]), every five seconds
+/// within half a minute of each rung after 2160 s (every 1800 s), and one second before each rung:
+/// a read off its rung by any amount, late or early to the second its clock counts, falls on an
+/// ask that is not the rung's. CONTROL: the same asks, each of a process that has read nothing,
+/// read at every one.
 #[test]
 fn a_usable_row_never_taken_is_read_by_rungs() {
     let (world, reader, main, work) = never_taken("pace-never-taken");
@@ -198,7 +202,16 @@ fn a_usable_row_never_taken_is_read_by_rungs() {
         [0, 60, 360, 2160].map(|at| (at, both.clone())),
         "{pace:?}"
     );
-    let _ = passes(&world, &reader, &mut pace, every_5s(HOUR, 24 * HOUR));
+    let on_a_rung = |at: i64| (at - 2160).rem_euclid(1800) == 0;
+    let near_a_rung = |at: i64| !(30..1770).contains(&(at - 2160).rem_euclid(1800));
+    let asks = every_5s(HOUR, 24 * HOUR)
+        .filter(|at| at % 30 == 0 || near_a_rung(*at))
+        .flat_map(|at| (if on_a_rung(at) { at - 1 } else { at })..=at);
+    let read = passes(&world, &reader, &mut pace, asks);
+    assert!(
+        read.iter().all(|(at, _)| on_a_rung(*at)),
+        "each read on a rung: {read:?}"
+    );
     assert_eq!(reader.calls.borrow().len(), 100, "a day: {pace:?}");
 
     let (world, reader, ..) = never_taken("pace-never-taken-unpaced");

@@ -250,6 +250,10 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_with_no_window() {
             .as_slice(),
         b"everyone"
     );
+    assert!(
+        !fresh.home.join(".secrets/shared").exists(),
+        "the vault writes no file of the entry under the home"
+    );
     let actor = device
         .request(trust.network, trust.authority)
         .unwrap()

@@ -92,10 +92,10 @@ fn chained_fixups() {
     }
 }
 
-/// The scratch world's words (`aterm_types::world`), which `src/macho_order.rs` mounts by
-/// `#[path]` into the order wrapper: included here so an edit to them recompiles and reruns this
+/// The scratch world's layout (`aterm_types::world`), which `src/macho_order.rs` mounts by
+/// `#[path]` into the order wrapper: included here so an edit to it recompiles and reruns this
 /// script, and hashed into the wrapper's name, so that edit builds a new wrapper.
-const WORLD_WORDS: &[u8] = include_bytes!("../aterm-types/src/world_words.rs");
+const WORLD_LAYOUT: &[u8] = include_bytes!("../aterm-types/src/world_layout.rs");
 
 /// On macOS `[profile.release]` builds with debug info and debug assertions off at
 /// `opt-level` 3, strip LTO-internalized local symbols (`-x`) so `dyld` does not fault
@@ -546,7 +546,7 @@ fn run_one_probe(
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in order_mod_bytes
         .iter()
-        .chain(WORLD_WORDS)
+        .chain(WORLD_LAYOUT)
         .chain(wrapper_src.as_bytes())
     {
         hash ^= u64::from(b);

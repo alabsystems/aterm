@@ -543,8 +543,8 @@ fn short_of_a_world(world: &ProbeWorld) -> Vec<String> {
 /// word for word after them, the lanes-off tables aterm-types holds; every process the probe
 /// starts in the world begins from an environment that carries the world's marker at the state
 /// folder under its HOME; each file it writes sits in a folder it makes first; and everything it
-/// lays out sits under the root it removes. Where the platform keeps no state under a HOME there is no
-/// world, and the probe starts no image.
+/// lays out sits under the root it removes. On a host that is no platform a world is laid out
+/// for there is no world, and the probe starts no image.
 #[test]
 fn a_layout_probe_starts_its_images_in_a_scratch_world() {
     let root = Path::new("/w/atord");

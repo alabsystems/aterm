@@ -4,6 +4,111 @@
 use super::*;
 
 #[test]
+fn candidate_source_provider_correlates_actual_401_writes_and_rejects_ambiguous_bearers() {
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let journal = dir.path().join("requests.jsonl");
+    let log = Mutex::new(ApiLog::new(journal.clone(), Instant::now()));
+    let bearer = SourceBearer::fresh().unwrap();
+    let other = SourceBearer::fresh().unwrap();
+    let token = bearer.0.as_str().unwrap();
+    let wrong = other.0.as_str().unwrap();
+    assert!(token != wrong);
+    let called = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&called);
+    let answer: Answer = Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Answered::items(vec![message_item("private model reply")])
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let hang = Duration::from_secs(60);
+    let mut client = TcpStream::connect_timeout(&listener.local_addr().unwrap(), hang).unwrap();
+    let (server, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Until(Instant::now() + hang),
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
+    for stream in [&server, &client] {
+        stream.set_read_timeout(Some(hang)).unwrap();
+        stream.set_write_timeout(Some(hang)).unwrap();
+    }
+    let prompt = "isolated candidate input";
+    let thread = "original-thread-private";
+    let body = format!(r#"{{"model":"{token}","input":[{{"role":"user","content":"{prompt}"}}]}}"#);
+    let valid = format!("Authorization: bEaReR {token}\r\n");
+    let invalid = format!("Authorization: Bearer {wrong}\r\n");
+    let fixed = format!("Authorization: Bearer {}\r\n", crate::stub::LAB_CODEX_KEY);
+    let both = format!("{valid}{invalid}");
+    let reversed = format!("{invalid}{valid}");
+    let repeated = format!("{valid}{valid}");
+    let comma = format!("Authorization: Bearer {token}, {wrong}\r\n");
+    let replies = std::thread::scope(|scope| {
+        scope.spawn(|| serve_one(server, &log, &answer, Some(&bearer)));
+        for (path, credentials) in [
+            ("/v1/responses", valid.as_str()),
+            ("/v1/responses", ""),
+            ("/v1/responses", fixed.as_str()),
+            ("/v1/responses", invalid.as_str()),
+            ("/v1/responses", both.as_str()),
+            ("/v1/responses", reversed.as_str()),
+            ("/v1/responses", repeated.as_str()),
+            ("/v1/responses", comma.as_str()),
+            ("/unrelated", valid.as_str()),
+        ] {
+            write!(
+                client,
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\n{credentials}x-client-request-id: {thread}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut received = String::new();
+        client.read_to_string(&mut received).unwrap();
+        received
+    });
+    let statuses: Vec<_> = replies
+        .split("HTTP/1.1 ")
+        .skip(1)
+        .map(|response| response.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            "200", "401", "401", "401", "401", "401", "401", "401", "404"
+        ]
+    );
+    assert_eq!(called.load(Ordering::Relaxed), 1);
+    let log = log.into_inner().unwrap();
+    let evidence = log.source_responses(thread, prompt).unwrap();
+    assert_eq!(
+        (evidence.accepted, evidence.refused, evidence.written),
+        (1, 7, 7)
+    );
+    for (unrelated_thread, unrelated_prompt) in [("sibling", prompt), (thread, "other turn")] {
+        let evidence = log
+            .source_responses(unrelated_thread, unrelated_prompt)
+            .unwrap();
+        assert_eq!(
+            (evidence.accepted, evidence.refused, evidence.written),
+            (1, 0, 0)
+        );
+    }
+    for path in [&journal, &response_log(&journal)] {
+        let text = std::fs::read_to_string(path).unwrap();
+        for private in [token, wrong, prompt, thread, "private model reply"] {
+            assert!(
+                !text.contains(private),
+                "qualification journal retained private bytes"
+            );
+        }
+    }
+}
+
+#[test]
 fn no_ip_policy_parses_and_denies_the_live_loopback_exception() {
     fn run(policy: &str, program: &str, args: &[&str]) -> std::process::Output {
         let mut command = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");

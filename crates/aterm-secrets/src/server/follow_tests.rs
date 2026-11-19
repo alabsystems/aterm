@@ -16,8 +16,8 @@ use crate::membership_log::{
 };
 use std::io::{Read, Write};
 
-const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
-const VAULT: &str = "team";
+pub(super) const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
+pub(super) const VAULT: &str = "team";
 
 /// The vault's one seat, and its log's records as it signs them: a genesis, the `[everyone]`
 /// epoch its `Put`s name, and whatever a test has it sign after.
@@ -153,7 +153,7 @@ pub(super) fn shed(whole: &Record) -> Record {
 }
 
 /// A node whose build reads format 2, and that suffers nothing.
-fn follows() -> Faults {
+pub(super) fn follows() -> Faults {
     Faults {
         follows: true,
         ..Faults::default()
@@ -161,20 +161,20 @@ fn follows() -> Faults {
 }
 
 /// What a format-2 node states of its records.
-fn two() -> RecordsBound {
+pub(super) fn two() -> RecordsBound {
     RecordsBound::here(false).at_format(FORMAT_TWO)
 }
 
 /// One answer, read whole off the wire.
-struct Answer {
-    status: u16,
-    head: String,
-    body: Vec<u8>,
+pub(super) struct Answer {
+    pub(super) status: u16,
+    pub(super) head: String,
+    pub(super) body: Vec<u8>,
 }
 
 impl Answer {
     /// The records bound its head states, read as this build reads it.
-    fn bound(&self) -> Option<RecordsBound> {
+    pub(super) fn bound(&self) -> Option<RecordsBound> {
         self.head.lines().find_map(|line| {
             let (name, value) = line.split_once(':')?;
             name.eq_ignore_ascii_case(crate::transport::RECORDS_BOUND_HEADER)
@@ -185,14 +185,14 @@ impl Answer {
 }
 
 /// A vault server over a store folder of its own, whose node suffers what a test injects.
-struct Server {
-    root: aterm_tempfile::TempDir,
+pub(super) struct Server {
+    pub(super) root: aterm_tempfile::TempDir,
     running: Option<Running>,
 }
 
 impl Server {
     /// One whose node suffers `faults`, holding nothing.
-    fn new(faults: Faults) -> Self {
+    pub(super) fn new(faults: Faults) -> Self {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let server = Self {
             root,
@@ -203,14 +203,14 @@ impl Server {
     }
 
     /// One whose node suffers `faults`, holding `records`, posted as a format-1 node posts.
-    fn holding(faults: Faults, records: &[Record]) -> Self {
+    pub(super) fn holding(faults: Faults, records: &[Record]) -> Self {
         let server = Self::new(faults);
         let posted = server.post(None, &RecordsBound::uncrossed(), &encode_records(records));
         assert_eq!(posted.status, 204, "{}", posted.head);
         server
     }
 
-    fn started(mut self) -> Self {
+    pub(super) fn started(mut self) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         self.running = Some(
             launch(
@@ -231,31 +231,31 @@ impl Server {
     }
 
     /// The same store under a server started anew, as after the process ended.
-    fn restarted(mut self) -> Self {
+    pub(super) fn restarted(mut self) -> Self {
         if let Some(running) = self.running.take() {
             running.stop();
         }
         self.started()
     }
 
-    fn running(&self) -> &Running {
+    pub(super) fn running(&self) -> &Running {
         self.running.as_ref().expect("running")
     }
 
-    fn mark(&self) -> FormatMark {
+    pub(super) fn mark(&self) -> FormatMark {
         FormatMark::at(self.root.path().join(format!("{VAULT}.format")))
     }
 
-    fn suffers(&self, faults: Faults) {
+    pub(super) fn suffers(&self, faults: Faults) {
         inject(self.mark().path(), faults);
     }
 
-    fn format(&self) -> u32 {
+    pub(super) fn format(&self) -> u32 {
         self.mark().stored().expect("the mark")
     }
 
     /// The bytes of its records file; none where it has none.
-    fn file(&self) -> Vec<u8> {
+    pub(super) fn file(&self) -> Vec<u8> {
         crate::records_storage::reader_path(&self.root.path().join(format!("{VAULT}.records")))
             .ok()
             .and_then(|path| std::fs::read(path).ok())
@@ -263,7 +263,7 @@ impl Server {
     }
 
     /// Whether its records file holds `record` in exactly the form given.
-    fn file_holds(&self, record: &Record) -> bool {
+    pub(super) fn file_holds(&self, record: &Record) -> bool {
         let wire = record.wire_bytes().expect("the record's bytes");
         self.file()
             .windows(wire.len())
@@ -271,15 +271,15 @@ impl Server {
     }
 
     /// Its store, after a look at its file.
-    fn store(&self) -> Store {
+    pub(super) fn store(&self) -> Store {
         self.running().stored_records(VAULT)
     }
 
-    fn held(&self) -> usize {
+    pub(super) fn held(&self) -> usize {
         self.store().log().map_or(0, Log::held_count)
     }
 
-    fn exchange(&self, request: &[u8]) -> Answer {
+    pub(super) fn exchange(&self, request: &[u8]) -> Answer {
         let mut stream = TcpStream::connect(self.running().addr).expect("connect");
         stream.set_read_timeout(Some(HANG)).expect("timeout");
         stream.set_write_timeout(Some(HANG)).expect("timeout");
@@ -304,7 +304,7 @@ impl Server {
     }
 
     /// A records POST of `body`, with `query`, stating `bound`.
-    fn post(&self, query: Option<&str>, bound: &RecordsBound, body: &[u8]) -> Answer {
+    pub(super) fn post(&self, query: Option<&str>, bound: &RecordsBound, body: &[u8]) -> Answer {
         let query = query.map_or_else(String::new, |query| format!("?{query}"));
         let mut request = format!(
             "POST /v1/{VAULT}/records{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}: \
@@ -319,7 +319,7 @@ impl Server {
     }
 
     /// A records POST of `records` as a format-2 node sends it.
-    fn post_two(&self, records: &[&Record]) -> Answer {
+    pub(super) fn post_two(&self, records: &[&Record]) -> Answer {
         self.post(
             Some(crate::crossing::FORMAT_POST_QUERY),
             &two(),
@@ -328,7 +328,7 @@ impl Server {
     }
 
     /// A records GET naming nothing, stating `bound`, of a server that does not wait.
-    fn get(&self, bound: &RecordsBound) -> Answer {
+    pub(super) fn get(&self, bound: &RecordsBound) -> Answer {
         self.exchange(
             format!(
                 "GET /v1/{VAULT}/records HTTP/1.1\r\nHost: 127.0.0.1\r\n{}: 1\r\n{}: \
@@ -342,7 +342,7 @@ impl Server {
     }
 
     /// This server's vault as a peer pull finds it.
-    fn as_peer(&self) -> crate::discover::DiscoveredVault {
+    pub(super) fn as_peer(&self) -> crate::discover::DiscoveredVault {
         crate::discover::DiscoveredVault {
             url: format!("http://{}/v1/{VAULT}", self.running().addr),
             txt: Some(VaultTxt {

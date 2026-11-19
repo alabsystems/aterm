@@ -8,6 +8,7 @@ use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt as _;
 
 const LIMIT: usize = 16 * 1024 * 1024;
+#[derive(Clone)]
 pub(crate) struct Settings {
     pub arguments: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,

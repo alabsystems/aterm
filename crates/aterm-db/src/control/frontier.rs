@@ -11,6 +11,46 @@
 //! nothing before the peer is authenticated. Bulk repair follows in membership rounds bounded by
 //! [`BATCH_RECORDS`] and [`BATCH_BYTES`]. Under `atdb/4` each side sends its whole seat witness,
 //! as 0.153 does, so a 0.153 peer and this build still meet.
+//!
+//! **The records format** (`docs/DESIGN-vault-log-2026-11-14.md` step 3, tracker FL-148E; dark).
+//! Every frame that states a records bound (`ACX4`, `AFR4`, `AEV4`, `ABT4`) states it in five
+//! bytes, the held bound and the crossed state, which is format 1's: a Mac with no format mark
+//! writes each frame byte for byte as every release since 0.153 does, and reads a peer's as
+//! they do. A Mac whose format mark names format 2, on a build that reads it
+//! ([`client::reads_later_format`]: none does while
+//! [`aterm_secrets::commons::hearing::READS_FORMAT`] names no release), sets a bit of the
+//! state byte ([`FORMATTED`]) and ends the frame with its byte capacity and its format
+//! ([`FORMAT_TRAILER`]), over `atdb/5` and later. Every release before it refuses each such
+//! frame, by its length or by the state byte, so it is sent only to a peer known to read it
+//! ([`stated_to`]), and a Mac that states none reads none ([`reads_format`]). Two bounds
+//! exchange only where their formats are equal ([`RecordsBound::can_exchange`]), which each
+//! frame's reader asks before any record is offered, taken or acknowledged, so a peer of
+//! another format is refused at its bound and leaves no record refused one by one
+//! ([`super::MembershipHint`]). A Mac past format 1 on a build that does not read its mark's
+//! format, and one on `atdb/4`, writes no frame at all ([`follows_format`], [`stated_to`]).
+//!
+//! Records are read at the format this Mac's bound states (`receive_evidence`,
+//! `client::retain_bounded_records_for_commons`), and a record a root of this Mac's log dropped
+//! ([`aterm_secrets::membership_log::rooted`]) reads as one it holds: a push that brings one is
+//! not refused for it ([`overlay`]), and `atdb/8`'s reconciliation names it, so a peer that
+//! holds the whole log offers none of them ([`held_and_known`]).
+//!
+//! **A served root** (tracker FL-148E5). On `atdb/8` and later, a Mac whose log is rooted serves
+//! its roots ([`aterm_secrets::membership_log::Served`]) to a peer whose reconciled set lacks a
+//! record a root dropped ([`serves`]): its first batch then holds every record the peer lacks,
+//! its header sets [`SERVED`] in the state byte, and the served frame follows the header, as
+//! the vault's pullers are served one reply (`Store::missing_served`). The peer takes the
+//! records and the roots together or nothing (`client::retain_served_records_for_commons`,
+//! which writes a rooted store as a rewritten records entry), so a peer behind a cut completes
+//! its session where records alone would leave it waiting. A frame goes only where both Macs
+//! state format 2 in this session: this Mac's bound (its mark, on a build that reads it,
+//! [`follows_format`]) and the peer's, which it stated in its own frames over a channel that
+//! proved its seat, and which only a build that reads format 2, and so this frame, writes
+//! ([`stated_to`]). A Mac that states format 1 serves nothing and reads [`SERVED`] in no frame,
+//! so every batch it writes is the released one. A refused frame takes nothing and leaves no
+//! strike ([`MembershipHint::settle`] is not told of it); under the same views it is not served
+//! again for [`REFUSAL_HOLD`] ([`MembershipHint::serves`]), and the peer is offered the records
+//! it lacks alone meanwhile.
 
 use super::*;
 use aterm_secrets::{
@@ -19,8 +59,8 @@ use aterm_secrets::{
         binding::{MAX_CHALLENGE, Pending, RESPONSE_LEN},
         bootstrap::Bootstrap,
     },
-    crossing::RecordsBound,
-    membership_log::{Body, Log, MAX_RECORD, REPLY_CAP, Reading, Record, Store as Records},
+    crossing::{FORMAT_ONE, FORMAT_TWO, RecordsBound},
+    membership_log::{Body, Log, MAX_RECORD, REPLY_CAP, Reading, Record, Served, Store as Records},
 };
 
 const META_LEN: usize = HELLO_FIXED + 6;
@@ -46,10 +86,21 @@ pub(super) const WHOLE_BATCH_RECORDS: usize = 256;
 pub(super) const WHOLE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const _: () = assert!(WHOLE_BATCH_BYTES >= MAX_RECORD);
 
-/// The most bytes of records a log these wires move holds: a format-1 store's capacity (the
-/// storage class of byte bound, [`aterm_secrets::crossing::capacity`]). A log past format 1
-/// speaks none of them ([`format_one`]).
-const LOG_BYTES: usize = Reading::Format(aterm_secrets::crossing::FORMAT_ONE).capacity();
+/// The most bytes of records a log these wires move holds: a store's capacity (the storage
+/// class of byte bound, [`aterm_secrets::crossing::capacity`]), which is one number for every
+/// format this build reads ([`Reading::STORE_BYTES`], which stops the build once it is not).
+const LOG_BYTES: usize = Reading::STORE_BYTES;
+
+/// What a bound of a later format than 1 adds to the end of the frame that states it: its byte
+/// capacity (`u64`) and its format (`u32`), big-endian.
+pub(super) const FORMAT_TRAILER: usize = 12;
+/// The bit of a bound's state byte, beside its crossed bit, that says [`FORMAT_TRAILER`] ends
+/// the frame. Every release before this one refuses a state byte above 1.
+pub(super) const FORMATTED: u8 = 2;
+/// The bit of a batch header's state byte, beside [`FORMATTED`], that says a served frame
+/// follows the header ahead of its records: only in a header that states a later format than 1,
+/// on `atdb/8` and later. Every reader of format 2 before this one refuses a state byte with it.
+pub(super) const SERVED: u8 = 4;
 
 /// The frontier wire a session speaks, as its ALPN named it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,7 +175,7 @@ impl Wire {
     /// The most membership rounds a session runs between peers that hold at most `capacity`
     /// records, which both sides count alike. Under `atdb/5`, every two rounds a side with
     /// records left sends a full batch of records or of bytes, or every record left, so the
-    /// rounds a log of `capacity` records and a format-1 store's bytes ([`LOG_BYTES`]) needs, and two more to
+    /// rounds a log of `capacity` records and a store's bytes ([`LOG_BYTES`]) needs, and two more to
     /// agree that nothing is left. Under `atdb/4`, 0.153's count: `capacity` over the number of
     /// largest records ([`MAX_RECORD`]) one batch's bytes hold, and two more.
     pub(super) const fn round_cap(self, capacity: usize) -> usize {
@@ -164,12 +215,31 @@ impl Metadata {
         wire[52..84].copy_from_slice(&trust.genesis);
         wire[84..HELLO_FIXED].copy_from_slice(self.request.bytes());
         wire[HELLO_FIXED..HELLO_FIXED + 4].copy_from_slice(&self.bound.held.to_be_bytes());
-        wire[HELLO_FIXED + 4] = u8::from(self.bound.crossed);
+        wire[HELLO_FIXED + 4] = state(self.bound);
         wire[META_LEN - 1] = self.flags;
         wire
     }
 
+    /// The frame that states this metadata: [`Self::encode`], and after it the trailer of a
+    /// bound of a later format than 1 ([`put_trailer`]). At format 1 it is [`Self::encode`]'s
+    /// bytes alone.
+    pub(super) fn frame(&self, trust: Trust) -> Vec<u8> {
+        let mut wire = self.encode(trust).to_vec();
+        put_trailer(&mut wire, self.bound);
+        wire
+    }
+
+    /// [`Self::decode_as`] as a Mac that states format 1 reads it: a frame of exactly
+    /// [`META_LEN`] bytes whose bound is format 1's.
+    #[cfg(test)]
     pub(super) fn decode(trust: Trust, wire: &[u8]) -> Result<Self> {
+        Self::decode_as(trust, wire, false)
+    }
+
+    /// The metadata `wire` states, its bound of a later format than 1 read only where `reads`
+    /// ([`reads_format`]).
+    pub(super) fn decode_as(trust: Trust, wire: &[u8], reads: bool) -> Result<Self> {
+        let (wire, trailer) = split_trailer(wire, HELLO_FIXED + 4, reads);
         if wire.len() != META_LEN
             || &wire[..4] != b"ACX4"
             || wire[4..20] != trust.network
@@ -196,26 +266,88 @@ impl Metadata {
         }
         Ok(Self {
             request,
-            bound: read_bound(&wire[HELLO_FIXED..HELLO_FIXED + 5])?,
+            bound: read_bound(&wire[HELLO_FIXED..HELLO_FIXED + 5], trailer)?,
             flags,
         })
     }
 }
 
-fn put_bound(wire: &mut Vec<u8>, bound: RecordsBound) {
-    wire.extend_from_slice(&bound.held.to_be_bytes());
-    wire.push(u8::from(bound.crossed));
+/// A bound's state byte: its crossed bit, and [`FORMATTED`] where it is of a later format than
+/// 1. A format-1 bound's is 0 or 1, as every release writes it.
+fn state(bound: RecordsBound) -> u8 {
+    let formatted = if bound.format == FORMAT_ONE {
+        0
+    } else {
+        FORMATTED
+    };
+    u8::from(bound.crossed) | formatted
 }
 
-fn read_bound(wire: &[u8]) -> Result<RecordsBound> {
-    if wire.len() != 5 || wire[4] > 1 {
+fn put_bound(wire: &mut Vec<u8>, bound: RecordsBound) {
+    wire.extend_from_slice(&bound.held.to_be_bytes());
+    wire.push(state(bound));
+}
+
+/// End `wire`, a frame that states `bound`, with what a later format than 1 adds
+/// ([`FORMAT_TRAILER`]): nothing at format 1.
+fn put_trailer(wire: &mut Vec<u8>, bound: RecordsBound) {
+    if bound.format != FORMAT_ONE {
+        wire.extend_from_slice(&bound.bytes.to_be_bytes());
+        wire.extend_from_slice(&bound.format.to_be_bytes());
+    }
+}
+
+/// How many more bytes a frame that states a bound may hold where its reader reads a later
+/// format than 1 (`reads`, [`reads_format`]): [`FORMAT_TRAILER`], and none otherwise, so a Mac
+/// that states format 1 holds each frame to the length every release does.
+const fn trailer_room(reads: bool) -> usize {
+    if reads { FORMAT_TRAILER } else { 0 }
+}
+
+/// `wire` without the trailer of the bound whose state byte is at `at`, and that trailer:
+/// only where this Mac reads one (`reads`) and the byte says one ends the frame
+/// ([`FORMATTED`]). Otherwise all of `wire` and no trailer, which each frame's own checks then
+/// judge as every release does: a state byte above 1 is no bound, and a longer frame is not
+/// that frame.
+fn split_trailer(wire: &[u8], at: usize, reads: bool) -> (&[u8], Option<&[u8]>) {
+    match wire.get(at) {
+        Some(byte) if reads && byte & FORMATTED != 0 && wire.len() > at + FORMAT_TRAILER => {
+            let (frame, trailer) = wire.split_at(wire.len() - FORMAT_TRAILER);
+            (frame, Some(trailer))
+        }
+        _ => (wire, None),
+    }
+}
+
+/// The bound a frame states in the five bytes `wire` (the held bound and the state byte) and,
+/// where it is of a later format than 1, in the `trailer` that ended its frame
+/// ([`split_trailer`]). With no trailer it is format 1's, read as every release reads it.
+fn read_bound(wire: &[u8], trailer: Option<&[u8]>) -> Result<RecordsBound> {
+    let most = if trailer.is_some() { FORMATTED | 1 } else { 1 };
+    if wire.len() != 5 || wire[4] > most {
         return Err(Error::new("invalid Commons records bound"));
     }
     let held = u32::from_be_bytes(wire[..4].try_into().map_err(failure)?);
     if held == 0 {
         return Err(Error::new("invalid Commons records capacity"));
     }
-    Ok(RecordsBound::of(held as usize, wire[4] != 0))
+    let Some(trailer) = trailer else {
+        return Ok(RecordsBound::of(held as usize, wire[4] != 0));
+    };
+    let (bytes, format) = trailer
+        .split_at_checked(8)
+        .ok_or_else(|| Error::new("invalid Commons records bound"))?;
+    let bytes = u64::from_be_bytes(bytes.try_into().map_err(failure)?);
+    let format = u32::from_be_bytes(format.try_into().map_err(failure)?);
+    if bytes == 0 || format <= FORMAT_ONE {
+        return Err(Error::new("invalid Commons records bound"));
+    }
+    Ok(RecordsBound {
+        held,
+        bytes,
+        format,
+        crossed: wire[4] & 1 != 0,
+    })
 }
 
 fn own_bound(endpoint: &Endpoint) -> Result<RecordsBound> {
@@ -223,37 +355,175 @@ fn own_bound(endpoint: &Endpoint) -> Result<RecordsBound> {
     if let Some(paths) = &endpoint.paths {
         bound.crossed |= client::records_marked_crossed(paths)
             .map_err(|error| local_failure("records protocol", error))?;
-        // The custody's format mark, as its crossed mark: a log whose mark says a later format
-        // speaks no frontier protocol on any path, not only one that loads its records.
+        // The custody's format mark, as its crossed mark: read on every path, not only one
+        // that loads its records.
         bound = bound.at_format(
             client::records_marked_format(paths)
                 .map_err(|error| local_failure("records protocol", error))?,
         );
+        // MUTANT (`mutants::Mutant::StatesFormatUnmarked`): a build that reads format 2 states
+        // it, mark or no mark.
+        #[cfg(test)]
+        if mutants::on(mutants::Mutant::StatesFormatUnmarked) && client::reads_later_format(paths) {
+            bound = bound.at_format(FORMAT_TWO);
+        }
     }
-    format_one(bound)?;
+    follows_format(endpoint, bound)?;
     Ok(bound)
 }
 
-/// The `ACX4`/`AFR4` bound states records and the crossed state alone, which is format 1's
-/// ([`aterm_secrets::crossing::FORMAT_ONE`]): a log past format 1 speaks no such protocol rather
-/// than state format 1 to a peer that would take its records for that.
-fn format_one(bound: RecordsBound) -> Result<()> {
-    if bound.format != aterm_secrets::crossing::FORMAT_ONE {
+/// The gate of every frame a Mac past format 1 writes or reads here: a bound of a later format
+/// than 1 is this Mac's only where its format mark names [`FORMAT_TWO`] and its build reads it
+/// ([`client::reads_later_format`], which none does while
+/// [`aterm_secrets::commons::hearing::READS_FORMAT`] names no release). A log past format 1 on
+/// any other build speaks no frontier protocol, rather than state format 1 to a peer that
+/// would take its records for that. A format-1 bound passes unasked.
+fn follows_format(endpoint: &Endpoint, bound: RecordsBound) -> Result<()> {
+    if bound.format == FORMAT_ONE
+        || (bound.format == FORMAT_TWO
+            && endpoint
+                .paths
+                .as_ref()
+                .is_some_and(client::reads_later_format))
+    {
+        return Ok(());
+    }
+    Err(Error::new(
+        "a membership log past records format 1 speaks no frontier protocol on a build that does not read its format",
+    ))
+}
+
+/// Whether this Mac reads a bound of a later format than 1 in a peer's frame: only where it
+/// states one itself ([`own_bound`]), so a Mac with no format mark reads each frame as every
+/// release does, and refuses one that states a later format as it refuses any frame that is
+/// not that frame.
+fn reads_format(endpoint: &Endpoint) -> Result<bool> {
+    // MUTANT (`mutants::Mutant::ReadsFormatUngated`): every Mac reads one.
+    #[cfg(test)]
+    if mutants::on(mutants::Mutant::ReadsFormatUngated) {
+        return Ok(true);
+    }
+    Ok(own_bound(endpoint)?.format != FORMAT_ONE)
+}
+
+/// The seat a channel proved ([`super::authenticate_identity`] holds a peer's request to it):
+/// its writer key and incarnation.
+fn proven(proof: &NodeProof) -> Option<Actor> {
+    let node = crate::database::decode_hex::<16>(&proof.node).ok()?;
+    let mut actor = [0; 48];
+    actor[..32].copy_from_slice(proof.key.bytes());
+    actor[32..].copy_from_slice(&node);
+    Some(actor)
+}
+
+/// Whether the peer the channel proved reads a bound of a later format than 1, by signed
+/// evidence this Mac holds of that seat: the time-signed version report it keeps of it
+/// ([`hearing::Reports::reported`], verified under the seat's binding) names
+/// [`Endpoint::format_floor`]'s release or later; or this Mac's own records hold, complete, a
+/// version-2 record that seat signed, which only a build that writes format 2 signs.
+fn peer_reads(endpoint: &Endpoint, proof: Option<&NodeProof>) -> bool {
+    let Some(actor) = proof
+        .and_then(proven)
+        .filter(|actor| *actor != endpoint.actor)
+    else {
+        return false;
+    };
+    let reported = endpoint.format_floor.is_some_and(|floor| {
+        endpoint.reports.as_deref().is_some_and(|reports| {
+            reports
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .reported(&actor)
+                .is_some_and(|version| version >= floor)
+        })
+    });
+    reported
+        || View::of(endpoint).is_ok_and(|view| {
+            view.0.as_ref().and_then(Records::log).is_some_and(|log| {
+                log.records()
+                    .any(|record| record.version() == 2 && *record.actor() == actor)
+            })
+        })
+}
+
+/// Whether a Mac that states a later format than 1 writes its first frame of a session on
+/// `wire` to the peer the channel proved: on `atdb/5` and later, and only to a peer known to
+/// read it.
+///
+/// A dialling Mac (`first` is none) knows by signed evidence alone ([`peer_reads`]).
+///
+/// An answering Mac knows by `first`, the peer's own first frame: it reads as metadata that
+/// states this Mac's own format and a capacity it exchanges with ([`compatible`]), for the
+/// seat whose key the channel proved ([`super::authenticate_identity`]). The peer wrote the
+/// form this Mac answers in, and the answer states this Mac's bound, as an answer states one
+/// to any peer; no record moves, and nothing is stored, until the peer's signed evidence
+/// gives it its seat. A peer that states format 1 is not answered: every frame after its
+/// metadata would be one it refuses.
+///
+/// # Errors
+/// The peer is not known to read it, or the wire is `atdb/4`: this Mac then writes nothing.
+fn stated_to(
+    endpoint: &Endpoint,
+    wire: Wire,
+    proof: Option<&NodeProof>,
+    first: Option<&[u8]>,
+) -> Result<()> {
+    // MUTANT (`mutants::Mutant::StatesFormatBlind`): to any peer, on any wire.
+    #[cfg(test)]
+    if mutants::on(mutants::Mutant::StatesFormatBlind) {
+        return Ok(());
+    }
+    if wire == Wire::Whole {
         return Err(Error::new(
-            "a membership log past records format 1 speaks no atdb/5 frontier protocol",
+            "a membership log past records format 1 speaks no atdb/4 frontier protocol",
         ));
     }
-    Ok(())
+    match first {
+        Some(frame) => {
+            let peer = Metadata::decode_as(endpoint.trust, frame, true)?;
+            authenticate_identity(endpoint.actor, proof, &peer.request)?;
+            compatible(endpoint, peer.bound)?;
+            Ok(())
+        }
+        None if peer_reads(endpoint, proof) => Ok(()),
+        None => Err(Error::new(
+            "a membership log past records format 1 dials only a peer known to read its format",
+        )),
+    }
 }
 
 fn compatible(endpoint: &Endpoint, remote: RecordsBound) -> Result<RecordsBound> {
     let local = own_bound(endpoint)?;
+    // MUTANT (`mutants::Mutant::FormatUnjudgedAtBound`): two bounds that differ only in their
+    // format exchange.
+    #[cfg(test)]
+    let remote = if mutants::on(mutants::Mutant::FormatUnjudgedAtBound) {
+        RecordsBound {
+            format: local.format,
+            bytes: local.bytes,
+            ..remote
+        }
+    } else {
+        remote
+    };
     if !local.can_exchange(remote) {
         return Err(Error::new(
             "Commons frontier record capacities are incompatible",
         ));
     }
     Ok(local)
+}
+
+/// Before a frame after the metadata states `bound`, this Mac's own: a bound of a later format
+/// than 1 is stated only to a peer whose last stated bound it exchanges with ([`compatible`]),
+/// so a format mark stored since the metadata was traded ends the session before a frame
+/// states it to a peer that would refuse the frame. A format-1 bound is stated as it always
+/// was, and its reader judges it.
+fn restated(endpoint: &Endpoint, bound: RecordsBound, peer: RecordsBound) -> Result<()> {
+    if bound.format != FORMAT_ONE {
+        compatible(endpoint, peer)?;
+    }
+    Ok(())
 }
 
 fn trade(stream: &mut (impl Read + Write), side: Side, own: &[u8], max: usize) -> Result<Vec<u8>> {
@@ -332,6 +602,13 @@ impl View {
     pub(super) fn have(&self) -> Vec<Digest> {
         self.0.as_ref().map_or_else(Vec::new, knowledge)
     }
+
+    /// A view that holds `store` (tests): what [`Self::of`] gives an endpoint whose records
+    /// read as `store`.
+    #[cfg(all(test, unix))]
+    pub(super) const fn holding(store: Records) -> Self {
+        Self(Some(store))
+    }
 }
 
 /// Trade what each side holds ([`View::have`]) once metadata named the peer's identity and before
@@ -346,8 +623,9 @@ fn trade_haves(
     view: &View,
 ) -> Result<Vec<Digest>> {
     let bound = own_bound(endpoint)?;
+    restated(endpoint, bound, peer.bound)?;
     let own = encode_frontier(bound, &view.have());
-    let max = 13 + bound.held as usize * 32;
+    let max = 13 + bound.held as usize * 32 + trailer_room(reads_format(endpoint)?);
     let wire = match side {
         Side::Initiator => {
             send_frame(stream, &own)?;
@@ -543,13 +821,14 @@ fn send_evidence_wires(
     {
         return Err(Error::new("Commons evidence exceeds its bound"));
     }
-    let mut header = [0u8; EVIDENCE_HEADER];
+    let mut header = vec![0u8; EVIDENCE_HEADER];
     header[..4].copy_from_slice(b"AEV4");
     header[4..8].copy_from_slice(&bound.held.to_be_bytes());
-    header[8] = u8::from(bound.crossed);
+    header[8] = state(bound);
     header[9] = u8::from(log);
     header[10..14].copy_from_slice(&(wires.len() as u32).to_be_bytes());
     header[14..22].copy_from_slice(&(bytes as u64).to_be_bytes());
+    put_trailer(&mut header, bound);
     send_frame(stream, &header)?;
     for frame in wires {
         compatible(endpoint, remote)?;
@@ -575,14 +854,17 @@ fn receive_evidence(
     max_bytes: usize,
 ) -> Result<Received> {
     let wire = session.wire;
+    let reads = reads_format(endpoint)?;
+    let most = EVIDENCE_HEADER + trailer_room(reads);
     let header = match answer {
-        Some(repair) => repair.receive_bounded_answer(stream, Side::Initiator, EVIDENCE_HEADER)?,
-        None => receive_frame(stream, EVIDENCE_HEADER)?,
+        Some(repair) => repair.receive_bounded_answer(stream, Side::Initiator, most)?,
+        None => receive_frame(stream, most)?,
     };
+    let (header, trailer) = split_trailer(&header, 8, reads);
     if header.len() != EVIDENCE_HEADER || &header[..4] != b"AEV4" || header[9] > 1 {
         return Err(Error::new("invalid Commons evidence header"));
     }
-    let bound = read_bound(&header[4..9])?;
+    let bound = read_bound(&header[4..9], trailer)?;
     let local = compatible(endpoint, bound)?;
     *peer_bound = bound;
     let count = u32::from_be_bytes(header[10..14].try_into().map_err(failure)?) as usize;
@@ -617,7 +899,8 @@ fn receive_evidence(
             check_witness(endpoint.trust, target, &frame)?;
             return Ok(Received::Node(frame));
         }
-        records.push(Record::decode(&frame).map_err(failure)?);
+        // Read as this Mac's store reads its own records: at the format its bound states.
+        records.push(Record::decode_in(&frame, Reading::Format(local.format)).map_err(failure)?);
     }
     if actual != bytes {
         return Err(Error::new("Commons evidence length differs"));
@@ -680,7 +963,16 @@ fn receive_evidence(
 /// would admit, and the peer could always have sent it. So a full Mac still judges a peer its own
 /// log seats. Nothing is written: a push is stored only once its peer is authenticated, by the
 /// membership rounds that follow.
-fn overlay(endpoint: &Endpoint, view: &View, pushed: Vec<Record>) -> Result<(Log, Vec<Record>)> {
+///
+/// A record a root of this Mac's log dropped ([`Log::knows`]) is one it holds: the store takes
+/// it as known and changes nothing, and the push is complete with it, as it is with any record
+/// this Mac held before the push. A peer that holds the whole log pushes such a record with
+/// its seat evidence whenever this Mac's stated heads do not reach it.
+pub(super) fn overlay(
+    endpoint: &Endpoint,
+    view: &View,
+    pushed: Vec<Record>,
+) -> Result<(Log, Vec<Record>)> {
     let mut store = view
         .0
         .clone()
@@ -726,9 +1018,20 @@ fn overlay(endpoint: &Endpoint, view: &View, pushed: Vec<Record>) -> Result<(Log
     let log = store
         .log()
         .ok_or_else(|| Error::new("Commons peer lacks historical log approval"))?;
+    // MUTANT (`mutants::Mutant::DroppedUnheld`): a dropped record is not held.
+    #[cfg(test)]
+    let knows = |id: &Digest| {
+        if mutants::on(mutants::Mutant::DroppedUnheld) {
+            log.get(id).is_some()
+        } else {
+            log.knows(id)
+        }
+    };
+    #[cfg(not(test))]
+    let knows = |id: &Digest| log.knows(id);
     if pushed
         .iter()
-        .any(|record| !unheld.contains(record.id()) && log.get(record.id()).is_none())
+        .any(|record| !unheld.contains(record.id()) && !knows(record.id()))
     {
         return Err(Error::new("Commons evidence is not causally complete"));
     }
@@ -769,18 +1072,29 @@ pub(super) fn connected(
     repair.begin_round();
     repair.phase = Phase::Membership;
     let own = Metadata::own(endpoint)?;
+    // A Mac that states format 1 writes and reads here what every release does. One that
+    // states a later format writes nothing until the peer is known to read it ([`stated_to`]).
+    let states = own.bound.format != FORMAT_ONE;
+    let reads = reads_format(endpoint)?;
+    let most = META_LEN + trailer_room(reads);
     let remote = match side {
         Side::Initiator => {
-            send_frame(stream, &own.encode(endpoint.trust))?;
-            repair.receive_bounded_answer(stream, side, META_LEN)?
+            if states {
+                stated_to(endpoint, wire, proof, None)?;
+            }
+            send_frame(stream, &own.frame(endpoint.trust))?;
+            repair.receive_bounded_answer(stream, side, most)?
         }
         Side::Responder => {
-            let remote = receive_frame(stream, META_LEN)?;
-            send_frame(stream, &own.encode(endpoint.trust))?;
+            let remote = receive_frame(stream, most)?;
+            if states {
+                stated_to(endpoint, wire, proof, Some(&remote))?;
+            }
+            send_frame(stream, &own.frame(endpoint.trust))?;
             remote
         }
     };
-    let mut peer = Metadata::decode(endpoint.trust, &remote)?;
+    let mut peer = Metadata::decode_as(endpoint.trust, &remote, reads)?;
     let actor = authenticate_identity(endpoint.actor, proof, &peer.request)?;
     compatible(endpoint, peer.bound)?;
     // Delta-frontier peers state what each side holds; an `atdb/4` peer sends its evidence next.
@@ -999,7 +1313,7 @@ fn load_records(endpoint: &Endpoint) -> Result<(Records, RecordsBound)> {
     let store = client::records_now(paths).map_err(|e| local_failure("frontier records", e))?;
     let bound =
         client::records_bound(paths, &store).map_err(|e| local_failure("frontier bound", e))?;
-    format_one(bound)?;
+    follows_format(endpoint, bound)?;
     if let Some(log) = store.log()
         && let aterm_secrets::membership_log::Body::Genesis { root, .. } = log.genesis().body()
         && (root.network != endpoint.trust.network
@@ -1022,6 +1336,7 @@ pub(super) fn encode_frontier(bound: RecordsBound, ids: &[Digest]) -> Vec<u8> {
     for id in ids {
         wire.extend_from_slice(id);
     }
+    put_trailer(&mut wire, bound);
     wire
 }
 
@@ -1051,10 +1366,11 @@ fn decode_frontier_and_set(
     peer: &mut Metadata,
     wire: &[u8],
 ) -> Result<(Vec<Digest>, BTreeSet<Digest>)> {
+    let (wire, trailer) = split_trailer(wire, 8, reads_format(endpoint)?);
     if wire.len() < 13 || &wire[..4] != b"AFR4" {
         return Err(Error::new("invalid Commons frontier"));
     }
-    let bound = read_bound(&wire[4..9])?;
+    let bound = read_bound(&wire[4..9], trailer)?;
     compatible(endpoint, bound)?;
     let count = u32::from_be_bytes(wire[9..13].try_into().map_err(failure)?) as usize;
     if count > bound.held as usize || wire.len() != 13 + count * 32 {
@@ -1072,27 +1388,48 @@ fn decode_frontier_and_set(
     Ok((ids, seen))
 }
 
+/// Send one batch of `records` and read the peer's durable receipts. With `served`, the batch is
+/// a served one ([`serves`]): its header sets [`SERVED`] and the served frame follows it ahead
+/// of the records, which may be more than a batch's bound, up to one reply's bytes.
 fn send_batch(
     endpoint: &Endpoint,
     stream: &mut (impl Read + Write),
     peer: RecordsBound,
     records: &[Record],
     wire: Wire,
+    served: Option<&Served>,
 ) -> Result<Report> {
     let bound = compatible(endpoint, peer)?;
+    if served.is_some() && (bound.format == FORMAT_ONE || !wire.ranges()) {
+        return Err(Error::new(
+            "a served root goes only in a batch that states a later records format, on atdb/8",
+        ));
+    }
     let bytes: usize = records.iter().map(Record::wire_len).sum();
-    let mut header = [0u8; 21];
+    let mut header = vec![0u8; 21];
     header[..4].copy_from_slice(b"ABT4");
     header[4..8].copy_from_slice(&bound.held.to_be_bytes());
-    header[8] = u8::from(bound.crossed);
+    header[8] = state(bound);
+    // MUTANT (`mutants::Mutant::ServedBitUngated`): every batch header says a frame follows.
+    #[cfg(test)]
+    if mutants::on(mutants::Mutant::ServedBitUngated) {
+        header[8] |= SERVED;
+    }
+    if served.is_some() {
+        header[8] |= SERVED;
+    }
     header[9..13].copy_from_slice(&(records.len() as u32).to_be_bytes());
     header[13..21].copy_from_slice(&(bytes as u64).to_be_bytes());
+    put_trailer(&mut header, bound);
     send_frame(stream, &header)?;
+    if let Some(served) = served {
+        send_frame(stream, &served.encode())?;
+    }
     for record in records {
         compatible(endpoint, peer)?;
         send_frame(stream, &record.wire_bytes()?)?;
     }
-    let ack = receive_frame(stream, 8 + wire.batch_records())?;
+    let ack = receive_frame(stream, 8 + records.len().max(wire.batch_records()))?;
     if ack.len() != 8 + records.len()
         || &ack[..4] != b"ACK4"
         || u32::from_be_bytes(ack[4..8].try_into().map_err(failure)?) as usize != records.len()
@@ -1109,29 +1446,48 @@ fn send_batch(
     })
 }
 
-/// Take one batch of the peer's records, of at most `room` records.
-fn receive_batch(
+/// Take one batch of the peer's records, of at most `room` records: how many records it held
+/// and whether it was a served one ([`SERVED`]), whose frame and records were taken together
+/// or not at all. A served batch is read only where this Mac reads a later format than 1 (the
+/// header's trailer) on `atdb/8` and later; every other reader judges the bit as no bound, as a
+/// release does.
+pub(super) fn receive_batch(
     endpoint: &Endpoint,
     stream: &mut (impl Read + Write),
     peer: &mut Metadata,
     wire: Wire,
     room: usize,
-) -> Result<(Report, usize)> {
-    let header = receive_frame(stream, 21)?;
+) -> Result<(Report, usize, bool)> {
+    let reads = reads_format(endpoint)?;
+    let header = receive_frame(stream, 21 + trailer_room(reads))?;
+    let (header, trailer) = split_trailer(&header, 8, reads);
     if header.len() != 21 || &header[..4] != b"ABT4" {
         return Err(Error::new("invalid Commons batch"));
     }
-    let bound = read_bound(&header[4..9])?;
+    let formatted = trailer.is_some();
+    // MUTANT (`mutants::Mutant::ServedBitUnread`): the served bit is read in a header with no
+    // format trailer.
+    #[cfg(test)]
+    let formatted = formatted || mutants::on(mutants::Mutant::ServedBitUnread);
+    let served = formatted && wire.ranges() && header[8] & SERVED != 0;
+    let mut stated = [0u8; 5];
+    stated.copy_from_slice(&header[4..9]);
+    if served {
+        stated[4] &= !SERVED;
+    }
+    let bound = read_bound(&stated, trailer)?;
     let local = compatible(endpoint, bound)?;
     peer.bound = bound;
     let count = u32::from_be_bytes(header[9..13].try_into().map_err(failure)?) as usize;
     let bytes = u64::from_be_bytes(header[13..21].try_into().map_err(failure)?);
-    let most = if count == 1 {
+    let most = if served {
+        REPLY_CAP
+    } else if count == 1 {
         wire.batch_bytes().max(MAX_RECORD)
     } else {
         wire.batch_bytes()
     };
-    if count > wire.batch_records()
+    if (!served && count > wire.batch_records())
         || count > room
         || count > bound.held as usize
         || count > local.held as usize
@@ -1139,6 +1495,12 @@ fn receive_batch(
     {
         return Err(Error::new("Commons batch exceeds its bound"));
     }
+    let frame = if served {
+        let room = REPLY_CAP - usize::try_from(bytes).map_err(failure)?;
+        Some(receive_frame(stream, room)?)
+    } else {
+        None
+    };
     let mut wires = Vec::with_capacity(count);
     let mut actual = 0u64;
     for _ in 0..count {
@@ -1158,13 +1520,23 @@ fn receive_batch(
         .paths
         .as_ref()
         .ok_or_else(|| Error::new("Commons has no membership custody"))?;
-    let held = client::retain_bounded_records_for_commons(
-        paths,
-        endpoint.trust.network,
-        endpoint.trust.authority,
-        bound,
-        &wires,
-    )
+    let held = match &frame {
+        Some(frame) => client::retain_served_records_for_commons(
+            paths,
+            endpoint.trust.network,
+            endpoint.trust.authority,
+            bound,
+            frame,
+            &wires,
+        ),
+        None => client::retain_bounded_records_for_commons(
+            paths,
+            endpoint.trust.network,
+            endpoint.trust.authority,
+            bound,
+            &wires,
+        ),
+    }
     .map_err(|e| local_failure("frontier retain", e))?;
     let mut ack = Vec::with_capacity(8 + held.len());
     ack.extend_from_slice(b"ACK4");
@@ -1176,11 +1548,14 @@ fn receive_batch(
         Report {
             sent: 0,
             received,
-            deferred: count - received,
+            // What a served batch leaves is what this Mac still lacks, which its caller counts
+            // again from its store.
+            deferred: if served { 0 } else { count - received },
             // The records' store does not tell held from new ([`super::Report::added`]).
             added: 0,
         },
         count,
+        served,
     ))
 }
 
@@ -1194,7 +1569,11 @@ fn repair_key(
     hash.update(b"aterm/commons/frontier-refusal/4\0");
     for bound in [local, remote] {
         hash.update(bound.held.to_be_bytes());
-        hash.update([u8::from(bound.crossed)]);
+        hash.update([state(bound)]);
+        // A later format's capacity and number, as its frames state them: none at format 1.
+        let mut stated = Vec::new();
+        put_trailer(&mut stated, bound);
+        hash.update(&stated);
     }
     hash.update(hold_key(ours, theirs));
     hash.finalize()
@@ -1278,12 +1657,13 @@ fn repair_records(
             return Ok((total, Ending::Interrupted));
         }
         let (store, bound) = load_records(endpoint)?;
+        restated(endpoint, bound, peer.bound)?;
         let (ids, ours) = knowledge_and_set(&store);
         let frontier = trade(
             stream,
             side,
             &encode_frontier(bound, &ids),
-            13 + bound.held as usize * 32,
+            13 + bound.held as usize * 32 + trailer_room(reads_format(endpoint)?),
         )?;
         let (theirs, remote) = decode_frontier_and_set(endpoint, peer, &frontier)?;
         let key = repair_key(bound, peer.bound, &ours, &remote);
@@ -1294,9 +1674,9 @@ fn repair_records(
         } else {
             Vec::new()
         };
-        let (sent, (received, incoming)) = match side {
+        let (sent, (received, incoming, _)) = match side {
             Side::Initiator => {
-                let sent = send_batch(endpoint, stream, peer.bound, &offered, wire)?;
+                let sent = send_batch(endpoint, stream, peer.bound, &offered, wire, None)?;
                 (
                     sent,
                     receive_batch(endpoint, stream, peer, wire, usize::MAX)?,
@@ -1305,7 +1685,7 @@ fn repair_records(
             Side::Responder => {
                 let got = receive_batch(endpoint, stream, peer, wire, usize::MAX)?;
                 (
-                    send_batch(endpoint, stream, peer.bound, &offered, wire)?,
+                    send_batch(endpoint, stream, peer.bound, &offered, wire, None)?,
                     got,
                 )
             }
@@ -1353,6 +1733,14 @@ fn repair_records(
 /// ([`super::proceed`]), both at the same frame boundary. A peer offers at most the records
 /// the reconciliation found it holds that this side lacks. Under the refusal hold
 /// ([`MembershipHint::offers`]) this side offers nothing and still takes what the peer offers.
+///
+/// Where this side serves its roots ([`serves`]), its first batch is a served one: the frame and
+/// every record the peer lacks, which the peer takes together or not at all; the peer then
+/// counts what it still lacks from its store, the ids the roots dropped among them where it
+/// took none. A served batch the peer took none of settles nothing ([`MembershipHint::settle`]):
+/// the peer judged a frame, not records, and keeps no strike. Under the same views it is not
+/// served the frame again for [`REFUSAL_HOLD`] ([`MembershipHint::serves`]), and those sessions
+/// offer it the records it lacks alone, which it takes or refuses as any records.
 fn drain_records(
     endpoint: &Endpoint,
     stream: &mut (impl Read + Write),
@@ -1363,13 +1751,10 @@ fn drain_records(
 ) -> Result<(Report, Ending)> {
     let wire = Wire::Ranges;
     let (store, bound) = load_records(endpoint)?;
-    let records: Vec<Record> = store
-        .log()
-        .map_or_else(Vec::new, |log| log.records().cloned().collect());
+    let (records, ours) = held_and_known(&store);
+    let roots = served_roots(endpoint, &store, bound, peer.bound);
     drop(store);
-    let ours: BTreeSet<Digest> = records.iter().map(|record| *record.id()).collect();
-    // At most what both sides can hold: a peer's stated bound is its own claim.
-    let most = bound.held.min(peer.bound.held) as usize;
+    let most = most_known(bound, peer.bound);
     let theirs = super::reconcile(
         stream,
         side,
@@ -1380,16 +1765,28 @@ fn drain_records(
     let mut lacked = theirs.difference(&ours).count();
     let key = repair_key(bound, peer.bound, &ours, &theirs);
     let now = Instant::now();
+    // FAULT (`super::faults::clock`): a test's Mac reads its holds later than the wall.
+    #[cfg(test)]
+    let now = super::faults::clock(now);
     let owed: Vec<Record> = records
         .into_iter()
         .filter(|record| !theirs.contains(record.id()))
         .collect();
     // Under the hold the peer is offered nothing, and what it lacks stays deferred.
-    let (missing, withheld) = if hint.offers(&key, now) {
+    let offers = hint.offers(&key, now);
+    let (missing, withheld) = if offers {
         (owed, 0)
     } else {
         (Vec::new(), owed.len())
     };
+    // A served batch the peer took nothing of under these views holds its frame back.
+    let again = hint.serves(&key, now);
+    // MUTANT (`mutants::Mutant::ServesRefusedRoot`): a refused frame is served again at once.
+    #[cfg(test)]
+    let again = again || mutants::on(mutants::Mutant::ServesRefusedRoot);
+    let mut serving = roots.filter(|served| offers && again && serves(served, &theirs, &missing));
+    // Whether the peer took the served batch, once one went.
+    let mut taken = None;
     let mut total = Report::default();
     let mut at = 0;
     let ending = loop {
@@ -1397,23 +1794,50 @@ fn drain_records(
             total.deferred = total.deferred.max(1);
             break Ending::Interrupted;
         }
-        let batch = next_batch(wire, &missing[at..]);
+        let served = serving.take();
+        #[cfg(test)]
+        let mut served = served;
+        let batch = if served.is_some() {
+            &missing[..]
+        } else {
+            next_batch(wire, &missing[at..])
+        };
         at += batch.len();
-        let (sent, (received, offered)) = match side {
+        // FAULT (`super::faults::served_as`): what a test's peer serves in place of this Mac's
+        // frame and records.
+        #[cfg(test)]
+        let faulted = served
+            .as_mut()
+            .map(|served| super::faults::served_as(served, batch));
+        #[cfg(test)]
+        let batch = faulted.as_deref().unwrap_or(batch);
+        let (sent, (received, offered, got_served)) = match side {
             Side::Initiator => {
-                let sent = send_batch(endpoint, stream, peer.bound, batch, wire)?;
+                let sent = send_batch(endpoint, stream, peer.bound, batch, wire, served.as_ref())?;
                 (sent, receive_batch(endpoint, stream, peer, wire, lacked)?)
             }
             Side::Responder => {
                 let got = receive_batch(endpoint, stream, peer, wire, lacked)?;
-                (send_batch(endpoint, stream, peer.bound, batch, wire)?, got)
+                (
+                    send_batch(endpoint, stream, peer.bound, batch, wire, served.as_ref())?,
+                    got,
+                )
             }
         };
-        lacked -= offered;
+        if served.is_some() {
+            taken = Some(sent.sent > 0);
+        }
+        lacked = if got_served {
+            theirs
+                .difference(&held_and_known(&load_records(endpoint)?.0).1)
+                .count()
+        } else {
+            lacked - offered
+        };
         total.sent += sent.sent;
         total.received += received.received;
         total.deferred += sent.deferred + received.deferred;
-        if batch.is_empty() && offered == 0 {
+        if batch.is_empty() && served.is_none() && offered == 0 && !got_served {
             // What either side held back (the peer's `lacked` is its own `withheld`).
             total.deferred += withheld + lacked;
             break if total.deferred == 0 {
@@ -1423,25 +1847,123 @@ fn drain_records(
             };
         }
     };
+    if let Some(taken) = taken {
+        hint.served(key, taken, now);
+    }
     // Every record the peer lacked was offered once this session, unless it was cut short.
-    hint.settle(
-        key,
-        &missing[..at]
-            .iter()
-            .map(|record| *record.id())
-            .collect::<Vec<_>>(),
-        total.sent,
-        at == missing.len(),
-        now,
-    );
+    let refused = taken == Some(false);
+    // MUTANT (`mutants::Mutant::RefusedRootStrikes`): a refused served batch is a refused round.
+    #[cfg(test)]
+    let refused = refused && !mutants::on(mutants::Mutant::RefusedRootStrikes);
+    if !refused {
+        hint.settle(
+            key,
+            &missing[..at]
+                .iter()
+                .map(|record| *record.id())
+                .collect::<Vec<_>>(),
+            total.sent,
+            at == missing.len(),
+            now,
+        );
+    }
     Ok((total, ending))
+}
+
+/// The roots this Mac may serve its peer on this session's records wire: its log's
+/// ([`Log::served`]), and only where both sides state format 2 (this Mac's `bound`, which its
+/// mark and its build gave it, [`follows_format`], and the `peer`'s, which it stated in its own
+/// frames this session) and this Mac's build reads it ([`client::reads_later_format`]). `None`
+/// for a whole log, and for every Mac that states format 1, which asks nothing more of its
+/// store.
+fn served_roots(
+    endpoint: &Endpoint,
+    store: &Records,
+    bound: RecordsBound,
+    peer: RecordsBound,
+) -> Option<Served> {
+    if bound.format != FORMAT_TWO
+        || peer.format != FORMAT_TWO
+        || !endpoint
+            .paths
+            .as_ref()
+            .is_some_and(client::reads_later_format)
+    {
+        return None;
+    }
+    // MUTANT (`mutants::Mutant::ServesNoRoot`): no root is served.
+    #[cfg(test)]
+    if mutants::on(mutants::Mutant::ServesNoRoot) {
+        return None;
+    }
+    store.log()?.served()
+}
+
+/// Whether this Mac serves `served` to a peer whose reconciled set is `theirs`, beside the
+/// records it lacks (`missing`): where the peer lacks a record a root dropped, which no record
+/// alone brings it (a record past the cut that follows one waits on it), and where the frame
+/// and the records fit one reply ([`REPLY_CAP`]), as a vault server serves them
+/// (`Store::missing_served`). A peer that holds or dropped every such record (it holds the cut,
+/// or a root that nests it) is sent records alone, and a reply past [`REPLY_CAP`] is sent as
+/// records alone, which the peer holds waiting for a peer that holds the cut.
+fn serves(served: &Served, theirs: &BTreeSet<Digest>, missing: &[Record]) -> bool {
+    // MUTANT (`mutants::Mutant::ServesAtTheCut`): served whatever the peer holds.
+    #[cfg(test)]
+    let lacks = mutants::on(mutants::Mutant::ServesAtTheCut)
+        || served.stubs.keys().any(|id| !theirs.contains(id));
+    #[cfg(not(test))]
+    let lacks = served.stubs.keys().any(|id| !theirs.contains(id));
+    lacks
+        && missing
+            .iter()
+            .try_fold(served.wire_len(), |n, record| {
+                n.checked_add(record.wire_len())
+            })
+            .is_some_and(|bytes| bytes <= REPLY_CAP)
+}
+
+/// The records `store` holds complete, in causal order, and the ids it reconciles with a peer:
+/// those records' and, of a log rooted at a final checkpoint, the id of each record a root
+/// dropped ([`Records::complete_inventory`]). A dropped record is one this Mac has: a peer that
+/// holds the whole log then finds this Mac lacks none of them and offers none, where a set of
+/// the held ids alone would have it offer every one of them in every session, each to be
+/// answered as known. This Mac offers a peer only records it holds, so a dropped id a peer
+/// lacks is offered no record: the root that dropped it is served instead ([`serves`]). For a
+/// whole log the ids are the records', as before.
+pub(super) fn held_and_known(store: &Records) -> (Vec<Record>, BTreeSet<Digest>) {
+    let records: Vec<Record> = store
+        .log()
+        .map_or_else(Vec::new, |log| log.records().cloned().collect());
+    // MUTANT (`mutants::Mutant::DroppedUnheld`): the held records' ids alone.
+    #[cfg(test)]
+    if mutants::on(mutants::Mutant::DroppedUnheld) {
+        let ids = records.iter().map(|record| *record.id()).collect();
+        return (records, ids);
+    }
+    (records, store.complete_inventory())
+}
+
+/// The most ids a peer's reconciled set names: at most what both sides can hold, since a peer's
+/// stated bound is its own claim. At format 1 that is the lesser held bound. A log of a later
+/// format may be rooted, and names each record a root dropped beside those it holds; a dropped
+/// record's stub counts against the store's bytes and holds its 32-byte id, so a store names at
+/// most its capacity over 32 of them.
+pub(super) fn most_known(local: RecordsBound, peer: RecordsBound) -> usize {
+    let held = local.held.min(peer.held) as usize;
+    if local.format == FORMAT_ONE {
+        return held;
+    }
+    held.saturating_add(usize::try_from(local.bytes.min(peer.bytes) / 32).unwrap_or(usize::MAX))
 }
 
 /// The reconciliation snapshot of `ids`, the records `records` holds in causal order: each
 /// signer's dense, unforked prefix agreed by its frontier ([`Snapshot::from_inventory`]), as a
 /// table round's is, so two long logs that share most of their history trade their tails rather
 /// than ranges over the whole log. A header the index refuses leaves its record to the ranges.
-fn snapshot(records: &[Record], ids: BTreeSet<Digest>) -> astream_wire::sync::rbsr::Snapshot {
+pub(super) fn snapshot(
+    records: &[Record],
+    ids: BTreeSet<Digest>,
+) -> astream_wire::sync::rbsr::Snapshot {
     let mut index = astream_wire::sync::Index::new(records.len().max(1));
     for record in records {
         let _ = index.insert(record.sync_header());

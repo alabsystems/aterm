@@ -350,6 +350,23 @@ pub(crate) fn fg_cpu(master: i32) -> Option<(i32, u64)> {
     }
 }
 
+/// WHETHER A SCOPED HARNESS'S CLAIMANT IS STOPPED (`SIGSTOP`/`SIGTSTP`), read on its own pid
+/// ([`pid_stopped`]), never on the tab's foreground group: aterm's harness watchdog reads a
+/// stopped claimant `stopped` and never restarts it for the beats it misses. `None` where this
+/// platform has no reader (D20: macOS and Linux have one, Windows none).
+#[cfg(unix)]
+pub(crate) fn claimant_stopped(pid: u32) -> Option<bool> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        libc::pid_t::try_from(pid).ok().and_then(pid_stopped)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// `pid`'s stop state from its [`crate::quit_safety::pid_bsdinfo`] record, which must also belong to this uid.
 #[cfg(target_os = "macos")]
 pub(crate) fn pid_stopped(pid: libc::pid_t) -> Option<bool> {

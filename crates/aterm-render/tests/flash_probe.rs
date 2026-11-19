@@ -99,6 +99,10 @@ fn flashes_by_place(style: &str, take: Take, look: Look, caret: &[u8]) -> Places
     let frames: Vec<u64> = (1..=end / STEP_MS).map(|k| k * STEP_MS).collect();
     let (to, kept) = sync_channel::<Kept>(2);
     let mut zig: Vec<Option<Zig>> = Vec::new();
+    // The frame before's pixels: a pixel that holds its value feeds its zigzag nothing new
+    // ([`turn`] on the value it took last changes nothing and turns nowhere), so only the pixels
+    // that changed are read.
+    let mut was: Vec<u32> = Vec::new();
     let mut turns: HashMap<usize, Vec<u64>> = HashMap::new();
     // Each frame's boxes (px, end exclusive): the pet's body and the flying head, which hold
     // the frame after theirs too; the caret's cell; and the word icons.
@@ -123,10 +127,11 @@ fn flashes_by_place(style: &str, take: Take, look: Look, caret: &[u8]) -> Places
                 iconed += usize::from(!g.word_icons.is_empty());
                 boxes.insert(k.ms, (bodies, caret, g.word_icons.clone()));
                 for (i, &p) in k.px.iter().enumerate() {
-                    if turn(&mut zig[i], luma(p)) {
+                    if was.get(i) != Some(&p) && turn(&mut zig[i], luma(p)) {
                         turns.entry(i).or_default().push(k.ms);
                     }
                 }
+                was = k.px;
                 seen += 1;
             }
             (width, turns, boxes, seen, iconed)

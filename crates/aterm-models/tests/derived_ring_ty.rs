@@ -1513,6 +1513,10 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
             "ActLeadOverPerson",
             "ActTwice",
             "ActorSwap",
+            "ScreenOpensUnderStream",
+            "TxClosesUnderStream",
+            "StreamRestArms",
+            "StreamEndTakesWall",
         ],
     );
 
@@ -1640,6 +1644,160 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
         (stale["bk"], stale["ga"]),
         (0, 0),
         "a stale input attributes nothing"
+    );
+}
+
+/// THE STREAM SOURCE (HX-15h, D29): once a harness's record stream feeds the turns, only it opens
+/// and closes one. Its laws are proven over the whole space with the screen's and the
+/// transcript's actions beside it, and each falls to its own `Buggy = 3` mutant: a screen verdict
+/// that opens a turn (`ScreenOpensUnderStream`) or a transcript end that closes one
+/// (`TxClosesUnderStream`) under the stream, a rest that arms a settle under it
+/// (`StreamRestArms`), and a stream end that takes the screen's wall with its turn
+/// (`StreamEndTakesWall`). The walks pin the source's steps one by one.
+#[test]
+fn derived_turn_tracker_takes_the_stream_source() {
+    let model = aterm_models_session::turn_tracker_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_breaks_first(&model);
+    let stream_laws = [
+        ("ScreenOpensUnderStream", "OnlyTheStreamMovesItsTurns"),
+        ("TxClosesUnderStream", "OnlyTheStreamMovesItsTurns"),
+        ("StreamRestArms", "StreamTurnsNeverSettle"),
+        ("StreamEndTakesWall", "WallNeedOutlivesItsTurn"),
+    ];
+    let buggy = aterm_spec::interp::with_buggy(&model, 3);
+    for (mutant, law) in stream_laws {
+        let mut alone = buggy.clone();
+        alone
+            .actions
+            .retain(|a| a.name == mutant || !stream_laws.iter().any(|(m, _)| *m == a.name));
+        assert_eq!(
+            aterm_spec::interp::violated_invariants(&alone),
+            std::collections::BTreeSet::from([law]),
+            "{mutant} alone breaks {law} and nothing else"
+        );
+    }
+
+    // The stream opens the turn; the screen's busy and rest beside it move no turn and arm no
+    // settle, and the transcript's end closes none.
+    let mut s = model.init_state();
+    assert!(model.fire("StreamStart", &mut s));
+    assert_eq!((s["sf"], s["turn"]), (1, 1));
+    for action in ["SeeBusy", "SeeIdle"] {
+        assert!(model.fire(action, &mut s), "{action}");
+    }
+    assert_eq!(
+        (s["turn"], s["pend"]),
+        (1, 0),
+        "the screen's rest arms nothing"
+    );
+    assert!(!model.action_enabled("Tick", &s));
+    assert!(!model.action_enabled("Rest", &s));
+    assert!(!model.action_enabled("CtlTurn", &s));
+    assert!(
+        !model.action_enabled("TxClose", &s),
+        "the transcript's end closes no turn the stream feeds"
+    );
+    assert!(model.fire("StreamEnd", &mut s));
+    assert_eq!((s["turn"], s["cw"], s["sf"]), (0, 13, 1));
+    assert!(model.fire("SeeBusy", &mut s));
+    assert_eq!(
+        s["turn"], 0,
+        "the screen's busy opens no turn under the stream"
+    );
+
+    // A `started` takes the turn the screen opened: no second turn.
+    let mut take = model.init_state();
+    for action in ["SeeBusy", "SeeIdle", "Tick"] {
+        assert!(model.fire(action, &mut take), "{action}");
+    }
+    assert_eq!(take["pend"], 1, "the screen's settle runs");
+    assert!(model.fire("StreamStart", &mut take));
+    assert_eq!(
+        (take["turn"], take["extra"], take["pend"], take["ticks"]),
+        (1, 0, 0, 0),
+        "taken, its settle disarmed"
+    );
+
+    // A dialog with no turn open hangs on the run; a box under the stream's turn outlives its
+    // end on the run; a survey ends with it; a wall stands on the run.
+    let mut d = model.init_state();
+    for action in ["StreamOn", "SeeDialog"] {
+        assert!(model.fire(action, &mut d), "{action}");
+    }
+    assert_eq!((d["turn"], d["step"], d["sturn"]), (0, 2, 0));
+    let mut b = model.init_state();
+    for action in ["StreamStart", "SeeBox", "AdmitHarness", "StreamEnd"] {
+        assert!(model.fire(action, &mut b), "{action}");
+    }
+    assert_eq!(
+        (b["turn"], b["step"], b["sturn"]),
+        (0, 1, 0),
+        "the box on the run"
+    );
+    assert_eq!((b["bk"], b["pd"]), (0, 4), "its admission's step closed");
+    let mut v = model.init_state();
+    for action in ["StreamStart", "SeeSurvey", "StreamEnd"] {
+        assert!(model.fire(action, &mut v), "{action}");
+    }
+    assert_eq!(
+        (v["turn"], v["step"]),
+        (0, 0),
+        "the survey ended with its turn"
+    );
+    let mut w = model.init_state();
+    for action in ["StreamStart", "SeeWall", "StreamEnd"] {
+        assert!(model.fire(action, &mut w), "{action}");
+    }
+    assert_eq!(
+        (w["turn"], w["step"], w["sturn"], w["wg"]),
+        (0, 3, 0, 0),
+        "the wall stands on the run"
+    );
+    assert!(model.fire("StreamStart", &mut w));
+    assert_eq!(
+        (w["turn"], w["step"], w["sturn"]),
+        (1, 3, 0),
+        "beside the new turn"
+    );
+    let mut same = w.clone();
+    assert!(model.fire("SeeWall", &mut same));
+    assert_eq!(same["sturn"], 0, "the same wall stays where it stood");
+    assert!(model.fire("SeeOtherWall", &mut w));
+    assert_eq!(w["sturn"], 1, "another wall hangs from the turn");
+
+    // The stand-down's end: the screen's rest settles the turn the stream left; a refuted wall
+    // arms nothing.
+    let mut off = model.init_state();
+    for action in ["StreamStart", "SeeIdle", "StreamOff"] {
+        assert!(model.fire(action, &mut off), "{action}");
+    }
+    assert_eq!((off["sf"], off["pend"], off["ticks"]), (0, 1, 0));
+    for action in ["Tick", "Tick", "Rest"] {
+        assert!(model.fire(action, &mut off), "{action}");
+    }
+    assert_eq!(
+        (off["turn"], off["cw"]),
+        (0, 2),
+        "the screen's settle closed it"
+    );
+    let mut refuted = model.init_state();
+    for action in ["StreamStart", "SeeWall", "TxRefute", "StreamOff"] {
+        assert!(model.fire(action, &mut refuted), "{action}");
+    }
+    assert_eq!(
+        (refuted["turn"], refuted["pend"]),
+        (1, 0),
+        "a refuted wall arms nothing"
+    );
+    let mut busy = model.init_state();
+    for action in ["StreamStart", "SeeBusy", "StreamOff"] {
+        assert!(model.fire(action, &mut busy), "{action}");
+    }
+    assert_eq!(
+        (busy["turn"], busy["pend"]),
+        (1, 0),
+        "a busy screen leaves the turn open"
     );
 }
 

@@ -1091,7 +1091,11 @@ fn walks_from(start: Start) -> Vec<Vec<Event>> {
             walks.push(vec![a, b, Event::Sync]);
         }
     }
-    // Every change of the default login, each followed by each sync: `a` to `b` once.
+    // Every change of the default login, each followed by each sync: `a` to `b` once, in a
+    // de Bruijn order of the names (each length-one or length-two Lyndon word in order, the first
+    // name again at the end), where each pair of names follows one another exactly once: 50 names,
+    // where walking each change as a pair apart took 98. Runs of three names are not each taken:
+    // the order holds 48 of the 343, where the pairs apart held 90, 47 of them not among the 48.
     const NAMES: [Event; 7] = [
         Event::Names(OWNER),
         Event::Names(WORK),
@@ -1101,14 +1105,23 @@ fn walks_from(start: Start) -> Vec<Vec<Event>> {
         Event::Absent,
         Event::Keyring,
     ];
-    for sync in [Event::Sync, Event::SyncSheet, Event::SyncLab] {
-        let mut long = Vec::new();
-        for a in NAMES {
-            for b in NAMES {
-                long.extend([a, sync, b, sync]);
-            }
+    let mut order = Vec::new();
+    for a in 0..NAMES.len() {
+        order.push(a);
+        for b in a + 1..NAMES.len() {
+            order.extend([a, b]);
         }
-        walks.push(long);
+    }
+    order.push(0);
+    let changes: BTreeSet<(usize, usize)> =
+        order.windows(2).map(|pair| (pair[0], pair[1])).collect();
+    assert_eq!(
+        (changes.len(), order.len()),
+        (NAMES.len() * NAMES.len(), NAMES.len() * NAMES.len() + 1),
+        "each change once: {order:?}"
+    );
+    for sync in [Event::Sync, Event::SyncSheet, Event::SyncLab] {
+        walks.push(order.iter().flat_map(|&name| [NAMES[name], sync]).collect());
     }
     walks
 }

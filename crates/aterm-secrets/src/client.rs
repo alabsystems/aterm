@@ -48,6 +48,8 @@ pub use registry_store::{
 };
 mod fan_out;
 mod fleet;
+#[cfg(unix)]
+mod format_two;
 mod foundation;
 mod genesis;
 mod handover;
@@ -60,6 +62,7 @@ mod ledger_publish;
 mod locker_skew;
 mod log_entries;
 mod log_fill;
+mod log_pass;
 mod materialization_selection;
 mod member_authority;
 #[cfg(unix)]
@@ -180,6 +183,10 @@ pub use log_entries::{
 pub use log_entries::{TestPassClaim, test_hold_pass_claim};
 pub(crate) use log_entries::{member_unset_names, member_waits_here, member_write};
 pub use log_fill::{LogFill, log_fill};
+pub use log_pass::{
+    Done as LogPass, LOG_PASS_FILE, last as log_pass_last, line as log_pass_line,
+    row as log_pass_row,
+};
 pub use mailbox_index::{
     mailbox_component_held, read_mailbox_component, refresh_mailbox_component_index,
 };
@@ -395,7 +402,8 @@ impl Paths {
     /// The header and data file are named whatever the records entry is, since a watcher takes
     /// this list once: while the entry is a plain file they are paths under a file (a lookup
     /// answers `ENOTDIR`), which a watcher takes as files not there yet, and the vault folder
-    /// hears the entry replaced by a layout. The source comes first.
+    /// hears the entry replaced by a layout. The source comes first. A write to a rewritten
+    /// entry is heard by its pin ([`Self::records_watch_files`]).
     #[must_use]
     pub fn standing_files(&self) -> Vec<PathBuf> {
         let mut files = vec![
@@ -404,10 +412,20 @@ impl Paths {
             self.identity_file(),
             handover::allowed_file(self),
         ];
-        if let Ok(records) = crate::records_storage::standing_files(&self.records_file()) {
-            files.extend(records);
-        }
+        files.extend(self.records_watch_files());
         files
+    }
+
+    /// The files of the records entry a watcher names ([`crate::records_storage::standing_files`]:
+    /// the entry, its pin and intent, and a layout's `layout` and `current`). A rewritten
+    /// entry's data file is not among them, since its name changes at each rewrite: a write to
+    /// it writes the pin again (`records_storage::rewrite::written`), which a watcher hears, as
+    /// it hears a rewrite by the pin's rename.
+    #[must_use]
+    pub fn records_watch_files(&self) -> Vec<PathBuf> {
+        crate::records_storage::standing_files(&self.records_file())
+            .map(Vec::from)
+            .unwrap_or_default()
     }
 
     fn source_file(&self) -> PathBuf {
@@ -489,14 +507,23 @@ impl Paths {
         self.dir.join("records")
     }
 
-    /// The current data file selected by the records entry, without changing storage
-    /// (`records_storage::reader_path`: a pinned layout standing as a reader last judged it is
-    /// not read again).
+    /// The current data file selected by the records entry, without changing storage, as this
+    /// Mac's records reader selects it ([`records_reading`]): a Mac that reads format 2 selects
+    /// a rewritten layout's pinned generation (`records_storage::rewrite::data_path`); every
+    /// other selects as format 1 does (`records_storage::reader_path`: a pinned layout standing
+    /// as a reader last judged it is not read again), which refuses a rewritten layout. A Mac
+    /// reads format 2 only once its format mark names it on a build that reads it, which no
+    /// running build is: on every other, this reads no mark and selects as it always did.
     ///
     /// # Errors
     /// The layout is pending, unsafe, missing its current file, inconsistent with its pin, or
-    /// requires a larger reader capacity than this build supports.
+    /// requires a larger reader capacity than this build supports; a rewritten layout this Mac
+    /// does not read; or, on a build that reads format 2, the format mark cannot be read.
     pub fn records_data_file(&self) -> crate::Result<PathBuf> {
+        #[cfg(unix)]
+        if records_reading(self)?.admits_two() {
+            return Ok(crate::records_storage::rewrite::data_path(&self.records_file())?.path);
+        }
         crate::records_storage::reader_path(&self.records_file())
     }
 
@@ -529,6 +556,13 @@ impl Paths {
     /// before this Mac holds its first record past format 1, never lowered or removed.
     pub(crate) fn format_file(&self) -> PathBuf {
         self.dir.join("records.format")
+    }
+
+    /// The note beside [`Self::records_file`] that this Mac's vault source refused its records
+    /// pull for a later records format than its build reads ([`told_later_format`]): what
+    /// `aterm fleet` shows as this Mac's own `needs update`, and nothing else reads.
+    pub(crate) fn later_format_file(&self) -> PathBuf {
+        self.dir.join("records.later-format")
     }
 
     /// The files that hold the membership history this Mac acknowledged, which
@@ -5626,6 +5660,25 @@ fn records_reading(paths: &Paths) -> crate::Result<crate::membership_log::Readin
     }
 }
 
+/// What stands at this Mac's records entry for a reader that keeps what it read while each
+/// file its selection is judged by stands as it was (the vault memos' stamps and the seat ask's
+/// memo): judged as this Mac's records reader selects ([`records_reading`]), a rewritten
+/// layout's pinned generation for a Mac that reads format 2
+/// (`records_storage::rewrite::standing`), and as format 1 judges for every other
+/// ([`crate::records_storage::standing`]), which refuses a rewritten layout. `None` where the
+/// selection refuses the entry or its files cannot be seen, or the format mark cannot be read:
+/// the reader then reads afresh.
+fn records_standing(
+    paths: &Paths,
+    glance: Option<&fsx::Glance>,
+) -> Option<crate::records_storage::Standing> {
+    #[cfg(unix)]
+    if records_reading(paths).ok()?.admits_two() {
+        return crate::records_storage::rewrite::standing(&paths.records_file(), glance);
+    }
+    crate::records_storage::standing(&paths.records_file(), glance)
+}
+
 /// The record store name `config`'s vault keeps and an empty store for it
 /// ([`crate::membership_log::Store::for_vault`]): ALab's (whose genesis the build pins) for a
 /// vault the ALab key signs, the vault's own name otherwise, and none for a vault that only calls
@@ -5675,13 +5728,32 @@ pub fn load_records(paths: &Paths) -> crate::Result<crate::membership_log::Store
             .get_or_init(|| read_identity(paths).ok().flatten())
             .as_ref()
     };
-    records_cache::read(
+    let mut store = records_cache::read(
         paths,
         vault,
         store,
         &of,
         records_cache::HeadPublication::Allowed,
-    )
+    )?;
+    write_as_read(&mut store, of);
+    Ok(store)
+}
+
+/// Make `store` draft as it reads: a store that reads format 2 drafts its `Put`s and `Deletes`
+/// as record version 2 for this Mac's identity, `identity` ([`crate::membership_log::writer`]),
+/// so every write from it signs version 2, the ones that load it here included. A store that
+/// reads format 1 (every store of a running build, while
+/// [`crate::commons::hearing::READS_FORMAT`] names no release) is left as it is, and nothing is
+/// read. With no identity here, a format-2 store drafts no `Put` or `Delete` at all.
+fn write_as_read<'a>(
+    store: &mut crate::membership_log::Store,
+    identity: impl FnOnce() -> Option<&'a crate::age::Identity>,
+) {
+    if store.reading().admits_two()
+        && let Some(identity) = identity()
+    {
+        store.write_two(identity);
+    }
 }
 
 /// This Mac's membership store as an authority decision reads it: [`load_records`], projected
@@ -5776,13 +5848,15 @@ fn load_records_for(
     config: &Config,
 ) -> crate::Result<crate::membership_log::Store> {
     let (vault, store) = records_store_selected(reads, Some(config))?;
-    records_cache::read(
+    let mut store = records_cache::read(
         reads.paths(),
         vault,
         store,
         &|| reads.identity().ok().flatten(),
         records_cache::HeadPublication::ReadOnly,
-    )
+    )?;
+    write_as_read(&mut store, || reads.identity().ok().flatten());
+    Ok(store)
 }
 
 /// Verify and merge `records` into `paths.records_file()` under the client state lock, returning
@@ -5917,10 +5991,12 @@ fn persist_stored(paths: &Paths, store: &crate::membership_log::Store) -> crate:
                 let mut suffix = Vec::with_capacity(length);
                 store.write_held_from(held, &mut suffix)?;
                 if append_records(&target, &stamp, &suffix).is_ok() {
+                    rewrite::written(&entry, &target)?;
                     return Ok(true);
                 }
             }
             write_record_file(&target, |writer| store.write_stored(writer))?;
+            rewrite::written(&entry, &target)?;
             return Ok(true);
         }
     }
@@ -5935,12 +6011,33 @@ fn persist_stored(paths: &Paths, store: &crate::membership_log::Store) -> crate:
              read it again",
         ));
     };
-    if absent {
+    rewrite_entry(paths, store, rewrite::What::Checkpoint(root))?;
+    Ok(true)
+}
+
+/// Rewrite this Mac's records entry to `store` (`records_storage::rewrite::rewrite`, its intent
+/// naming `what`): from exactly the bytes read here, every record of which the store holds or
+/// dropped, so a record another writer appended since is never dropped unseen. An entry that
+/// holds nothing is first written empty by the ordinary writer, which the rewrite then
+/// replaces. The caller owns a records write's guards.
+///
+/// # Errors
+/// The entry cannot be selected or read; it holds a record the store neither holds nor dropped
+/// (read it again); or the rewrite fails, leaving the entry what its pin says.
+#[cfg(unix)]
+fn rewrite_entry(
+    paths: &Paths,
+    store: &crate::membership_log::Store,
+    what: crate::records_storage::rewrite::What,
+) -> crate::Result<()> {
+    use crate::records_storage::rewrite;
+    let entry = paths.records_file();
+    if crate::records_storage::absent(&entry)? {
         let target = records_file_for_write(paths, store)?;
         write_record_file(&target, |_| Ok(()))?;
     }
     let from = rewrite::data_path(&entry)?;
-    let before = fsx::read_private(&from.path, capacity)?
+    let before = fsx::read_private(&from.path, store.capacity())?
         .ok_or_else(|| Error::new("this Mac's membership records file is missing"))?;
     let on_file = records_store(paths)?
         .1
@@ -5958,10 +6055,38 @@ fn persist_stored(paths: &Paths, store: &crate::membership_log::Store) -> crate:
     rewrite::rewrite(
         &entry,
         rewrite::Predecessor::of(before.as_slice()),
-        rewrite::What::Checkpoint(root),
+        what,
         &|out| store.write_stored(out),
     )?;
-    Ok(true)
+    Ok(())
+}
+
+/// Write `store`, the store this Mac's records entry holds with the bodies of `shed` shed
+/// (`crate::membership_log::Store::shed_superseded`), by a rewrite of the entry whose intent
+/// names the shed set (its count and the SHA-256 of its ids, ascending): the one way those
+/// bytes leave the disk ([`rewrite_entry`]). It changes no record's id, so the retained
+/// history and the members lane are told nothing; the format guard is [`write_records`]'.
+/// Only the format-2 pass calls it (`log_pass`), behind its gate.
+///
+/// # Errors
+/// As [`reads_marked_format`] and [`rewrite_entry`]; more shed records than a `u32` counts.
+#[cfg(unix)]
+fn write_shed(
+    paths: &Paths,
+    store: &crate::membership_log::Store,
+    shed: &[crate::membership_log::RecordId],
+) -> crate::Result<()> {
+    reads_marked_format(paths, store)?;
+    let mut digest = aterm_digest::Sha256::new();
+    for id in shed {
+        digest.update(id);
+    }
+    let what = crate::records_storage::rewrite::What::Shed {
+        records: u32::try_from(shed.len())
+            .map_err(|_| Error::new("more shed records than a rewrite names"))?,
+        digest: digest.finalize(),
+    };
+    rewrite_entry(paths, store, what)
 }
 
 /// The first `len` bytes of the file at `path`, or as many as it holds.
@@ -6330,6 +6455,31 @@ pub fn records_marked_format(paths: &Paths) -> crate::Result<u32> {
     format_mark(paths).stored()
 }
 
+/// Whether this Mac's build reads a later records format than 1
+/// ([`crate::crossing::FormatMark::follows`]): none does while
+/// [`crate::commons::hearing::READS_FORMAT`] names no release, and no Windows member does. The
+/// gate a caller outside this crate asks before it states a later format on a wire of its own
+/// (aterm-db's frontier protocols) or reads a peer's statement of one.
+#[must_use]
+pub fn reads_later_format(paths: &Paths) -> bool {
+    #[cfg(unix)]
+    return format_mark(paths).follows();
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        false
+    }
+}
+
+/// Seam (tests of other crates): from now on the Mac at `paths` runs a build that reads
+/// records format 2 ([`reads_later_format`]), as every build does once
+/// [`crate::commons::hearing::READS_FORMAT`] names a release. It stores no mark.
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[doc(hidden)]
+pub fn test_reads_format_two(paths: &Paths) {
+    crate::crossing::reads_format_two(&paths.format_file());
+}
+
 /// The bound a Mac that stated `stated` states when it asks again a member that refused it for
 /// the member's later records format ([`crate::ErrorKind::LaterFormat`]): `stated` at format 2
 /// ([`crate::crossing::RecordsBound::at_format`]), and only for a Mac that stated format 1 on a
@@ -6443,6 +6593,122 @@ pub fn retain_bounded_records_for_commons(
     retain_commons_records_with(paths, network, authority, wires, Some(source), || {})
 }
 
+/// Take the roots a peer served over aterm-db's records exchange (`served`, a
+/// [`crate::membership_log::Served`] frame) with the records it sent beside them (`wires`), as
+/// the vault's pullers take a served reply: the store takes the records and the roots together
+/// ([`crate::membership_log::Store::ingest_served`]) or nothing, and a store that took a root
+/// is written as a rewritten records entry ([`write_records`], through `persist_stored`), the
+/// crossed mark first where `source` is crossed. Returns one acknowledgement per wire: whether
+/// the store now holds that record or a root it took dropped it.
+///
+/// A frame or a record that does not read at this Mac's format, a root the store refuses (its
+/// stubs do not authenticate, it is not final by its shares, or its frame is of another vault),
+/// a log of another root or lineage, and a state lock another writer holds take nothing and
+/// acknowledge no wire: the caller reads that as a refusal, not a failure.
+///
+/// Its gate, asked before anything is read: this Mac's build reads format 2
+/// ([`reads_later_format`]) and `source` states format 2; and, once the records are read,
+/// this Mac's store reads format 2 (its format mark names it). No build reads format 2 while
+/// [`crate::commons::hearing::READS_FORMAT`] names no release, so no running Mac takes a root
+/// here.
+///
+/// # Errors
+/// The gate; the records and the frame pass one reply's bytes
+/// ([`crate::membership_log::REPLY_CAP`]) or the store's held bound; `source` cannot exchange
+/// with this Mac's bound; or this Mac's records cannot be read or written.
+pub fn retain_served_records_for_commons(
+    paths: &Paths,
+    network: [u8; 16],
+    authority: [u8; 32],
+    source: crate::crossing::RecordsBound,
+    served: &[u8],
+    wires: &[Vec<u8>],
+) -> crate::Result<Vec<bool>> {
+    use crate::membership_log::{Body, Reading, Record, Served};
+    if !reads_later_format(paths) || source.format != crate::crossing::FORMAT_TWO {
+        return Err(Error::of_kind(
+            crate::ErrorKind::Refused,
+            "a served root is taken only by a Mac that reads records format 2, from a source that states it",
+        ));
+    }
+    let refused = || Ok(vec![false; wires.len()]);
+    let bytes = wires
+        .iter()
+        .try_fold(served.len(), |n, wire| n.checked_add(wire.len()));
+    if bytes.is_none_or(|n| n > crate::membership_log::REPLY_CAP) {
+        return Err(Error::of_kind(
+            crate::ErrorKind::Refused,
+            "a served root and its records pass one reply's bytes",
+        ));
+    }
+    let Some(_lock) = StateLock::try_take_until(paths, Instant::now() + Duration::from_secs(2))?
+    else {
+        return refused();
+    };
+    let mut store = load_records(paths)?;
+    if store.reading() != Reading::Format(crate::crossing::FORMAT_TWO) {
+        return Err(Error::of_kind(
+            crate::ErrorKind::Refused,
+            "this Mac's membership records are read at format 1: it takes no served root",
+        ));
+    }
+    require_commons_source(paths, &store, Some(source))?;
+    if wires.len() > store.budgets().held {
+        return Err(Error::of_kind(
+            crate::ErrorKind::Refused,
+            "Commons membership batch exceeds the record or byte bound",
+        ));
+    }
+    let expected = crate::membership_log::Root { network, authority };
+    let ours = |log: &crate::membership_log::Log| -> crate::Result<bool> {
+        Ok(
+            matches!(log.genesis().body(), Body::Genesis { root, .. } if *root == expected)
+                && log_entries::commons_log_matches_local_lineage(paths, log)?,
+        )
+    };
+    if let Some(log) = store.log()
+        && !ours(log)?
+    {
+        return refused();
+    }
+    let reading = store.reading();
+    let Ok(served) = Served::decode(served, reading) else {
+        return refused();
+    };
+    let mut records = Vec::with_capacity(wires.len());
+    for wire in wires {
+        let Ok(record) = Record::decode_in(wire, reading) else {
+            return refused();
+        };
+        if let Body::Genesis { root, .. } = record.body()
+            && (*root != expected
+                || !log_entries::genesis_record_matches_local_lineage(paths, &record)
+                    .unwrap_or(false))
+        {
+            return refused();
+        }
+        records.push(record);
+    }
+    let ids: Vec<crate::membership_log::RecordId> =
+        records.iter().map(|record| *record.id()).collect();
+    let before = store.complete_inventory();
+    if store.ingest_served(records, Some(&served)).is_err() {
+        return refused();
+    }
+    match store.log() {
+        Some(log) if ours(log)? => {}
+        _ => return refused(),
+    }
+    if store.complete_inventory() != before {
+        if source.crossed {
+            write_taught_by_crossed(paths, &crossing_mark(paths), &store)?;
+        } else {
+            write_records(paths, &store)?;
+        }
+    }
+    Ok(ids.iter().map(|id| store.holds(id)).collect())
+}
+
 fn require_commons_source(
     paths: &Paths,
     store: &crate::membership_log::Store,
@@ -6497,10 +6763,17 @@ fn retain_commons_records_with(
     } else {
         None
     };
+    // A bounded source's records are read as this Mac's store reads its own
+    // ([`crate::membership_log::Store::reading`]): format 1 for every Mac with no format mark,
+    // and for the legacy protocols, which a Mac past format 1 does not speak.
+    let reading = prefetched.as_ref().map_or(
+        crate::membership_log::Reading::ONE,
+        crate::membership_log::Store::reading,
+    );
     let decoded: Vec<Option<crate::membership_log::Record>> = wires
         .iter()
         .map(|wire| {
-            let record = crate::membership_log::Record::decode(wire).ok()?;
+            let record = crate::membership_log::Record::decode_in(wire, reading).ok()?;
             if let crate::membership_log::Body::Genesis { root, .. } = record.body()
                 && (*root != expected
                     || !log_entries::genesis_record_matches_local_lineage(paths, &record)
@@ -6964,6 +7237,18 @@ fn records_pass(
         &mut later,
     );
     #[cfg(unix)]
+    note_later_format(
+        paths,
+        ask,
+        pass.as_ref().is_ok_and(|pass| !pass.source_short),
+        &later,
+    );
+    // Its gate: `format_two::observe` judges nothing and writes nothing on a Mac whose build
+    // reads no format 2 (every running build), nor on one whose mark names format 2. A fence
+    // that cannot be judged now is judged at the next pass, and a watch it breaks starts again.
+    #[cfg(unix)]
+    let _ = format_two::observe(paths);
+    #[cfg(unix)]
     if let Some(followed) = follow_later_format(paths, &later, deadline)? {
         return Ok(RecordsPass {
             added: followed + pass.as_ref().map_or(0, |pass| pass.added),
@@ -6974,6 +7259,61 @@ fn records_pass(
         });
     }
     pass
+}
+
+/// What [`Paths::later_format_file`] holds: nothing reads it back (any file there is the note),
+/// it says what the file is to a person who finds it. Only the Unix records pass writes it.
+#[cfg(unix)]
+const LATER_FORMAT_NOTE: &[u8] = b"aterm-secrets records refused for a later format\n";
+
+/// Keep this Mac's note that its vault's source refused it for a later records format
+/// ([`told_later_format`]) as a records pass that asked the source (`ask`) left it: stored where
+/// the source refused the pull beside a bound stating a later format than this Mac's (it is
+/// among `later`, [`crate::ErrorKind::LaterFormat`]) and this Mac's build reads no format 2
+/// ([`crate::crossing::FormatMark::follows`]: a build that does follows instead,
+/// [`follow_later_format`]); removed where the pass heard the source whole (`heard`: it
+/// succeeded and the source did not fall short, [`RecordsPass::source_short`]) with no such
+/// refusal, or where the build follows. A pass of the peers alone, or one the source failed while
+/// a peer answered, leaves it as it was.
+///
+/// Its gate: nothing is written but on a source's `409` beside a later format's bound, which no
+/// released server sends (none states a later format than 1 while no node stores a format
+/// mark), so toward every released source the pass writes nothing here and only looks for the
+/// note (a `stat`). It stores no mark and no record, states nothing on any wire, and a source's
+/// unsigned word moves nothing but a display: `aterm fleet`'s `needs update` on this Mac's own
+/// row (`aterm_agent::fleet_view::FormatFloor`), until a pass hears the source whole without it.
+/// A note that cannot be written or removed is left for the next pass.
+#[cfg(unix)]
+fn note_later_format(paths: &Paths, ask: Ask<'_>, heard: bool, later: &[String]) {
+    if matches!(ask, Ask::Peers) {
+        return;
+    }
+    let follows = format_mark(paths).follows();
+    let refused = !follows
+        && !later.is_empty()
+        && configured(paths).is_ok_and(
+            |config| matches!(&config.source, Source::Url(source) if later.contains(source)),
+        );
+    let note = paths.later_format_file();
+    let held = crate::fsx::kind(&note).is_ok_and(|kind| kind != crate::fsx::Kind::Missing);
+    if refused && !held {
+        let _ = crate::fsx::write_atomic(&note, LATER_FORMAT_NOTE, 0o600);
+    } else if held && !refused && (heard || follows) {
+        let _ = std::fs::remove_file(&note);
+    }
+}
+
+/// Whether this Mac's vault source refused its last records pass that asked it for a later
+/// records format than this Mac's build reads ([`Paths::later_format_file`], kept by each such
+/// pass): the source's own word, unsigned, which `aterm fleet` shows as this Mac's own `needs
+/// update` and nothing else reads. `false` with no note, where the note's path does not read,
+/// and on a build that reads a later format ([`reads_later_format`]), which follows such a
+/// source instead.
+#[must_use]
+pub fn told_later_format(paths: &Paths) -> bool {
+    !reads_later_format(paths)
+        && crate::fsx::kind(&paths.later_format_file())
+            .is_ok_and(|kind| kind != crate::fsx::Kind::Missing)
 }
 
 /// The vault name a records pass judges a fresh store under ([`judge_received_records`]).
@@ -8478,6 +8818,12 @@ fn sync_repairing_inner(
     if pass {
         let _removal = pass_counts::within(Phase::Removal);
         remove::vault_pass(paths, posts_by);
+        // The format-2 log's own pass. Its gate (`log_pass::run`) answers before it reads
+        // anything on a Mac whose build reads no format 2, every running build, and reads only
+        // the format mark on one whose mark names no format 2. A pass that fails runs again at
+        // the next vault pass: each step is a function of the records.
+        #[cfg(unix)]
+        let _ = log_pass::run(paths);
     }
     let pending_records = log_entries::current_records_digest(paths, &config, &before)
         .is_some_and(|digest| Some(digest) != before.records_digest)

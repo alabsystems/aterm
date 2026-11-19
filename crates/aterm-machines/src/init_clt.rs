@@ -448,6 +448,10 @@ pub struct CommandLineTools {
     /// The root work the last probe admitted ([`Self::read`]), which an apply re-reads within
     /// ([`Self::plan_after`]).
     root_plan: Mutex<RootPlan>,
+    /// What the root LAN broker answered this run's apply for Spotlight
+    /// ([`Self::ask_broker_first`]), so a run asks it once; the home read again afterwards, not
+    /// the answer, says whether the password still owes the step.
+    broker_scope: Mutex<Option<aterm_uds::lan::ScopeAnswer>>,
 }
 
 /// The compiled root work admitted by the functional developer-tools probe.
@@ -497,6 +501,7 @@ impl CommandLineTools {
             new_folders: false,
             explicit_tab: false,
             root_plan: Mutex::new(RootPlan::WithTools),
+            broker_scope: Mutex::new(None),
         }
     }
 
@@ -563,10 +568,13 @@ impl CommandLineTools {
     /// This item in a person's own run that applies or plans (`scopes`; never a `--check`): it
     /// also owes Spotlight the folders made in a home setup's password already scoped
     /// ([`crate::init_spotlight::scope_owed`]), as a tab the person's own press opened does
-    /// ([`Self::with_explicit_tab`]). A check says whether this Mac is set up, by the rule the
-    /// window and every automatic run read
-    /// ([`crate::init_spotlight::automatic_scope_owed`]), and a folder made since is work a
-    /// person's request does, not a Mac left unfinished.
+    /// ([`Self::with_explicit_tab`]). Its apply asks the root LAN broker for them first where
+    /// Spotlight is the one step owed ([`Self::ask_broker_first`]), and carries into the
+    /// password whatever the home, read again, still owes: every folder where the broker
+    /// refused, was busy, failed or is none of this build's, and the rest of a batch. A check
+    /// says whether this Mac is set up, by the rule the window and every automatic run read
+    /// ([`crate::init_spotlight::automatic_scope_owed`]), and a folder made since is work the
+    /// broker, or a person's request, does, not a Mac left unfinished.
     #[must_use]
     pub fn scoping_new_folders(self, scopes: bool) -> Self {
         Self {
@@ -736,9 +744,12 @@ impl CommandLineTools {
     /// run that applies or plans owes one they removed ([`Self::restores_removed`]), and only their
     /// press of Finish setup ([`Self::with_explicit_tab`]) or their run that applies or plans
     /// ([`Self::scoping_new_folders`]) excludes from Spotlight a folder made in a home setup's
-    /// password already scoped; every other run owes Spotlight only a home never scoped
-    /// ([`crate::init_spotlight::automatic_scope_owed`]), a `--check` among them, and automatic
-    /// runs retain the original metadata inventory and durable episode policy.
+    /// password already scoped, while the home, read again after the root LAN broker's answer
+    /// ([`Self::ask_broker_first`]), still owes one; every other run owes Spotlight only a home
+    /// never scoped that no broker of this build takes
+    /// ([`crate::init_spotlight::automatic_scope_owed`]),
+    /// a `--check` among them, and automatic runs retain the original metadata inventory and
+    /// durable episode policy.
     ///
     /// Where an update replaced this program's executable while it ran, the build now there
     /// says whether anything is owed ([`Self::installed_build_done`]): it is the build the root
@@ -1297,6 +1308,17 @@ pub fn selected(word: &str) -> bool {
     aterm_converge::selects(word, ID, "developer", Some(aterm_converge::Layer::Base))
 }
 
+/// What a person's run says as it asks the root LAN broker for Spotlight before the password
+/// ([`CommandLineTools::ask_broker_first`]): the broker may wait out its pace first.
+pub const BROKER_ASKED: &str = "aterm init: asking aterm's LAN helper to keep this account's new \
+                                home folders out of Spotlight with no password (it can take a \
+                                minute)";
+
+/// What a person's run says where the root LAN broker answered busy, before it waits one pace
+/// ([`aterm_uds::lan::SCOPE_PACE`]) and asks it once more ([`CommandLineTools::ask_broker_first`]).
+pub const BROKER_BUSY: &str = "aterm init: aterm's LAN helper could not take these folders just \
+                               now; asking it once more in a minute, before the Mac password";
+
 /// Why pending root work cannot ask for a password from here.
 pub const NO_TTY: &str = "the remaining Mac setup needs an administrator password, and this \
                           run has no terminal to ask it in";
@@ -1462,6 +1484,7 @@ impl Item for CommandLineTools {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        self.ask_broker_first(sys);
         if let Some(tab) = &self.tab {
             return self.apply_in_tab(sys, tab);
         }
@@ -1574,6 +1597,62 @@ impl Item for CommandLineTools {
 }
 
 impl CommandLineTools {
+    /// In a person's run that takes up a folder made since ([`Self::scoping_new_folders`],
+    /// [`Self::with_explicit_tab`]), where Spotlight is the one step owed and a root LAN broker of
+    /// this build serves ([`crate::init_spotlight::broker_serves`], the rule `sync.spotlight` and
+    /// the automatic ask read), ask it for that step before any password
+    /// ([`System::scope_home`]), once a run: it excludes the console account's own new top-level
+    /// home folders with none. A busy answer (another request waiting out the broker's pace, among
+    /// its causes) is asked once more after one pace ([`aterm_uds::lan::SCOPE_PACE`]), the person
+    /// told why the run waits. Where another step is owed the password is asked anyway, and
+    /// Spotlight rides along; where no broker of this build serves, nothing is said or asked and
+    /// the password is. Each answer is journaled; what the password still owes is the home as it
+    /// reads after them ([`Self::own_owed`] reads [`crate::init_spotlight::scope_owed`] again), so
+    /// only the broker's own exclusion of every folder owed takes the step off the password, never
+    /// an answer alone.
+    fn ask_broker_first(&self, sys: &dyn System) {
+        use aterm_uds::lan::ScopeAnswer;
+        let extends = self.is_explicit() && (self.explicit_tab || self.new_folders);
+        if !extends {
+            return;
+        }
+        let asked = || {
+            self.broker_scope
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        if asked().is_some() {
+            return;
+        }
+        if self.own_owed(sys) != [crate::root_steps::Owed::Spotlight] {
+            return;
+        }
+        if !crate::init_spotlight::broker_serves(sys) {
+            *asked() = Some(ScopeAnswer::Unserved(
+                crate::init_spotlight::NOT_SERVED.to_owned(),
+            ));
+            return;
+        }
+        let ask = || {
+            let answer = sys.scope_home();
+            aterm_log::info!(
+                "Spotlight: the LAN broker answered {} for this account's new home folders",
+                answer.class()
+            );
+            answer
+        };
+        // The broker may wait out its pace (up to a minute) before it answers: the person hears
+        // why the run waits before the password's prompt.
+        sys.tell(BROKER_ASKED);
+        let mut answer = ask();
+        if answer == ScopeAnswer::Busy {
+            sys.tell(BROKER_BUSY);
+            sys.sleep(aterm_uds::lan::SCOPE_PACE);
+            answer = ask();
+        }
+        *asked() = Some(answer);
+    }
+
     /// What the probe reads, and why the tab's install would not finish when it reads short of
     /// a change: the tools present; else, with them missing, an install already under way or
     /// Apple's installer window open for them (deferred to it, asking nothing; the window's row

@@ -1,0 +1,26 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h review: the harness counts the turns of its conversation, so a `turn` record of a
+# number it already named, other than a repeat of the turn it holds open, is one it sent before
+# (its resend queue once its claim came back) and writes nothing. Here the stream's turn 5 is
+# left open as the stand-down ends; the screen settles it and opens its own turn; the resent
+# `turn 5 done` and `turn 5 started` then close and take nothing, and `turn 6 started` takes the
+# screen's turn, which its end closes.
+stream started 5 by=person
+expect open t1 turn par=r1 src=harness hseq=1 turn_by=person @0
+see busy
+at 500 see idle
+stream off
+expect wake=1500
+at 1500 expect turn=none
+expect close t1 turn out=done src=screen @500
+at 2000 see busy
+expect open t2 turn par=r1 src=screen @2000
+at 2500 stream ended 5 done
+expect turn=t2
+at 2600 stream started 5 by=person
+expect turn=t2
+at 3000 stream started 6 by=person
+expect amend t2 turn src=harness conf=claim hseq=4 turn_by=person @3000
+at 4000 stream ended 6 done
+expect close t2 turn out=done src=harness hseq=5 @4000
+expect turn=none

@@ -546,9 +546,11 @@ fn every_seed_holds_every_law_under_a_rate_limit_that_binds() {
                 .find(|v| breaks(v, law))
                 .map_or("", String::as_str)
         );
+        // With the rule on, the sweep above held this seed to every law, `law` among them.
         assert!(
-            !breaks_law(&run(&rate_bound(off.seed)), law),
-            "with the rule on, the same seed keeps `{law}`"
+            (1..=COMMITTED_SEEDS).contains(&off.seed),
+            "the control's seed {} is outside the sweep's 1..={COMMITTED_SEEDS}",
+            off.seed
         );
     }
 }
@@ -767,6 +769,17 @@ fn run_all(
 fn committed() -> &'static [Outcome] {
     static RUNS: std::sync::OnceLock<Vec<Outcome>> = std::sync::OnceLock::new();
     RUNS.get_or_init(|| run_all(&Opts::seed, 1..=COMMITTED_SEEDS))
+}
+
+/// The committed world of `seed` ([`Opts::seed`]), as the committed sweep ran it: a control's
+/// seed within [`CONTROL_SEEDS`] is one of its.
+fn committed_world(seed: u64) -> &'static Outcome {
+    committed()
+        .iter()
+        .find(|out| out.seed == seed)
+        .unwrap_or_else(|| {
+            panic!("seed {seed} is outside the committed sweep's 1..={COMMITTED_SEEDS}")
+        })
 }
 
 fn breaks_law(out: &Outcome, law: &str) -> bool {
@@ -1729,6 +1742,35 @@ fn each_rule_switched_off_is_caught() {
             "dup delivery",
             122,
         ),
+        // ATERM-KI-1116-7314's seed 1468: an ask whose deadline a power loss's next generation
+        // took off the log, published again there by the replay; the told rows' four rules stay
+        // switched back to every build before's, the world that met it (with every rule on 1468
+        // holds every law with this rule off too). Its bridge tests hold the rest:
+        // `Mutant::ReplayDeadlineFromNow` and this rule by
+        // `an_ask_the_replay_lands_again_on_a_moved_generation_expires_at_its_own_deadline`,
+        // `Mutant::ReleaseOverAnUnwrittenDeadline` by
+        // `an_undecided_asks_record_taken_for_its_drain_is_released_once_its_deadline_is_on_disk`,
+        // `Mutant::ReplayTakesTheWinnerForItsOwn` by
+        // `an_ask_the_replay_lands_at_its_keys_winner_or_its_own_attempt_is_noted_only_at_its_own`,
+        // `Mutant::RelandedAskNotedPerOffset` by
+        // `an_ask_the_replay_lands_again_where_its_first_landing_stands_is_noted_once`,
+        // `Mutant::ReplayWinnerOffsetFromAnyLog` by
+        // `a_keyed_ask_the_replay_lands_is_its_own_by_where_it_lies_against_its_pins_head`, and
+        // `Mutant::ReplyFromIgnoresTheRelandedAsk` and `Mutant::ReplayArmsOverAnUnarmedSettle` by
+        // `a_reply_to_an_ask_the_replay_lands_again_before_its_release_is_judged_by_its_recipient`.
+        (
+            "an ask the replay lands again on a log that forgot its deadline is noted there (KI-1116-7314)",
+            Box::new(|s| {
+                asking(s)
+                    .with(Mutant::ToldNewestOfEachSubjectOnly)
+                    .with(Mutant::MovedDropsTheSubject)
+                    .with(Mutant::ProofRefusedAtAMismatch)
+                    .with(Mutant::ToldHistoryUnread)
+                    .testing(Mutant::ReplayLeavesTheDeadlineUnnoted)
+            }),
+            "deadline",
+            1468,
+        ),
     ];
     // Six of the delivery gate's rules (ATERM-KI-1114-1414, case 6) have no sim witness: no
     // seed of their worlds breaks a law with the rule off that holds every law with every rule
@@ -1752,6 +1794,24 @@ fn each_rule_switched_off_is_caught() {
     // `Mutant::UndecidedInHandUnseen`, which masks it there; and
     // `Mutant::UndecidedFetched` by
     // `a_fetch_holds_back_a_record_a_delivery_would_take_for_an_undecided_attempt`.
+    // The keyed hold's six rules (ATERM-KI-1114-1414's keyed re-posts and their review,
+    // 2026-11-18) have no sim witness either: the sim's bridges run with the mesh off, their
+    // producers placed, so no read of a keyed re-post's attempt is case 6, and with each off no
+    // seed of the keyed reminted world to 128 breaks a law (to 1,000 with
+    // `Mutant::KeyedHoldUnarmed` off, the 12 seeds that break `key` with every rule on break it
+    // at the same offsets, and no other; `Mutant::OneArmASequenceUnkept` searched before its
+    // landing rule joined it, a rule that acts only on a standing arm, which no read of that
+    // stamping world sets, read, not run). Their bridge tests: `Mutant::KeyedHoldUnarmed` by
+    // `a_keyed_case_six_hold_hands_its_attempt_once_across_the_cut_that_gives_it_up`;
+    // `Mutant::UndecidedTakesBelowItsFloor` by
+    // `the_delivery_gate_takes_an_undecided_attempts_record_by_its_origin_else_by_the_newest_seen`
+    // and `the_delivery_gates_call_site_holds_each_of_its_rules`;
+    // `Mutant::KeyedTakenUnowned` by
+    // `a_keyed_record_taken_in_its_winners_words_settles_its_retry_there`;
+    // `Mutant::KeyedArmKeepsTheLowerFloor` and `Mutant::OneArmASequenceUnkept` by
+    // `one_arm_a_sequence_stands_between_two_posts_and_a_keyed_re_arm_keeps_its_higher_floor`;
+    // and `Mutant::ArmOutlivesItsPost` by
+    // `a_keyed_arm_goes_with_its_post_whatever_read_settled_it`.
     // The rules of the reviews of 2026-11-17 have no sim witness either: with each off, no seed
     // of the reminted worlds (stamping, stampless, stampless with fetches) to 128 breaks a law
     // that holds with every rule on (the world with fetches breaks one at seed 21 with every rule
@@ -1909,6 +1969,9 @@ fn each_rule_switched_off_is_caught() {
         // And 122 the proof's stop (of 412: 122, 138, 250 and 412; the fetching world's 112 to 128;
         // 2026-11-17).
         "a proof keeps the matches below a told row another record took (KI-1116-7314)",
+        // None within 64 of its world meets it; 1468 is the first within 20,000 that reaches it
+        // with its rule off and holds every law with it on (2026-11-18).
+        "an ask the replay lands again on a log that forgot its deadline is noted there (KI-1116-7314)",
     ];
     const RAREST: &[&str] = &[
         "the incarnation lease is trusted only in the boot that wrote it",
@@ -2216,7 +2279,11 @@ const FOUND_RETAINED: &[FoundIn] = &[
     // ATERM-KI-1116-7314's told samples moved 59070 to 13720, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
     // ATERM-KI-1116-7314's told rows moved 13720 to 40124, the first to 60,000 that reaches it with
-    // its rule off and holds every law with it on.
+    // its rule off and holds every law with it on. Its replayed asks, noted where the replay
+    // lands them, moved 40124 off it, and no seed of this world to 60,000 reaches it with its
+    // rule off since (explicit discovery, 2026-11-18): 40124 stays a found seed that holds every
+    // law, and `bridge::tests` holds the rule by
+    // `a_keys_winner_given_up_at_its_pin_is_read_on_past_the_cut_to_its_owners_copy`.
     (
         windowed_keyed,
         40124,
@@ -2228,7 +2295,11 @@ const FOUND_RETAINED: &[FoundIn] = &[
     // ATERM-KI-1111-5's grouped post send moved seed 56 off it; 8988 is the first within 60,000
     // at the same 1200 steps.
     // ATERM-KI-1116-7314's told rows moved 8988 to 814, the first to 60,000 that reaches it with
-    // its rule off and holds every law with it on (2026-11-18).
+    // its rule off and holds every law with it on (2026-11-18). Its replayed asks, noted where the
+    // replay lands them, moved 814 off it, and no seed of this world to 60,000 at 1200 steps
+    // reaches it with its rule off since (explicit discovery, 2026-11-18): 814 stays a found seed
+    // that holds every law, and `bridge::tests` holds the rule by
+    // `a_failures_unwritten_group_entries_are_dropped_highest_first`.
     (
         windowed,
         814,
@@ -2334,7 +2405,8 @@ const FOUND_ASKING: &[FoundIn] = &[
     // ATERM-KI-1116-7314's told rows moved 4652 to 4170, the first to 60,000 that reaches it with
     // its rule off and holds every law with it on, and it stays so since their history holds every
     // row (2026-11-18): no seed below it breaks `deadline` with every rule on there, 1468, which
-    // did on their first cut, among them (ATERM-KI-1116-7314's Left).
+    // did on their first cut, among them (fixed since: an ask the replay lands again is noted
+    // there, ATERM-KI-1116-7314).
     (
         asking,
         4170,
@@ -2554,19 +2626,9 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         "dup post",
     ),
     (
-        "a key's winner given up at its pin was not read on to its owner's copy past the cut",
-        Mutant::KeyedWinnerNotReadPastACut,
-        "key",
-    ),
-    (
         "the deadline sweep expired an ask whose answer the mailbox held unhandled",
         Mutant::SweepIgnoresQueuedAnswers,
         "deadline",
-    ),
-    (
-        "a stop between the drops behind a refused post let the replay overtake the drain",
-        Mutant::DropBehindLowestFirst,
-        "order",
     ),
     (
         "the replay published again an expiry whose ask was answered on the bus since",
@@ -2678,6 +2740,18 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         Mutant::OutcomeUnknownIsAnAnswer,
         "dup post",
     ),
+    // "a key's winner given up at its pin was not read on to its owner's copy past the cut"
+    // (`Mutant::KeyedWinnerNotReadPastACut`, `key`) has no row since ATERM-KI-1116-7314's
+    // replayed asks, noted where the replay lands them, moved seed 40124 off it and no seed of
+    // its world to 60,000 reached it with its rule off (explicit discovery, 2026-11-18). Seed
+    // 40124 stays a found seed that holds every law, and `bridge::tests` holds the rule by
+    // `a_keys_winner_given_up_at_its_pin_is_read_on_past_the_cut_to_its_owners_copy`.
+    // "a stop between the drops behind a refused post let the replay overtake the drain"
+    // (`Mutant::DropBehindLowestFirst`, `order`) has no row since ATERM-KI-1116-7314's replayed
+    // asks moved seed 814 off it and no seed of its world to 60,000, at its 1200 steps, reached it
+    // with its rule off (explicit discovery, 2026-11-18). Seed 814 stays a found seed that holds
+    // every law, and `bridge::tests` holds the rule by
+    // `a_failures_unwritten_group_entries_are_dropped_highest_first`.
     // "another log's pin drop a power cut undid held the mirror on the old log's window"
     // (`Mutant::DroppedPinUnderTheFence`, `mirror:`) has no row since ATERM-KI-1116-7314's told
     // rows moved seed 34919 off it and no seed of its world to 60,000 reached it with its rule
@@ -2868,9 +2942,11 @@ fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
         wedged.seed,
         wedged.violations.join("; ")
     );
+    let same = committed_world(wedged.seed);
     assert!(
-        run(&Opts::seed(wedged.seed)).violations.is_empty(),
-        "the committed world of the same seed breaks no law"
+        same.violations.is_empty(),
+        "the committed world of the same seed breaks no law: {}",
+        report(same)
     );
     let mut whole = refusing(wedged.seed);
     whole.torn_device = false;
@@ -2920,9 +2996,11 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         stopped.seed,
         stopped.violations.join("; ")
     );
+    let same = committed_world(stopped.seed);
     assert!(
-        run(&Opts::seed(stopped.seed)).violations.is_empty(),
-        "the committed world of the same seed breaks no law"
+        same.violations.is_empty(),
+        "the committed world of the same seed breaks no law: {}",
+        report(same)
     );
     let untorn = |s| {
         let mut o = keeping(s);
@@ -2932,18 +3010,24 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
     // Only a world with a mirror (`seed / 2` odd) and a power cut (`seed` odd) can tear a pin. A pin
     // stop with another cause, in a world that lacks either, goes unseen here.
     let tearable: Vec<u64> = (1..=SEEDS).filter(|s| s % 4 == 3).collect();
-    for out in aterm_spec::check::each(&tearable, |&seed| run(&untorn(seed))) {
+    let kept = aterm_spec::check::each(&tearable, |&seed| run(&untorn(seed)));
+    for out in &kept {
         assert!(
-            !breaks_law(&out, "stopped for its pin"),
+            !breaks_law(out, "stopped for its pin"),
             "seed {}: with the torn pin kept, on a device that never tears, the mirror stopped \
              for its pin: {}",
             out.seed,
-            report(&out)
+            report(out)
         );
     }
+    let same = kept
+        .iter()
+        .find(|out| out.seed == stopped.seed)
+        .expect("the control's seed tore a pin: a tearable seed the sweep above ran");
     assert!(
-        run(&untorn(stopped.seed)).violations.is_empty(),
-        "the same seed with the torn pin kept, on a device that never tears, breaks no law"
+        same.violations.is_empty(),
+        "the same seed with the torn pin kept, on a device that never tears, breaks no law: {}",
+        report(same)
     );
     for (mutant, law, witness) in [
         (Mutant::KeyInThePinAlone, "alias keys", 19),
@@ -2969,7 +3053,7 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
                 .map_or("", String::as_str)
         );
         assert!(
-            !breaks_law(&run(&Opts::seed(off.seed)), law),
+            !breaks_law(committed_world(off.seed), law),
             "with the copy read, the same seed keeps `{law}`"
         );
     }

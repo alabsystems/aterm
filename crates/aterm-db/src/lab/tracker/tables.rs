@@ -408,16 +408,21 @@ crate::att_collection!(
     }
 );
 
-/// The package columns frozen once a package leaves ready (§4.3).
+/// The package columns frozen once a package is claimed (§4.3, [`super::frozen`]).
 pub const FROZEN: &[&str] = &["exit", "outcome"];
+/// The package columns a change asks for: a frozen column, or the state of a package whose
+/// done is withdrawn, which no write of a state does alone (TK-15).
+pub const CHANGED: &[&str] = &["exit", "outcome", "state"];
 
 crate::att_collection!(
-    /// A change to a frozen column of a package (§3 `change`, §4.3), keyed by a digest of the
-    /// package, the column and the value asked for: the digest of the value it replaces, the
-    /// value, the reason and who approved it. The value asked for is held in the column of the
-    /// package's own name and type (`exit` or `outcome`, whichever `column` says), so an exit
-    /// asked for is checked as an exit is: free JSON would hold it to the free-text guard, which
-    /// refuses a test's long path. What an approved change lets through is TK-15's.
+    /// A change to a frozen column of a package (§3 `change`, §4.3), or the withdrawal of its
+    /// done, keyed by a digest of the package, the column and the value asked for: the digest
+    /// of the value it replaces ([`super::frozen::digest`]), the value, the reason and who
+    /// approved it. The value asked for is held in the column of the package's own name and
+    /// type (`exit`, `outcome` or `state`, whichever `column` says), so an exit asked for is
+    /// checked as an exit is: free JSON would hold it to the free-text guard, which refuses a
+    /// test's long path. An approved change is the only way such a column changes once the
+    /// package is claimed, and the only way out of done ([`super::frozen`]).
     pub CHANGE = Collection {
         name: "change",
         version: 1,
@@ -427,10 +432,11 @@ crate::att_collection!(
         derive: Derive::BirthSha256,
         columns: &[
             Column::new("package", Ty::Ref("package")).fixed(),
-            Column::new("column", Ty::Enum(FROZEN)).fixed(),
-            Column::new("before", Ty::Digest).null(),
+            Column::new("column", Ty::Enum(CHANGED)).fixed(),
+            Column::new("before", Ty::Digest).null().fixed(),
             Column::new("exit", Ty::Struct(EXIT)).null().fixed(),
             Column::new("outcome", Ty::Prose(BODY)).null().fixed(),
+            Column::new("state", Ty::Enum(PACKAGE_STATES)).null().fixed(),
             Column::new("reason", Ty::Prose(BODY)),
             Column::new("approved_by", Ty::Principal).null(),
             row(),

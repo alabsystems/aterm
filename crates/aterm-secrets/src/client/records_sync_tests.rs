@@ -1084,6 +1084,7 @@ fn a_keyless_host_leaves_nothing_in_a_store_with_no_genesis() {
                 body: Body::Name {
                     name: format!("junk-{i}"),
                 },
+                statement: None,
             }
             .sign(&[0xee; 32], [0xee; 16])
             .expect("signed")
@@ -1239,6 +1240,7 @@ impl Founded {
             body: Body::Name {
                 name: name.to_owned(),
             },
+            statement: None,
         }
         .sign(&self.writer, self.incarnation)
         .expect("signed")
@@ -1397,6 +1399,7 @@ fn what_a_server_sent_that_the_store_refused_stays_remembered_while_the_store_on
         body: Body::Name {
             name: "unseated".to_owned(),
         },
+        statement: None,
     }
     .sign(&unseated_writer, unseated_incarnation)
     .expect("signed");
@@ -1463,6 +1466,7 @@ fn a_member_whose_frontier_fills_the_pull_url_still_names_what_it_could_not_take
                 body: Body::Name {
                     name: format!("fork-{i}"),
                 },
+                statement: None,
             }
             .sign(&w2, inc2)
             .expect("fork")
@@ -1784,6 +1788,7 @@ fn a_member_whose_server_holds_records_it_cannot_take_lets_no_key_in_by_proof() 
                 member: old,
                 cutoff: next.parents()[0],
             },
+            statement: None,
         }
         .sign(seed, incarnation)
         .expect("signed");
@@ -2168,6 +2173,7 @@ fn a_whole_repost_carries_complete_records_only() {
         body: Body::Name {
             name: "waiting".to_owned(),
         },
+        statement: None,
     }
     .sign(&writer, incarnation)
     .expect("signed");

@@ -381,3 +381,24 @@ fn a_kept_coalition_is_read_again_only_when_its_pid_version_moved() {
     assert_eq!(sweep(&[(9, None)]), (vec![Some(12)], 0));
     assert_eq!(reads.take(), 4);
 }
+
+/// The maps the sweep keeps by pid hash it as the workspace's keyless FxHash does
+/// (`aterm_hash::FxBuildHasher`), not with std's per-map SipHash key: the kernel assigns pids,
+/// so pids made to collide need as many live processes, which the process table bounds, and
+/// each of a sweep's lookups and keeps costs one multiply instead of SipHash's rounds.
+#[test]
+fn the_kept_maps_hash_a_pid_without_a_key() {
+    use std::hash::BuildHasher;
+    let ids = CoalitionIds::default();
+    let fx = aterm_hash::FxBuildHasher;
+    for pid in [2_u32, 501, 77_088, u32::MAX] {
+        let want = fx.hash_one(pid);
+        assert_eq!(ids.kept.hasher().hash_one(pid), want, "kept, pid {pid}");
+        assert_eq!(ids.names.hasher().hash_one(pid), want, "names, pid {pid}");
+        assert_eq!(
+            ids.generations.hasher().hash_one(pid),
+            want,
+            "generations, pid {pid}"
+        );
+    }
+}

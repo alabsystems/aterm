@@ -549,8 +549,9 @@ fn the_reader_paints_every_row_and_its_header_whole_at_every_text_size() {
                         "false",
                         "{context}: a block paints every row it has room for: {line}"
                     );
-                    let frame = crate::native_markdown::block_frame(
-                        crate::native_markdown::BlockShape::of(&parsed.blocks[index]),
+                    let frame = crate::native_markdown::preview_frame(
+                        &parsed.blocks[index],
+                        node.rect.width,
                         crate::native_ui::reader_type(),
                     );
                     if let Some(frame) = frame {
@@ -892,7 +893,8 @@ fn markdown_reader_compiles_typed_blocks_and_hides_markup() {
     assert!(compiled.paint.iter().any(|node| matches!(
         &node.content,
         UiContent::MarkdownBlock(MarkdownBlockSpec {
-            kind: MarkdownBlockKind::Quote,
+            kind: MarkdownBlockKind::Paragraph,
+            quote_depth: 1,
             ..
         })
     )));
@@ -1127,6 +1129,225 @@ fn markdown_outline_and_links_use_typed_policy_without_local_file_access() {
             )
             .unwrap();
         assert!(outcome.effects.is_empty(), "link {denied} must stay inert");
+    }
+}
+
+#[test]
+fn shared_quote_rails_cross_the_layout_gap_without_growing_the_hit_regions() {
+    use crate::widget::DrawPrim;
+
+    let source =
+        "> > ## First\n> > > ### Second\n> > ```text\n> > contents\n> > ```\n\n> Separate\n";
+    let (runtime, instance, view) = markdown_runtime(source);
+    let viewport = LogicalRect::new(0.0, 0.0, 320.0, 800.0);
+    let ui = runtime
+        .render(instance, view, &cx(viewport, None))
+        .unwrap()
+        .compile(viewport)
+        .unwrap();
+    ui.validate_parity().unwrap();
+    let mut clips = vec![viewport];
+    let mut panels = Vec::new();
+    for prim in ui.tray(aterm_render::Theme::default(), 13.0).prims {
+        let clip = *clips.last().unwrap();
+        match prim {
+            DrawPrim::ClipPush { x, y, w, h } => {
+                clips.push(
+                    clip.intersect(LogicalRect::new(x, y, w, h))
+                        .unwrap_or_default(),
+                );
+            }
+            DrawPrim::ClipPop => {
+                clips.pop().unwrap();
+            }
+            DrawPrim::Panel {
+                x, y, w, h, radius, ..
+            } => {
+                if let Some(visible) = clip.intersect(LogicalRect::new(x, y, w, h)) {
+                    panels.push((visible, w, radius));
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(clips, [viewport]);
+    let blocks: Vec<_> = ui
+        .paint
+        .iter()
+        .filter(|node| matches!(node.content, UiContent::MarkdownBlock(_)))
+        .collect();
+    assert_eq!(blocks.len(), 4);
+    let rails_at = |y: f32| -> Vec<f32> {
+        panels
+            .iter()
+            .filter_map(|(panel, w, radius)| {
+                (*w == 3.0 && *radius == 1.5 && panel.y <= y && y < panel.bottom())
+                    .then_some(panel.x)
+            })
+            .collect()
+    };
+    let first_rails = rails_at(blocks[0].rect.y + 8.0);
+    assert_eq!(first_rails.len(), 2);
+    assert_eq!(rails_at(blocks[1].rect.y + 8.0).len(), 3);
+    for (index, pair) in blocks.windows(2).enumerate() {
+        let node = pair[0];
+        let content = ui.semantic(&node.key).unwrap().rect;
+        let gap_y = content.bottom() + crate::native_markdown::VISUAL_BLOCK_GAP / 2.0;
+        let x = node.rect.x + node.rect.width / 2.0;
+        assert!(node.clip.contains(x, gap_y));
+        assert!((node.rect.bottom() - pair[1].rect.y).abs() < 0.01);
+        assert!(
+            !ui.hits
+                .iter()
+                .any(|hit| hit.key.as_str().starts_with("markdown/block/")
+                    && hit.rect.contains(x, gap_y))
+        );
+        let rails = rails_at(gap_y);
+        let has_quote_wash = panels.iter().any(|(panel, w, radius)| {
+            *radius == 8.0 && (*w - node.rect.width).abs() < 0.01 && panel.contains(x, gap_y)
+        });
+        assert_eq!(has_quote_wash, index < 2);
+        if index < 2 {
+            assert_eq!(rails, first_rails);
+        } else {
+            assert!(rails.is_empty());
+        }
+    }
+    let code = ui.semantic(&blocks[2].key).unwrap().rect;
+    assert!(panels.iter().any(|(panel, _, radius)| *radius == 9.0
+        && panel.x > code.x
+        && (panel.y - code.y).abs() < 0.01
+        && (panel.bottom() - code.bottom()).abs() < 0.01));
+}
+
+#[test]
+fn quoted_numbered_item_paints_its_marker_and_opens_a_quoted_heading() {
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = std::fs::canonicalize(dir.path()).unwrap().join("guide.md");
+    let source = format!(
+        "# Préface\n\n> 3. [Read the {}\n>    before continuing](#field-notes)\n>\n> ## Field notes\n",
+        "installation instructions ".repeat(8).trim_end()
+    );
+    std::fs::write(&path, &source).unwrap();
+    let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+    let mut app = crate::App::headless_for_test();
+    let window = crate::WindowId(0);
+    app.open_document_tab(AppKind::Markdown, &uri).unwrap();
+    let (instance, view) = app.active_native_view(window).unwrap();
+    let viewport = LogicalRect::new(0.0, 0.0, 1_000.0, 800.0);
+    let item = source.find("> 3.").unwrap()..source.find(">\n").unwrap();
+    let heading = source.find("> ## Field notes").unwrap();
+    let invoke = |app: &mut crate::App, id: ActionId| {
+        app.dispatch_native_event(
+            window,
+            AppEvent::Action(ActionInvocation { id, value: None }),
+        )
+        .unwrap();
+    };
+
+    for mode in ["editor/markdown/read", "editor/markdown/split"] {
+        invoke(&mut app, ActionId::new(mode));
+        let ui = app
+            .compiled_native_ui_for(window, instance, view, viewport)
+            .unwrap();
+        ui.validate_parity().unwrap();
+        assert!(
+            ui.semantic(&UiKey::new(mode))
+                .unwrap()
+                .state
+                .unwrap()
+                .selected
+        );
+        let node = ui
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == "markdown/block/1")
+            .unwrap();
+        let UiContent::MarkdownBlock(spec) = &node.content else {
+            panic!("expected the numbered item in {mode:?}");
+        };
+        assert_eq!(spec.quote_depth, 1);
+        assert!(matches!(
+            spec.kind,
+            MarkdownBlockKind::ListItem {
+                ordinal: Some(3),
+                ..
+            }
+        ));
+        assert_eq!(spec.source, item);
+        let painted = ui.tray(aterm_render::Theme::default(), 13.0);
+        assert!(painted.prims.iter().any(|prim| {
+            matches!(prim, crate::widget::DrawPrim::Text { s, x, baseline, .. }
+                if s == "3." && node.rect.contains(*x, *baseline))
+        }));
+
+        let key = UiKey::new("markdown/block/1/link/0");
+        let mut hits = ui.hits.iter().filter(|hit| hit.key == key);
+        let first = hits.next().unwrap();
+        let last = hits
+            .next_back()
+            .expect("the link wraps across multiple painted rows");
+        assert!(first.rect.y < last.rect.y);
+        let clicked = ui
+            .hit_test(
+                last.rect.x + last.rect.width / 2.0,
+                last.rect.y + last.rect.height / 2.0,
+            )
+            .unwrap();
+        assert_eq!(clicked.key, key);
+        invoke(&mut app, clicked.action.clone());
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("expected the original editor view");
+        };
+        assert_eq!(
+            state.markdown.as_ref().unwrap().reader.source_anchor,
+            heading
+        );
+        invoke(&mut app, ActionId::new("markdown/outline/0"));
+    }
+}
+
+#[test]
+fn pointer_over_repeated_labels_uses_each_authored_destination() {
+    let (mut runtime, instance, view) = markdown_runtime(
+        "[Guide](https://example.com/one) and [Guide][two]\n\n| Name | Link |\n| --- | --- |\n| Third | [Guide][] |\n| Editor | <editor@example.org> |\n\n[two]: https://example.com/two\n[Guide]: https://example.com/three",
+    );
+    let viewport = LogicalRect::new(0.0, 0.0, 640.0, 720.0);
+    let compiled = runtime
+        .render(instance, view, &cx(viewport, None))
+        .unwrap()
+        .compile(viewport)
+        .unwrap();
+    compiled.validate_parity().unwrap();
+    for (index, block, label, destination) in [
+        (0, 0, "Guide", "https://example.com/one"),
+        (1, 0, "Guide", "https://example.com/two"),
+        (2, 1, "Guide", "https://example.com/three"),
+        (3, 1, "editor@example.org", "mailto:editor@example.org"),
+    ] {
+        let key = UiKey::new(format!("markdown/block/{block}/link/{index}"));
+        let node = compiled.semantic(&key).unwrap();
+        assert_eq!(node.label, label);
+        let hit = compiled
+            .hit_test(
+                node.rect.x + node.rect.width / 2.0,
+                node.rect.y + node.rect.height / 2.0,
+            )
+            .unwrap();
+        assert_eq!(hit.key, key);
+        let outcome = runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: hit.action.clone(),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome.effects.as_slice(),[AppEffect::OpenExternal{request,..}] if request.uri==destination)
+        );
     }
 }
 

@@ -67,7 +67,7 @@ pub(crate) fn type_words(
 }
 
 /// A type's words: what a value of it is.
-fn ty_words(ty: &Ty, named: &dyn Fn(&str) -> String) -> String {
+pub(crate) fn ty_words(ty: &Ty, named: &dyn Fn(&str) -> String) -> String {
     match ty {
         Ty::Bool => "true or false".into(),
         Ty::Int { .. } => "number".into(),

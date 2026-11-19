@@ -30,6 +30,8 @@ fn a_lost_guest_cuts_the_session_off_and_starts_no_other() {
         results: PathBuf::new(),
         rec: Recording::default(),
         roles: Vec::new(),
+        dock: Default::default(),
+        hostname: String::new(),
         end_terminal: None,
         marks: Vec::new(),
     };

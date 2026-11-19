@@ -154,12 +154,16 @@ fn refusing_an_oversized_nickname_keeps_temporary_storage_bounded() {
 }
 
 #[test]
-fn a_lowercase_nickname_shows_capitalised_and_any_other_as_typed() {
+fn nicknames_title_case_words_and_separate_visible_word_and_number_boundaries() {
     let shown = |word: &str| Nickname::parse(word).unwrap().display();
     assert_eq!(shown("heron"), "Heron");
-    assert_eq!(shown("old otter"), "Old otter");
-    assert_eq!(shown("macOS Fan"), "macOS Fan");
-    assert_eq!(shown("élan"), "élan");
+    assert_eq!(shown("old otter"), "Old Otter");
+    assert_eq!(shown("macOS Fan"), "Mac Os Fan");
+    assert_eq!(shown("élan"), "Élan");
+    assert_eq!(shown("MissBunny22Red"), "Miss Bunny 22 Red");
+    assert_eq!(shown("BLUE-Otter"), "Blue Otter");
+    assert_eq!(shown("littleowl"), "Littleowl");
+    assert!(Nickname::equivalent("Miss Bunny 22", "missbunny22"));
 }
 
 #[test]

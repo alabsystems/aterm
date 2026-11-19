@@ -8,20 +8,33 @@ use crate::membership_log::store::framed::{FrameReadError, FrameReader};
 use crate::membership_log::{MAX_HELD_RECORDS, REPLY_CAP, Reading, Record, RecordId};
 use std::io::{Cursor, Read, Write};
 
-pub(super) struct StagedRecords(Vec<Record>);
+/// Records a POST's body or a peer's answer brought, verified, and the roots a peer served
+/// after them (`crate::membership_log::served`): a POST carries none, and a peer serves a frame
+/// only to a pull that asked for one, which only a pull that reads format 2 does
+/// (`crate::transport::fetch_record_frames_with_known`).
+pub(super) struct StagedRecords(Vec<Record>, Option<crate::membership_log::Served>);
 
 impl StagedRecords {
     pub(super) fn records(&self) -> &[Record] {
         &self.0
     }
 
-    pub(super) fn into_records(self) -> Vec<Record> {
-        self.0
+    /// The roots a peer served after the records.
+    pub(super) const fn served(&self) -> Option<&crate::membership_log::Served> {
+        self.1.as_ref()
     }
 
-    /// A completed pull's selected immutable owners have already been verified.
-    pub(super) fn from_verified(records: Vec<Record>) -> Self {
-        Self(records)
+    pub(super) fn into_parts(self) -> (Vec<Record>, Option<crate::membership_log::Served>) {
+        (self.0, self.1)
+    }
+
+    /// A completed pull's selected immutable owners have already been verified, with the roots
+    /// the peer served after them.
+    pub(super) fn from_verified(
+        records: Vec<Record>,
+        served: Option<crate::membership_log::Served>,
+    ) -> Self {
+        Self(records, served)
     }
 }
 
@@ -133,7 +146,7 @@ fn stage_with(
             break Reply::text(400, "membership record stream exceeds record bound");
         }
         let frame = match frames.read(&mut reader) {
-            Ok(None) if reader.limit() == 0 => return Ok(StagedRecords(records)),
+            Ok(None) if reader.limit() == 0 => return Ok(StagedRecords(records, None)),
             Ok(None) => return Err(Reply::text(400, "the body ended before its Content-Length")),
             Ok(Some(frame)) => frame,
             Err(FrameReadError::Read(error)) => return Err(read_failure(error)),

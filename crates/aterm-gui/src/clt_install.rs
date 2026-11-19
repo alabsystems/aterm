@@ -1154,9 +1154,13 @@ pub(crate) struct RootReadings {
     pub(crate) broker: bool,
     /// A folder beside Applications, Documents, Desktop and the synced drives still indexed
     /// where setup's password has never scoped this home, or never scoped the rest of the data
-    /// volume for it (a folder made since a password scoped it waits for the next root
-    /// transaction and asks nothing by itself), which is the reading every `aterm init` shares
-    /// (`aterm_machines::init_spotlight::automatic_scope_owed`).
+    /// volume for it, unless a root LAN broker of this build serves and would take every such
+    /// folder, which it then excludes with no password
+    /// ([`aterm_types::macos_setup::spotlight_scope::automatic_owed_here`]; it takes only the
+    /// home's own top-level folders, so a home never scoped still owes the password, and a
+    /// folder made since a password scoped it is the broker's at the home's top level, or waits
+    /// for the next root transaction, and asks nothing by itself), which is the reading every
+    /// `aterm init` shares (`aterm_machines::init_spotlight::automatic_scope_owed`).
     pub(crate) spotlight: bool,
 }
 
@@ -1281,7 +1285,16 @@ pub(crate) fn read_root_steps() -> bool {
                         || aterm_secrets::service::system_job_state(aterm_uds::lan::LABEL),
                         || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
                     ),
-                    spotlight: aterm_types::macos_setup::spotlight_scope::automatic_owed_here(),
+                    // A home setup's password never scoped, unless a root LAN broker of this
+                    // build serves and would take it: the rule every automatic run of
+                    // `aterm init` reads.
+                    spotlight: aterm_types::macos_setup::spotlight_scope::automatic_owed_here(
+                        || {
+                            aterm_uds::lan::install::serves_this_build_here(|| {
+                                aterm_secrets::service::system_job_state(aterm_uds::lan::LABEL)
+                            })
+                        },
+                    ),
                 };
                 // Each input by name, so the journal says which step owes the password.
                 let inputs = format!("{readings:?}");

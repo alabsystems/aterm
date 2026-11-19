@@ -23,7 +23,7 @@ pub use refresh::Authority as RefreshAuthority;
 pub use refresh::RecoveryContext as RefreshRecoveryContext;
 #[cfg(unix)]
 pub(in crate::harness) use refresh::{
-    Snapshot as RejectedSnapshot, rejected_snapshot, verify_or_refresh,
+    Snapshot as RejectedSnapshot, rejected_snapshot, rejection_file, verify_or_refresh,
     verify_or_refresh_with_rejection,
 };
 

@@ -44,15 +44,15 @@ fn revival_evaluate(
     }
     raw = interpreted_cells(&MACHINE, &raw, operations.iter(), &index).into_owned();
     for id in [100, 200].into_iter().take(mode as usize) {
-        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index).unwrap();
+        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index, None).unwrap();
         let mut next = Index::new(8);
         let copied = carried_operation(id, &raw, (!lose_context).then_some(&evidence), &mut next);
         raw = cells(&[&copied]);
         operations = vec![copied];
         index = next;
     }
-    let shown = election(&project(&MACHINE, &raw, operations.iter(), &index)).0;
-    let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index).unwrap();
+    let shown = election(&project(&MACHINE, &raw, operations.iter(), &index, None)).0;
+    let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index, None).unwrap();
     let coordinate = (MACHINE.name.into(), format!("{}.label", ROWS[0]));
     let origin = if lose_retirement { [10; 32] } else { [5; 32] };
     let tenure = match Provenance::decode(&evidence[&coordinate][&origin]).unwrap() {
@@ -108,7 +108,7 @@ fn undo_evaluate(model: &aterm_spec::derive::Model, lose_undo: bool, lose_contex
     let mut raw = cells(&[&a, &b]);
     let mut operations = vec![a, b];
     if mode > 0 {
-        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index).unwrap();
+        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index, None).unwrap();
         let mut next = Index::new(8);
         let carried = carried_operation(100, &raw, Some(&evidence), &mut next);
         raw = cells(&[&carried]);
@@ -127,15 +127,15 @@ fn undo_evaluate(model: &aterm_spec::derive::Model, lose_undo: bool, lose_contex
     operations.extend([withdrawn, restored]);
     raw = restored_cells(&MACHINE, &raw, operations.iter()).into_owned();
     if mode == 2 {
-        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index).unwrap();
+        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index, None).unwrap();
         let mut next = Index::new(8);
         let carried = carried_operation(200, &raw, (!lose_context).then_some(&evidence), &mut next);
         raw = cells(&[&carried]);
         operations = vec![carried];
         index = next;
     }
-    let shown = election(&project(&MACHINE, &raw, operations.iter(), &index)).0;
-    let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index).unwrap();
+    let shown = election(&project(&MACHINE, &raw, operations.iter(), &index, None)).0;
+    let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index, None).unwrap();
     let origin = if mode > 0 && lose_undo {
         [10; 32]
     } else {
@@ -228,6 +228,7 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
         &cells(&heads.iter().collect::<Vec<_>>()),
         operations.iter(),
         &index,
+        None,
     );
     let mut expected = election(&original).0;
     if mode == 2 || mode == 3 {
@@ -247,6 +248,7 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
                 &cells(&heads.iter().collect::<Vec<_>>()),
                 operations.iter(),
                 &index,
+                None,
             ))
             .0;
         }
@@ -254,7 +256,7 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
     let mut raw = cells(&heads.iter().collect::<Vec<_>>());
     let mut origin_a = heads[0].id;
     if mode == 1 || mode == 4 {
-        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index).unwrap();
+        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index, None).unwrap();
         let mut target = Index::new(4);
         let mut carried = operation(100, ROWS[0], "label", "m7", &[], &mut target);
         carried.changes = heads
@@ -366,15 +368,17 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
         },
         refused: Vec::new(),
         refusals: Vec::new(),
+        state: crate::typed::state::State::default(),
+        claims_floor: None,
         cells_from: None,
     };
     let accepted = view
         .require_roll_source(&crate::alab::registry::REGISTRY)
         .is_ok();
     let (shown, holders, tenure) = if accepted {
-        let read = project(&MACHINE, &raw, operations.iter(), &index);
+        let read = project(&MACHINE, &raw, operations.iter(), &index, None);
         let (shown, holders) = election(&read);
-        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index).unwrap();
+        let evidence = snapshot(&MACHINE, &raw, operations.iter(), &index, None).unwrap();
         let encoded = &evidence[&(MACHINE.name.into(), format!("{}.label", ROWS[0]))][&origin_a];
         let tenure = match Provenance::decode(encoded).unwrap() {
             Provenance::Known(starts) => i64::from(starts.keys().next().unwrap()[0]),

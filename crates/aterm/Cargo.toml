@@ -112,6 +112,10 @@ aterm-secrets = { workspace = true }
 aterm-uds = { workspace = true }
 aterm-vitals = { workspace = true }
 
+[target.'cfg(any(unix, windows))'.dependencies]
+# Shared-file snapshots are readable even on systems without a Commons writer.
+aterm-file = { workspace = true }
+
 # `aterm link` — the fabric bridge. A LIBRARY like every other verb, so the one
 # Mach-O carries it. Its astream crates come from the vendor/astream submodule (see
 # vendor/README-astream.md), and none of them carries a cipher tree.
@@ -133,8 +137,6 @@ aterm-link = { path = "../aterm-link" }
 # also the allowed direct path every aterm process is given at start (§5).
 aterm-lan = { workspace = true }
 aterm-db = { workspace = true }
-# The harness's lab view reads the registry's shared files (docs/DESIGN-shared-files-2026-11-11.md).
-aterm-file = { workspace = true }
 # The shared-login composition binds full Commons identities and parses public
 # request digests; both libraries are already present through aterm-db.
 aterm-codec = { workspace = true }

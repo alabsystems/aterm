@@ -421,6 +421,19 @@ pub trait Host: Sync + std::fmt::Debug {
     fn fresh_tree_usage(&self, root: u32) -> Option<Vec<TreeMember>> {
         self.tree_usage(root)
     }
+    /// Every process whose parent chain reaches `root`, each with its process group, in
+    /// breadth-first order, from the sweep [`Host::tree_usage`] reads: what a test binary's kin
+    /// book reads (`exec_kin.rs`). `None` where unread, the default: a host with no sweep books
+    /// no kin.
+    fn tree_kin(&self, _root: u32) -> Option<Vec<KinRow>> {
+        None
+    }
+    /// [`Host::tree_kin`] from a process-table sweep begun by this call, as each of `finish`'s
+    /// own kill paths reads it before its group signal; an injected host with no cache may use
+    /// its current reading.
+    fn fresh_tree_kin(&self, root: u32) -> Option<Vec<KinRow>> {
+        self.tree_kin(root)
+    }
     /// How often a child's process-group counters are read. The live host uses
     /// [`READ_USAGE_EVERY`]; a test may make its injected progress probe immediate.
     fn usage_every(&self) -> Duration {
@@ -501,6 +514,20 @@ pub struct TreeMember {
     pub cpu_ns: u64,
 }
 
+/// One descendant of a test binary as its kin book reads it ([`Host::tree_kin`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KinRow {
+    /// Its pid.
+    pub pid: u32,
+    /// Its parent, as the sweep read it.
+    pub ppid: u32,
+    /// Its process group (0 where unread).
+    pub pgid: u32,
+    /// The sweep's start stamp ([`aterm_sysprobe::ProcessReading::start`]): with the pid, the
+    /// key a book binds a row by once.
+    pub start: u64,
+}
+
 /// The OS's answers ([`Host`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LiveHost;
@@ -516,6 +543,14 @@ impl Host for LiveHost {
 
     fn fresh_tree_usage(&self, root: u32) -> Option<Vec<TreeMember>> {
         live_tree_usage(root, true)
+    }
+
+    fn tree_kin(&self, root: u32) -> Option<Vec<KinRow>> {
+        live_sweep(false, |sweep| tree_kin_from_sweep(sweep, root))
+    }
+
+    fn fresh_tree_kin(&self, root: u32) -> Option<Vec<KinRow>> {
+        live_sweep(true, |sweep| tree_kin_from_sweep(sweep, root))
     }
 
     fn idle(&self) -> Option<Duration> {
@@ -608,11 +643,53 @@ fn tree_usage_from_sweep(sweep: &aterm_sysprobe::Sweep, root: u32) -> Option<Vec
     Some(members)
 }
 
-/// The full process-table sweep behind `sys jobs`, shared by every concurrent test binary. One
-/// sweep per usage cadence avoids turning hundreds of binaries into hundreds of table walks.
-/// A post-sample confirmation forces a new sweep so another binary's cached pre-resume view can
-/// never convict this one.
-fn live_tree_usage(root: u32, fresh: bool) -> Option<Vec<TreeMember>> {
+/// `root`'s descendants in one sweep, by parent, in breadth-first order, each with its group
+/// ([`Host::tree_kin`]). A row with no start is passed through for its children and not given.
+/// `None` for a truncated sweep, one that does not hold `root` or names a pid twice, and a tree
+/// past [`TEST_TREE_CAP`].
+fn tree_kin_from_sweep(sweep: &aterm_sysprobe::Sweep, root: u32) -> Option<Vec<KinRow>> {
+    if sweep.truncated {
+        return None;
+    }
+    let mut pids = BTreeSet::new();
+    let mut children: BTreeMap<u32, Vec<&aterm_sysprobe::ProcessReading>> = BTreeMap::new();
+    for process in &sweep.procs {
+        if !pids.insert(process.pid) {
+            return None;
+        }
+        children.entry(process.ppid).or_default().push(process);
+    }
+    if !pids.contains(&root) {
+        return None;
+    }
+    let mut open = VecDeque::from([root]);
+    let mut seen = BTreeSet::from([root]);
+    let mut rows = Vec::new();
+    while let Some(pid) = open.pop_front() {
+        for child in children.get(&pid).into_iter().flatten() {
+            if !seen.insert(child.pid) || seen.len() > TEST_TREE_CAP {
+                return None;
+            }
+            if let Some(start) = child.start {
+                rows.push(KinRow {
+                    pid: child.pid,
+                    ppid: child.ppid,
+                    pgid: child.pgid,
+                    start,
+                });
+            }
+            open.push_back(child.pid);
+        }
+    }
+    Some(rows)
+}
+
+/// The full process-table sweep behind `sys jobs`, shared by every concurrent test binary's
+/// tree reads ([`live_tree_usage`]) and its kin book's ([`Host::tree_kin`]). One sweep per usage
+/// cadence avoids turning hundreds of binaries into hundreds of table walks. A post-sample
+/// confirmation and a kill path's kin read force a new sweep (`fresh`), so another binary's
+/// cached pre-resume view can never convict this one, and a kill books what its tree holds then.
+fn live_sweep<T>(fresh: bool, read: impl FnOnce(&aterm_sysprobe::Sweep) -> Option<T>) -> Option<T> {
     #[derive(Debug, Default)]
     struct Kept {
         at: Option<Instant>,
@@ -632,9 +709,12 @@ fn live_tree_usage(root: u32, fresh: bool) -> Option<Vec<TreeMember>> {
         kept.sweep = aterm_sysprobe::processes();
         kept.at = Some(now);
     }
-    kept.sweep
-        .as_ref()
-        .and_then(|sweep| tree_usage_from_sweep(sweep, root))
+    kept.sweep.as_ref().and_then(read)
+}
+
+/// `root`'s complete descendant-tree reading from the shared sweep ([`live_sweep`]).
+fn live_tree_usage(root: u32, fresh: bool) -> Option<Vec<TreeMember>> {
+    live_sweep(fresh, |sweep| tree_usage_from_sweep(sweep, root))
 }
 
 /// The host a run's children are spawned and timed on.
@@ -663,6 +743,26 @@ pub trait StageGroupEnd: Sync + std::fmt::Debug {
     /// empty only when no process is left in it either, and can prove it empty where the
     /// sweep's listing could not ([`group::empty`]).
     fn group_reaped(&self, pgid: u32, label: &str);
+    /// Book `kin`, a descendant of the test binary that leads group `pgid` which left that group
+    /// (its own group or its own session), bound to the binary by identity while verify held the
+    /// binary unreaped (`exec_kin.rs`). By default nothing is kept.
+    fn kin_seen(&self, _pgid: u32, _label: &str, _kin: &aterm_uds::runs::Kin) {}
+    /// The directories whose programs W-kin never proves, books, or books anything through
+    /// (`aterm_uds::runs::bind`): the run's locked toolchain. By default none.
+    fn kin_spared(&self) -> &[PathBuf] {
+        &[]
+    }
+    /// The test binary `root`, which led group `pgid`, has left its run, on every path: after its
+    /// reap wherever the run reaped it (`exec_kin.rs`). `book` is what its kin book holds. By
+    /// default nothing ends them.
+    fn stage_left(
+        &self,
+        _pgid: u32,
+        _label: &str,
+        _root: &aterm_uds::runs::Kin,
+        _book: &BTreeSet<aterm_uds::runs::Kin>,
+    ) {
+    }
 }
 
 /// What a child did.
@@ -2752,6 +2852,22 @@ fn finish_inner(
     if let Some(groups) = stage_groups {
         groups.group_made(child.id(), label);
     }
+    // A test binary's kin book, and what hands it to the run's record once the binary has left
+    // this run (declared after the group's custody and the child, it drops before them).
+    #[cfg(unix)]
+    let kin = stage_groups
+        .filter(|_| cmd.test_cases.is_some())
+        .and_then(|groups| kin::KinTrack::new(groups, label, child.id()));
+    #[cfg(unix)]
+    let _kin_left = kin::Left(kin.as_ref());
+    #[cfg(unix)]
+    let book_kin = |fresh: bool| {
+        if let Some(kin) = &kin {
+            kin.read(env.host, fresh);
+        }
+    };
+    #[cfg(not(unix))]
+    let book_kin = |_fresh: bool| {};
     #[cfg(unix)]
     drop(spawning);
 
@@ -2772,6 +2888,7 @@ fn finish_inner(
                         "cannot monitor {} for output progress: {error}",
                         watch.binary
                     );
+                    book_kin(true);
                     let killed = kill_and_reap(
                         &mut child,
                         #[cfg(unix)]
@@ -2841,6 +2958,7 @@ fn finish_inner(
                     if let Some(red) = local_red {
                         red();
                     }
+                    book_kin(true);
                     let killed = kill_and_reap(
                         &mut child,
                         #[cfg(unix)]
@@ -2895,6 +3013,7 @@ fn finish_inner(
             }
         }
         clock.tick();
+        book_kin(false);
         let suspected = !ending()
             && match (&cmd.test_cases, cases.as_ref(), &mut progress) {
                 (Some(_), Some(cases), Some(progress)) => {
@@ -2972,6 +3091,7 @@ fn finish_inner(
                     json: watch.json,
                 };
                 eprintln!("verify: {}", hung.detail());
+                book_kin(true);
                 let killed = kill_and_reap(
                     &mut child,
                     #[cfg(unix)]
@@ -3014,6 +3134,7 @@ fn finish_inner(
             }
         } else if let Some(why) = clock.stuck(child.id()) {
             eprintln!("verify: {label}: {why}");
+            book_kin(true);
             let killed = kill_and_reap(
                 &mut child,
                 #[cfg(unix)]
@@ -3041,6 +3162,7 @@ fn finish_inner(
         } else if let Some(v) = starts.stranded(|| clock.quiet_members(), label) {
             eprintln!("verify: {label}: {}", v.words);
             let grace = (!v.leader).then(|| cmd.term_grace.unwrap_or(STUCK_GRACE));
+            book_kin(true);
             let note = kill_unrun(
                 &mut child,
                 #[cfg(unix)]
@@ -3075,6 +3197,7 @@ fn finish_inner(
                 "no captured output or complete descendant CPU/I/O progress for {:?}",
                 progress.window
             );
+            book_kin(true);
             let killed = kill_and_reap(
                 &mut child,
                 #[cfg(unix)]
@@ -3102,6 +3225,7 @@ fn finish_inner(
         } else if let Some(limit) = ceiling
             && clock.over(limit)
         {
+            book_kin(true);
             if let Some(v) = starts.at_ceiling(clock.quiet_members(), limit) {
                 let note = kill_unrun(
                     &mut child,
@@ -4174,6 +4298,11 @@ pub fn capture_reply(cmd: &Cmd, env: ExecEnv<'_>) -> String {
     let r = run(&cmd.clone().capture(Capture::Emit), env);
     r.trimmed_output().to_string()
 }
+
+/// A test binary's kin book ([`kin::KinTrack`]) and its hand-off ([`kin::Left`]).
+#[cfg(unix)]
+#[path = "exec_kin.rs"]
+mod kin;
 
 #[cfg(test)]
 #[path = "exec_tests.rs"]

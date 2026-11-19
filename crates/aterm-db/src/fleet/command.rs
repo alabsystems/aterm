@@ -56,7 +56,8 @@ A table prints as TSV with a header row unless --json. A cell nobody read is `?`
 never 0; an empty cell is known to hold nothing. --where keeps rows whose cell reads as val\n\
 (any item of a list cell). Each input's state (live, held, never, off) is in the JSON answer\n\
 and on stderr beside a TSV one. This command asks no machine: a fleet read is a window's, so\n\
-`agents` and the machines' answer columns are unread here, the network observer's history is\n\
+`agents` and the machines' answer columns are unread here, and so is this Mac's own reading of\n\
+its vitals (`own=never`), which gives its load, pairs and verdicts; the network observer's history is\n\
 read as it was retained (`network=held(unobserved)`), and a relation whose own input was not\n\
 read prints no row and exits 1.\n";
 
@@ -133,6 +134,7 @@ fn sources_json(sources: &Sources) -> Value {
         "journal": source_json(&sources.journal),
         "network": source_json(&sources.network),
         "fleet_read": source_json(&sources.read),
+        "own": source_json(&sources.own),
     })
 }
 
@@ -143,11 +145,12 @@ pub fn sources_line(sources: &Sources) -> String {
         None => state.word().to_owned(),
     };
     format!(
-        "registry={} journal={} network={} fleet_read={}",
+        "registry={} journal={} network={} fleet_read={} own={}",
         word(&sources.lab),
         word(&sources.journal),
         word(&sources.network),
         word(&sources.read),
+        word(&sources.own),
     )
 }
 

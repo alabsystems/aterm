@@ -52,6 +52,7 @@ mod ring_bounds;
 mod row_floor;
 mod seq_replay;
 mod seq_twins;
+mod stream_turn;
 mod transcript_replays;
 mod turn_cause;
 mod turn_replays;

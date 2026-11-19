@@ -367,7 +367,7 @@ impl App {
         now_unix: i64,
     ) -> crate::needs::NeedFacts {
         let ctx = &h.ctx;
-        let (attention, supervisor, self_claimed) = {
+        let (attention, supervisor, self_claimed, unsupervised) = {
             let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let mut attention = meta.attention_owners.kinded();
             if attention.is_empty()
@@ -384,6 +384,7 @@ impl App {
                 meta.live_claim(now_us)
                     .map(|claim| (claim.holder.clone(), claim.speaks_for_boxes_and_walls())),
                 meta.supervisor_proven(now_us),
+                meta.unsupervised.clone(),
             )
         };
         let restarts = relaunching.contains(h.ctx.self_id.as_str())
@@ -522,6 +523,7 @@ impl App {
             now_unix,
             told,
             grok_signin,
+            unsupervised,
         }
     }
 
@@ -1778,10 +1780,22 @@ impl Desk for App {
         };
         let now_us = crate::metrics::us_at(Desk::clock(self));
         crate::native_act::expire_source_adoption(&ctx, now_us);
-        if crate::session_timeline::publish_lapse_supervisor(&ctx, now_us).published() {
+        if let Some(lapsed) =
+            crate::session_timeline::publish_lapse_supervisor(&ctx, now_us).published()
+        {
+            // The lapse ends the stream's stand-down: a settle it armed is the loop's to tick.
+            self.note_slog_wake(session);
             self.redraw_claude_footer(session);
             self.note_harness_arm(session);
             self.harness_screen_moved();
+            // A contract 4 claim's re-exec grace ran out: the watchdog ends what is left of
+            // its harness, off this thread.
+            #[cfg(unix)]
+            if let Some(scoped) = lapsed.universal {
+                crate::harness_watchdog::past_grace(&ctx, &lapsed.holder, scoped);
+            }
+            #[cfg(not(unix))]
+            let _ = lapsed;
         }
     }
 

@@ -28,16 +28,30 @@
 //!
 //! One live lane holds a prefix, and one live row an `id`, by each collection's `unique` sets:
 //! the table layer refuses and reports those (`unique`).
+//!
+//! A row's link to a machine leads into another table family, the registry, which no rule of
+//! this table can judge: a reader that holds both reports where one leads ([`links`], design
+//! §4.6).
+//!
+//! - **A machine a row names is bound by a facts row** (`link-unbound`): the machine reads as
+//!   its uuid.
+//! - **The machine row it comes to is held** (`link-missing`) **and live** (`link-retired`).
+//!   A row merged into another is live only where the machine's own lineage states the merge.
+//! - **A sample compared on one machine was taken on a machine with a row**
+//!   (`same-machine-unanswered`).
 
 use super::mapped::{key_of, made_from};
-use super::tables::{DECISION, PACKAGE};
+use super::tables::{DECISION, METRIC, PACKAGE};
 use crate::Result;
 pub use crate::alab::checks::Finding;
+use crate::alab::link::{Machine, Machines};
+use crate::alab::registry::MACHINE_LINK;
 use crate::database::Change;
 use crate::typed::{
-    Kind, LIFECYCLE, Refused, Table,
+    Collection, Column, Kind, LIFECYCLE, Refused, Table, Ty,
     cell::{self, CellKey, CellValue, Cells, Projection},
     check, keys,
+    owned::LogRead,
 };
 use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,6 +71,16 @@ pub fn sentence(kind: &str) -> Option<&'static str> {
         "decided-by-said" => {
             "A decision names who decided in words, not as a session or program aterm stated"
         }
+        "link-unbound" => {
+            "A row names a machine that states no facts in the registry, so it reads as its \
+             machine id and nothing says which machine it is"
+        }
+        "link-missing" => "A row names a machine whose machine row the registry does not hold",
+        "link-retired" => "A row names a machine whose machine row is not live",
+        "same-machine-unanswered" => {
+            "A sample of a metric compared on one machine was taken on a machine the registry \
+             has no row for, so nothing says whether it is the same machine"
+        }
         _ => return super::state::sentence(kind),
     })
 }
@@ -69,6 +93,10 @@ pub fn heading(kind: &str) -> Option<&'static str> {
         "depends-cycle" => "Packages depend in a circle",
         "state-mapped" => "State mapped from another word",
         "decided-by-said" => "Decider named in words",
+        "link-unbound" => "Machine with no facts",
+        "link-missing" => "Machine row not held",
+        "link-retired" => "Machine row not live",
+        "same-machine-unanswered" => "Same machine unanswered",
         _ => return super::state::heading(kind),
     })
 }
@@ -133,6 +161,153 @@ pub fn tracker(table: &Table, cells: &Cells) -> (Vec<Finding>, Vec<check::Findin
     found.sort_unstable();
     found.dedup();
     (found, generic)
+}
+
+/// `text` where it is a machine uuid. Any other text names no machine: in a cell it is a value
+/// this build cannot read, which the table layer reports (`raw`), and a finding's keys never
+/// carry it.
+fn uuid(text: Option<&str>) -> Option<&str> {
+    text.filter(|text| keys::parse_uuid32(text).is_some())
+}
+
+/// Each machine a value of type `ty` names by a link to its registry row ([`MACHINE_LINK`]): a
+/// link itself, a principal's machine, and each such member of a struct or a list.
+fn machines_named<'v>(ty: &Ty, value: &'v Value, named: &mut Vec<&'v str>) {
+    match ty {
+        Ty::Link(link) if *link == MACHINE_LINK => named.extend(uuid(value.as_str())),
+        Ty::Principal => named.extend(uuid(value.get("machine").and_then(Value::as_str))),
+        // A list, and a set an owned or log row states whole.
+        Ty::List(of, _) | Ty::Set(of) => {
+            for item in value.as_array().into_iter().flatten() {
+                machines_named(of, item, named);
+            }
+        }
+        Ty::Struct(members) => {
+            for member in *members {
+                if let Some(value) = value.get(member.name) {
+                    machines_named(&member.ty, value, named);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Each machine `column` of a cells `row` names: a set of links by its present members, any
+/// other column by each value written to it, a conflict's every candidate included (two
+/// concurrent claims of one package both name their holder).
+fn machines_of<'r>(column: &Column, row: &'r cell::Row) -> Vec<&'r str> {
+    let mut named = Vec::new();
+    match (column.ty, row.fields.get(column.name)) {
+        (Ty::Set(Ty::Link(link)), Some(field)) if *link == MACHINE_LINK => {
+            named.extend(
+                field
+                    .members()
+                    .into_iter()
+                    .filter_map(|text| uuid(Some(text))),
+            );
+        }
+        (_, Some(field)) => {
+            for value in field.candidates_x() {
+                machines_named(&column.ty, value, &mut named);
+            }
+        }
+        _ => {}
+    }
+    named
+}
+
+/// Every link from `table`'s rows to a registry machine that does not come to a live machine
+/// row, as `machines` (the registry, read at the generation that holds its rows now:
+/// [`Machines::of`]) resolves it: among the live rows of the cells collections in `cells` and
+/// the entries of the logs in `logs`, each [`MACHINE_LINK`] and each principal's machine.
+///
+/// - `link-unbound`: no facts row binds the machine, its own or a successor's, so it reads as
+///   its uuid (a Linux member before LT-C6, a debug build, a machine alone on its LAN).
+/// - `link-missing`: its facts bind a machine row the registry does not hold.
+/// - `link-retired`: the machine row it comes to is not live: retired, or merged with no
+///   writer of the machine's lineage stating that merge, or in a state this build cannot read.
+///   A row merged into a live one by a merge the machine's lineage states is that live row,
+///   and no finding.
+/// - `same-machine-unanswered`: a sample of a metric whose `comparable_on` is `same-machine`
+///   names a machine that comes to no machine row, so no comparison of it has an answer.
+///
+/// A finding names the row and the machine's uuid, both keys, and for a sample its metric. A
+/// link is a statement about the registry as it stands, so a row is never refused for where its
+/// link leads: the registry changes after the row is written. `table` is a generation of
+/// `lab/tracker`.
+pub fn links(
+    table: &Table,
+    cells: &Cells,
+    logs: &BTreeMap<&'static str, LogRead>,
+    machines: &Machines,
+) -> Vec<Finding> {
+    let mut found = Vec::new();
+    let mut judge = |collection: &Collection, key: &str, uuid: &str| {
+        let kind = match machines.resolve(uuid) {
+            Machine::Row(_) => return,
+            Machine::Unbound => "link-unbound",
+            Machine::Missing(_) => "link-missing",
+            Machine::Retired(_) | Machine::Unsettled(_) => "link-retired",
+        };
+        found.push(Finding {
+            kind,
+            collection: collection.name,
+            pks: vec![key.to_owned(), uuid.to_owned()],
+        });
+    };
+    for collection in table.collections.iter().filter(|c| c.kind == Kind::Cells) {
+        let rows = cell::project(collection, cells).rows;
+        for (pk, row) in rows.iter().filter(|(_, row)| row.live()) {
+            for column in collection.columns {
+                for uuid in machines_of(column, row) {
+                    judge(collection, pk, uuid);
+                }
+            }
+        }
+    }
+    let metrics = table
+        .collection(METRIC.name)
+        .map(|metric| cell::project(metric, cells));
+    let same_machine = |metric: &str| {
+        metrics
+            .as_ref()
+            .and_then(|metrics| metrics.rows.get(metric))
+            .filter(|row| row.live())
+            .and_then(|row| row.get("comparable_on"))
+            .and_then(Value::as_str)
+            == Some("same-machine")
+    };
+    let mut unanswered = Vec::new();
+    for collection in table.collections.iter().filter(|c| c.kind == Kind::Log) {
+        let entries = logs.get(collection.name).map(|log| log.entries.as_slice());
+        for entry in entries.into_iter().flatten() {
+            let key = format!("{}.{}", keys::uuid32(&entry.machine), entry.n);
+            let mut named = Vec::new();
+            for column in collection.columns {
+                if let Some(value) = entry.value.get(column.name) {
+                    machines_named(&column.ty, value, &mut named);
+                }
+            }
+            for uuid in named {
+                judge(collection, &key, uuid);
+                let metric = entry.value.get("metric").and_then(Value::as_str);
+                if let Some(metric) = metric.filter(|metric| same_machine(metric))
+                    && machines.resolve(uuid).row().is_none()
+                {
+                    unanswered.push(Finding {
+                        kind: "same-machine-unanswered",
+                        collection: collection.name,
+                        pks: vec![key.clone(), uuid.to_owned(), metric.to_owned()],
+                    });
+                }
+            }
+        }
+    }
+    found.extend(unanswered);
+    found.sort_unstable();
+    found.dedup();
+    found
 }
 
 /// Whether a principal's value names no session and no program: only what a record said.

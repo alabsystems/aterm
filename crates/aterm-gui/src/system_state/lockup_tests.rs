@@ -29,7 +29,7 @@ fn dark() -> bool {
 fn baked_paint(spec: LockupSpec, width: f32) -> LockupPaint {
     let wanted = spec.wanted(width);
     for (art, w, h) in wanted.keys() {
-        art.keep(w, h, art.bake(w, h).into());
+        art.keep(w, h, art.bake(w, h));
     }
     LockupPaint {
         spec,
@@ -238,7 +238,7 @@ fn a_new_step_waits_for_its_bakes_and_the_last_one_stays_meanwhile() {
     };
     let keep = |baked: Baked| {
         for (art, w, h) in baked.keys() {
-            art.keep(w, h, art.bake(w, h).into());
+            art.keep(w, h, art.bake(w, h));
         }
     };
     // Nothing kept: the words alone.

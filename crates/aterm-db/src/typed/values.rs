@@ -140,7 +140,8 @@ fn word(text: &str) -> bool {
 /// Check the text of a link to a row of another table family ([`Link`], design §4.6): the
 /// row's key, in the key grammar and no secret, or for a machine its 32-digit Commons machine
 /// uuid, lower-case hex. Whether the family holds that row is not read here: no table holds
-/// another family's rows, and the link check follows it (TK-07).
+/// another family's rows, and the link check follows it (`alab::link`,
+/// `lab::tracker::checks::links`).
 ///
 /// # Errors
 /// The rule it breaks.
@@ -156,10 +157,11 @@ pub fn link(link: &Link, text: &str) -> Result<(), &'static str> {
 }
 
 /// Whether `text` names a principal's machine: its 32-digit Commons machine uuid, the text of a
-/// link to a registry machine ([`link`], [`Named::Machine`]), or its `m<N>` label, which the
-/// tracker's free-text records name a machine by and the link check refuses (TK-07).
+/// link to a registry machine ([`link`], [`Named::Machine`]). A label is refused: it is neither
+/// unique nor stable (the `machine` collection declares no unique column), so a record that
+/// named its machine in words keeps the words in `said`.
 fn machine(text: &str) -> bool {
-    keys::is_label(text) || (text.len() == 32 && keys::parse_uuid32(text).is_some())
+    keys::parse_uuid32(text).is_some()
 }
 
 /// Who made a change (design §4.5): the session, the agent program and the Mac aterm reads
@@ -175,7 +177,8 @@ pub struct Principal {
     /// The program that made the change (`claude`, `codex-alab`, `person`, `import`).
     pub program: Option<String>,
     /// The machine: its machine uuid, the text of a link to a registry machine
-    /// ([`super::Named::Machine`]), or its label.
+    /// ([`super::Named::Machine`]), which a reader follows to that machine's row
+    /// (`alab::link::Machines`).
     pub machine: Option<String>,
     /// The program's claim: its account, a registry account key.
     pub account: Option<String>,
@@ -247,7 +250,7 @@ impl Principal {
 
 /// Check a principal's value: an object of [`Principal`]'s members and no other, naming a
 /// session, a program or what an imported record said; each word in its grammar, the machine
-/// a label or machine uuid, the account a registry key, and `said` the tracker's prose of at most
+/// a machine uuid, the account a registry key, and `said` the tracker's prose of at most
 /// [`MAX_SAID`] bytes.
 ///
 /// # Errors
@@ -270,7 +273,7 @@ pub fn principal(x: &Value) -> Result<(), &'static str> {
         };
         if !ok {
             return Err(match name.as_str() {
-                "machine" => "a principal's machine is its label or machine uuid",
+                "machine" => "a principal's machine is its 32-digit machine uuid",
                 "account" => "a principal's account is a registry key",
                 "said" => "what a principal said is prose of at most 256 bytes",
                 _ => "a principal's session, program, model and harness are words",

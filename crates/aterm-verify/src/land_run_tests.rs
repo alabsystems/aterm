@@ -19,6 +19,7 @@ pub(crate) fn run() -> Run {
         session: Some("tab-1".to_owned()),
         memory_mib: Some(131_072),
         cores: Some(16),
+        ..Run::default()
     }
 }
 

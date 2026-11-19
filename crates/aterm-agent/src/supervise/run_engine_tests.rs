@@ -879,6 +879,14 @@ fn worker_home() -> crate::supervise::ScratchDir {
     home
 }
 
+/// A worker's tab ID this process alone names: its pid and `n`, one `n` to a test.
+#[cfg(unix)]
+fn worker_sid(n: u64) -> String {
+    aterm_types::tab_id::TabId::from_bits(u64::from(std::process::id()) << 8 | n)
+        .as_str()
+        .to_string()
+}
+
 #[cfg(unix)]
 fn worker_vars(sid: &str, home: &Path) -> Vec<(String, String)> {
     vec![
@@ -933,7 +941,7 @@ fn judge_git_box_with(worker: &StandIn, sid: &str, cwd: &Path) -> (usize, Vec<St
 fn a_git_box_is_judged_in_the_workers_own_environment() {
     let repo = loop_scratch("worker-env");
     loop_git(&repo, &["init", "-q", "."]);
-    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 1);
+    let sid = worker_sid(1);
     let home = worker_home();
     let clean = StandIn::spawn(&worker_vars(&sid, &home));
     assert_eq!(
@@ -960,7 +968,7 @@ fn a_git_box_is_judged_in_the_workers_own_environment() {
     );
     drop(configured);
 
-    let stranger = StandIn::spawn(&worker_vars("s-99999999999999999999", &home));
+    let stranger = StandIn::spawn(&worker_vars("t9999999999", &home));
     let (presses, rows) = judge_git_box_with(&stranger, &sid, &repo);
     assert_eq!(presses, 0, "{rows:?}");
     assert!(
@@ -968,10 +976,7 @@ fn a_git_box_is_judged_in_the_workers_own_environment() {
             .any(|r| r.contains("belongs to another session")),
         "{rows:?}"
     );
-    assert!(
-        !rows.iter().any(|r| r.contains("s-99999999999999999999")),
-        "{rows:?}"
-    );
+    assert!(!rows.iter().any(|r| r.contains("t9999999999")), "{rows:?}");
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -984,7 +989,7 @@ fn a_recorded_git_box_keeps_the_workers_secrets_off_its_tape() {
     use crate::supervise::tape::doors;
     let repo = loop_scratch("worker-secrets");
     planted_repo(&repo);
-    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 5);
+    let sid = worker_sid(5);
     let home = worker_home();
     let mut vars = worker_vars(&sid, &home);
     vars.push(("ANTHROPIC_API_KEY".to_string(), PLANTED_KEY.to_string()));
@@ -1048,7 +1053,7 @@ fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
     let home = root.join("home");
     std::fs::create_dir_all(&home).expect("home");
     let claude = root.join("identity-claude");
-    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 2);
+    let sid = worker_sid(2);
     let register = |pid: u32| {
         write_snapshot(&claude, "");
         std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
@@ -1128,7 +1133,7 @@ fn a_bash_box_reads_a_relative_operand_where_the_bash_tool_stands() {
     std::fs::create_dir_all(&nested).expect("dirs");
     let claude = root.join("identity-claude");
     write_snapshot(&claude, "");
-    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 6);
+    let sid = worker_sid(6);
     let mut vars = worker_vars(&sid, &home);
     vars.push((
         "CLAUDE_CONFIG_DIR".to_string(),
@@ -1204,7 +1209,7 @@ fn a_bash_box_reads_a_relative_operand_where_the_bash_tool_stands() {
 fn a_bash_box_is_judged_under_the_workers_shell_startup() {
     let repo = loop_scratch("worker-shell");
     loop_git(&repo, &["init", "-q", "."]);
-    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 5);
+    let sid = worker_sid(7);
     let home = loop_scratch("worker-shell-home");
     let vars = worker_vars(&sid, &home);
 
@@ -1241,15 +1246,15 @@ fn a_bash_box_is_judged_under_the_workers_shell_startup() {
 
 #[test]
 fn the_sessions_foreground_group_is_read_off_the_roster() {
-    let rows = "0 s-aaaaaaaaaaaaaaaaaaaa driving=- watchers=1 turns=0 alive nonce=00 fgpgid=101\n\
-                1 s-bbbbbbbbbbbbbbbbbbbb driving=- watchers=0 turns=0 alive nonce=00 fgpgid=-\n\
-                2 s-cccccccccccccccccccc driving=- watchers=0 turns=0 alive nonce=00 fgpgid=303\n\
-                3 s-dddddddddddddddddddd driving=- watchers=0 turns=0 alive nonce=00 fgpgid=303\n\
+    let rows = "0 taaaaaaaaaa driving=- watchers=1 turns=0 alive nonce=00 fgpgid=101\n\
+                1 tbbbbbbbbbb driving=- watchers=0 turns=0 alive nonce=00 fgpgid=-\n\
+                2 tcccccccccc driving=- watchers=0 turns=0 alive nonce=00 fgpgid=303\n\
+                3 tdddddddddd driving=- watchers=0 turns=0 alive nonce=00 fgpgid=303\n\
                 4 s-eeeeeeeeeeeeeeeeeeee driving=- watchers=0 turns=0 alive nonce=00 fgpgid=505\n";
     let group = approval_loop::session_group;
     assert_eq!(
         group(rows, None, Some("0")),
-        Ok(("s-aaaaaaaaaaaaaaaaaaaa".to_string(), 101))
+        Ok(("taaaaaaaaaa".to_string(), 101))
     );
     assert!(group(rows, None, Some("1")).is_err(), "unknown group");
     assert!(group(rows, None, Some("2")).is_err(), "a shared group");
@@ -1268,7 +1273,7 @@ fn the_sessions_foreground_group_is_read_off_the_roster() {
         "an addressed session missing from the roster is not stood in for by the local id"
     );
     assert!(
-        group(rows, Some("s-dddddddddddddddddddd"), None).is_err(),
+        group(rows, Some("tdddddddddd"), None).is_err(),
         "a shared group"
     );
 }
@@ -1279,7 +1284,7 @@ fn a_loop_addressing_its_session_binds_the_worker_by_that_id() {
     let repo = loop_scratch("worker-stable-id");
     loop_git(&repo, &["init", "-q", "."]);
     let ours = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 3);
-    let theirs = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 4);
+    let theirs = worker_sid(4);
     let home = worker_home();
     let mut vars = worker_vars(&ours, &home);
     for (k, v) in [

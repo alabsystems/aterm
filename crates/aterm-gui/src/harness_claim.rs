@@ -125,6 +125,46 @@ pub(crate) struct KeptChild {
     pub(crate) birth: Birth,
 }
 
+#[cfg(unix)]
+impl KeptChild {
+    /// THE KEPT CHILD'S IDENTITY NOW, read through `control`: the token its pid reads with
+    /// while it still reads at the birth aterm kept ([`Self::birth`]), else `None` (it ended,
+    /// or its pid names another process). A vendor that exec'd keeps its pid and its birth and
+    /// is still the kept child; the token carries the pid version read now, which
+    /// [`aterm_uds::process::end_proven`] holds every later read to.
+    pub(crate) fn identity(
+        &self,
+        control: &mut impl aterm_uds::process::EndControl,
+    ) -> Option<aterm_uds::process::Identity> {
+        let pid = i32::try_from(self.pid).ok()?;
+        control.identity(pid).filter(|now| now.birth == self.birth)
+    }
+
+    /// END THE KEPT CHILD BY THE IDENTITY aterm KEEPS: `SIGTERM`, then `SIGKILL` past `grace`
+    /// ([`aterm_uds::process::end_proven`]), each signal sent only while its pid still reads at
+    /// [`Self::birth`] (`still_proven`) and with the token read just before it. `Ok` with
+    /// nothing sent and `gone` where it no longer reads at its birth: it ended already (the
+    /// claimant's group `SIGKILL` usually ends it, since it is kept in that group).
+    ///
+    /// # Errors
+    /// [`aterm_uds::process::EndRefusal`]: its identity moved between the reads, or the kernel
+    /// refused the `SIGTERM` while it still reads.
+    pub(crate) fn end(
+        &self,
+        control: &mut impl aterm_uds::process::EndControl,
+        grace: std::time::Duration,
+    ) -> Result<aterm_uds::process::Ended, aterm_uds::process::EndRefusal> {
+        let Some(token) = self.identity(control) else {
+            return Ok(aterm_uds::process::Ended {
+                gone: true,
+                ..aterm_uds::process::Ended::default()
+            });
+        };
+        let birth = self.birth;
+        aterm_uds::process::end_proven(token, grace, control, |now| now.birth == birth)
+    }
+}
+
 /// The longest parent walk from a claim's child to its claimant ([`keep_child`]): a harness's
 /// child sits one or two exec layers below it (a shell, a launcher), never sixteen.
 pub(crate) const CHILD_WALK_MAX: usize = 16;
@@ -298,8 +338,9 @@ impl From<Proven> for ClaimProof {
 /// one aterm read from the build its proof admitted
 /// ([`crate::session_timeline::SessionMeta::verified_version`]: that build's manifest, or `link`
 /// for a development link), never the claim's or a `claim` record's `version=`; the vendor has no
-/// verified source and is the word the claim states. `-` for a word that is not known, and for
-/// both under any other claim or none.
+/// verified source and is the word the claim states, else the one its claimant's latest `session`
+/// record stated (D7, [`crate::session_timeline::StreamState::vendor`]). `-` for a word that is not
+/// known, and for both under any other claim or none.
 #[must_use]
 pub(crate) fn wire_versions(
     meta: &crate::session_timeline::SessionMeta,
@@ -309,10 +350,86 @@ pub(crate) fn wire_versions(
     match meta.live_scoped(now_us) {
         Some(s) => (
             word(meta.verified_version(now_us)),
-            word(s.claim.vendor.as_deref()),
+            word(s.claim.vendor.as_deref().or_else(|| {
+                meta.stream
+                    .as_ref()
+                    .filter(|stream| stream.proven == s.proven)
+                    .and_then(|stream| stream.vendor.as_deref())
+            })),
         ),
         None => ("-".to_string(), "-".to_string()),
     }
+}
+
+/// The longest word a relaunch line carries, in bytes ([`validate_run`]).
+pub(crate) const RUN_WORD_MAX: usize = 1024;
+
+/// The most words a relaunch line carries ([`validate_run`]).
+pub(crate) const RUN_WORDS_MAX: usize = 64;
+
+/// Why a relaunch's words were refused ([`validate_run`]): nothing is typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "only the Unix harness watchdog relaunches")
+)]
+pub(crate) enum RunRefusal {
+    /// The first word is not the claim's registry row's verified tool, or that tool is no word.
+    NotTheTool,
+    /// The second word is not `run`.
+    NotRun,
+    /// Word `at` (from 0) is empty, longer than [`RUN_WORD_MAX`], or holds a character that is
+    /// not printable ASCII (a control character, a newline, anything a terminal could misdraw).
+    Word { at: usize },
+    /// More than [`RUN_WORDS_MAX`] words.
+    TooMany,
+    /// The words after the tool are not alab-wire's relaunch grammar ([`alab_wire::Run::parse`]):
+    /// an unknown flag, a flag twice or without its value, a value out of its grammar, or no `--`.
+    Grammar(alab_wire::RunError),
+    /// No word follows `--`: the line would start a fresh conversation, which a relaunch never
+    /// types (the HX-15 plan's D22).
+    NoResume,
+}
+
+/// VALIDATE A RELAUNCH'S WORDS, whichever vendor's (the HX-15 plan's D21 and D22): `words` is the
+/// whole line aterm's harness watchdog types, `<tool> run [--account <label>] [--home <dir>]
+/// [--model <word>] -- <resume…>`, and `tool` the claim's registry row's verified tool. Only
+/// that tool starts the line: a record's first word is never typed or run, wherever it sits.
+/// Every word must be a bounded printable word: 1 to [`RUN_WORD_MAX`] bytes of printable ASCII
+/// (a space allowed, as the shell quoting carries it; a control character, a newline or a
+/// non-ASCII character never), at most [`RUN_WORDS_MAX`] of them. The words after the tool
+/// must read as alab-wire's grammar ([`alab_wire::Run::parse`]) with at least one resume word
+/// after `--`: a line with none would start a fresh conversation (D22). The words are quoted for
+/// the shell when typed (`aterm_agent::harness::relaunch_type::run_line`).
+///
+/// # Errors
+/// [`RunRefusal`]: the first word not the row's tool (or the tool no word), the second not
+/// `run`, a word out of bounds, too many words, words out of the grammar, or no resume word.
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "only the Unix harness watchdog relaunches")
+)]
+pub(crate) fn validate_run(words: &[String], tool: &str) -> Result<(), RunRefusal> {
+    let word = |word: &str| {
+        (1..=RUN_WORD_MAX).contains(&word.len()) && word.bytes().all(|b| (b' '..=b'~').contains(&b))
+    };
+    if words.len() > RUN_WORDS_MAX {
+        return Err(RunRefusal::TooMany);
+    }
+    if !word(tool) || tool.contains(' ') || words.first().map(String::as_str) != Some(tool) {
+        return Err(RunRefusal::NotTheTool);
+    }
+    if words.get(1).map(String::as_str) != Some("run") {
+        return Err(RunRefusal::NotRun);
+    }
+    if let Some(at) = words.iter().position(|w| !word(w)) {
+        return Err(RunRefusal::Word { at });
+    }
+    let run = alab_wire::Run::parse(&words[1..]).map_err(RunRefusal::Grammar)?;
+    if run.resume.is_empty() {
+        return Err(RunRefusal::NoResume);
+    }
+    Ok(())
 }
 
 /// Return the claimed pid if `facts` prove rostered `holder`'s scoped claim: the kernel's peer is

@@ -112,7 +112,7 @@ fn startup_recovery_a_stop_between_repaired_attempts_prevents_the_next_offer() {
         change(|script| script.authorizations = [Ok(Some(2))].into());
         let mut attempts = 0;
         let mut retired = 0;
-        run_repaired_startups(|reserved| {
+        run_repaired_startups(None, |reserved| {
             attempts += 1;
             if attempts == 1 {
                 assert!(reserved.is_none());
@@ -343,7 +343,7 @@ fn corrupt_accepted_answer_recovery(stop: bool, in_place: bool, prior_target: bo
     let mut passes = 0;
     let mut original_sent = 0;
     let mut admitted = None;
-    run_repaired_startups(|reserved| {
+    run_repaired_startups(None, |reserved| {
         passes += 1;
         assert_eq!(STARTUP_CLAIMS.load(Ordering::Acquire), 0);
         heal_unread_setup();
@@ -696,27 +696,23 @@ fn startup_recovery_a_published_checkpoint_is_stoppable_after_its_done_marker_re
     assert!(script().runs.is_empty());
 }
 
-fn bring_forward_readable_permissions() -> Result<aterm_cli::macos_doctor::BroughtForward, String> {
+fn stage_readable_permissions(root: &Path) {
     use aterm_cli::macos_doctor::{InitialSetupAdmissionFault, InitialSetupAdmissionStopTest};
-    let root = CLAIM_ROOT.lock().unwrap().clone().unwrap();
-    let mut setup = InitialSetupAdmissionStopTest::startup(&root)?;
+    let mut setup = InitialSetupAdmissionStopTest::startup(root).unwrap();
     assert!(
         setup
             .persist(InitialSetupAdmissionFault::BeforeFinal)
             .is_err()
     );
-    let snapshot = setup.snapshot().map_err(|why| why.to_string())?;
+    let snapshot = setup.snapshot().unwrap();
     assert!(!snapshot.finished);
     assert!(
-        setup.admission()?.is_none(),
+        setup.admission().unwrap().is_none(),
         "startup must still admit its readable offer"
     );
-    Ok(aterm_cli::macos_doctor::BroughtForward::Run(
-        snapshot.revision,
-    ))
 }
 
-fn continue_readable_permissions_inline() {
+fn continue_readable_permissions_inline(reserved: u64) {
     use aterm_cli::macos_doctor::{ProvisionalSetupWatchTest, claim_initial_setup_rerun_at};
     assert!(!INITIAL_SETUP_BUSY.load(Ordering::Acquire));
     assert_eq!(STARTUP_CLAIMS.load(Ordering::Acquire), 0);
@@ -733,7 +729,10 @@ fn continue_readable_permissions_inline() {
             .finished
     );
     ProvisionalSetupWatchTest::at(&root).recover().unwrap();
-    change(|script| script.startups_inline += 1);
+    change(|script| {
+        script.startups_inline += 1;
+        script.inline_startup_reservation = Some(reserved);
+    });
 }
 
 /// A Restore pressed while another setup holds this Mac's setup records waits quietly, its
@@ -789,14 +788,14 @@ fn startup_recovery_restore_falls_back_on_its_released_worker_when_spawn_is_refu
     for accepted in [true, false] {
         let _io = TestIo::install();
         let _healing = Healing::idle();
-        change(|script| script.startup_spawns.push_back(accepted));
-        {
-            let mut io = SETUP_IO.write().unwrap();
-            io.bring_forward = bring_forward_readable_permissions;
-            io.start_startup_inline = continue_readable_permissions_inline;
-        }
+        change(|script| {
+            script.startup_spawns.push_back(accepted);
+            script.restored_setup_needs_startup = Ok(true);
+        });
+        SETUP_IO.write().unwrap().start_startup_inline = continue_readable_permissions_inline;
         let root = CLAIM_ROOT.lock().unwrap().clone().unwrap();
         let busy = take_initial_setup_slot().unwrap();
+        let next_sent = SETUP_SENT.load(Ordering::Acquire) + 1;
         let mut restores = 0;
         run_setup_restore(busy, |_, holding| {
             restores += 1;
@@ -806,6 +805,7 @@ fn startup_recovery_restore_falls_back_on_its_released_worker_when_spawn_is_refu
                 .unwrap()
                 .unwrap();
             assert!(holding(), "nothing pressed meanwhile");
+            stage_readable_permissions(&root);
             InitialSetupObserved {
                 result: Ok(Some(Report {
                     action: Action::Restore,
@@ -822,10 +822,15 @@ fn startup_recovery_restore_falls_back_on_its_released_worker_when_spawn_is_refu
         assert!(!INITIAL_SETUP_BUSY.load(Ordering::Acquire));
         assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
         assert_eq!(script().startups, 1);
+        assert_eq!(script().startup_reservations, [Some(next_sent)]);
         assert_eq!(
             script().startups_inline,
             usize::from(!accepted),
             "a refused spawn must continue the readable pending setup on this released worker"
+        );
+        assert_eq!(
+            script().inline_startup_reservation,
+            (!accepted).then_some(next_sent)
         );
         let snapshot = ProvisionalSetupWatchTest::at(&root).snapshot().unwrap();
         assert!(!snapshot.finished);

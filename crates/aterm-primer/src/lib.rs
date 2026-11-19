@@ -34,7 +34,7 @@ macro_rules! land_check_answer {
 pub const LAND_CHECK_ANSWER: &str = land_check_answer!();
 
 /// Edition written in the private resident context marker and used in a reading's method.
-pub const RESIDENT_BRIEF_VERSION: u32 = 1;
+pub const RESIDENT_BRIEF_VERSION: u32 = 2;
 
 /// Standing instructions installed only in the booked resident's working directory.
 pub const RESIDENT_BRIEF: &str = include_str!("../assets/resident-brief.md");

@@ -55,11 +55,22 @@ fn life(pk: &str, live: bool) -> (String, Staged) {
 /// The labels column's settlement of the read `current` (the operations whose values the cells
 /// hold) of `history` holds.
 fn settlement(current: &[&Op], history: &[&Op], index: &Index) -> Settlement {
-    let (projected, mut settled) =
-        settled(&MACHINE, &cells(current), history.iter().copied(), index);
+    let (projected, mut settled) = settled(
+        &MACHINE,
+        &cells(current),
+        history.iter().copied(),
+        index,
+        None,
+    );
     assert_eq!(
         projected,
-        project(&MACHINE, &cells(current), history.iter().copied(), index),
+        project(
+            &MACHINE,
+            &cells(current),
+            history.iter().copied(),
+            index,
+            None
+        ),
         "keeping the settlement changes nothing of the read"
     );
     settled
@@ -75,7 +86,13 @@ fn reads_as_predicted(
     history: &[&Op],
     index: &Index,
 ) {
-    let read = project(&MACHINE, &cells(current), history.iter().copied(), index);
+    let read = project(
+        &MACHINE,
+        &cells(current),
+        history.iter().copied(),
+        index,
+        None,
+    );
     let shown: BTreeMap<String, Option<String>> = read
         .rows
         .iter()

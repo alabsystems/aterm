@@ -4,6 +4,21 @@
 #[cfg(unix)]
 use super::*;
 
+// The unit fixtures resolve only local packages. Reuse one private Cargo home for a
+// test thread's graph reads, outside its Git worktree and concurrent builds' cache lock.
+pub(super) fn use_fixture_home(cmd: &mut aterm_uds::spawnfd::Command) -> Result<(), String> {
+    thread_local! {
+        static FIXTURE_CARGO_HOME: std::io::Result<aterm_tempfile::TempDir> = aterm_tempfile::tempdir();
+    }
+    FIXTURE_CARGO_HOME.with(|home| {
+        let home = home
+            .as_ref()
+            .map_err(|e| format!("create graph fixture Cargo home: {e}"))?;
+        cmd.env("CARGO_HOME", home.path());
+        Ok(())
+    })
+}
+
 #[cfg(unix)]
 #[test]
 fn failed_original_child_retains_both_streams_and_natural_exit() {

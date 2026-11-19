@@ -37,6 +37,10 @@ pub enum EventKind {
     /// A process a cleanup sweep left, with its observed identity and reason.
     /// Diagnostic evidence; it establishes no signal authority or check verdict.
     ProcessSurvivor,
+    /// What the closure at a run's test binaries' ends cost (W-kin, [`crate::runs::KinCost`]),
+    /// with how many kin the run booked and its ender ended; not the binds at its tree reads,
+    /// the sweep each of `exec::finish`'s kill paths begins, or the ender's own work.
+    KinLeft,
     RunFinished,
     RunPlanned,
     RunResealed,

@@ -44,30 +44,25 @@ impl RecordLock {
     }
 
     /// Take `file`'s exclusive lock, blocking until the handle that holds it lets go (or its
-    /// process ends, which lets go of it whatever ended it).
+    /// process ends, which lets go of it whatever ended it). A take a signal ends (`EINTR`,
+    /// where the signal's handler did not ask to restart: std's `File::lock` does not retry
+    /// it) is taken again on the same descriptor, so a signal never ends the wait.
     ///
     /// # Errors
-    /// The OS error.
+    /// The OS error, other than `Interrupted`.
     pub fn lock(file: File, record: u64) -> std::io::Result<Self> {
         let file: std::fs::File = file;
-        #[cfg(windows)]
-        {
-            record_range::lock(&file, record)?;
-            Ok(Self {
-                file: Some(file),
-                record,
-            })
+        loop {
+            match take(&file, record) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                taken => break taken?,
+            }
         }
-        #[cfg(not(windows))]
-        {
-            let _ = record;
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the record guard's own take: its Drop releases by LOCK_UN"
-            )]
-            file.lock()?;
-            Ok(Self { file: Some(file) })
-        }
+        Ok(Self {
+            file: Some(file),
+            #[cfg(windows)]
+            record,
+        })
     }
 
     /// Let the lock go, keeping the file open.
@@ -106,6 +101,41 @@ impl RecordLock {
             custody: std::sync::Arc::new(Custody::default()),
         }
     }
+}
+
+/// One blocking take of `file`'s exclusive lock ([`RecordLock::lock`]): its whole file by
+/// `flock`, or on Windows its range from `record` on. A test's laid answer ([`laid_take`]),
+/// where it laid one, is answered instead.
+fn take(file: &File, record: u64) -> std::io::Result<()> {
+    if let Some(laid) = laid_take() {
+        return laid;
+    }
+    #[cfg(windows)]
+    {
+        record_range::lock(file, record)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = record;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the record guard's own take: its Drop releases by LOCK_UN"
+        )]
+        file.lock()
+    }
+}
+
+/// TEST SEAM: the next error this thread's test laid as a blocking take's answer ([`take`]), in
+/// the order it laid them.
+#[cfg(all(test, unix))]
+fn laid_take() -> Option<std::io::Result<()>> {
+    tests::LAID_TAKES.with(|laid| laid.borrow_mut().pop_front().map(Err))
+}
+
+/// Every build but a unix test build lays no answer: every take is the OS's.
+#[cfg(not(all(test, unix)))]
+const fn laid_take() -> Option<std::io::Result<()>> {
+    None
 }
 
 impl std::ops::Deref for RecordLock {

@@ -127,7 +127,7 @@ impl LoginObs {
         }
     }
 
-    fn to_json(&self) -> Value {
+    pub(super) fn to_json(&self) -> Value {
         let mut o = Map::new();
         o.insert("at".into(), Value::from(self.at));
         o.insert("witness".into(), Value::from(self.witness.as_str()));
@@ -135,7 +135,7 @@ impl LoginObs {
         Value::Object(o)
     }
 
-    fn from_json(v: &Value, cap: Cap) -> Option<Self> {
+    pub(super) fn from_json(v: &Value, cap: Cap) -> Option<Self> {
         Some(Self::new(
             stamp(v.get("at"), cap)?,
             v.get("witness")?.as_str()?,

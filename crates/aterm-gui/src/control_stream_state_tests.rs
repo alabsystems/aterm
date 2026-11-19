@@ -345,7 +345,7 @@ fn a_tab_without_state_is_still_fed_by_the_screen_reader() {
     let id = stream.id();
     stream.open(ONE);
     assert_eq!(stream.record(1, Body::Beat), (1, None));
-    assert_eq!(stream.record(2, unapplied()), (2, None));
+    assert_eq!(stream.record(2, title()), (2, None));
     assert_eq!(
         rig.state(ONE).applied.iter().copied().collect::<Vec<_>>(),
         ["beat"],
@@ -422,8 +422,9 @@ fn a_tab_without_state_is_still_fed_by_the_screen_reader() {
     assert_eq!(published(&rig, ONE).0, "idle");
 }
 
-/// `asking` AND `walled` NAME NO KIND, and no `ask` or `wall` record is applied yet: the kind
-/// is the screen reader's. `asking` reads the screen's `question`, or its `prompt` with the
+/// `asking` AND `walled` NAME NO KIND, and with no `ask` or `wall` record applied the kind is
+/// the screen reader's (D13's fallback; the records' own kind is
+/// `control_stream_asks_tests.rs`'s). `asking` reads the screen's `question`, or its `prompt` with the
 /// box, else `prompt`; `walled` reads the screen's `wall:<kind>`.
 /// NEGATIVE HALF: the screen names a kind only for those two states: under `idle` and `working`
 /// the same screen reading changes nothing.
@@ -825,8 +826,12 @@ fn a_stream_tab_opens_its_agent_run_from_the_claims_row() {
         // NEGATIVE HALF: the claim alone, with no stream and no record, opened nothing.
         assert!(runs(&rig, sid).is_empty(), "{sid}: {:?}", runs(&rig, sid));
         stream.open(sid);
-        // NEGATIVE HALF: a record acknowledged and not applied, and one the grant drops.
-        assert_eq!(stream.record(1, unapplied()), (1, None));
+        // NEGATIVE HALF: records acknowledged and not applied, and one the grant drops.
+        assert_eq!(
+            stream.raw(r#"{"k":"hx99-later","seq":1,"ms":0}"#),
+            (1, None),
+            "an unknown kind is acknowledged and applied by nothing"
+        );
         assert_eq!(
             stream.record(2, title()),
             (2, None),

@@ -5593,6 +5593,7 @@ fn a_record_with_a_bad_signature_is_refused() {
         body: Body::Name {
             name: "forger".to_owned(),
         },
+        statement: None,
     }
     .sign(&w_forger, inc_forger)
     .expect("self-signed by non-member");
@@ -5792,6 +5793,7 @@ fn a_frontier_of_two_hundred_forked_heads_still_pulls_records() {
                 body: Body::Name {
                     name: format!("fork-{i}"),
                 },
+                statement: None,
             }
             .sign(&w2, inc2)
             .expect("fork")
@@ -5846,6 +5848,7 @@ fn a_record_whose_parent_exists_nowhere_is_not_sent_on_every_pull() {
         body: Body::Name {
             name: "orphan".to_owned(),
         },
+        statement: None,
     }
     .sign(&w_junk, inc_junk)
     .expect("signed");
@@ -6123,6 +6126,7 @@ fn a_store_with_no_genesis_takes_posted_records_only_with_the_genesis_that_roots
                     salt: [0x33; 32],
                     ciphertext: vec![0x5a; 4_096].into(),
                 },
+                statement: None,
             }
             .sign(&[0xee; 32], [0xee; 16])
             .expect("signed")
@@ -7603,6 +7607,7 @@ impl Founded {
             body: crate::membership_log::Body::Name {
                 name: format!("w{i}"),
             },
+            statement: None,
         }
         .sign(&self.writer, self.incarnation)
         .expect("signed")

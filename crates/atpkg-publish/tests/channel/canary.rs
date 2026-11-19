@@ -540,6 +540,111 @@ fn stage_existing(rig: &Rig, out: &Path) -> Result<()> {
     )
 }
 
+fn check_installed(rig: &Rig, out: &Path) -> Result<()> {
+    canary::run(
+        &rig.ctx,
+        &[
+            "trust=8".into(),
+            "--out".into(),
+            out.to_str().unwrap().into(),
+            "--check-installed".into(),
+        ],
+    )
+}
+
+#[test]
+fn checking_an_installed_canary_authenticates_its_original_evidence_without_publication() {
+    let (rig, q, source) = setup();
+    let out = install(&rig, &q, &source);
+    assert!(
+        check_installed(&rig, &out).is_err(),
+        "intact local evidence still needs the authoritative channel head"
+    );
+    rig.publish_head(&Doc::new(7, &[("trust", 7)]));
+    let before = atpkg::tree_root(&out).unwrap();
+    let changes = rig.host.changes();
+    check_installed(&rig, &out).expect("current roster authenticates the existing installation");
+    assert_eq!(atpkg::tree_root(&out).unwrap(), before);
+    assert_eq!(rig.host.changes(), changes);
+
+    let receipt = std::fs::read(out.join(canary::RECEIPT)).unwrap();
+    let signature = std::fs::read(out.join(canary::SIGNATURE)).unwrap();
+    std::fs::remove_file(out.join(canary::SIGNATURE)).unwrap();
+    assert!(
+        check_installed(&rig, &out).is_err(),
+        "requires both signed files"
+    );
+    std::fs::write(out.join(canary::SIGNATURE), rig.keys.sign(b"other bytes")).unwrap();
+    assert!(
+        check_installed(&rig, &out)
+            .unwrap_err()
+            .to_string()
+            .contains("signature refused")
+    );
+    std::fs::write(out.join(canary::SIGNATURE), &signature).unwrap();
+    let asset = format!("trust-8-{}.tar.zst", Triple::host().unwrap());
+    std::fs::write(out.join(asset), b"damaged archive").unwrap();
+    assert!(
+        check_installed(&rig, &out)
+            .unwrap_err()
+            .to_string()
+            .contains("differs from the installed")
+    );
+    assert_eq!(std::fs::read(out.join(canary::RECEIPT)).unwrap(), receipt);
+    assert_eq!(
+        std::fs::read(out.join(canary::SIGNATURE)).unwrap(),
+        signature
+    );
+    assert_eq!(rig.host.changes(), changes);
+}
+
+#[test]
+fn checking_an_installed_canary_requires_the_native_tree_in_its_own_store() {
+    let (rig, q, source) = setup();
+    let out = install(&rig, &q, &source);
+    rig.publish_head(&Doc::new(7, &[("trust", 7)]));
+    let logical = atpkg::Layout {
+        prefix: out.join("prefix"),
+    }
+    .build_dir("trust", 8);
+    let aside = logical.with_file_name("8.noindex");
+    if std::fs::symlink_metadata(&logical).unwrap().is_dir() {
+        std::fs::rename(&logical, &aside).unwrap();
+        std::os::unix::fs::symlink("8.noindex", &logical).unwrap();
+    }
+    check_installed(&rig, &out).expect("atpkg's own sibling alias");
+    let foreign = rig.path("another installation");
+    std::fs::rename(&aside, &foreign).unwrap();
+    std::os::unix::fs::symlink(&foreign, &aside).unwrap();
+    assert!(
+        check_installed(&rig, &out)
+            .unwrap_err()
+            .to_string()
+            .contains("canonical installed")
+    );
+    std::fs::remove_file(&aside).unwrap();
+    std::fs::rename(foreign, &aside).unwrap();
+    std::fs::write(logical.join("bin/trustc"), b"changed since canary").unwrap();
+    assert!(
+        check_installed(&rig, &out)
+            .unwrap_err()
+            .to_string()
+            .contains("differs from the signed canary tree")
+    );
+    let foreign = if Triple::host().unwrap().as_str() == "aarch64-unknown-linux-gnu" {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-linux-gnu"
+    };
+    train_targets(&rig, &out, &[foreign]);
+    assert!(
+        check_installed(&rig, &out)
+            .unwrap_err()
+            .to_string()
+            .contains("no installation for")
+    );
+}
+
 #[test]
 fn staging_canary_evidence_leaves_the_index_and_existing_receipts_unchanged() {
     let (rig, q, source) = setup();
@@ -674,6 +779,13 @@ fn consumer_lock_and_command_modes_are_explicit() {
         )
         .is_err()
     );
+    for args in [
+        "trust=8 --out canary --check-installed --consumer aterm=checkout",
+        "trust=8 --out canary --check-installed --stage-receipt",
+        "trust=8 --out canary --stage-receipt --check-installed",
+    ] {
+        assert!(canary::parse(&words(args)).is_err(), "{args}");
+    }
     let report = canary::Native.consumer(
         "ay",
         &rig.path("missing"),

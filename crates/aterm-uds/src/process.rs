@@ -558,7 +558,7 @@ pub use kin::{
     TRUST_CHECK_VAR, VERIFY_RUN_VAR, Walk, at_program_check, boot_id, group_listing_can_be_whole,
     group_members, held_age, held_programs, held_since, host_id, launchd_idversion,
     launched_before, pid_namespace, process_serial, read_hop, read_identity, read_lineage,
-    read_process_markers, stripped_from_child, thread_ran, walk,
+    read_process_markers, read_session, stripped_from_child, thread_ran, walk,
 };
 #[cfg(any(unix, windows))]
 pub use kin::{held_among, held_since_among};

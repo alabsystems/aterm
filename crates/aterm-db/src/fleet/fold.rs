@@ -13,7 +13,10 @@
 //!   binds; this Mac's own answer finds the row its facts row binds, whatever its header says.
 //!   Where two sightings name one machine, this Mac's own answer stands over a peer's and a
 //!   newer one over an older, and the rest are counted ([`Counts::shadowed`]). A read says
-//!   whether a machine answers for [`REACH_KEEP_MS`] and no longer.
+//!   whether a machine answers for [`REACH_KEEP_MS`] and no longer, and its pairs, verdicts
+//!   and load are given only while it does; another machine's load, cores busy and verdicts
+//!   are its answers' last word on each for [`LOOK_KEEP_MS`]. This Mac's own column, pairs,
+//!   verdicts, load and free space are its own vitals', read in process ([`Inputs::own`]).
 //! - **Accounts**: every registry row by provider then label. Usage is the journal's reading,
 //!   read again as of the fold's instant: a window whose reset has passed has no figure.
 //!   `expected` comes from the registry's preferences and from nothing else; `active` is
@@ -30,11 +33,15 @@
 //!   first 8 digits of its Commons uuid. `walled` is a wall every session of the account
 //!   meets ([`WindowQuota::walls_account`]); each model's own weekly wall stands beside it in
 //!   `model_walls`, as `ai/limits` states the two, so neither hides the other (FL-271).
-//! - **Agents**: every agent session a machine listed in an answer no older than
-//!   [`AGENTS_KEEP_MS`]. Its account is the registry row its word resolves to; a word that
+//! - **Agents**: every agent session a machine listed in its answer, while it answers now
+//!   ([`REACH_KEEP_MS`]): a machine that stops answering has no agent rows and no agent counts
+//!   from that fold on, its agents not read, while its build and its last-seen time stand.
+//!   Its account is the registry row its word resolves to; a word that
 //!   resolves to none is dropped and counted ([`Counts::unresolved_accounts`]).
 
-use super::read::{AccountWord, Harness, Latest, OWN_ID, Sighted};
+use super::read::{
+    AccountWord, Harness, How, LOOK_KEEP_MS, Latest, Limits, Look, OWN_ID, Own, Sighted,
+};
 use super::rows::{
     ACCOUNT_STATUS, AccountRef, AccountRow, AgentRow, Evidence, EvidenceHow, Fact, MACHINE_STATUS,
     MachineRef, MachineRow, ModelWall, ObservedState, PlanSource, RETIRED, Reach, SEEN_ON_MAX,
@@ -57,10 +64,6 @@ use aterm_types::network_state::{NetworkStateSnapshot, PeerObservation, Reachabi
 use aterm_types::update_standing::{UpdateFact, UpdateStanding};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-
-/// How long a machine's last answer speaks for its agents: past it the machine has no agent
-/// counts and no agent rows. Its agents are then unknown, not idle and not gone.
-pub const AGENTS_KEEP_MS: u64 = 2 * 3_600_000;
 
 /// How long a fleet read says whether a machine answers: five of the glance's one-minute reads.
 /// Past it a machine the read heard is `unread`, not `up`, and one it found silent is `unread`,
@@ -190,6 +193,8 @@ pub struct Sources {
     pub network: SourceState,
     /// The fleet reads.
     pub read: SourceState,
+    /// This Mac's own reading, from its vitals.
+    pub own: SourceState,
 }
 
 /// What the fold reads.
@@ -199,6 +204,8 @@ pub struct Inputs {
     pub journal: Source<Arc<Seen>>,
     pub network: Source<Arc<NetworkStateSnapshot>>,
     pub read: Source<Arc<Latest>>,
+    /// This Mac's own reading, made in process from its deck's vitals ([`Own`]).
+    pub own: Source<Arc<Own>>,
 }
 
 /// What the fold left out of the rows, counted.
@@ -233,6 +240,7 @@ impl FleetTables {
                 journal: SourceState::Never,
                 network: SourceState::Never,
                 read: SourceState::Never,
+                own: SourceState::Never,
             },
             counts: Counts::default(),
         }
@@ -492,74 +500,25 @@ fn observed_state(
     }
 }
 
-/// A machine row's sighting facts. `newest_ms` is the newest read that could have named the
-/// machine: any read for this Mac, a read that asked the fleet for a peer.
+/// A machine row's sighting facts, and whether it answers now. `newest_ms` is the newest read
+/// that could have named the machine: any read for this Mac, a read that asked the fleet for a
+/// peer. What it said survives its silence, dated (its host, its build, its free space, its
+/// updater's standing, when it was last seen); its sessions, tallies, pairs, verdicts and load
+/// are given only while it answers now (FP-D10): the newest read named it, heard it, and is
+/// young. A peer's load, cores busy and verdicts are what its answers kept
+/// ([`super::read::Kept`]), each for [`LOOK_KEEP_MS`] from its read; this Mac's own are its
+/// vitals' ([`own_facts`]), never its answer's.
 fn sighted_facts(
     row: &mut MachineRow,
     sighted: &Sighted,
     newest_ms: u64,
     now_ms: u64,
     next: &mut Next,
-) {
+) -> bool {
     row.host.clone_from(&sighted.host);
-    if let Some(answered) = &sighted.answered {
-        let at = answered.at_ms;
-        row.proven = Some(!sighted.unproven);
-        row.build = answered.v.build.clone().map(|build| At::new(build, at));
-        row.disk_free_mb = answered.v.home_free_mb.map(|free| At::new(free, at));
-        // Its pairs, verdicts and load are its own look's, each side read or not on its own.
-        let look = &answered.v.look;
-        let read = |value: Option<u64>| value.map(|value| At::new(value, at));
-        row.cpu = Pair {
-            used: read(look.cpu_busy_x100),
-            capacity: read(look.cores),
-        };
-        row.mem = Pair {
-            used: read(look.mem_used_mb),
-            capacity: read(look.mem_total_mb),
-        };
-        row.gpu = Pair {
-            used: read(
-                look.gpu_busy_pct
-                    .zip(look.gpu_cores)
-                    .map(|(pct, cores)| pct.saturating_mul(cores)),
-            ),
-            capacity: read(look.gpu_cores),
-        };
-        row.disk = Pair {
-            used: read(
-                look.disk_total_mb
-                    .zip(answered.v.home_free_mb)
-                    .and_then(|(total, free)| total.checked_sub(free)),
-            ),
-            capacity: read(look.disk_total_mb),
-        };
-        row.net = Pair {
-            // A link's rate is each direction's: the busier one is what it uses of it.
-            used: read(
-                look.net_rx_kbps
-                    .zip(look.net_tx_kbps)
-                    .map(|(rx, tx)| rx.max(tx)),
-            ),
-            capacity: read(look.net_link_kbps),
-        };
-        let limits = look.limits;
-        row.limits = [limits.cpu, limits.mem, limits.gpu, limits.disk]
-            .iter()
-            .any(Option::is_some)
-            .then(|| At::new(limits, at));
-        row.load = look.load.map(|load| At::new(load, at));
-        row.update = answered.v.update.clone().map(|update| At::new(update, at));
-        row.last_seen_ms = Some(at);
-        if now_ms.saturating_sub(at) <= AGENTS_KEEP_MS {
-            row.sessions = answered.v.sessions.map(|sessions| At::new(sessions, at));
-            row.tally = answered.v.tally.map(|tally| At::new(tally, at));
-            row.agents_listed = Some(u32::try_from(answered.v.agents.len()).unwrap_or(u32::MAX));
-            next.at(at.saturating_add(AGENTS_KEEP_MS).saturating_add(1));
-        }
-    }
     // Only the newest read says whether it answers now, and only while that read is young.
-    if sighted.named_ms == newest_ms && now_ms.saturating_sub(newest_ms) <= REACH_KEEP_MS {
+    let young = sighted.named_ms == newest_ms && now_ms.saturating_sub(newest_ms) <= REACH_KEEP_MS;
+    if young {
         row.how = Via::of(sighted.how);
         row.reach_at_ms = Some(newest_ms);
         match &sighted.silent {
@@ -571,6 +530,136 @@ fn sighted_facts(
         }
         next.at(newest_ms.saturating_add(REACH_KEEP_MS).saturating_add(1));
     }
+    let Some(answered) = &sighted.answered else {
+        return false;
+    };
+    let at = answered.at_ms;
+    row.proven = Some(!sighted.unproven);
+    row.build = answered.v.build.clone().map(|build| At::new(build, at));
+    row.disk_free_mb = answered.v.home_free_mb.map(|free| At::new(free, at));
+    row.update = answered.v.update.clone().map(|update| At::new(update, at));
+    row.last_seen_ms = Some(at);
+    // The newest read named it and found it silent: its last answer speaks for nothing now.
+    if !young || sighted.silent.is_some() {
+        return false;
+    }
+    row.sessions = answered.v.sessions.map(|sessions| At::new(sessions, at));
+    row.tally = answered.v.tally.map(|tally| At::new(tally, at));
+    row.agents_listed = Some(u32::try_from(answered.v.agents.len()).unwrap_or(u32::MAX));
+    if sighted.how == How::Survey {
+        look_pairs(row, &answered.v.look, answered.v.home_free_mb, at);
+        let kept = &sighted.kept;
+        row.cpu = Pair {
+            used: given(kept.cpu.used, now_ms, next),
+            capacity: given(kept.cpu.capacity, now_ms, next),
+        };
+        let [cpu, mem, disk, gpu] = [
+            kept.cpu_limit,
+            kept.mem_limit,
+            kept.disk_limit,
+            kept.gpu_limit,
+        ]
+        .map(|verdict| given(verdict, now_ms, next));
+        // The verdicts still given, dated by the oldest of them: none is shown as newer than
+        // the read that judged it.
+        row.limits = [cpu, mem, disk, gpu]
+            .iter()
+            .flatten()
+            .map(|verdict| verdict.at_ms)
+            .min()
+            .map(|at| {
+                At::new(
+                    Limits {
+                        cpu: cpu.map(|verdict| verdict.v),
+                        mem: mem.map(|verdict| verdict.v),
+                        disk: disk.map(|verdict| verdict.v),
+                        gpu: gpu.map(|verdict| verdict.v),
+                    },
+                    at,
+                )
+            });
+        row.load = given(kept.load, now_ms, next);
+    }
+    true
+}
+
+/// A kept figure while it is [`LOOK_KEEP_MS`] young, naming the instant it lapses; `None` once
+/// it is older, never the old figure as now.
+fn given<T>(kept: Option<At<T>>, now_ms: u64, next: &mut Next) -> Option<At<T>> {
+    let kept = kept.filter(|kept| now_ms.saturating_sub(kept.at_ms) <= LOOK_KEEP_MS)?;
+    next.at(kept.at_ms.saturating_add(LOOK_KEEP_MS).saturating_add(1));
+    Some(kept)
+}
+
+/// `look`'s pairs on `row`, read at `at`, each side read or not on its own: a share or a part of
+/// an unread capacity (a GPU's busy share of its cores, a disk's used part of its size) is
+/// unread too. `home_free_mb` is the home volume's free space the disk's use is its size less.
+/// Its CPU pair, verdicts and load too, which a peer's row then takes from what it kept.
+fn look_pairs(row: &mut MachineRow, look: &Look, home_free_mb: Option<u64>, at: u64) {
+    let read = |value: Option<u64>| value.map(|value| At::new(value, at));
+    row.cpu = Pair {
+        used: read(look.cpu_busy_x100),
+        capacity: read(look.cores),
+    };
+    row.mem = Pair {
+        used: read(look.mem_used_mb),
+        capacity: read(look.mem_total_mb),
+    };
+    row.gpu = Pair {
+        used: read(
+            look.gpu_busy_pct
+                .zip(look.gpu_cores)
+                .map(|(pct, cores)| pct.saturating_mul(cores)),
+        ),
+        capacity: read(look.gpu_cores),
+    };
+    row.disk = Pair {
+        used: read(
+            look.disk_total_mb
+                .zip(home_free_mb)
+                .and_then(|(total, free)| total.checked_sub(free)),
+        ),
+        capacity: read(look.disk_total_mb),
+    };
+    row.net = Pair {
+        // A link's rate is each direction's: the busier one is what it uses of it.
+        used: read(
+            look.net_rx_kbps
+                .zip(look.net_tx_kbps)
+                .map(|(rx, tx)| rx.max(tx)),
+        ),
+        capacity: read(look.net_link_kbps),
+    };
+    let limits = look.limits;
+    row.limits = [limits.cpu, limits.mem, limits.gpu, limits.disk]
+        .iter()
+        .any(Option::is_some)
+        .then(|| At::new(limits, at));
+    row.load = look.load.map(|load| At::new(load, at));
+}
+
+/// This Mac's own column from its own reading, made in process from its deck's vitals (FP-D10),
+/// while it is [`LOOK_KEEP_MS`] young: its pairs, verdicts, load and free space, and its reach
+/// `up`, whatever
+/// its own survey answer said or whether any read was made (a Mac in no fleet makes none). Its
+/// agents stay its answer's, given only while that answers now.
+fn own_facts(row: &mut MachineRow, own: &Source<Arc<Own>>, now_ms: u64) {
+    // Its lapse is named with the input's state, whether or not this Mac has a row.
+    let Some((own, at)) = own
+        .value()
+        .zip(own.at_ms())
+        .filter(|(_, at)| now_ms.saturating_sub(*at) <= LOOK_KEEP_MS)
+    else {
+        // Its free space is its vitals' alone: never its answer's, stale or not.
+        row.disk_free_mb = None;
+        return;
+    };
+    look_pairs(row, &own.look, own.home_free_mb, at);
+    row.disk_free_mb = own.home_free_mb.map(|free| At::new(free, at));
+    row.reach = Reach::Up;
+    row.reach_why = None;
+    row.how = Via::Own;
+    row.reach_at_ms = row.reach_at_ms.max(Some(at));
 }
 
 /// A build's release numbers, `MAJOR.MINOR.PATCH` with any `+…` after them set aside, compared
@@ -777,8 +866,9 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
 
     // Machines: every registry row, then the answers no row names.
     let mut machines: Vec<MachineRow> = Vec::new();
-    // Each machine row's sighting, for the agents relation.
+    // Each machine row's sighting, for the agents relation, and the rows that answer now.
     let mut sighted_of: BTreeMap<String, &Sighted> = BTreeMap::new();
+    let mut answering: BTreeSet<String> = BTreeSet::new();
     for machine in lab.iter().flat_map(|lab| lab.machines.values()) {
         let mut row = MachineRow::unread(machine.pk.clone());
         row.label.clone_from(&machine.label);
@@ -805,7 +895,9 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             lab.map(|lab| u32::try_from(lab.preferred_by(&machine.pk).count()).unwrap_or(u32::MAX));
         if let Some((_, sighted)) = standing.get(machine.pk.as_str()) {
             let newest = newest_for(latest, sighted);
-            sighted_facts(&mut row, sighted, newest, now_ms, &mut next);
+            if sighted_facts(&mut row, sighted, newest, now_ms, &mut next) {
+                answering.insert(row.machine.clone());
+            }
             sighted_of.insert(row.machine.clone(), sighted);
         }
         if let Some(peer) = peers.get(machine.pk.as_str()) {
@@ -864,7 +956,9 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             // With no registry read, nothing says the registry does not name it.
             row.status = lab.map(|_| UNREGISTERED);
             let newest = newest_for(latest, sighted);
-            sighted_facts(&mut row, sighted, newest, now_ms, &mut next);
+            if sighted_facts(&mut row, sighted, newest, now_ms, &mut next) {
+                answering.insert(row.machine.clone());
+            }
             sighted_of.insert(row.machine.clone(), sighted);
             row
         })
@@ -882,24 +976,40 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             ))
     });
     machines.extend(strangers);
-    // Old and not updating: judged of each answer young enough to say the machine answers now
-    // (`REACH_KEEP_MS`), its build and its standing that one answer's, never a journal's build or
-    // a sleeping machine's last word.
-    let answering = |machine: &str| {
+    // This Mac's own column: the row its own answer stands for, else the one its facts row
+    // binds, from its vitals.
+    let own_row = machines
+        .iter()
+        .position(|row| {
+            sighted_of
+                .get(&row.machine)
+                .is_some_and(|sighted| sighted.how == How::Own)
+        })
+        .or_else(|| {
+            let me = lab?.me.as_deref()?;
+            machines.iter().position(|row| row.machine == me)
+        });
+    if let Some(row) = own_row.and_then(|at| machines.get_mut(at)) {
+        own_facts(row, &inputs.own, now_ms);
+    }
+
+    // Old and not updating: judged of each answer that answers now, its build and its standing
+    // that one answer's, never a journal's build or a sleeping machine's last word.
+    let answer_now = |machine: &str| {
         sighted_of
             .get(machine)
+            .filter(|_| answering.contains(machine))
             .and_then(|sighted| sighted.answered.as_ref().map(|at| (sighted, at)))
-            .filter(|(_, at)| now_ms.saturating_sub(at.at_ms) <= REACH_KEEP_MS)
     };
     let fleet = fleet_build(
         machines
             .iter()
-            .filter_map(|row| answering(&row.machine))
+            .filter_map(|row| answer_now(&row.machine))
             .filter(|(sighted, _)| !sighted.unproven)
             .filter_map(|(_, answered)| answered.v.build.as_deref()),
     );
     for row in &mut machines {
-        row.old = answering(&row.machine).and_then(|(_, answered)| {
+        row.old = answer_now(&row.machine).and_then(|(_, answered)| {
             old_and_not_updating(
                 answered.v.build.as_deref(),
                 fleet,
@@ -908,15 +1018,11 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
         });
     }
 
-    // Agents: each listed session of each machine whose answer still speaks for them.
+    // Agents: each listed session of each machine that answers now.
     let accounts_by_name = lab.map(accounts_by_name).unwrap_or_default();
     let mut agents: Vec<AgentRow> = Vec::new();
     for row in &machines {
-        let Some((sighted, answered)) = sighted_of
-            .get(&row.machine)
-            .and_then(|sighted| sighted.answered.as_ref().map(|at| (sighted, at)))
-            .filter(|(_, at)| now_ms.saturating_sub(at.at_ms) <= AGENTS_KEEP_MS)
-        else {
+        let Some((sighted, answered)) = answer_now(&row.machine) else {
             continue;
         };
         let (how, proven) = (sighted.how, !sighted.unproven);
@@ -1376,6 +1482,22 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
         state => state,
     };
 
+    // This Mac's own reading too old to draw is held, as a stale read is, at the instant named.
+    let own = match inputs.own.state() {
+        SourceState::Live { at_ms } => {
+            next.at(at_ms.saturating_add(LOOK_KEEP_MS).saturating_add(1));
+            if now_ms.saturating_sub(at_ms) > LOOK_KEEP_MS {
+                SourceState::Held {
+                    why: super::HELD_STALE,
+                    at_ms: Some(at_ms),
+                }
+            } else {
+                SourceState::Live { at_ms }
+            }
+        }
+        state => state,
+    };
+
     Folded {
         tables: FleetTables {
             machines,
@@ -1386,6 +1508,7 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
                 journal: inputs.journal.state(),
                 network: inputs.network.state(),
                 read,
+                own,
             },
             counts,
         },

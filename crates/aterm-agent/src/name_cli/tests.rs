@@ -51,7 +51,7 @@ fn a_registry_origin_is_named_in_the_json_report() {
     };
     let json: aterm_json::Value = aterm_json::from_str(&shown.json()).expect("JSON");
     assert_eq!(json["made"].as_str(), Some("registry"));
-    assert_eq!(json["title"].as_str(), Some("m86 MissBunny"));
+    assert_eq!(json["title"].as_str(), Some("m86 Miss Bunny"));
 }
 
 fn no_roster() -> io::Result<Option<String>> {
@@ -219,7 +219,7 @@ fn set_reports_the_exact_name_and_previews_without_changing_it() {
     )
     .expect("previews");
     assert!(
-        preview.starts_with("m86 MissBunny  class=chosen fleet=out"),
+        preview.starts_with("m86 Miss Bunny  class=chosen fleet=out"),
         "{preview}"
     );
     assert_eq!(notes, [Note::NameDryRun]);
@@ -239,14 +239,14 @@ fn set_reports_the_exact_name_and_previews_without_changing_it() {
     .expect("renames");
     let json: aterm_json::Value = aterm_json::from_str(&json).expect("JSON");
     assert_eq!(json["name"].as_str(), Some("m86"));
-    assert_eq!(json["nick"].as_str(), Some("MissBunny"));
+    assert_eq!(json["nick"].as_str(), Some("Miss Bunny"));
     assert!(notes.is_empty());
     assert_eq!(
         file::read(root.path())
             .expect("reads")
             .expect("a name")
             .title(),
-        "m86 MissBunny"
+        "m86 Miss Bunny"
     );
 }
 
@@ -319,13 +319,13 @@ fn the_report_names_the_fleet_the_node_and_a_migration_not_finished() {
     let name = file::read(root.path())
         .expect("reads")
         .expect("made by the report");
-    let (nick, shown) = (name.nick.as_str(), name.nick.display());
+    let shown = name.nick.display();
     let node = me.node();
     assert_eq!(
         json,
         format!(
             "{{\"class\":\"seeded\",\"fleet\":\"in\",\"made\":\"evidence\",\"migration\":\"pending\",\
-             \"name\":\"m8\",\"nick\":\"{nick}\",\"nick_class\":\"auto\",\"node\":\"{node}\",\
+             \"name\":\"m8\",\"nick\":\"{shown}\",\"nick_class\":\"auto\",\"node\":\"{node}\",\
              \"number\":8,\"rev\":0,\"since\":{IMPLIED_SINCE},\"title\":\"m8 {shown}\"}}\n"
         ),
         "the roster's NAME at the implied rank, pending migration"
@@ -387,12 +387,12 @@ fn a_report_keeps_a_known_name_when_identity_is_damaged_but_refuses_uncertain_na
         let unread = || -> io::Result<Option<String>> { unreachable!("the name is already known") };
         let (json, _) = report(root.path(), None, true, unread, NOW).expect("reports the name");
         let json: aterm_json::Value = aterm_json::from_str(&json).expect("JSON");
-        assert_eq!(json["title"].as_str(), Some("m86 MissBunny"));
+        assert_eq!(json["title"].as_str(), Some("m86 Miss Bunny"));
         assert_eq!(json["number"].as_u64(), Some(86));
         assert_eq!(json["rev"].as_u64(), Some(1));
         assert!(json["node"].is_null(), "an unread identity is not a node");
         let (line, _) = report(root.path(), None, false, unread, NOW).expect("reports text");
-        assert_eq!(line, "m86 MissBunny  class=chosen fleet=out\n");
+        assert_eq!(line, "m86 Miss Bunny  class=chosen fleet=out\n");
         assert!(
             renick(
                 root.path(),
@@ -571,7 +571,7 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
         root.path(),
         Some(&vault(root.path())),
         &NickAsk {
-            to: &heron,
+            to: &NickTo::Word(nickname("blue-heron")),
             kind: ByKind::Agent,
             dry_run: false,
         },
@@ -610,7 +610,7 @@ fn nick_sets_a_chosen_nickname_raising_rev_and_keeping_the_claim() {
     assert_eq!(
         asked,
         [[
-            format!("nickname={}", drawn.nick.as_str()),
+            format!("nickname={}", drawn.display_nick()),
             "by=program".to_owned()
         ]],
         "the row's write says a program asked"

@@ -166,6 +166,42 @@ fn a_swing_of_a_tenth_exactly_is_a_flash_and_a_darker_state_at_0_80_exactly_is_n
     assert_eq!(turns_of(&[0.5, 1.0, 0.7999, 1.0, 0.7999]), 4);
 }
 
+/// A pixel read again at the value it read last turns nothing and changes nothing, which lets a
+/// reader skip the pixels a frame kept (`Flicker::frame`, the flier film's `read`): every value
+/// of a walk read twice leaves the count as the walk read once.
+/// NEGATIVE CONTROL: at a swing of zero, a repeat is a turn.
+#[test]
+fn a_value_read_again_turns_nothing() {
+    let state = |t: &Turns| (t.dir.clone(), t.lo.clone(), t.hi.clone(), t.at.clone());
+    let walk = |swing: f64, twice: bool| {
+        let mut t = Turns::new(1, swing, FLASH_DARK_BELOW);
+        // Steps of a seventh, a tenth and none, under and over the darker state's edge.
+        let mut v = 0.5_f64;
+        for k in 0u32..400 {
+            v = (v + [0.0, 1.0 / 7.0, -0.1, 0.0, 0.31][(k % 5) as usize] * f64::from(k % 3))
+                .rem_euclid(1.0);
+            t.see(0, v, 16 * (2 * k));
+            if twice {
+                t.see(0, v, 16 * (2 * k + 1));
+            }
+        }
+        t
+    };
+    let (once, twice) = (walk(FLASH_SWING, false), walk(FLASH_SWING, true));
+    assert!(
+        once.at.get(&0).is_some_and(|at| at.len() > 20),
+        "the walk turns"
+    );
+    assert!(
+        state(&once) == state(&twice),
+        "a repeated value changed the count"
+    );
+    assert!(
+        walk(0.0, true).at[&0].len() > walk(0.0, false).at[&0].len(),
+        "control: at a swing of zero a repeat must turn"
+    );
+}
+
 #[test]
 fn a_fall_is_measured_from_the_highest_value_since_the_last_turn() {
     // On a light page a pixel steps down to 0.85 (no turn: its darker state is not under 0.80), wobbles up

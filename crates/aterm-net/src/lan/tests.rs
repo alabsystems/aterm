@@ -24,8 +24,10 @@ pub(super) fn broker() -> aterm_uds::lan::Seam {
                     socket: socket.clone(),
                 };
                 std::thread::spawn(move || {
-                    // A test's broker keeps nothing: its output is no file the plist names.
-                    let served = aterm_lan::serve(opts, aterm_lan::keep_log());
+                    // A test's broker keeps nothing: its output is no file the plist names, and it
+                    // serves the LAN alone.
+                    let served =
+                        aterm_lan::serve(opts, aterm_lan::Duties::none(), aterm_lan::keep_log());
                     panic!("the test broker stopped: {served:?}");
                 });
                 let seam = aterm_uds::lan::Seam {

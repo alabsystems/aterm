@@ -85,8 +85,9 @@ pub struct ServerHeardFact {
 /// replies (`OK <n>\ninstance …\n…`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwarmSurveyFacts {
-    /// Host-checked release process identities, the release pump's fact (`release_pump`) and
-    /// bounded local GitHub quota summaries.
+    /// Host-checked release process identities, the release pump's fact (`release_pump`),
+    /// bounded local GitHub quota summaries, and what the Mac's last format-2 vault log pass
+    /// did (`vault_log`, `aterm_secrets::client::log_pass_row`).
     pub operation_lines: Vec<String>,
     /// Fleet node id (`node=` on `instance`), when enrolled in a fleet.
     pub node: Option<String>,
@@ -611,6 +612,13 @@ impl SwarmSurveyFacts {
                     env.aterm_state.as_deref(),
                     u64::try_from(env.now).unwrap_or(0),
                 ))
+                // What this Mac's last format-2 vault log pass did: no row where none kept a
+                // record, which is every Mac whose build reads no format 2.
+                .chain(home.and_then(|home| {
+                    aterm_secrets::client::log_pass_row(&aterm_secrets::client::Paths::for_home(
+                        home,
+                    ))
+                }))
                 .collect(),
             node,
             label,
@@ -870,6 +878,7 @@ impl SwarmSurveyFacts {
             } else if line.starts_with("release_line ")
                 || line.starts_with(aterm_ctl::release_pump::ROW)
                 || line.starts_with("github_rate ")
+                || line.starts_with("vault_log ")
             {
                 operation_lines.push(line.to_owned());
             }

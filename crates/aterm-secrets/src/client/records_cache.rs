@@ -529,7 +529,8 @@ enum Observed {
 /// takes a rewritten layout (`records_storage::rewrite::selected`), which every other reader
 /// refuses ([`crate::records_storage::selected`]). A store reads format 2 only once its Mac's
 /// format mark names it on a build that reads it (`crate::membership_log::follow::reading`).
-fn select(
+/// `client::genesis`'s private-realm read selects by it too.
+pub(super) fn select(
     paths: &Paths,
     reading: crate::membership_log::Reading,
 ) -> crate::Result<crate::records_storage::Selected> {

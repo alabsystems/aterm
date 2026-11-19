@@ -11,11 +11,12 @@ use aterm_types::control_verbs::ScreenGen;
 
 use super::agent_image::{self, Lane};
 use super::relaunch::{
-    Launch, NoPlan, Plan, PromptLook, PromptMark, Relaunch, RelaunchLineError, STALE_S, TAB_TAKEN,
-    WAIT_HAND_LIFTS, await_new, carry_on, confirm, expired, hand_waits_out, launched, overtaken_by,
-    overtaken_line, pause, plan, recorded, relaunch, relaunch_of, resume_mode, screen_mode,
-    tab_front, type_relaunch_line_with, unplanned, wait_now, wait_until,
+    Launch, NoPlan, Plan, Relaunch, STALE_S, TAB_TAKEN, WAIT_HAND_LIFTS, await_new, carry_on,
+    confirm, expired, hand_waits_out, launched, overtaken_by, overtaken_line, pause, plan,
+    recorded, relaunch, relaunch_of, resume_mode, screen_mode, tab_front, unplanned, wait_now,
+    wait_until,
 };
+use super::relaunch_type::{PromptLook, PromptMark, RelaunchLineError, type_relaunch_line_with};
 use super::upgrade::{self, Candidate, Facts, Phase, Request, SessionFile, Source, Step, Version};
 use crate::RelayClient;
 use crate::supervise::approvals;
@@ -4602,6 +4603,8 @@ pub(super) struct St {
     pub(super) codex_home: String,
     pub(super) codex_home_env: Option<String>,
     pub(super) codex_auth_path: Option<String>,
+    /// The default login replaces a named login, including a path inherited from the shell.
+    pub(super) selected_codex_default: bool,
     pub(super) argv: Vec<String>,
     pub(super) cwd: String,
     pub(super) twin: String,
@@ -5976,6 +5979,9 @@ impl St {
         if let Some(auth) = &self.codex_auth_path {
             o.insert("codex_auth_path".into(), Value::from(auth.as_str()));
         }
+        if self.selected_codex_default {
+            o.insert("selected_codex_default".into(), Value::from(true));
+        }
         if !self.muse_data.is_empty() {
             o.insert("muse_data".into(), Value::from(self.muse_data.as_str()));
         }
@@ -6377,6 +6383,9 @@ impl St {
                 .get("codex_auth_path")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            selected_codex_default: v
+                .get("selected_codex_default")
+                .map_or(Some(false), Value::as_bool)?,
             argv: list("argv"),
             cwd: s("cwd"),
             twin: s("twin"),
@@ -11254,7 +11263,11 @@ pub fn self_claimed_after_exit(
     asked: Option<super::restart_stamp::Cause>,
 ) -> Report {
     let cause = match asked {
-        Some(super::restart_stamp::Cause::Stall) => super::relaunch::ExitCause::Stall,
+        Some(
+            super::restart_stamp::Cause::Stall
+            | super::restart_stamp::Cause::Beat
+            | super::restart_stamp::Cause::Memory,
+        ) => super::relaunch::ExitCause::Stall,
         Some(super::restart_stamp::Cause::Asked) => super::relaunch::ExitCause::Asked,
         None => super::relaunch::ExitCause::Exit,
     };

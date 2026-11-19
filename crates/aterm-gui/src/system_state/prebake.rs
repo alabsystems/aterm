@@ -332,7 +332,7 @@ impl Oven for Cache {
 
     fn bake(&self, key: Key) -> Arc<[u8]> {
         let (art, w, h) = key;
-        art.bake(w, h).into()
+        art.bake(w, h)
     }
 
     fn keep(&self, key: Key, pixels: Arc<[u8]>) {

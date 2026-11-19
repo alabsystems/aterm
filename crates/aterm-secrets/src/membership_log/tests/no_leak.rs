@@ -23,7 +23,7 @@ fn moved(who: Mac, on: Mac, label: &str) -> Entrant {
             [3; 32],
             [who.0; 16],
             who.incarnation(),
-            &on.identity(),
+            on.identity(),
             &who.seed(),
         )
         .unwrap(),
@@ -116,7 +116,7 @@ fn an_epoch_that_lacks_a_seat_moved_beside_its_remove_is_due() {
     // What the old gate let through: B's `Wrap` opens E to the identity A's move holds too, on any
     // log where that recipient is not removed (B's, or one A keeps).
     b_log.keep(wrap);
-    let unwrapped = b_log.unwrap_epochs(&B.identity()).unwrap();
+    let unwrapped = b_log.unwrap_epochs(B.identity()).unwrap();
     assert_eq!(unwrapped.get(epoch.id()).map(|k| **k), Some(*key));
 }
 

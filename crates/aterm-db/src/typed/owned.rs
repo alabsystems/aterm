@@ -12,7 +12,7 @@
 //! attributable. Each key's latest row ranks by (period, n, sequence), an exact tie by the
 //! smallest operation digest.
 
-use super::{Collection, Kind, SCHEMA, Table, Writers, keys};
+use super::{Collection, Kind, Table, Writers, keys};
 use crate::database::Change;
 use astream_wire::sync::{Actor, Digest};
 use aterm_json::Value;
@@ -143,9 +143,9 @@ pub(crate) fn kept(table: &Table, change: &Change, signer: Option<[u8; 16]>) -> 
         project = "aterm_db::typed::model_tests::cells_transition"
     )
 )]
-pub fn read_owned(
+pub fn read_owned<'a>(
     collection: &Collection,
-    ops: &[Op],
+    ops: impl IntoIterator<Item = &'a Op>,
     resolve: impl Fn(&Digest, &Actor) -> Option<[u8; 16]>,
 ) -> OwnedRead {
     let mut read = OwnedRead::default();
@@ -209,9 +209,9 @@ pub struct LogRead {
 /// Read a log collection: append-only per writer, `<uuid32>.<n>` keys, each inert unless its
 /// uuid is its signer's machine. A counter a writer reused keeps its first entry, by period,
 /// then by sequence within the period's table, then by the smallest operation digest.
-pub fn read_log(
+pub fn read_log<'a>(
     collection: &Collection,
-    ops: &[Op],
+    ops: impl IntoIterator<Item = &'a Op>,
     resolve: impl Fn(&Digest, &Actor) -> Option<[u8; 16]>,
 ) -> LogRead {
     let mut read = LogRead::default();
@@ -377,37 +377,11 @@ pub enum SchemaState {
 /// the current cell, since under per-cell replacement an older build's write after a newer row
 /// would otherwise replace it (design §3.5).
 pub fn schema_state(ops: &[Op], collection: &str) -> SchemaState {
-    let mut best: Option<(u32, Vec<Value>)> = None;
+    let mut state = super::state::State::default();
     for op in ops {
-        for change in &op.changes {
-            if change.collection != SCHEMA || change.key != collection {
-                continue;
-            }
-            let Some((version, row)) = change.value.as_ref().and_then(|value| {
-                let version = u32::try_from(value.get("r")?.as_u64()?).ok()?;
-                Some((version, value.clone()))
-            }) else {
-                continue;
-            };
-            match best.as_mut() {
-                Some((held, rows)) if *held == version => {
-                    if !rows.contains(&row) {
-                        rows.push(row);
-                    }
-                }
-                Some((held, _)) if *held > version => {}
-                _ => best = Some((version, vec![row])),
-            }
-        }
+        super::state::fold_schema(&mut state, op);
     }
-    match best {
-        None => SchemaState::Absent,
-        Some((version, mut rows)) if rows.len() == 1 => SchemaState::One {
-            version,
-            row: rows.remove(0),
-        },
-        Some((version, _)) => SchemaState::Split { version },
-    }
+    state.schema_state(collection)
 }
 
 /// Whether a build whose compiled collection is at `ours` may publish its schema row: never
@@ -506,39 +480,78 @@ pub(crate) fn quota_of(
     records: impl Iterator<Item = (Actor, u64, Digest, bool)>,
     merges: &[(Actor, u64)],
 ) -> Quota {
-    let mut business = BTreeMap::<Actor, BTreeSet<u64>>::new();
-    let mut by_writer = BTreeMap::<Actor, Vec<(u64, Digest)>>::new();
-    for (actor, sequence, id, automatic) in records {
-        business.entry(actor).or_default().insert(sequence);
-        if automatic {
-            by_writer.entry(actor).or_default().push((sequence, id));
-        }
-    }
-    let mut joins = BTreeMap::<Actor, BTreeSet<u64>>::new();
-    for (actor, sequence) in merges {
-        joins.entry(*actor).or_default().insert(*sequence);
-    }
     let mut quota = Quota::default();
-    for (actor, mut records) in by_writer {
-        records.sort_unstable();
-        let mut spent = 0;
-        for (sequence, id) in records {
-            // The merges between this writer's previous business record and this one.
-            let after = business[&actor]
-                .range(..sequence)
-                .next_back()
-                .map_or(0, |previous| previous + 1);
-            let merged = joins
-                .get(&actor)
-                .map_or(0, |joins| joins.range(after..sequence).count());
-            spent += 1 + merged;
-            if spent > table.self_quota {
-                quota.over.insert(id);
-            }
+    for (actor, events) in writer_events(records, merges) {
+        let mut counter = Counter::default();
+        charge(table, &mut counter, events, &mut quota.over);
+        if let Some(spent) = counter.spent {
+            quota.spent.insert(actor, spent);
         }
-        quota.spent.insert(actor, spent);
     }
     quota
+}
+
+/// One writer's quota, counted through its newest record: what a fold from a checkpoint's state
+/// continues from (`typed::state`), in place of the records past the quota, which grow with
+/// history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counter {
+    /// Records its automatic records cost ([`Quota::spent`]); `None` before its first.
+    pub spent: Option<usize>,
+    /// Its newest business record's sequence; 0 before its first.
+    pub last_business: u64,
+    /// Its causal-only merges after that record, which its next automatic record pays for.
+    pub merges_after: usize,
+}
+
+/// A writer's record as the quota charges it: a causal-only merge (`None`), or a business
+/// record's digest and whether it is [`automatic`].
+pub(crate) type Event = Option<(Digest, bool)>;
+
+/// Each writer's records of `records` (writer, sequence, digest, whether automatic) and
+/// `merges`, by sequence.
+pub(crate) fn writer_events(
+    records: impl Iterator<Item = (Actor, u64, Digest, bool)>,
+    merges: &[(Actor, u64)],
+) -> BTreeMap<Actor, BTreeMap<u64, Event>> {
+    let mut events = BTreeMap::<Actor, BTreeMap<u64, Event>>::new();
+    for (actor, sequence) in merges {
+        events.entry(*actor).or_default().insert(*sequence, None);
+    }
+    for (actor, sequence, id, automatic) in records {
+        events
+            .entry(actor)
+            .or_default()
+            .insert(sequence, Some((id, automatic)));
+    }
+    events
+}
+
+/// Charge one writer's `events` (by sequence, each past every record `counter` counted) to
+/// `counter`, adding each automatic record whose cost passes `table.self_quota` to `over`.
+pub(crate) fn charge(
+    table: &Table,
+    counter: &mut Counter,
+    events: BTreeMap<u64, Event>,
+    over: &mut BTreeSet<Digest>,
+) {
+    for (sequence, event) in events {
+        let Some((id, automatic)) = event else {
+            counter.merges_after += 1;
+            continue;
+        };
+        if automatic {
+            // It costs one record plus the merges between its writer's previous business record
+            // and it.
+            let spent = counter.spent.unwrap_or(0) + 1 + counter.merges_after;
+            counter.spent = Some(spent);
+            if spent > table.self_quota {
+                over.insert(id);
+            }
+        }
+        counter.last_business = sequence;
+        counter.merges_after = 0;
+    }
 }
 
 /// How many of `entries`, taken in priority order (the caller sorts them, most important

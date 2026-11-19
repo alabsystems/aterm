@@ -73,6 +73,7 @@ fn a_run_reopened_under_an_open_window_goes_on_here() {
         arm_attempts: usize,
         admit_on_arm: Option<usize>,
         pending: Option<u64>,
+        unread_first: bool,
         resumed: usize,
         busy_first: bool,
         lose_after_first: bool,
@@ -108,6 +109,9 @@ fn a_run_reopened_under_an_open_window_goes_on_here() {
             self.busy_first && self.waits.is_empty()
         }
         fn resumable(&mut self) -> Result<Option<u64>, String> {
+            if std::mem::take(&mut self.unread_first) {
+                return Err("temporarily unread".into());
+            }
             Ok(self.pending.take())
         }
         fn resume(&mut self) {
@@ -118,7 +122,7 @@ fn a_run_reopened_under_an_open_window_goes_on_here() {
         }
         fn say(&mut self, _: String) {}
     }
-    for case in ["initial", "rearm", "missing", "healthy", "busy"] {
+    for case in ["initial", "rearm", "missing", "healthy", "busy", "unread"] {
         let mut host = Loop {
             at: Instant::now(),
             watching: false,
@@ -129,7 +133,8 @@ fn a_run_reopened_under_an_open_window_goes_on_here() {
                 "rearm" => Some(2),
                 _ => None,
             },
-            pending: None,
+            pending: (case == "unread").then_some(7),
+            unread_first: case == "unread",
             resumed: 0,
             busy_first: case == "busy",
             lose_after_first: case == "rearm",
@@ -146,7 +151,7 @@ fn a_run_reopened_under_an_open_window_goes_on_here() {
         );
         let expected: &[usize] = match case {
             "initial" => &[1],
-            "rearm" | "busy" => &[0, 1],
+            "rearm" | "busy" | "unread" => &[0, 1],
             _ => &[0, 0],
         };
         assert_eq!(
@@ -162,10 +167,18 @@ fn a_run_reopened_under_an_open_window_goes_on_here() {
         } else {
             LOOK_AGAIN
         };
-        assert!(
-            host.waits.iter().all(|(within, _)| *within == wait),
-            "{case}: no unbounded missing-watch wait or rapid polling"
-        );
+        if case == "unread" {
+            assert_eq!(
+                host.waits,
+                [(PASS_RETRY_SCHEDULE.after(1), 0), (LOOK_AGAIN, 1)],
+                "a healthy watch still schedules read recovery without a file event"
+            );
+        } else {
+            assert!(
+                host.waits.iter().all(|(within, _)| *within == wait),
+                "{case}: no unbounded missing-watch wait or rapid polling"
+            );
+        }
         assert_eq!(
             host.arm_attempts,
             if matches!(case, "rearm" | "missing") {
@@ -186,9 +199,9 @@ fn nothing_goes_on_beside_setup_here_or_with_no_run_owed() {
     let mut host = Fake::new([Ok(None), Err("the records are being written".into())]);
     host.here = [true].into();
     let mut taken = Taken::default();
-    for _ in 0..3 {
-        assert_eq!(look(&mut host, &mut taken), LOOK_AGAIN);
-    }
+    assert_eq!(look(&mut host, &mut taken), LOOK_AGAIN);
+    assert_eq!(look(&mut host, &mut taken), LOOK_AGAIN);
+    assert_eq!(look(&mut host, &mut taken), PASS_RETRY_SCHEDULE.after(1));
     assert!(host.did.is_empty(), "{:?}", host.did);
     assert!(host.resumable.is_empty(), "each look past setup here read");
 }
@@ -225,4 +238,93 @@ fn a_take_up_that_leaves_its_run_owed_waits_the_runs_pause() {
     assert_eq!(host.did, ["resume", "resume", "resume"]);
     assert_eq!(taken.revision, None);
     assert_eq!(taken.tries, 0);
+}
+
+#[test]
+fn an_unread_first_look_preserves_the_known_runs_pacing_without_starting_work() {
+    let mut host = Fake::new([Err("temporary read failure".into()), Ok(Some(7)), Ok(None)]);
+    let due = host.at + PASS_RETRY_SCHEDULE.after(3);
+    let mut taken = Taken {
+        revision: Some(7),
+        tries: 3,
+        due: Some(due),
+    };
+    let pause = look(&mut host, &mut taken);
+    assert_eq!(pause, PASS_RETRY_SCHEDULE.after(1));
+    assert!(host.did.is_empty());
+    assert_eq!(
+        (taken.revision, taken.tries, taken.due),
+        (Some(7), 3, Some(due))
+    );
+    host.at += pause;
+    assert_eq!(look(&mut host, &mut taken), due - host.at);
+    assert!(
+        host.did.is_empty(),
+        "recovering the read does not waive the run's throttle"
+    );
+    host.at = due;
+    assert_eq!(look(&mut host, &mut taken), LOOK_AGAIN);
+    assert_eq!((taken.revision, taken.tries, taken.due), (None, 0, None));
+}
+
+#[test]
+fn an_unread_post_resume_counts_the_attempt_and_noisy_records_do_not_bypass_its_due() {
+    let mut host = Fake::new([
+        Ok(Some(7)),
+        Err("first result unavailable".into()),
+        Ok(Some(7)),
+        Ok(Some(7)),
+        Ok(Some(7)),
+        Err("second result unavailable".into()),
+        Ok(Some(7)),
+        Ok(Some(7)),
+        Ok(None),
+    ]);
+    let mut taken = Taken::default();
+    let first = PASS_RETRY_SCHEDULE.after(1);
+    assert_eq!(look(&mut host, &mut taken), first);
+    assert_eq!(taken.tries, 1);
+    assert_eq!(taken.revision, Some(7));
+    let first_due = taken.due.unwrap();
+    assert_eq!(first_due, host.at + first);
+    host.at += first / 2;
+    for _ in 0..2 {
+        assert_eq!(look(&mut host, &mut taken), first_due - host.at);
+    }
+    assert_eq!(host.did, ["resume"]);
+    host.at = first_due;
+    assert_eq!(
+        look(&mut host, &mut taken),
+        first,
+        "reread uncertainty has its own shorter retry"
+    );
+    let second_due = host.at + PASS_RETRY_SCHEDULE.after(2);
+    assert_eq!(taken.due, Some(second_due));
+    assert_eq!(taken.tries, 2);
+    assert_eq!(host.did, ["resume", "resume"]);
+    host.at += first;
+    for _ in 0..2 {
+        assert_eq!(look(&mut host, &mut taken), second_due - host.at);
+        assert_eq!(taken.tries, 2);
+    }
+    assert_eq!(host.did, ["resume", "resume"]);
+    host.at = second_due;
+    assert_eq!(look(&mut host, &mut taken), LOOK_AGAIN);
+    assert_eq!((taken.revision, taken.tries, taken.due), (None, 0, None));
+}
+
+#[test]
+fn a_newer_revision_seen_after_resume_is_looked_at_without_an_hour_wait_or_old_throttle() {
+    let mut host = Fake::new([Ok(Some(7)), Ok(Some(8)), Ok(Some(8)), Ok(Some(8))]);
+    let mut taken = Taken {
+        revision: Some(7),
+        tries: 4,
+        due: Some(host.at),
+    };
+    assert_eq!(look(&mut host, &mut taken), Duration::ZERO);
+    assert_eq!(host.did, ["resume"]);
+    assert_eq!((taken.revision, taken.tries, taken.due), (None, 0, None));
+    assert_eq!(look(&mut host, &mut taken), PASS_RETRY_SCHEDULE.after(1));
+    assert_eq!(host.did, ["resume", "resume"]);
+    assert_eq!((taken.revision, taken.tries), (Some(8), 1));
 }

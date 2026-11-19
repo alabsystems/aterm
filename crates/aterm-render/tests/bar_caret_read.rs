@@ -225,10 +225,7 @@ fn a_bar_caret_reads_against_its_cell_on_the_dark_page() {
 
 #[test]
 fn a_bar_caret_reads_against_its_cell_on_paper() {
-    bars_read_on(
-        GITHUB_LIGHT,
-        (&["flat rainbow + cat", "comet"], Scene::Typing),
-    );
+    bars_read_on(GITHUB_LIGHT, (&["rainbow + cat", "comet"], Scene::Typing));
 }
 
 /// The columns the clean twin draws the bar in ([`bar_reading`]'s span), from the cell's left.

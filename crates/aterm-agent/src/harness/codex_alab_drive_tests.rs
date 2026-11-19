@@ -685,6 +685,7 @@ impl Rig {
                 home: self.home.clone(),
                 home_env,
                 self_claimed: None,
+                selected_default: false,
             }),
             dialect: shell_dialect(SHELL, &self.kernel, Vec::new),
             login: None,
@@ -843,6 +844,87 @@ fn a_clean_exit_that_removed_its_writer_lock_resumes_the_same_conversation() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains(T2), "the same conversation: {lines:?}");
     assert!(Witnesses::under(&rig.opts.state).handled(snap.pid, &snap.start));
+}
+
+#[test]
+fn selecting_the_default_login_clears_the_shells_auth_path_only_for_the_move() {
+    const NAMED: &str = "/fixture/named/auth.json";
+    let inherited = [
+        (ca::AUTH_PATH_ENV, NAMED),
+        (ca::HOME_ENV, "/fixture/other-home"),
+        ("CODEX_API_KEY", "key fixture"),
+        ("CODEX_ACCESS_TOKEN", "token fixture"),
+    ];
+    for (case, selected_default, expected) in [
+        ("named-to-default", true, ["unset"; 4]),
+        (
+            "unchanged-default",
+            false,
+            inherited.map(|(_, value)| value),
+        ),
+    ] {
+        let rig = Rig::new(case, &["zsh: terminated codex"]);
+        // The fixture program runs the local script as `sh resume <thread>`.
+        std::fs::create_dir_all(rig.twin.parent().unwrap()).expect("fixture program directory");
+        std::os::unix::fs::symlink("/bin/sh", &rig.twin).expect("fixture program");
+        std::fs::write(
+            rig.dir.join("resume"),
+            r#"printf '%s\n' "${CODEX_AUTH_PATH-unset}" "${CODEX_HOME-unset}" \
+    "${CODEX_API_KEY-unset}" "${CODEX_ACCESS_TOKEN-unset}" "${OPENAI_API_KEY-unset}" "${KEEP_ME-unset}" "$@""#,
+        )
+        .expect("resume script");
+        let mut snap = rig.snap(None);
+        let destination = rig.resume(None);
+        let run = snap.codex_mut().unwrap();
+        run.self_claimed = Some(destination.clone());
+        run.selected_default = selected_default;
+        rig.kernel
+            .owners
+            .lock()
+            .expect("writer owners")
+            .push_back(aterm_uds::ownerlock::Owner::Live);
+        let held = self_claimed_after_exit(
+            &rig.opts,
+            &snap,
+            &destination,
+            ExitCause::Asked,
+            &rig.kernel,
+        );
+        assert_eq!(held.step, "wait:thread-locked", "{case}: {held:?}");
+        assert!(rig.typed().is_empty(), "{case}");
+        // The real carry path receives only the record reloaded from disk.
+        let report = carry_in_flight_with(&rig.opts, held, rig.state(), &key(TAB), &rig.kernel);
+        assert_eq!(report.step, "done:resumed", "{case}: {report:?}");
+        let line = rig.state().line;
+        let typed = rig.typed();
+        assert_eq!(typed.len(), 1, "{case}: {typed:?}");
+        assert!(
+            !line.is_empty() && typed[0].ends_with(&line),
+            "{case}: {typed:?}"
+        );
+
+        let mut shell = aterm_uds::spawnfd::command("/bin/sh");
+        shell
+            .args(["-c", &line])
+            .current_dir(&rig.dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .envs(inherited)
+            .env("OPENAI_API_KEY", "tool fixture")
+            .env("KEEP_ME", "retained");
+        let output = aterm_uds::deadline::output_while_process_progressing(
+            &mut shell,
+            aterm_spec::wait::MUST_HAPPEN,
+            "fixture shell running the account restart",
+        )
+        .expect("run typed relaunch");
+        assert!(output.status.success(), "{case}: {output:?}");
+        assert_eq!(
+            output.stdout,
+            format!("{}\ntool fixture\nretained\n{T2}\n", expected.join("\n")).as_bytes(),
+            "{case}"
+        );
+    }
 }
 
 /// THE HAND-BACK OF A SESSION AN ACCOUNT RENEWAL SIGNALLED WITH NO SUCCESSOR (aterm-gui's

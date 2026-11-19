@@ -309,8 +309,9 @@ fn asks_with(paths: &Paths, seat_of: &dyn Fn(&Paths) -> Seat) -> bool {
 }
 
 /// What a [`SEATS`] entry was read at: every file the selection of the records' data is judged
-/// by, as it stood ([`crate::records_storage::standing`]: the entry and its pin, its intent where
-/// neither of those stands, and a layout's header and data file), and `source.toml`
+/// by, as it stood (`client::records_standing`: the entry and its pin, its intent where neither
+/// of those stands, and a layout's header and data file, a rewritten layout's pinned
+/// generation's where this Mac reads format 2), and `source.toml`
 /// ([`fsx::Seen`]). A seat changes only with
 /// the records or the configuration (its pin and handoffs); the state's move off `In` is checked
 /// on every call before the memo is read. The data file is among them because a record that
@@ -325,9 +326,9 @@ static SEATS: std::sync::Mutex<Memo> = std::sync::Mutex::new(Memo::new());
 
 /// [`Mark`] of `paths` now; `None` where the records' selection refuses its files or
 /// `source.toml` cannot be seen.
-fn mark(paths: &Paths) -> Option<Mark> {
+pub(super) fn mark(paths: &Paths) -> Option<Mark> {
     Some((
-        crate::records_storage::standing(&paths.records_file(), None)?,
+        super::records_standing(paths, None)?,
         fsx::seen_if_present(&paths.source_file()).ok()??,
     ))
 }

@@ -88,35 +88,27 @@ fn descriptor(
 /// path, can take one more record and the causal joins it may need, joins an interrupted append
 /// left included (design §3.9).
 fn quota_room(session: &Session<'_>, log: &Log, view: &View, reserve: usize) -> bool {
-    let actor = session.actor();
-    let spent = view.quota.spent.get(&actor).copied().unwrap_or(0);
-    let last_business = view
-        .ops
-        .iter()
-        .filter(|op| op.actor == actor)
-        .map(|op| op.sequence)
-        .max()
-        .unwrap_or(0);
-    let pending = log.pending_merges_after(actor, last_business);
-    log.append_records_bound().saturating_add(pending)
+    let counter = view
+        .state
+        .quota
+        .get(&session.actor())
+        .copied()
+        .unwrap_or_default();
+    log.append_records_bound()
+        .saturating_add(counter.merges_after)
         <= REGISTRY
             .self_quota
             .saturating_sub(reserve)
-            .saturating_sub(spent)
+            .saturating_sub(counter.spent.unwrap_or(0))
 }
 
 /// The records `actor` wrote that carry an `account-obs` row: what observation spent of its
 /// share ([`observe::OBSERVE_RESERVE`]).
 fn observed_records(view: &View, actor: astream_wire::sync::Actor) -> usize {
-    view.ops
-        .iter()
-        .filter(|op| op.actor == actor && op.revert.is_none())
-        .filter(|op| {
-            op.changes
-                .iter()
-                .any(|change| change.collection == ACCOUNT_OBS.name)
-        })
-        .count()
+    view.state
+        .touched
+        .get(&(actor, ACCOUNT_OBS.name.to_owned()))
+        .map_or(0, |count| usize::try_from(*count).unwrap_or(usize::MAX))
 }
 
 /// This Mac's Commons uuid, 32 hex: the suffix of every owned row it writes.

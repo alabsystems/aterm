@@ -935,7 +935,7 @@ pub(crate) fn watch(source: PathBuf, checker: Option<Updates>) -> io::Result<()>
                         "{} was replaced: exiting for launchd to start it",
                         own.display()
                     ));
-                    std::process::exit(0);
+                    crate::scope::exit_for_launchd();
                 }
                 if adopting && let Some(updates) = &checker {
                     let image_bundle = Path::new(aterm_uds::lan::IMAGE_BUNDLE);
@@ -969,7 +969,7 @@ pub(crate) fn watch(source: PathBuf, checker: Option<Updates>) -> io::Result<()>
                                 source.display(),
                                 image_bundle.display()
                             ));
-                            std::process::exit(0);
+                            crate::scope::exit_for_launchd();
                         }
                         Round::Failed {
                             error: error @ (Failure::Published(_) | Failure::Superseded),
@@ -979,7 +979,7 @@ pub(crate) fn watch(source: PathBuf, checker: Option<Updates>) -> io::Result<()>
                                 "{}: {error}; exiting for launchd",
                                 source.display()
                             ));
-                            std::process::exit(0);
+                            crate::scope::exit_for_launchd();
                         }
                         Round::Failed {
                             error,

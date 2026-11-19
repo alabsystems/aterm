@@ -267,6 +267,8 @@ pub struct Hop {
     pub parent_uniqueid: u64,
     /// Its parent now (`pbi_ppid`): `1` once launchd adopted it.
     pub parent: u32,
+    /// Its process group (`pbi_pgid`).
+    pub pgid: u32,
     /// Its session's controlling terminal (`e_tdev`, the terminal's `st_rdev`); `None` for a
     /// session with none (`NODEV`), as a `setsid` leaves it.
     pub tty: Option<u32>,
@@ -308,6 +310,7 @@ pub fn read_hop(pid: i32) -> Option<Hop> {
         uniqueid: info.p_uniqueid,
         parent_uniqueid: info.p_puniqueid,
         parent: info.pbsd.pbi_ppid,
+        pgid: info.pbsd.pbi_pgid,
         tty: (info.pbsd.e_tdev != NODEV).then_some(info.pbsd.e_tdev),
     })
 }
@@ -317,6 +320,30 @@ pub fn read_hop(pid: i32) -> Option<Hop> {
 #[cfg(not(target_vendor = "apple"))]
 #[must_use]
 pub fn read_hop(_pid: i32) -> Option<Hop> {
+    None
+}
+
+/// `pid`'s session (`getsid(2)`): the pid of the process that made it with `setsid`, or `None`
+/// for pid ≤ 1 and a pid no process holds. Neither kernel gives a new process a pid that still
+/// names a session (XNU's fork passes over a pid a session or a group holds; Linux keeps a pid
+/// allocated while any process names it as its group or its session), so while the leader of
+/// session `s` lives, every process that reads `s` here is in the session it made.
+#[cfg(unix)]
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn read_session(pid: i32) -> Option<u32> {
+    if pid <= 1 {
+        return None;
+    }
+    // SAFETY: an integer-only query that writes nothing.
+    let session = unsafe { libc::getsid(pid) };
+    u32::try_from(session).ok().filter(|&session| session > 0)
+}
+
+/// See the Unix twin: nothing is read here.
+#[cfg(not(unix))]
+#[must_use]
+pub fn read_session(_pid: i32) -> Option<u32> {
     None
 }
 

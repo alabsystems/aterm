@@ -5,10 +5,13 @@
 //! file a layout (`docs/DESIGN-vault-log-2026-11-14.md` step 4, tracker FL-148D). The first only
 //! ever grows what the entry holds; this one replaces it with a smaller file (a log pruned at a
 //! final checkpoint, or one whose superseded bodies were shed), which is the only way those
-//! bytes leave the disk. Its one caller outside the tests is a Mac that reads format 2 taking a
-//! served root into its file (`client::persist_stored`), and the one reader of what it writes
-//! is that Mac's records cache ([`selected`]); no running build reads format 2, so it stays
-//! dark (FL-148F runs the pass that prunes and sheds).
+//! bytes leave the disk. Its callers outside the tests are a Mac and a vault server that read
+//! format 2 taking a served root into their records file (`client::persist_stored`,
+//! `server::persist_stored`). Their readers read what it writes where they read format 2:
+//! the server's (`server::records_data_path`), and the Mac's records cache ([`selected`]) and
+//! the readers that name the data file or stamp its selection ([`data_path`], [`standing`]).
+//! No running build reads format 2, so it stays dark (FL-148F runs the pass that prunes and
+//! sheds).
 //!
 //! **The steps** ([`Step`], in this order):
 //!
@@ -87,7 +90,8 @@
 //!   of this module: they refuse a rewritten layout as an older build does, and read an entry
 //!   whose rewrite was cut short before its pin as the predecessor it is. So no path that
 //!   reads records alone is ever handed a file that holds a root's stubs. A reader that reads
-//!   format 2 selects with [`data_path`].
+//!   format 2 selects with [`data_path`] or [`selected`], and stamps the selection with
+//!   [`standing`].
 //! - **The generation is a number and the rewrite that made it** ([`RecordsGeneration`],
 //!   [`generation`]): the number is 1 at the first rewrite and one more at each, 0 for an entry
 //!   never rewritten, and the rewrite is named by the SHA-256 of its header, the pin's second
@@ -184,7 +188,7 @@ const PIN_MAGIC: &str = "aterm-records-pin/2";
 /// A broken rewrite, for the tests' negative controls.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Mutant {
+pub(crate) enum Mutant {
     /// The predecessor's files are unlinked before the pin moves.
     UnlinkFirst,
     /// The pin moves as soon as the intent is declared, before the new data and header stand.
@@ -220,12 +224,14 @@ pub(super) enum Mutant {
     PrepareFirst,
     /// The generation is its number alone: no rewrite is named.
     NumberAlone,
+    /// A write to a rewritten generation's data file writes no pin again ([`written`]).
+    Unheard,
 }
 
 /// A point at which a test ends a rewrite as a crash would, or loses part of a write.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Cut {
+pub(crate) enum Cut {
     /// The process dies while it writes this scratch file: half of it stands, unrenamed.
     Torn(Piece),
     /// The process dies with this scratch file whole and flushed, before its rename.
@@ -242,7 +248,7 @@ pub(super) enum Cut {
 /// The files a rewrite writes.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Piece {
+pub(crate) enum Piece {
     Intent,
     Data,
     Header,
@@ -252,13 +258,26 @@ pub(super) enum Piece {
 #[cfg(test)]
 thread_local! {
     /// The mutant this thread's rewrites run as, if any.
-    pub(super) static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
+    pub(crate) static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
     /// Where this thread's next rewrite or recovery is cut, if anywhere.
-    pub(super) static CUT: std::cell::Cell<Option<Cut>> = const { std::cell::Cell::new(None) };
+    pub(crate) static CUT: std::cell::Cell<Option<Cut>> = const { std::cell::Cell::new(None) };
+    /// Whether this thread's [`rewrite`]s die as their process would ([`Dies`]).
+    pub(crate) static DIES: std::cell::Cell<Option<Dies>> = const { std::cell::Cell::new(None) };
     /// Each unlink this thread's rewrites and recoveries made (`unlink <name>`) and each flush
     /// of a directory [`Context::retire`] made (`flush parent`, `flush layout`), in order.
-    pub(super) static TRACE: std::cell::RefCell<Vec<String>> =
+    pub(crate) static TRACE: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How a test's [`rewrite`] dies as its process would: it returns at once, and recovers nothing
+/// of what it left, as a process that died recovers only when it runs again ([`recover`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Dies {
+    /// Once this step is done.
+    After(Step),
+    /// At the cut that stands ([`CUT`]), if it cuts the rewrite.
+    AtCut,
 }
 
 #[cfg(test)]
@@ -613,6 +632,32 @@ pub(crate) fn generation(entry: &Path) -> Result<RecordsGeneration> {
     })
 }
 
+/// Make a write to the data file of the rewritten `entry`'s pinned generation, which `target`
+/// selected ([`write_path`]) and still locks, heard where a watcher of the entry listens: the
+/// pin, which [`super::standing_files`] names, is written again with its own bytes, by a rename
+/// and a flush of its folder. A watcher of the standing files hears a rewrite by the pin's
+/// rename, and an append to a rewritten generation the same way, however many rewrites since it
+/// took its list; the data file's own name changes at each rewrite, so no list a watcher takes
+/// once names it. The pin selects what it selected: the same bytes, renamed whole over itself.
+///
+/// # Errors
+/// The pin cannot be read or written again, or no longer selects `target`'s file.
+pub(crate) fn written(entry: &Path, target: &super::WriteTarget) -> Result<()> {
+    #[cfg(test)]
+    if mutant(Mutant::Unheard) {
+        return Ok(());
+    }
+    let context = Context::new(entry)?;
+    let Pinned::Two { header, .. } = context.pinned()? else {
+        return Err(refused(CHANGED));
+    };
+    if entry.join(data_name(header.number)) != target.path {
+        return Err(refused(CHANGED));
+    }
+    let pin = read_file(&context.parent, &context.pin, META_LIMIT)?;
+    publish(&context.parent, &context.pin, &pin, true)
+}
+
 /// [`super::data_path`] for a reader that reads format 2: the pinned generation's data file,
 /// or what `super::data_path` answers for an entry never rewritten. A rewrite cut short
 /// changes nothing here: the pin selects one generation, whole.
@@ -651,6 +696,31 @@ pub(crate) fn selected(entry: &Path) -> Result<super::Selected> {
         path: data_path(entry)?.path,
         witnesses: None,
         rewritten: true,
+    })
+}
+
+/// [`super::standing`] for a reader that reads format 2: at a rewritten entry, the pin and the
+/// entry as they stood (`super::selection_witnesses`), then the pinned generation's header and
+/// data file ([`data_path`]); at an entry never rewritten, what `super::standing` answers. A
+/// rewrite moves the pin by a rename and an append changes the data file's stamp, so a standing
+/// taken before a read differs from every one taken after either. `None` where [`data_path`]
+/// refuses the entry or a file cannot be seen.
+pub(crate) fn standing(entry: &Path, glance: Option<&fsx::Glance>) -> Option<super::Standing> {
+    if !is_rewritten(entry).ok()? {
+        return super::standing(entry, glance);
+    }
+    let witnesses = super::selection_witnesses(entry, glance).ok()?;
+    let number = data_path(entry).ok()?.generation;
+    let judged = super::Judged::of_files(
+        entry,
+        witnesses,
+        None,
+        [&header_name(number), &data_name(number)],
+    )
+    .ok()?;
+    Some(super::Standing {
+        witnesses,
+        judged: Some(Box::new(judged)),
     })
 }
 
@@ -756,8 +826,21 @@ pub(crate) fn rewrite(
         context.prepare(|_| Ok(()))?;
     }
     let before = context.pinned()?.number();
-    match context.rewrite_with(from, what, produce, &|_| Ok(())) {
+    #[cfg(test)]
+    let dies = DIES.get();
+    #[cfg(test)]
+    let after = |step| {
+        if dies == Some(Dies::After(step)) {
+            return Err(refused("a test's process died after a step"));
+        }
+        Ok(())
+    };
+    #[cfg(not(test))]
+    let after = |_| Ok(());
+    match context.rewrite_with(from, what, produce, &after) {
         Ok(done) => Ok(done),
+        #[cfg(test)]
+        Err(error) if dies.is_some() => Err(error),
         Err(error) => {
             // The pin says which store stands, whatever stopped the rewrite; it is the new one
             // for this caller only once recovery finished, which flushed the pin's rename.

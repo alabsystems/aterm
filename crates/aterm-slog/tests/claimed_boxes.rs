@@ -8,7 +8,7 @@
 
 use aterm_slog::{
     ActWord, Actor, AttributionView, Binding, BoxWord, Chose, ClaimEdge, ClaimedBox, ClaimedReport,
-    Log, Node, ScreenStep, ShortId, TurnTracker, TxEvent, TxPos, TxState, Verdict,
+    Log, Node, ScreenStep, ShortId, StreamSteps, TurnTracker, TxEvent, TxPos, TxState, Verdict,
 };
 
 use crate::support::{WALL0, agent_session, at, lines, time_order_holds};
@@ -405,4 +405,68 @@ fn brief_lists_claimed_boxes() {
     );
     let st = log.state();
     assert_eq!((st.totals.appr, st.totals.qs), (2, 1), "the fold's totals");
+}
+
+/// HX-15i1 REVIEW: A BOX THE STREAM STOOD DOWN FOR IS TAKEN AGAIN WHEN IT STOPS FEEDING ITS KIND.
+/// While a claim's record stream feeds approvals ([`TurnTracker::set_stream_steps`]), a claimed
+/// box standing as the stand-down begins closes and one reported meanwhile opens nothing; once
+/// the stream stops feeding the kind, the box still reported opens its step again at the host's
+/// next settle ([`TurnTracker::retake`]), and so does the screen's box the published word still
+/// shows, its word unchanged.
+/// NEGATIVE HALF: a box that left meanwhile, and a stand-down that has not ended, open nothing.
+#[test]
+fn a_box_the_stream_stood_down_for_opens_again_when_the_stream_stops_feeding_its_kind() {
+    let fed = StreamSteps {
+        approvals: true,
+        questions: false,
+        walls: false,
+    };
+    let approvals = |log: &Log| {
+        records(log)
+            .iter()
+            .filter(|l| l.starts_with("open p") && l.contains(" approval "))
+            .count()
+    };
+
+    // A claimed box standing as the stand-down begins.
+    let (mut log, _run, mut tr) = run();
+    shown(&mut log, &mut tr, Some(ClaimedBox::Approval), 7, 200);
+    tr.set_stream_steps(&mut log, fed, at(300));
+    assert!(tr.claim_node().is_none(), "it closed for the stream");
+    // NEGATIVE HALF: the stand-down stands.
+    assert!(!tr.retake(&mut log, at(350)));
+    assert_eq!(approvals(&log), 1);
+    tr.set_stream_steps(&mut log, StreamSteps::default(), at(400));
+    assert!(tr.retake(&mut log, at(400)));
+    assert_eq!(approvals(&log), 2, "{:#?}", records(&log));
+    assert!(tr.claim_node().is_some());
+    ordered(&log);
+
+    // NEGATIVE HALF: a box that left while the stream fed its kind.
+    let (mut log, _run, mut tr) = run();
+    tr.set_stream_steps(&mut log, fed, at(100));
+    shown(&mut log, &mut tr, Some(ClaimedBox::Approval), 7, 200);
+    assert_eq!(approvals(&log), 0, "withheld");
+    shown(&mut log, &mut tr, None, 9, 250);
+    tr.set_stream_steps(&mut log, StreamSteps::default(), at(300));
+    assert!(!tr.retake(&mut log, at(300)));
+    assert_eq!(approvals(&log), 0);
+
+    // The screen's box, its word unchanged.
+    let (mut log, _run, mut tr) = run();
+    tr.set_stream_steps(&mut log, fed, at(100));
+    let _ = tr.observe(
+        &mut log,
+        Verdict::Prompt(BoxWord::from_detail("edit")),
+        None,
+        at(200),
+    );
+    assert_eq!(approvals(&log), 0, "the prompt parser stood down");
+    tr.set_stream_steps(&mut log, StreamSteps::default(), at(300));
+    assert!(tr.retake(&mut log, at(300)));
+    assert_eq!(
+        records(&log).last().map(String::as_str),
+        Some("open p1 approval par=t1 box=edit src=screen conf=strong t=+300")
+    );
+    ordered(&log);
 }

@@ -64,7 +64,7 @@ use alab_policy::vocab::{Phase, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 24, "0.24");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 25, "0.25");
 
 /// How many of the screen's last worded rows a wall row may stand in ([`live_from`]): the
 /// notice a turn ended on, with room for a composer and key rows under it.

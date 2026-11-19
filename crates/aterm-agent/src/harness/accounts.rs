@@ -5796,6 +5796,44 @@ pub fn observe_served(state: &mut State, logins: &mut Logins, label: &str, at: i
     out
 }
 
+/// RECORDS THAT A RUN ON `label` MET A BLOCKED PATH TO THE VENDOR, dated by `obs` (plan package
+/// UB-05): a sign-in or a review that met a bot check or a block page, a 403 named by its status
+/// alone ([`aterm_phase::wall::StrikeCause::Blocked`]), or no answer
+/// ([`crate::ai::store::Ended::Unreached`]). It is an observation of the path, kept as
+/// [`Account::unreached`], never of the login: nothing reaches the login ledger, so the
+/// verdict stands as its own evidence reads it, struck or served, and no event is told. The
+/// newest is kept (by date, then witness); the same witness read again renews nothing. Whether
+/// it was kept.
+pub fn note_unreached(state: &mut State, label: &str, obs: LoginObs) -> bool {
+    let Some(account) = account_mut(state, label) else {
+        return false;
+    };
+    let newer = account.unreached.as_ref().is_none_or(|held| {
+        held.witness != obs.witness && (obs.at, &obs.witness) > (held.at, &held.witness)
+    });
+    if newer {
+        account.unreached = Some(obs);
+    }
+    newer
+}
+
+/// RECORDS THAT A SIGN-IN OF `label` MET A BOT CHECK OR A BLOCK PAGE AT `at` (plan package UB-05):
+/// the account's path observation ([`note_unreached`]), witnessed by the sign-in's stop at `at`,
+/// never evidence of its login. Every door that records a sign-in's bot check writes it beside the
+/// check: the Claude renewal's, a driven sign-in's, and the check written alone where the run's
+/// own record did not land. Whether it was kept.
+pub fn note_sign_in_unreached(state: &mut State, label: &str, at: i64) -> bool {
+    note_unreached(
+        state,
+        label,
+        LoginObs::new(
+            at,
+            &format!("sign-in-bot-check@{at}"),
+            aterm_evidence::Source::Reading,
+        ),
+    )
+}
+
 /// Whether evidence that certifies a sign-in of `label`'s login (a pooled tab's served turn, a
 /// review that worked, a Codex review's checked sign-back, a tab's sign-in) is a new login to
 /// record ([`note_checked_sign_in`]): its word reads signed out (the projection of
@@ -6673,6 +6711,7 @@ pub(crate) fn fill_observations(into: &mut Account, from: Account) {
     fill(&mut into.warned_week, from.warned_week);
     fill(&mut into.key, from.key);
     fill(&mut into.keyed_at, from.keyed_at);
+    fill(&mut into.unreached, from.unreached);
 }
 
 /// Newest observation or scoped clearing of a single vendor quota-limit type.
@@ -7576,6 +7615,12 @@ pub struct Account {
     /// Machine-local: the login's dated evidence, whose newest reading decides its word (plan
     /// package UB-04).
     pub login: LoginLedger,
+    /// Machine-local: the newest run on this account that met a blocked path to the vendor (plan
+    /// package UB-05, [`note_unreached`]): a sign-in or a review that met a bot check or a block
+    /// page, a 403 named by its status alone, or no answer. An observation of the path, never
+    /// of the login: no verdict reads it ([`LoginLedger::verdict`]), so a blocked path neither
+    /// strikes the login nor lifts a strike.
+    pub unreached: Option<LoginObs>,
     /// Machine-local applicability of a legacy harness's auth word to its managed login.
     pub auth_scope: ManagedScope,
     /// Machine-local credential and routing context of the retained auth observation.
@@ -7644,6 +7689,7 @@ impl PartialEq for Account {
             && self.auth == other.auth
             && self.auth_at == other.auth_at
             && self.login == other.login
+            && self.unreached == other.unreached
             && self.auth_scope == other.auth_scope
             && self.auth_context == other.auth_context
             && self.renewal_metadata == other.renewal_metadata
@@ -9142,6 +9188,9 @@ fn account_json(a: &Account) -> Value {
     if !a.login.kept_nothing() {
         o.insert("login".to_owned(), a.login.to_json());
     }
+    if let Some(unreached) = &a.unreached {
+        o.insert("unreached".to_owned(), unreached.to_json());
+    }
     if a.auth_scope.is_retired() {
         o.insert("auth_retired".to_owned(), Value::Bool(true));
     }
@@ -9418,6 +9467,9 @@ fn account_of(v: &Value, now: trace::Now) -> Account {
         auth,
         auth_at,
         login,
+        unreached: v
+            .get("unreached")
+            .and_then(|unreached| LoginObs::from_json(unreached, by_now)),
         auth_scope: ManagedScope::from_retired(
             v.get("auth_retired")
                 .is_some_and(|value| value.as_bool() != Some(false)),
@@ -13199,6 +13251,7 @@ pub fn note_reading_held(
             auth,
             auth_at,
             login,
+            unreached: _,
             auth_scope,
             auth_context,
             renewal_metadata,

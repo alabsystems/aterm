@@ -280,6 +280,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         };
         // Who says they ran it: `--by <word>`, else a person at a terminal, else a program.
         // Why, and on what evidence: `--reason <line>` and each `--evidence <piece>`.
+        let mut attempt = publish::INLINE;
         let mut by = None;
         let mut reason = None;
         let mut evidence = Vec::new();
@@ -292,6 +293,8 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                     return usage("--by takes one word");
                 };
                 by = Some(said);
+            } else if word == "--queue-only" {
+                attempt = std::time::Duration::ZERO;
             } else if word == "--reason" {
                 let Some(line) = iter.next() else {
                     return usage("--reason takes one line");
@@ -354,7 +357,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             by: &by,
             session: session.as_deref().filter(|session| !session.is_empty()),
             now_ms: aterm_time::unix_millis().unwrap_or(0),
-            attempt: publish::INLINE,
+            attempt,
             journal: journal.as_ref(),
             json,
             stdin: stdin.as_deref(),
@@ -381,19 +384,5 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let Some(root) = Root::live() else {
         return usage("no home directory");
     };
-    match cli::run(&root, &super::types::known(), &words) {
-        cli::Run::Answer(answer) => {
-            if !answer.err.is_empty() {
-                let _ = std::io::stderr().write_all(answer.err.as_bytes());
-            }
-            aterm_uds::stdout::answer_exit(VERB, &answer.out, answer.code)
-        }
-        cli::Run::Watch(file, watch) => {
-            let mut emit =
-                |line: &str| aterm_uds::stdout::write_all(format!("{line}\n").as_bytes()).is_ok();
-            ExitCode::from(cli::watch(&file, watch, &mut emit, &mut |every| {
-                std::thread::sleep(every);
-            }))
-        }
-    }
+    cli::entry::emit(cli::run(&root, &super::types::known(), &words))
 }

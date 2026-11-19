@@ -4,20 +4,22 @@
 //! Verify's run records read back: the record's format, the bounded read of a whole admitted
 //! snapshot, the `dead_seen` append, the kernel reads a judgment takes ([`Kernel`],
 //! [`LiveKernel`]), what the live runs claim ([`Claims`]) and the A1–A7 verdict on one process
-//! ([`Judge::judge`]). aterm-verify writes the records and runs the passes that end what this
-//! proves; the window's `sys left` and doctor read them here
-//! (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §4.3).
+//! ([`Judge::judge`]), with W-kin: the descendants verify books of a test binary it holds
+//! ([`Kin`], [`bind`], [`adopted_kin`], [`group_kin`], [`kin_at_end`]) and the sidecar that
+//! keeps them beside the record ([`kin_path`], [`read_kin`]). aterm-verify writes the records
+//! and runs the passes that end what this proves; the window's `sys left` and doctor read them
+//! here (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §4.1, §4.3).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::process::{
-    Birth, END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, HeldNow, Identity, Lineage,
-    Markers, ProcessPresence, end_proven, group_members, held_programs, launchd_idversion,
-    process_presence, read_birth, read_lineage, read_process_markers, read_process_path,
-    thread_ran,
+    Birth, END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, HeldNow, Hop, Identity,
+    Lineage, MAX_HOPS, Markers, ProcessPresence, end_proven, group_members, held_programs,
+    launchd_idversion, process_presence, read_birth, read_hop, read_lineage, read_process_argv,
+    read_process_markers, read_process_path, read_session, thread_ran,
 };
 
 /// The kernel reads a judgment takes, injected so the classification is a unit test over a fake.
@@ -35,6 +37,25 @@ pub trait Kernel {
     fn members(&self, pgid: u32) -> Option<GroupMembers>;
     /// `pid`'s executable path, or `None` (gone, deleted, not ours, or no reader).
     fn exe(&self, pid: i32) -> Option<PathBuf>;
+    /// `pid`'s step of lineage with its parent's unique id ([`read_hop`], Apple), or `None`: gone,
+    /// not ours, a zombie, or a kernel that names no parent by a unique id. The default reads
+    /// none, so a kernel that lays out no hops books no kin by them ([`bind`], [`adopted_kin`]).
+    fn hop(&self, _pid: i32) -> Option<Hop> {
+        None
+    }
+    /// Whether `pid`'s verb (`argv[1]`) names an aterm program launchd keeps by design
+    /// ([`crate::left::by_design`]: a tether's watcher, a build's claim holder), or `None` where
+    /// its arguments do not read. Asked only of a process whose thread ran. The default reads
+    /// none, which W-kin reads as not proven ([`Judge::judge`]).
+    fn by_design(&self, _pid: i32) -> Option<bool> {
+        None
+    }
+    /// `pid`'s session ([`read_session`]: the pid of the process that made it with `setsid`), or
+    /// `None` where it does not read. The default reads none, so a kernel that lays out no
+    /// sessions proves no member of a kin's group by its session ([`group_kin`]).
+    fn session(&self, _pid: i32) -> Option<u32> {
+        None
+    }
     /// `pid`'s marker variables, or `None` when unreadable.
     fn markers(&self, pid: i32) -> Option<Markers>;
     /// Whether macOS's program check may hold `pid`: `Some(false)` only once its one thread ran ([`thread_ran`]), so a lone unstarted thread at any age, arch or volume reads `Some(true)`: its environment is never read, and it is never signalled. `None` when unreadable.
@@ -85,6 +106,21 @@ impl Kernel for LiveKernel {
     // that opens its program by path it is the translator, under no root.
     fn exe(&self, pid: i32) -> Option<PathBuf> {
         read_process_path(pid)
+    }
+    fn hop(&self, pid: i32) -> Option<Hop> {
+        read_hop(pid)
+    }
+    fn by_design(&self, pid: i32) -> Option<bool> {
+        let argv = read_process_argv(pid)?;
+        Some(
+            argv.get(1)
+                .and_then(|verb| verb.to_str())
+                .and_then(crate::left::by_design)
+                .is_some(),
+        )
+    }
+    fn session(&self, pid: i32) -> Option<u32> {
+        read_session(pid)
     }
     fn markers(&self, pid: i32) -> Option<Markers> {
         read_process_markers(pid)
@@ -307,6 +343,146 @@ pub fn header_text(
     text
 }
 
+/// The sidecar beside run record `record` (`<id>.run`) that keeps its kin: `<id>.kin`. It is
+/// a file of its own because the cleanup reader of the records ([`read_records`]) refuses a
+/// record with a line it does not know, and with it every record of its snapshot, as every
+/// verify since a084efcf9ac (2026-10-22) reads them: a kin line in the record would have such a
+/// verify, running beside this one or after it, refuse the records. (The first readers, from
+/// a771dc301aa until then, skipped such a line.) [`read_records`] reads `.run` files alone.
+#[must_use]
+pub fn kin_path(record: &Path) -> PathBuf {
+    record.with_extension("kin")
+}
+
+/// A kin sidecar's opening lines: `kin v=1 boot=<boot> id=<id> tty=<dev|->`, then one
+/// `spared path=<dir>` line per directory W-kin never proves ([`KinJudge`]).
+#[must_use]
+pub fn kin_header_text(boot: &str, id: RunId, tty: Option<u32>, spared: &[PathBuf]) -> String {
+    let mut text = format!(
+        "kin v=1 boot={boot} id={} tty={}\n",
+        id.text(),
+        tty.map_or_else(|| "-".to_owned(), |dev| dev.to_string()),
+    );
+    for dir in spared {
+        text.push_str(&format!(
+            "spared path={}\n",
+            pct_encode(&dir.display().to_string())
+        ));
+    }
+    text
+}
+
+/// One booked kin's line: `kin pid=<n> birth=<n> uniqueid=<n> of=<pgid>`, `of` the stage group
+/// whose test binary it descends from, which the record's `group` line names with its stage.
+/// Every field is a number, so a line is at most [`KIN_LINE_BYTES`] bytes.
+#[must_use]
+pub fn kin_line(kin: &Kin, of: u32) -> String {
+    format!(
+        "kin pid={} birth={} uniqueid={} of={of}",
+        kin.pid, kin.birth.0, kin.uniqueid
+    )
+}
+
+/// The most bytes a [`kin_line`] takes, its newline included: four numbers of at most 20 digits.
+pub const KIN_LINE_BYTES: usize = "kin pid= birth= uniqueid= of=\n".len() + 4 * 20;
+
+/// The most kin lines a sidecar holds ([`read_kin`] refuses more): within the record's read bound
+/// with its header and its spared lines, whatever a run's test binaries leave. A writer that
+/// reaches it writes no more, and what it books past it is the live run's alone.
+pub const KIN_LINES_MAX: usize = 32_768;
+
+/// A kin sidecar read back ([`read_kin`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KinRecord {
+    /// The boot it was written under.
+    pub boot: String,
+    /// Its run's id.
+    pub id: RunId,
+    /// Its run's own terminal ([`KinJudge::tty`]).
+    pub tty: Option<u32>,
+    /// The directories W-kin never proves for its run ([`KinJudge::spared`]).
+    pub spared: Vec<PathBuf>,
+    /// The kin it booked, in the order it booked them.
+    pub kin: Vec<Kin>,
+}
+
+/// The kin sidecar at `path`, read under the record's shared lock and bounded as a record is:
+/// `Ok(None)` for one that is not a complete supported sidecar of the run its name names (cut
+/// short, a line or a field it does not know, a header naming another run), which gives no kin.
+///
+/// # Errors
+/// The open's or the read's, [`std::io::ErrorKind::InvalidData`] for a file that is no bounded
+/// regular one, or [`std::io::ErrorKind::WouldBlock`] while a writer holds it.
+pub fn read_kin(path: &Path) -> std::io::Result<Option<KinRecord>> {
+    Ok(parse_kin(path, &read_record_text(path)?))
+}
+
+/// [`read_kin`]'s strict reading of `text`, the sidecar at `path`.
+#[must_use]
+pub fn parse_kin(path: &Path, text: &str) -> Option<KinRecord> {
+    if text.is_empty() || !text.ends_with('\n') {
+        return None;
+    }
+    let mut record: Option<KinRecord> = None;
+    for (index, line) in text.lines().enumerate() {
+        match (line.split_whitespace().next()?, index) {
+            ("kin", 0) => {
+                let fields = cleanup_fields(line, &["v", "boot", "id", "tty"])?;
+                let [version, boot, id, tty] = fields.as_slice() else {
+                    return None;
+                };
+                let parsed = RunId::parse(id)?;
+                if *version != "1"
+                    || boot.is_empty()
+                    || parsed.pid <= 1
+                    || parsed.text() != *id
+                    || path.file_name()?.to_str()? != format!("{id}.kin")
+                {
+                    return None;
+                }
+                let tty = match *tty {
+                    "-" => None,
+                    dev => Some(digits::<u32>(dev)?),
+                };
+                record = Some(KinRecord {
+                    boot: (*boot).to_owned(),
+                    id: parsed,
+                    tty,
+                    spared: Vec::new(),
+                    kin: Vec::new(),
+                });
+            }
+            ("spared", _) => {
+                let fields = cleanup_fields(line, &["path"])?;
+                let dir = cleanup_decoded(fields.first()?)?;
+                if dir.is_empty() {
+                    return None;
+                }
+                record.as_mut()?.spared.push(PathBuf::from(dir));
+            }
+            ("kin", _) => {
+                let fields = cleanup_fields(line, &["pid", "birth", "uniqueid", "of"])?;
+                let [pid, birth, uniqueid, of] = fields.as_slice() else {
+                    return None;
+                };
+                let pid = digits::<i32>(pid).filter(|&pid| pid > 1)?;
+                digits::<u32>(of)?;
+                let record = record.as_mut()?;
+                if record.kin.len() >= KIN_LINES_MAX {
+                    return None;
+                }
+                record.kin.push(Kin {
+                    pid,
+                    birth: Birth(digits(birth)?),
+                    uniqueid: digits(uniqueid)?,
+                });
+            }
+            _ => return None,
+        }
+    }
+    record
+}
+
 /// A failed birth read preserves the process unless a separate query confirms it holds
 /// nothing: no process has the pid, or the one that has it exited and waits to be reaped.
 pub fn may_match_birth(
@@ -406,6 +582,542 @@ pub fn led_groups(rec: &Record, kernel: &(impl Kernel + ?Sized)) -> Vec<(u32, u6
         .collect()
 }
 
+/// A process a verify run booked as one of a test binary's descendants while it held that
+/// binary unreaped (W-kin, `docs/DESIGN-leftover-processes-2026-10-16.md` §4.1): who it was by
+/// pid, birth and unique id. A process that reads all three is that process: on Apple no other
+/// process of the boot holds its unique id; on Linux the unique id is its start tick, which only
+/// another process born in the same tick at the same pid could share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Kin {
+    /// Its pid.
+    pub pid: i32,
+    /// Its birth ([`Birth`]'s unit).
+    pub birth: Birth,
+    /// Its unique id ([`Lineage::uniqueid`]).
+    pub uniqueid: u64,
+}
+
+impl Kin {
+    /// The kin `lin` reads as.
+    #[must_use]
+    pub const fn of(lin: &Lineage) -> Self {
+        Self {
+            pid: lin.identity.pid,
+            birth: lin.identity.birth,
+            uniqueid: lin.uniqueid,
+        }
+    }
+
+    /// Whether `lin` reads as this process: its pid, its birth and its unique id all equal.
+    #[must_use]
+    pub fn is(&self, lin: &Lineage) -> bool {
+        *self == Self::of(lin)
+    }
+}
+
+/// How verify ties a child to its parent when it books it ([`bind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// By the parent's unique id the child names ([`Hop::parent_uniqueid`]), set at its fork
+    /// and at each exec: Apple.
+    UniqueId,
+    /// By the parent the child names now, born no later than the child: where no parent is
+    /// named by a unique id (Linux, [`Kernel::lineage`]).
+    Birth,
+}
+
+/// This kernel's [`Link`].
+pub const LINK: Link = if cfg!(target_vendor = "apple") {
+    Link::UniqueId
+} else {
+    Link::Birth
+};
+
+/// One step of a chain [`bind`] reads.
+struct Step {
+    kin: Kin,
+    parent: u32,
+    parent_uniqueid: Option<u64>,
+}
+
+impl Step {
+    fn read(kernel: &(impl Kernel + ?Sized), pid: i32, link: Link) -> Option<Self> {
+        match link {
+            Link::UniqueId => kernel.hop(pid).map(|h| Self {
+                kin: Kin {
+                    pid,
+                    birth: h.identity.birth,
+                    uniqueid: h.uniqueid,
+                },
+                parent: h.parent,
+                parent_uniqueid: Some(h.parent_uniqueid),
+            }),
+            Link::Birth => kernel.lineage(pid).map(|l| Self {
+                kin: Kin::of(&l),
+                parent: l.parent,
+                parent_uniqueid: None,
+            }),
+        }
+    }
+
+    /// Whether this step names `parent` as its parent, by `link`.
+    fn names(&self, parent: &Kin, link: Link) -> bool {
+        i32::try_from(self.parent).is_ok_and(|pid| pid == parent.pid)
+            && match link {
+                Link::UniqueId => self.parent_uniqueid == Some(parent.uniqueid),
+                Link::Birth => parent.birth <= self.kin.birth,
+            }
+    }
+}
+
+/// What W-kin reads a process's program as ([`program`], [`program_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Program {
+    /// Its thread has not run ([`Kernel::held`]), or its executable or its verb does not read.
+    Unread,
+    /// A program W-kin never proves, never books and books nothing through: under a
+    /// [`KinJudge::spared`] directory, an aterm image ([`crate::left::is_aterm_image`]), a
+    /// `trustd` (a name, which here only spares), or a verb launchd keeps by design
+    /// ([`Kernel::by_design`]).
+    Spared,
+    /// No spared program.
+    Other,
+    /// Read [`Program::Other`], then no longer read as the process it was read for
+    /// ([`program_of`]): it exited, or its pid was taken, while its program was read.
+    Gone,
+}
+
+/// `pid`'s [`Program`], `spared` the directories W-kin never proves: its thread is read first,
+/// so no executable or argument of a held program is. `reads` counts the reads made.
+fn program(
+    kernel: &(impl Kernel + ?Sized),
+    pid: i32,
+    spared: &[PathBuf],
+    reads: &mut usize,
+) -> Program {
+    *reads += 1;
+    if kernel.held(pid) != Some(false) {
+        return Program::Unread;
+    }
+    *reads += 1;
+    let Some(exe) = kernel.exe(pid) else {
+        return Program::Unread;
+    };
+    if under_any(&exe, spared)
+        || crate::left::is_aterm_image(&exe)
+        || exe.file_name().is_some_and(|name| name == "trustd")
+    {
+        return Program::Spared;
+    }
+    *reads += 1;
+    match kernel.by_design(pid) {
+        Some(false) => Program::Other,
+        Some(true) => Program::Spared,
+        None => Program::Unread,
+    }
+}
+
+/// The [`program`] of the process `kin` names: a reading of [`Program::Other`] stands only
+/// where that pid reads as `kin` again after it ([`Kin::is`]), so the program read was that
+/// process's and not one that took its pid since; [`Program::Gone`] otherwise. `reads` counts
+/// the reads made.
+fn program_of(
+    kernel: &(impl Kernel + ?Sized),
+    kin: &Kin,
+    spared: &[PathBuf],
+    reads: &mut usize,
+) -> Program {
+    let read = program(kernel, kin.pid, spared, reads);
+    if read != Program::Other {
+        return read;
+    }
+    *reads += 1;
+    if kernel.lineage(kin.pid).is_some_and(|lin| kin.is(&lin)) {
+        read
+    } else {
+        Program::Gone
+    }
+}
+
+/// The kin `pid` is when its chain of parents, read hop by hop now, reaches `root` (the test
+/// binary while verify holds it unreaped, so its pid names it; `None` once it may be reaped, so
+/// a chain ends only at a booked kin) or a process of `booked` that still reads as booked: each
+/// child names its parent by pid and, by `link`, by that parent's unique id
+/// ([`Link::UniqueId`]) or by a parent born no later than it ([`Link::Birth`]), and `pid` and
+/// every process of the chain between it and `root`, the booked kin it ends at included, reads
+/// as no spared program ([`program_of`]: [`Program::Other`]), so `bind` gives no spared program
+/// and nothing whose chain runs through one. `None` where a hop does not read (gone, another
+/// user's, a zombie), a link fails, a program on the chain reads otherwise (spared, held,
+/// unread, or gone), the chain meets launchd or init first (an orphan: [`adopted_kin`] is its
+/// book), or it is longer than [`MAX_HOPS`]. `spared` holds the directories W-kin never proves
+/// ([`KinJudge::spared`]); `reads` counts the reads made.
+pub fn bind(
+    kernel: &(impl Kernel + ?Sized),
+    pid: i32,
+    root: Option<Kin>,
+    booked: &BTreeSet<Kin>,
+    spared: &[PathBuf],
+    link: Link,
+    reads: &mut usize,
+) -> Option<Kin> {
+    *reads += 1;
+    let child = Step::read(kernel, pid, link)?;
+    if program_of(kernel, &child.kin, spared, reads) != Program::Other {
+        return None;
+    }
+    let mut at = Step {
+        kin: child.kin,
+        parent: child.parent,
+        parent_uniqueid: child.parent_uniqueid,
+    };
+    for _ in 0..MAX_HOPS {
+        let parent = i32::try_from(at.parent).ok().filter(|&p| p > 1)?;
+        if let Some(root) = root
+            && parent == root.pid
+        {
+            return at.names(&root, link).then_some(child.kin);
+        }
+        *reads += 1;
+        let up = Step::read(kernel, parent, link)?;
+        if !at.names(&up.kin, link) || program_of(kernel, &up.kin, spared, reads) != Program::Other
+        {
+            return None;
+        }
+        if booked.contains(&up.kin) {
+            return Some(child.kin);
+        }
+        at = up;
+    }
+    None
+}
+
+/// What a test binary's end adds to its book where the kernel names a parent by its unique id
+/// ([`Link::UniqueId`], Apple): each process of this uid born after `root` (the binary) whose
+/// parent unique id names `root`, a process of `booked`, or one found here, read in unique-id
+/// order so a parent is read before its child, and that reads as no spared program
+/// ([`program_of`]: [`Program::Other`]; `spared` as [`bind`] reads it). launchd's adoption
+/// leaves a process's parent unique id, so this finds the binary's descendants no tree read
+/// saw, those born after the last one among them, wherever each process between them and the
+/// binary was found too; one that exec'd after its adoption names launchd from then on, and is
+/// not found. A process that reads otherwise (a spared program, or one whose thread, executable
+/// or verb does not read) is not returned and links nothing below it, and neither does a process
+/// of `booked` that reads so now; one of `booked` that has exited links what it left, as it read
+/// as no spared program when it was booked. A process in `root`'s own group (`root_pgid`) links
+/// those below it and is not returned: verify's group end and its sweep are its. Neither are
+/// those already in `booked`. `reads` counts the reads made: a hop per listed process, and the
+/// programs read.
+pub fn adopted_kin(
+    kernel: &(impl Kernel + ?Sized),
+    root: Kin,
+    root_pgid: u32,
+    booked: &BTreeSet<Kin>,
+    spared: &[PathBuf],
+    reads: &mut usize,
+) -> Vec<Kin> {
+    let Some(pids) = kernel.uid_pids() else {
+        return Vec::new();
+    };
+    let mut hops: Vec<Hop> = pids
+        .into_iter()
+        .filter(|&pid| pid != root.pid)
+        .filter_map(|pid| {
+            *reads += 1;
+            kernel.hop(pid)
+        })
+        .filter(|hop| hop.uniqueid > root.uniqueid)
+        .collect();
+    hops.sort_unstable_by_key(|hop| hop.uniqueid);
+    let mut known: BTreeSet<u64> = std::iter::once(root.uniqueid)
+        .chain(booked.iter().map(|kin| kin.uniqueid))
+        .collect();
+    let mut found = Vec::new();
+    for hop in hops {
+        let kin = Kin {
+            pid: hop.identity.pid,
+            birth: hop.identity.birth,
+            uniqueid: hop.uniqueid,
+        };
+        if booked.contains(&kin) {
+            if matches!(
+                program_of(kernel, &kin, spared, reads),
+                Program::Spared | Program::Unread
+            ) {
+                known.remove(&kin.uniqueid);
+            }
+            continue;
+        }
+        if !known.contains(&hop.parent_uniqueid)
+            || program_of(kernel, &kin, spared, reads) != Program::Other
+        {
+            continue;
+        }
+        known.insert(hop.uniqueid);
+        if hop.pgid != root_pgid {
+            found.push(kin);
+        }
+    }
+    found
+}
+
+/// Whether no living parent of a member of the session `leader` made, `step` that member's
+/// step, reads as a spared program: its parents are climbed one by one, each linked to the step
+/// below as [`bind`] links one, and each must read as no spared program ([`program_of`]:
+/// [`Program::Other`]). The climb holds at the leader, at launchd or init (a parent ≤ 1), and
+/// where the chain of living parents ends: at a parent that does not read and that the kernel
+/// reads as gone or exited ([`Kernel::presence`]), or whose pid names a process the step below
+/// does not name as its parent (it exited and its pid was taken since). It fails at a parent
+/// whose program reads otherwise (spared, held, unread, or gone while it was read), at one that
+/// does not read and is not read as gone (another user's), and past [`MAX_HOPS`]. So no member
+/// holds that a living spared program below the leader started, itself or through living
+/// processes; one whose parent has exited does, whatever that parent ran.
+///
+/// `climbed` keeps, for the leader's other members in the same [`group_kin`] call, the verdict
+/// the climb reached at each process it passed (the member, and each parent it went on from):
+/// a later climb whose step names a kept process (its step read, and linked as above) ends
+/// there as climbing on would end over the same reads, without reading that process's program
+/// again: a process kept as held `h` hops above it holds where the hops climbed to it and `h`
+/// are within [`MAX_HOPS`] in all, and one kept as refused fails. A climb that passes
+/// [`MAX_HOPS`] keeps nothing. So climbs that each end within [`MAX_HOPS`] read the program of
+/// each parent they share once. [`group_kin`] reads every member's lineage before it climbs from
+/// any, so each verdict a climb keeps was read after every member it serves, as a climb that
+/// keeps nothing reads each parent's program after its member: a process a parent started after
+/// its program was read was not born when the members were read, and is not given through that
+/// parent's kept verdict. `reads` counts the reads made.
+fn spares_no_living_parent(
+    kernel: &(impl Kernel + ?Sized),
+    step: Step,
+    leader: &Kin,
+    spared: &[PathBuf],
+    link: Link,
+    climbed: &mut BTreeMap<Kin, Climbed>,
+    reads: &mut usize,
+) -> bool {
+    // The member, then each parent read as no spared program, in the order climbed.
+    let mut path = vec![step.kin];
+    let mut at = step;
+    let end = loop {
+        // The hop now climbed: from the last process of `path` to its parent.
+        let hop = path.len();
+        if hop > MAX_HOPS {
+            return false;
+        }
+        let Ok(parent) = i32::try_from(at.parent) else {
+            break Climbed::Refused;
+        };
+        if parent <= 1 || parent == leader.pid {
+            break Climbed::Held(hop);
+        }
+        *reads += 1;
+        let Some(up) = Step::read(kernel, parent, link) else {
+            *reads += 1;
+            break match kernel.presence(parent) {
+                ProcessPresence::Absent | ProcessPresence::Exited => Climbed::Held(hop),
+                ProcessPresence::Present | ProcessPresence::Unknown => Climbed::Refused,
+            };
+        };
+        if !at.names(&up.kin, link) {
+            break Climbed::Held(hop);
+        }
+        match climbed.get(&up.kin) {
+            Some(&Climbed::Held(above)) => break Climbed::Held(hop + above),
+            Some(&Climbed::Refused) => break Climbed::Refused,
+            None => {}
+        }
+        if program_of(kernel, &up.kin, spared, reads) != Program::Other {
+            climbed.insert(up.kin, Climbed::Refused);
+            break Climbed::Refused;
+        }
+        path.push(up.kin);
+        at = up;
+    };
+    match end {
+        Climbed::Held(hops) if hops <= MAX_HOPS => {
+            for (passed, kin) in path.into_iter().enumerate() {
+                climbed.insert(kin, Climbed::Held(hops - passed));
+            }
+            true
+        }
+        Climbed::Held(_) => false,
+        Climbed::Refused => {
+            climbed.extend(path.into_iter().map(|kin| (kin, Climbed::Refused)));
+            false
+        }
+    }
+}
+
+/// What a climb ([`spares_no_living_parent`]) reached from a process it passed, kept for the
+/// other members of the same leader's session in one [`group_kin`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Climbed {
+    /// It held this many hops above the process.
+    Held(usize),
+    /// It failed short of [`MAX_HOPS`]: at a parent whose program reads otherwise, at one that
+    /// does not read and is not read as gone, or at a parent past `i32::MAX`.
+    Refused,
+}
+
+/// The members of each group a process of `booked` leads that are proven its descendants,
+/// listed while that leader reads as booked and as no spared program ([`program_of`]): each
+/// born at or after it, reading as no spared program, and not in `booked`. A member of a
+/// session the leader made with `setsid` (the leader and the member both read the leader's pid
+/// as their session, [`Kernel::session`]) is given where its step reads as the member, no
+/// living parent of it up to the leader reads as a spared program
+/// ([`spares_no_living_parent`]), and the leader still reads as booked and as no spared program
+/// once its members are read ([`program_of`] again), so the session they read was the one it
+/// made, every process in that session descends from it, and a leader that ran a spared program
+/// while they were read gives none of them; they are never tried by [`bind`], so where the
+/// leader's last read fails none of them is given. The climbs of one leader's members share
+/// what each reached ([`Climbed`]): a member an earlier climb passed is given or refused as that
+/// climb reached it, with no read of its program, its step or its parents. Every member's
+/// lineage, and where the leader made a session the session of each member that lineage keeps
+/// (its group the leader's, its unique id not below the leader's, not booked), is read before
+/// any member is tried, so each verdict a climb keeps was read after every member it serves:
+/// a process started at a listed pid after a parent's program was read is not the member read
+/// there, and is not given through that parent's kept verdict. Any other member is given where
+/// it is bound to a process of `booked` by its chain of parents read now ([`bind`] with no
+/// root: the binary is reaped by then, so its pid names nothing). A leader that made only a group
+/// (`process_group(0)`) shares the session verify's launcher runs in, whose processes may join
+/// that group by their own `setpgid`: such a joiner is proven by neither, and is not given. On
+/// Apple a member whose chain passes through a kin that has exited is [`adopted_kin`]'s, by the
+/// unique ids of that chain. `spared` as [`bind`] reads it; `reads` counts the reads made.
+pub fn group_kin(
+    kernel: &(impl Kernel + ?Sized),
+    booked: &BTreeSet<Kin>,
+    spared: &[PathBuf],
+    link: Link,
+    reads: &mut usize,
+) -> Vec<Kin> {
+    let mut found: Vec<Kin> = Vec::new();
+    for leader in booked {
+        let Ok(pgid) = u32::try_from(leader.pid) else {
+            continue;
+        };
+        *reads += 1;
+        if !kernel
+            .lineage(leader.pid)
+            .is_some_and(|l| leader.is(&l) && l.pgid == pgid)
+            || program_of(kernel, leader, spared, reads) != Program::Other
+        {
+            continue;
+        }
+        *reads += 2;
+        let made = kernel.session(leader.pid) == Some(pgid);
+        let Some(members) = kernel.members(pgid) else {
+            continue;
+        };
+        // Every member's lineage (and, where the leader made a session, the session of each member
+        // its lineage keeps) is read before any member is tried, so each verdict a climb keeps is
+        // read after every member it serves.
+        let mut listed: Vec<(i32, Kin, bool)> = Vec::new();
+        for member in members.pids.into_iter().filter(|&m| m != leader.pid) {
+            *reads += 1;
+            let Some(lin) = kernel.lineage(member) else {
+                continue;
+            };
+            let kin = Kin::of(&lin);
+            if lin.pgid != pgid || lin.uniqueid < leader.uniqueid || booked.contains(&kin) {
+                continue;
+            }
+            let in_made = made && {
+                *reads += 1;
+                kernel.session(member) == Some(pgid)
+            };
+            listed.push((member, kin, in_made));
+        }
+        let mut in_session: Vec<Kin> = Vec::new();
+        let mut climbed: BTreeMap<Kin, Climbed> = BTreeMap::new();
+        for (member, kin, in_made) in listed {
+            if found.contains(&kin) || in_session.contains(&kin) {
+                continue;
+            }
+            if in_made {
+                let given = match climbed.get(&kin) {
+                    Some(Climbed::Held(_)) => true,
+                    Some(Climbed::Refused) => false,
+                    None if program_of(kernel, &kin, spared, reads) != Program::Other => {
+                        climbed.insert(kin, Climbed::Refused);
+                        false
+                    }
+                    None => {
+                        *reads += 1;
+                        Step::read(kernel, member, link)
+                            .filter(|step| step.kin == kin)
+                            .is_some_and(|step| {
+                                spares_no_living_parent(
+                                    kernel,
+                                    step,
+                                    leader,
+                                    spared,
+                                    link,
+                                    &mut climbed,
+                                    reads,
+                                )
+                            })
+                    }
+                };
+                if given {
+                    in_session.push(kin);
+                }
+            } else if bind(kernel, member, None, booked, spared, link, reads) == Some(kin) {
+                found.push(kin);
+            }
+        }
+        if !in_session.is_empty() && program_of(kernel, leader, spared, reads) == Program::Other {
+            found.extend(in_session);
+        }
+    }
+    found
+}
+
+/// What a test binary's end makes of the kin booked of it (`book`): `book`, what
+/// [`adopted_kin`] adds where the kernel names a parent by its unique id ([`Link::UniqueId`],
+/// Apple; Linux keeps no record that ties an orphan to the binary), and what [`group_kin`] adds
+/// over both. `root` is the binary and `root_pgid` the group it led; `spared` as [`bind`] reads
+/// it; `reads` counts the reads made.
+pub fn kin_at_end(
+    kernel: &(impl Kernel + ?Sized),
+    root: Kin,
+    root_pgid: u32,
+    book: &BTreeSet<Kin>,
+    spared: &[PathBuf],
+    link: Link,
+    reads: &mut usize,
+) -> BTreeSet<Kin> {
+    let mut kin = book.clone();
+    if link == Link::UniqueId {
+        let adopted = adopted_kin(kernel, root, root_pgid, &kin, spared, reads);
+        kin.extend(adopted);
+    }
+    let grouped = group_kin(kernel, &kin, spared, link, reads);
+    kin.extend(grouped);
+    kin
+}
+
+/// What W-kin made of one booked kin ([`Judge::judge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KinRead {
+    /// Proven the run's to end.
+    Proven,
+    /// A program W-kin never proves: under a spared directory, an aterm image, a `trustd`, or a
+    /// verb launchd keeps by design.
+    Spared,
+    /// Not proven now: held, unread, not orphaned, claimed, or on a terminal another holds.
+    Unproven,
+}
+
+/// What W-kin reads beside a run's judgment ([`Judge::kin`]).
+#[derive(Clone, Copy, Debug)]
+pub struct KinJudge<'a> {
+    /// The kin the run booked.
+    pub booked: &'a BTreeSet<Kin>,
+    /// The directories whose programs W-kin never proves, never books and books nothing through
+    /// ([`bind`]): the run's locked toolchain, so never its `trustd`.
+    pub spared: &'a [PathBuf],
+    /// The run's own terminal, its launcher's session's, which each stage and the kin it left in
+    /// that session inherit: A7 holds for a kin on it.
+    pub tty: Option<u32>,
+}
+
 /// One run whose members a pass judges.
 pub struct Judge<'a, K: ?Sized> {
     /// The kernel the judgment reads.
@@ -426,6 +1138,8 @@ pub struct Judge<'a, K: ?Sized> {
     pub launchd: Option<i32>,
     /// What the live runs claim.
     pub claims: &'a Claims,
+    /// The run's booked kin (W-kin), where it keeps any.
+    pub kin: Option<KinJudge<'a>>,
 }
 
 impl<K: Kernel + ?Sized> Judge<'_, K> {
@@ -433,10 +1147,69 @@ impl<K: Kernel + ?Sized> Judge<'_, K> {
     /// W-run, A3 C-tree, A4 orphaned, A5 its thread ran, A6 no live record claims it, A7 its
     /// tty's master is free. A1 (the launcher reads dead) is the caller's, which judges a dead
     /// record's members, or its own run's at its end.
+    ///
+    /// W-kin: a process that reads as one the run booked ([`KinJudge::booked`]) is proven, with
+    /// neither C-tree nor a window, by A4, A5, A6 and A7 (which also holds on the run's own
+    /// terminal, [`KinJudge::tty`]), its verb read and naming no program launchd keeps by design
+    /// ([`Kernel::by_design`]), and its executable read, under no [`KinJudge::spared`] directory,
+    /// no aterm image ([`crate::left::is_aterm_image`]: one the run built is still judged by
+    /// W-run and C-tree) and no `trustd` (a name, which here only spares). A kin spared so (by
+    /// its executable or its verb) is judged as any other process; any other kin W-kin does not
+    /// prove is judged so too, and named where that finds it not the run's.
     pub fn judge(&self, pid: i32) -> Verdict {
         let Some(lin) = self.kernel.lineage(pid) else {
             return Verdict::NotOurs;
         };
+        match self.kin_read(pid, &lin) {
+            Some(KinRead::Proven) => Verdict::Proven,
+            None | Some(KinRead::Spared) => self.judged(pid, &lin),
+            Some(KinRead::Unproven) => match self.judged(pid, &lin) {
+                Verdict::NotOurs => Verdict::Named,
+                verdict => verdict,
+            },
+        }
+    }
+
+    /// Whether W-kin proves `pid` ([`Self::judge`]): what a pass names as the witness of an end.
+    pub fn proves_kin(&self, pid: i32) -> bool {
+        self.kernel
+            .lineage(pid)
+            .is_some_and(|lin| self.kin_read(pid, &lin) == Some(KinRead::Proven))
+    }
+
+    /// W-kin's reading of `pid`, which `lin` reads as: `None` where it is no booked kin. Its
+    /// thread is read first, so no executable, argument or environment of a held program is.
+    fn kin_read(&self, pid: i32, lin: &Lineage) -> Option<KinRead> {
+        let kin = self.kin.filter(|kin| kin.booked.contains(&Kin::of(lin)))?;
+        match program(self.kernel, pid, kin.spared, &mut 0) {
+            Program::Unread | Program::Gone => return Some(KinRead::Unproven),
+            Program::Spared => return Some(KinRead::Spared),
+            Program::Other => {}
+        }
+        let markers = self.kernel.markers(pid);
+        let proven = lin.orphaned(self.launchd, self.run_uniqueid, || {
+            self.parent_uniqueid(lin)
+        }) && !self.claims.claims(lin, markers.as_ref())
+            && lin.tty.is_none_or(|dev| {
+                kin.tty == Some(dev) || self.kernel.tty_master_held(dev) == Some(false)
+            });
+        Some(if proven {
+            KinRead::Proven
+        } else {
+            KinRead::Unproven
+        })
+    }
+
+    fn parent_uniqueid(&self, lin: &Lineage) -> Option<u64> {
+        i32::try_from(lin.parent)
+            .ok()
+            .and_then(|parent| self.kernel.lineage(parent))
+            .map(|parent| parent.uniqueid)
+    }
+
+    /// A2–A7 for `pid`, which `lin` reads as.
+    fn judged(&self, pid: i32, lin: &Lineage) -> Verdict {
+        let lin = *lin;
         let born_in = |from: u64| (from..=self.horizon).contains(&lin.uniqueid);
         let w_group = self
             .groups
@@ -469,14 +1242,10 @@ impl<K: Kernel + ?Sized> Judge<'_, K> {
             return Verdict::NotOurs;
         }
         // Without a launcher version (Linux), a parent older than the run adopted it.
-        let parent_uniqueid = || {
-            i32::try_from(lin.parent)
-                .ok()
-                .and_then(|parent| self.kernel.lineage(parent))
-                .map(|parent| parent.uniqueid)
-        };
         let proven = under_roots()
-            && lin.orphaned(self.launchd, self.run_uniqueid, parent_uniqueid)
+            && lin.orphaned(self.launchd, self.run_uniqueid, || {
+                self.parent_uniqueid(&lin)
+            })
             && !self.claims.claims(&lin, markers.as_ref())
             && lin
                 .tty
@@ -523,6 +1292,9 @@ pub fn table(kernel: &(impl Kernel + ?Sized), me: i32) -> Option<(Vec<i32>, u64)
 
 /// Bound the text read even if a record grows after its size was checked.
 const RECORD_BYTES: u64 = 4 * 1024 * 1024;
+
+// A full kin sidecar, with room for its header and its spared lines, reads within the bound.
+const _: () = assert!((KIN_LINES_MAX * KIN_LINE_BYTES) as u64 + 64 * 1024 <= RECORD_BYTES);
 
 fn read_record_text(path: &Path) -> std::io::Result<String> {
     read_bounded_regular_text_with(path, RECORD_BYTES, true)

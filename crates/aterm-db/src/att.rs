@@ -42,12 +42,13 @@ use crate::{
         cell::{self, Cells},
         grid::{self, Plan, Stale},
         owned::{self, Op, SchemaState},
+        state::State,
     },
 };
 use astream_wire::sync::{Actor, Digest};
 use aterm_json::Value;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use crate::documents::log::Hlc;
 pub use diff::{CellDiff, Delta, Diff, Maker, Point};
@@ -771,7 +772,22 @@ impl View {
             .into_iter()
             .filter_map(|(operation, command)| Op::from_eligible(0, operation, command))
             .collect();
-        let quota = owned::quota(table, &ops, &merges);
+        let resolve = |roster: &Digest, actor: &Actor| {
+            resolved.bindings.get(&(*roster, *actor)).copied().flatten()
+        };
+        let (state, over) = State::fold(
+            table,
+            None,
+            &ops,
+            &merges,
+            resolved.carried_records(),
+            log.unwritable(|_| true),
+            resolve,
+        );
+        let quota = owned::Quota {
+            spent: state.spent(),
+            over,
+        };
         let filtered;
         let within: &[Op] = if quota.over.is_empty() {
             &ops
@@ -782,9 +798,6 @@ impl View {
                 .cloned()
                 .collect::<Vec<Op>>();
             &filtered
-        };
-        let resolve = |roster: &Digest, actor: &Actor| {
-            resolved.bindings.get(&(*roster, *actor)).copied().flatten()
         };
         let awaited = log.awaited(resolved.actor);
         let refused = log.refused(&awaited);
@@ -824,39 +837,15 @@ impl View {
             && inert.carried.is_empty())
         .then(|| log.cells_marked())
         .flatten();
-        // A carried record stands where an operation within its writer's quota carried it.
-        let archived: Vec<Op> = resolved
-            .carried
-            .values()
-            .filter(|carried| carried.by.iter().any(|id| !quota.over.contains(id)))
-            .map(|carried| carried.op.clone())
-            .collect();
+        // A row a Mac wrote in this generation outranks the one a roll carried for it.
         let mut owned: BTreeMap<&'static str, owned::OwnedRead> = table
             .collections
             .iter()
             .filter(|collection| collection.kind == typed::Kind::Owned)
-            .map(|collection| {
-                let mut read = owned::read_owned(collection, within, resolve);
-                // A row a Mac wrote in this generation outranks the one a roll carried for it.
-                let carried = owned::read_owned(collection, &archived, resolve);
-                read.inert += carried.inert;
-                for (key, row) in carried.rows {
-                    read.rows.entry(key).or_insert(row);
-                }
-                (collection.name, read)
-            })
+            .map(|collection| (collection.name, state.owned_read(collection.name)))
             .collect();
-        let mut logs: BTreeMap<&'static str, owned::LogRead> = table
-            .collections
-            .iter()
-            .filter(|collection| collection.kind == typed::Kind::Log)
-            .map(|collection| {
-                (
-                    collection.name,
-                    owned::read_log(collection, within, resolve),
-                )
-            })
-            .collect();
+        // A log's entries as this generation's records hold them ([`State::fold`]).
+        let mut logs = state.logs.clone();
         // What the sealed generations before this one hold of each, in a family that keeps its
         // records: a roll restates no owned row and no log entry, so each is read where its
         // signer wrote it.
@@ -886,6 +875,8 @@ impl View {
             quota,
             owned,
             logs,
+            state,
+            claims_floor: None,
             cells_from,
         }
     }
@@ -995,6 +986,13 @@ impl Resolved {
             bindings,
             sealed: Vec::new(),
         })
+    }
+
+    /// Each carried record that authenticates, with the records that carried it.
+    pub(crate) fn carried_records(&self) -> impl Iterator<Item = (&Op, &BTreeSet<Digest>)> {
+        self.carried
+            .values()
+            .map(|carried| (&carried.op, &carried.by))
     }
 
     /// `self` over `sealed`, the owned rows and log entries of the sealed generations before

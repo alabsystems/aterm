@@ -739,6 +739,100 @@ fn actual_direct_socket_cleanup_reaches_retained_identity_without_foreground_or_
 }
 
 #[test]
+fn retained_replacement_dispatch_requires_original_native_owners_before_callbacks() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    // This really is the kernel peer of the served connection, but has no
+    // admitted Native constructor, frontend controller, service or foreground.
+    // A complete request must reach that admission boundary without treating
+    // its caller-selected IDs or callback addresses as any of those owners.
+    let session = crate::stub_session(1);
+    let lifetime = account_work::Lifetime::default();
+    let registry = Arc::new(registry::Registry::for_app(&lifetime));
+    let (server, _client) = aterm_uds::kept_out(std::os::unix::net::UnixStream::pair).unwrap();
+    let _fd = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+    let _direct = crate::control::DirectPeer::enter();
+    let actual = identify(&session.ctx).unwrap();
+    assert_eq!(actual.caller.pid, std::process::id());
+    assert_eq!(actual.caller.sid, session.ctx.self_id.as_str());
+
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let path = directory.path().join("not-authority.sock");
+    let listener = aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(&path)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let callback = path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let connection = u64::MAX - 88004;
+    let fields = format!(
+        "schema=1 request=0123456789abcdef0000000000000001 operation={} member={} controller_operation={} service={}",
+        "a".repeat(32),
+        "b".repeat(32),
+        "c".repeat(32),
+        "d".repeat(32),
+    );
+    assert_eq!(
+        serve(
+            &session.ctx,
+            -1,
+            &format!("controller-service-attach {fields} callback={callback}"),
+            &lifetime,
+            &registry,
+            Some(connection),
+        ),
+        "ERR codex-auth denied\n",
+        "the existing physical attachment route already refuses this actual unadmitted peer"
+    );
+    let prepare = format!(
+        "controller-retained-prepare {fields} source_build=1 target_build=2 settings={callback} input={callback} command={callback}"
+    );
+    assert!(handles(&prepare));
+    assert_eq!(
+        serve(
+            &session.ctx,
+            -1,
+            &prepare,
+            &lifetime,
+            &registry,
+            Some(connection)
+        ),
+        "ERR codex-auth denied\n",
+        "the actual Native handler must recognize replacement data and refuse the unadmitted peer before any callback IO"
+    );
+    assert!(
+        matches!(aterm_uds::accept(&listener, aterm_uds::AcceptWait::Ready, aterm_uds::AcceptedMode::Nonblocking), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+
+    // A UI/frontier label is not App promotion. Even a kernel-authenticated
+    // process cannot promote this unissued service or turn data into a receipt.
+    let promote = format!(
+        "controller-retained-app-promote {fields} go={} frontier={}",
+        "e".repeat(32),
+        "f".repeat(32),
+    );
+    assert_eq!(
+        serve(
+            &session.ctx,
+            -1,
+            &promote,
+            &lifetime,
+            &registry,
+            Some(connection)
+        ),
+        "ERR codex-auth denied\n"
+    );
+    assert!(
+        matches!(aterm_uds::accept(&listener, aterm_uds::AcceptWait::Ready, aterm_uds::AcceptedMode::Nonblocking), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    registry.connection_closed(connection);
+    connection_closed(connection);
+}
+
+#[test]
 fn owned_control_wire_requires_an_independent_controller_and_exact_challenge_fields() {
     let base = format!(
         "schema=1 request=0123456789abcdef0000000000000001 operation={} member={}",
@@ -779,6 +873,39 @@ fn owned_control_wire_requires_an_independent_controller_and_exact_challenge_fie
     ] {
         assert!(Request::parse(&bad).is_none());
     }
+}
+
+#[test]
+fn restoration_query_is_closed_data_and_cannot_select_an_owner_without_native_admission() {
+    let base = format!(
+        "controller-retained-restoration-current schema=1 request=0123456789abcdef0000000000000001 operation={} member={} controller_operation={} service={} go={} old_attachment={} new_attachment={} frontier={}",
+        "a".repeat(32),
+        "b".repeat(32),
+        "c".repeat(32),
+        "d".repeat(32),
+        "e".repeat(32),
+        "f".repeat(32),
+        "1".repeat(32),
+        "2".repeat(32)
+    );
+    assert!(Request::parse(&base).is_some());
+    for invalid in [
+        base.replace(&format!(" old_attachment={}", "f".repeat(32)), ""),
+        format!("{base} go={}", "e".repeat(32)),
+        format!("{base} app_owner={}", "3".repeat(32)),
+    ] {
+        assert!(Request::parse(&invalid).is_none());
+    }
+    let session = crate::stub_session(1);
+    let lifetime = account_work::Lifetime::default();
+    let registry = Arc::new(registry::Registry::for_app(&lifetime));
+    let id = u64::MAX - 88009;
+    assert_eq!(
+        serve(&session.ctx, -1, &base, &lifetime, &registry, Some(id)),
+        "ERR codex-auth denied\n"
+    );
+    registry.connection_closed(id);
+    connection_closed(id);
 }
 
 #[test]

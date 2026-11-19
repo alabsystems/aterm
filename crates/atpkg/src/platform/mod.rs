@@ -1450,6 +1450,41 @@ pub(crate) use probe_shim::executable as executable_for_current_user;
 #[cfg(unix)]
 pub use probe_shim::{ProbeForwarder, ProbeImage, ProbeShim, probe_shim};
 
+/// The declared package target and ordinary invocation of a recognized wrapper, including the guarded
+/// stable launch entry on Unix. A physical package selection cannot be inferred from a
+/// fallback line embedded in an arbitrary shell program.
+#[cfg(unix)]
+pub(crate) fn observed_alab_forward(wrapper: &Path, stable: &Path) -> Option<(PathBuf, PathBuf)> {
+    if !executable_for_current_user(wrapper)? {
+        return None;
+    }
+    let shim = read_shim(wrapper);
+    let Some(body) = shim.body else {
+        let direct = shim.target?; // Direct symlink, including a legacy primary.
+        return Some((direct.clone(), direct));
+    };
+    let producer = shim_producer::recognize(wrapper, &body)?;
+    if producer.route.is_some() {
+        return None;
+    }
+    if let Some(launch) = producer.launch {
+        if launch != stable {
+            return None;
+        }
+        if probe_shim::guarded_launch(&launch)? {
+            return Some((producer.target, launch));
+        }
+    }
+    Some((producer.target.clone(), producer.target))
+}
+
+/// Windows agent shims forward directly to a package entrypoint.
+#[cfg(not(unix))]
+pub(crate) fn observed_alab_forward(wrapper: &Path, _stable: &Path) -> Option<(PathBuf, PathBuf)> {
+    let direct = resolve_shim(wrapper)?;
+    Some((direct.clone(), direct))
+}
+
 /// The target a Unix shim execs (its first `exec '…' "$@"` line).
 #[cfg(any(unix, test))]
 pub(crate) fn parse_sh_shim_target(content: &str) -> Option<PathBuf> {

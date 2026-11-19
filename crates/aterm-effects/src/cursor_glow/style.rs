@@ -119,11 +119,12 @@ pub struct GlowConfig {
     pub beam: bool,
     /// Horizontal attach point of the live-cursor bridge as a fraction of cell width (`0.5` = centre).
     pub head_dx: f32,
-    /// The rainbow ribbon's shape, which is theme data: `true` is the tall body, the one `rainbow`
-    /// theme's, its band behind the typed words and its vivid rail under them; `false` is the
-    /// underline with its highlighter, which no built-in theme picks.
+    /// No ribbon body reads it: the ribbon has one body, the tall one (its band behind the typed
+    /// words, its vivid rail under them), since the underline and flat bodies were removed, and
+    /// the trail status names that body (aterm-gui's `ribbon_look`) from the style alone. Only
+    /// the state words fold it.
     pub ribbon_tall: bool,
-    /// The flat body, a shape no built-in theme picks.
+    /// No ribbon body reads it, as [`Self::ribbon_tall`]; the state words fold it.
     pub ribbon_flat: bool,
     /// Whether the classic wake uses the two-tone tracer (`true`) instead of a rolling spectrum (`false`).
     pub classic_mono: bool,

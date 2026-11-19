@@ -1033,7 +1033,7 @@ fn a_chosen_machine_number_drives_existing_identity_and_os_projections() {
     let generated = generated_os_names(Some(&state), &target, os_label.as_deref())
         .unwrap()
         .unwrap();
-    assert_eq!(generated.computer_name(), "m86 MissBunny");
+    assert_eq!(generated.computer_name(), "m86 Miss Bunny");
     assert_eq!(generated.host_name(), "m86-missbunny");
     let old = OwnNames {
         computer: Some("m184".into()),
@@ -2256,3 +2256,229 @@ fn identity_record_refuses_symlinked_state_and_converge_directories() {
 ))]
 #[path = "converge_spent_tests.rs"]
 mod spent;
+
+/// `sync.spotlight` end to end: a folder made in a home setup's password already scoped is
+/// excluded from Spotlight by a pass that has no terminal and asks no password. The row runs
+/// as the account (this test's uid), through the real client, the wire and a broker served at a
+/// socket of this test's own with the real duty, over one fake Mac both read: alice at the
+/// console, her home under root's `/Users` on the data volume, `trust` new beside `Developer`,
+/// which the receipt names, this build's broker installed and running, and Spotlight's tools
+/// scripted.
+/// NEGATIVE CONTROLS: a row whose apply asks no broker, and a shared apply that does not extend
+/// the receipt, each leave `trust` owed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_folder_made_in_a_scoped_home_is_excluded_with_no_terminal_and_no_password() {
+    use aterm_machines::port::{Fake, FileId, Ran, Stat};
+    use std::sync::{Arc, Mutex};
+    const HOME: &str = "/Users//alice";
+    const DATA_VOLUME: &str = "/System/Volumes/Data";
+    const CONFIG: &str = "/System/Volumes/Data/.Spotlight-V100/VolumeConfiguration.plist";
+    const RECEIPT: &str = aterm_machines::init_spotlight::SCOPE_RECEIPT;
+    let uid = aterm_uds::peer::our_uid();
+    let folder = |owner: u32, mode: u32| Stat {
+        uid: owner,
+        gid: 20,
+        mode,
+        dir: true,
+        symlink: false,
+        len: 0,
+    };
+    let mut mac = Fake::root();
+    mac.euid = uid;
+    mac.logged_in(&aterm_machines::model::User {
+        name: "alice".into(),
+        uid,
+        gid: 20,
+        home: HOME.into(),
+        shell: "/bin/zsh".into(),
+        admin: true,
+    })
+    .stat_of("/", folder(0, 0o755))
+    .stat_of("/Users", folder(0, 0o755))
+    .stat_of(HOME, folder(uid, 0o750))
+    .stat_of(
+        "/dev/console",
+        Stat {
+            uid,
+            gid: 0,
+            mode: 0o600,
+            dir: false,
+            symlink: false,
+            len: 0,
+        },
+    )
+    .file(RECEIPT, format!("{HOME}/Developer\n").as_bytes())
+    .file(CONFIG, format!("{HOME}/Developer\n").as_bytes())
+    .file(&format!("{HOME}/.zsh_history"), b"");
+    for name in ["Developer", "trust", "Documents"] {
+        let path = format!("{HOME}/{name}");
+        mac.file(&path, b"").stat_of(&path, folder(uid, 0o755));
+    }
+    // Each on the data volume, as `lstat` reads it there.
+    mac.stat_of(DATA_VOLUME, folder(0, 0o755));
+    for (ino, path) in [
+        (2, DATA_VOLUME.to_owned()),
+        (1000, HOME.to_owned()),
+        (1001, format!("{HOME}/Developer")),
+        (1002, format!("{HOME}/trust")),
+        (1003, format!("{HOME}/Documents")),
+    ] {
+        mac.file_id_of(
+            std::path::Path::new(&path),
+            FileId {
+                dev: 16_777_229,
+                ino,
+                born_ns: None,
+            },
+        );
+    }
+    // This build's broker, its image and plist this build's, as the account reads its install:
+    // a team release, as a development build owns no broker.
+    let source = std::path::Path::new("/Applications/aterm.app");
+    let info = aterm_uds::lan::install::test_info(1_790_120_495);
+    let image = aterm_uds::lan::install::test_release("ABCDE12345", 0, &info);
+    mac.running_app = Some(source.to_owned());
+    mac.file(
+        &format!("{}/Contents/MacOS/aterm", source.display()),
+        &image,
+    )
+    .file(&format!("{}/Contents/Info.plist", source.display()), &info)
+    .file(aterm_uds::lan::IMAGE_EXECUTABLE, &image)
+    .file(
+        aterm_uds::lan::PLIST_PATH,
+        aterm_uds::lan::install::plist_text(source).as_bytes(),
+    );
+    // `plutil` reads and extends whichever copy of the configuration it is handed, a list a
+    // line; `mdutil` reads the volume indexed; `killall -9 mds` succeeds.
+    let config_of = |mac: &Fake, file: &str| -> Option<Vec<String>> {
+        Some(
+            String::from_utf8(mac.written(file)?)
+                .ok()?
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+        )
+    };
+    mac.simulate(move |mac, cmd| {
+        let args: Vec<String> = cmd
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match (cmd.program.to_str()?, args.as_slice()) {
+            ("/usr/bin/mdutil", ["-s", "/System/Volumes/Data"]) => {
+                Some(Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"))
+            }
+            ("/usr/bin/plutil", ["-extract", "Exclusions", "xml1", "-o", "-", file]) => {
+                let entries: String = config_of(mac, file)?
+                    .iter()
+                    .map(|path| format!("<string>{path}</string>"))
+                    .collect();
+                Some(Ran::ok(&format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n\
+                     <array>{entries}</array>\n</plist>\n"
+                )))
+            }
+            ("/usr/bin/plutil", ["-insert", "Exclusions.0", "-string", path, file]) => {
+                let mut list = config_of(mac, file)?;
+                list.insert(0, (*path).to_owned());
+                let text: String = list.iter().map(|entry| format!("{entry}\n")).collect();
+                mac.file(file, text.as_bytes());
+                Some(Ran::ok(""))
+            }
+            ("/usr/bin/plutil", ["-lint", _]) | ("/usr/bin/killall", ["-9", "mds"]) => {
+                Some(Ran::ok(""))
+            }
+            ("/bin/launchctl", ["print", "system/systems.alab.aterm-lan"]) => Some(Ran::ok(
+                "system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n",
+            )),
+            _ => None,
+        }
+    });
+    let mac = Arc::new(mac);
+
+    // The broker, as launchd serves it, with the real duty over the same Mac.
+    let root = aterm_tempfile::tempdir().unwrap();
+    let socket = root.path().join("broker.sock");
+    let opts = aterm_lan::Opts {
+        source: root.path().join("no-source.app"),
+        socket: socket.clone(),
+    };
+    let duties = aterm_lan::Duties {
+        scope: Some(aterm_machines::init_spotlight::broker_duty(
+            Arc::clone(&mac) as Arc<dyn aterm_machines::port::System + Send + Sync>,
+        )),
+    };
+    std::thread::spawn(move || {
+        let served = aterm_lan::serve(opts, duties, aterm_lan::keep_log());
+        panic!("the test broker stopped: {served:?}");
+    });
+    let seam = aterm_uds::lan::Seam {
+        socket: Some(socket),
+        ..aterm_uds::lan::Seam::default()
+    };
+    let until = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while let Err(error) = aterm_uds::lan::seam_here(seam.clone(), aterm_uds::lan::broker::hello) {
+        assert!(
+            std::time::Instant::now() < until,
+            "the test broker never answered: {error}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let answers = Arc::new(Mutex::new(Vec::new()));
+    {
+        let answers = Arc::clone(&answers);
+        mac.on_scope_home(move |_| {
+            let answer = aterm_uds::lan::seam_here(seam.clone(), aterm_uds::lan::scope_home);
+            answers.lock().unwrap().push(answer.clone());
+            answer
+        });
+    }
+
+    let live =
+        Live::spotlight_on(Arc::clone(&mac) as Arc<dyn aterm_machines::port::System + Send + Sync>);
+    let row = aterm_machines::sync::row(
+        &live,
+        aterm_machines::sync::SPOTLIGHT,
+        aterm_machines::sync::Trigger::Window,
+        aterm_converge::Mode::Apply,
+    )
+    .unwrap();
+    let rows = aterm_converge::run_scoped(
+        &[row],
+        aterm_converge::Mode::Apply,
+        aterm_converge::Scope::EVERY,
+        &mut aterm_converge::NoJournal,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].outcome,
+        aterm_converge::Outcome::Changed,
+        "{rows:?}"
+    );
+    assert_eq!(rows[0].class, Some(aterm_converge::Class::Relay));
+    assert_eq!(rows[0].from.as_deref(), Some("indexed: trust"));
+    assert_eq!(
+        *answers.lock().unwrap(),
+        [aterm_uds::lan::ScopeAnswer::Excluded(1)]
+    );
+    assert_eq!(
+        mac.written(CONFIG).as_deref(),
+        Some(format!("{HOME}/trust\n{HOME}/Developer\n").as_bytes())
+    );
+    assert_eq!(
+        mac.written(RECEIPT).as_deref(),
+        Some(format!("{HOME}/Developer\n{HOME}/trust\n").as_bytes())
+    );
+    let calls = mac.calls();
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.contains("/usr/bin/sudo") && !call.starts_with("tty ")),
+        "no password and no terminal: {calls:?}"
+    );
+}

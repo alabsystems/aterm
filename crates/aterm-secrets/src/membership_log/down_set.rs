@@ -25,6 +25,14 @@
 //! 6. antichains of two records and more, smallest first ([`Search::antichains`]): an old log
 //!    with few heads, under any number of later records.
 //!
+//! **A rooted log** (one pruned at a final checkpoint, [`super::rooted`]) knows records it does
+//! not hold: those a root dropped, of which it keeps a stub ([`Log::knows`]). A log some Mac
+//! held before the prune may have one as a head, so the hint names a dropped record where the
+//! log knows each it names (2), and after the parents (4) come each dropped record alone and
+//! the newest of each record's parents where one of them is dropped ([`Search::dropped`]). The
+//! walks of (5) and (6) take held records alone, so a search of a rooted log is never complete:
+//! one that names nothing says nothing of whether the log holds the down-set.
+//!
 //! Work: the search stops at its budget, which counts what it does and not how many candidates
 //! it hashes, since a candidate of a wide log is long and the walk between two of them is not
 //! free. One unit is 64 bytes of it:
@@ -60,6 +68,9 @@ pub enum NamedBy {
     Record,
     /// The newest of one held record's parents: the heads its signer held.
     Parents,
+    /// A record a root of the log dropped, or the newest of a record's parents, one of them
+    /// dropped ([`Search::dropped`]).
+    Dropped,
     /// The log less this many records that came after the down-set.
     Later(usize),
     /// An antichain of this many held records.
@@ -76,7 +87,8 @@ pub struct DownSetSearch {
     /// The units of work done, which the budget bounds (the module's list).
     pub work: usize,
     /// Whether the search hashed every down-set of the log: with nothing named, the log holds
-    /// no down-set of that digest. `false` where it stopped at its budget.
+    /// no down-set of that digest. `false` where it stopped at its budget, and for a rooted log,
+    /// whose down-sets with a dropped head the walks do not take (the module's list).
     pub complete: bool,
 }
 
@@ -156,6 +168,56 @@ impl Search<'_> {
                 .0
                 .to_vec();
             return ControlFlow::Break(End::Named(named));
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// The newest of `ids`, records the log holds or a root of it dropped ([`Log::knows`]):
+    /// those in no other's past, by id, charged one unit for each pair compared.
+    fn newest_known(&mut self, ids: &[RecordId]) -> ControlFlow<End, BTreeSet<RecordId>> {
+        let log = self.log;
+        let ids: BTreeSet<RecordId> = ids.iter().copied().collect();
+        self.spend(ids.len().saturating_mul(ids.len()))?;
+        ControlFlow::Continue(
+            ids.iter()
+                .filter(|a| !ids.iter().any(|b| log.lies_before(a, b)))
+                .copied()
+                .collect(),
+        )
+    }
+
+    /// A rooted log's candidates of the records a root of it dropped: each one alone, the last
+    /// the evaluators place first ([`Log::position`]), and then the newest of each record's
+    /// parents, held or dropped, where they are two or more and one of them is dropped (a
+    /// record follows the heads its signer held, which a prune may since have dropped).
+    /// Nothing for a whole log.
+    fn dropped(&mut self) -> ControlFlow<End> {
+        let log = self.log;
+        let Some(rooting) = log.rooting() else {
+            return ControlFlow::Continue(());
+        };
+        let mut stubs: Vec<(usize, RecordId)> = rooting
+            .stubs
+            .keys()
+            .filter_map(|id| Some((log.position(id)?, *id)))
+            .collect();
+        stubs.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, id) in &stubs {
+            self.hash(std::slice::from_ref(id))?;
+        }
+        let held = log.order.iter().rev().map(|record| record.parents());
+        let dropped = stubs
+            .iter()
+            .filter_map(|(_, id)| rooting.stubs.get(id))
+            .map(|stub| stub.parents.as_slice());
+        for parents in held.chain(dropped) {
+            if parents.len() < 2 || !parents.iter().any(|parent| log.is_dropped(parent)) {
+                continue;
+            }
+            let newest = self.newest_known(parents)?;
+            if newest.len() >= 2 {
+                self.hash(newest.iter())?;
+            }
         }
         ControlFlow::Continue(())
     }
@@ -368,8 +430,9 @@ impl Peel {
 }
 
 impl Log {
-    /// The sorted heads of a down-set of this log (a set of held records that holds each one's
-    /// parents) whose heads digest is `digest`: SHA-256 of `ALHD1` and those heads, as
+    /// The sorted heads of a down-set of this log (a set of records it holds, or of a rooted
+    /// log's records and those a root of it dropped, that holds each one's parents) whose heads
+    /// digest is `digest`: SHA-256 of `ALHD1` and those heads, as
     /// [`Log::heads_digest`] hashes its own. `hint` names records the down-set is thought to
     /// hold (an envelope's stamp); it orders the search and proves nothing. `None` where no
     /// candidate matched within `budget` units of work (the module's list) past the log's own
@@ -377,9 +440,10 @@ impl Log {
     ///
     /// **What a match proves.** An equal digest is a SHA-256 preimage, so the heads returned
     /// are the heads the digest was taken over: those of the log some Mac held. Each is held
-    /// here, and a log holds a record only after its parents, so this log holds every record in
-    /// their pasts: the whole of that log. This log is that one or a descendant of it, never a
-    /// rollback, and nothing but the preimage is taken as proof of it.
+    /// here, or was dropped by a root of this log, which holds the final checkpoint whose cut
+    /// held it; and a log takes a record only after its parents, so this log holds or dropped
+    /// every record in their pasts: the whole of that log. This log is that one or a descendant
+    /// of it, never a rollback, and nothing but the preimage is taken as proof of it.
     ///
     /// **Why this is no scan of the held order.** The order is one topological order of the
     /// records, kept only while one `Log` lives: every load sorts the records again, concurrent
@@ -426,7 +490,8 @@ impl Log {
         let (named, complete) = match search.candidates(hint) {
             ControlFlow::Break((End::Named(heads), by)) => (Some((heads, by)), false),
             ControlFlow::Break((End::Spent, _)) => (None, false),
-            ControlFlow::Continue(()) => (None, true),
+            // A rooted log's down-sets with a dropped head are not all walked.
+            ControlFlow::Continue(()) => (None, self.rooting().is_none()),
         };
         DownSetSearch {
             named,
@@ -448,9 +513,14 @@ impl Search<'_> {
                 .newest(log.indexes(hint))
                 .map_break(by(NamedBy::Hint))?;
             self.hash(newest.iter()).map_break(by(NamedBy::Hint))?;
+        } else if !hint.is_empty() && hint.iter().all(|id| log.knows(id)) {
+            // A rooted log's hint naming a record a root of it dropped.
+            let newest = self.newest_known(hint).map_break(by(NamedBy::Hint))?;
+            self.hash(newest.iter()).map_break(by(NamedBy::Hint))?;
         }
         self.antichains(1).map_break(by(NamedBy::Record))?;
         self.parents().map_break(by(NamedBy::Parents))?;
+        self.dropped().map_break(by(NamedBy::Dropped))?;
         // Half of what is left for the records that came after, so a wide log's many ways of
         // taking a few records leave the small antichains their share.
         let whole = self.budget;

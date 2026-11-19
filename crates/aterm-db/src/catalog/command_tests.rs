@@ -425,6 +425,42 @@ fn membership_history_is_reported_without_admin_or_table_initialization() {
     assert!(!lab.paths[1].dir.join("commons/tables").exists());
 }
 
+/// `commons-status` states the records format of a Mac whose format mark names a later one
+/// than 1, beside the byte capacity it already states (`limits.record_bytes`): the format its
+/// `atdb/5` frontier protocols state. A Mac with no format mark says no such key, so its status
+/// is what it was, and reading either writes no file.
+///
+/// NEGATIVE CONTROL: with `membership_history` inserting no `records_format`, the test fails
+/// with `left: Null`, `right: Number(Number(Unsigned(2)))`.
+#[test]
+fn atdb_five_states_the_records_format_and_bytes_in_the_status_of_a_marked_mac() {
+    use aterm_secrets::{client, commons::roster::Role};
+    let lab = crate::table::tests::Lab::with_foundation(&[Role::Writer, Role::Reader]);
+    client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+    let limits = || status(&lab.paths[0])["membership_history"]["limits"].clone();
+    let unmarked = limits();
+    assert!(
+        !unmarked.as_object().unwrap().contains_key("records_format"),
+        "{unmarked}"
+    );
+    assert_eq!(
+        unmarked["record_bytes"],
+        json!(aterm_secrets::membership_log::Reading::ONE.capacity())
+    );
+    aterm_secrets::fsx::write_atomic(
+        &lab.paths[0].records_file().with_extension("format"),
+        b"aterm-secrets records format 2\n",
+        0o600,
+    )
+    .unwrap();
+    let before = crate::tests::files(lab._home.path());
+    let marked = limits();
+    assert_eq!(marked["records_format"], json!(2));
+    assert_eq!(marked["record_bytes"], unmarked["record_bytes"]);
+    assert_eq!(marked["held_records"], unmarked["held_records"]);
+    assert_eq!(crate::tests::files(lab._home.path()), before);
+}
+
 /// Each record of a records stream, read from its frame header alone: its kind's code and the
 /// frame's bytes. Independent of the readers the vault's own counts use.
 fn frames(wire: &[u8]) -> Vec<(u8, &[u8])> {

@@ -330,19 +330,335 @@ pub fn edge_block(text: &str) -> bool {
 /// remedy), never one a sentence only names, whose status is Cloudflare's with its page's words
 /// after it.
 fn edge_status(lower: &str) -> Option<u16> {
-    lower.match_indices("api error").find_map(|(at, head)| {
-        let line = lower[..at].rsplit('\n').next().unwrap_or_default();
-        let before = line
-            .trim_start_matches(|c: char| !c.is_alphanumeric())
-            .trim_end();
-        if !(before.is_empty() || before.ends_with(['·', '∙'])) {
-            return None;
-        }
-        let rest = &lower[at + head.len()..];
+    api_errors(lower, false).find_map(|(_, rest)| {
         api_status(rest)
             .filter(|code| EDGE_STATUSES.contains(code))
             .filter(|_| EDGE_PAGE_WORDS.iter().any(|word| rest.contains(word)))
     })
+}
+
+/// The join by which the screen's reader appends words that are no part of the error it read
+/// ([`crate::phase`]'s: the `/goal` echo it reads through to its error row, `API Error: 403
+/// Forbidden — Goal cleared after an unrecoverable error (authentication failed): "…"`, and the
+/// toast that says Claude Code goes on): a printed status's body ends there, so neither the
+/// echo's own `(authentication failed)` nor the person's quoted goal is read as what the API
+/// answered.
+const READER_JOIN: &str = " \u{2014} ";
+
+/// `rest`, the text after a printed status's head, up to the reader's join ([`READER_JOIN`]): the
+/// error's own body.
+fn own_body(rest: &str) -> &str {
+    rest.find(READER_JOIN).map_or(rest, |end| &rest[..end])
+}
+
+/// THE STATUS A PAGE'S TITLE CARRIES AS AN `API Error`'S BODY ([`strike_cause`], where
+/// [`api_status`] reads none): a 401 or a 403 standing as a whole run of digits (no letter, digit
+/// or `_` against it) in `body`'s leading words, up to its first line's end or its first `·`.
+/// Claude Code (2.1.323, 2.1.327) reduces an HTML page answering a 401 or a 403 in the API's place
+/// to its `<title>`, and prints the status before it only where the title's own runs of digits do
+/// not include it (``h&&!o.match(/\d+/g)?.includes(h)?`${h} ${o}`:o``): a stock error page
+/// titled with its status reaches the wall with no status first (Tomcat's `HTTP Status 403 –
+/// Forbidden`, Jetty's `Error 403 Forbidden`, Google Front End's `Error 403 (Forbidden)!!1`, IIS's
+/// `HTTP Error 403.14 - Forbidden`). A run inside a word (`E403`, `req_403abc`), a longer run
+/// (`4031`) or one past the first `·` is no title's status.
+fn titled_status(body: &str) -> Option<u16> {
+    let lead = body
+        .trim_start_matches([':', ' '])
+        .split(['\n', '·', '∙'])
+        .next()
+        .unwrap_or_default();
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let bytes = lead.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if !bytes[at].is_ascii_digit() {
+            at += 1;
+            continue;
+        }
+        let end = bytes[at..]
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .map_or(bytes.len(), |n| at + n);
+        let run = &lead[at..end];
+        if matches!(run, "401" | "403")
+            && !word(lead[..at].chars().next_back())
+            && !word(lead[end..].chars().next())
+        {
+            return run.parse().ok();
+        }
+        at = end;
+    }
+    None
+}
+
+/// Each `api error` in `lower` (already lowercased) that opens a line (past its gutter's marks) or
+/// one of its `·` segments, never one a sentence only names (`The run saw API Error: 403 …
+/// earlier`); with `sentences`, one that opens a sentence too (`Failed to authenticate. API
+/// Error: 403 Forbidden`, as a one-shot run's error output words it): as (where the text after
+/// it starts in `lower`, that text up to the reader's join, [`own_body`]).
+fn api_errors(lower: &str, sentences: bool) -> impl Iterator<Item = (usize, &str)> {
+    lower
+        .match_indices("api error")
+        .filter_map(move |(at, head)| {
+            let line = lower[..at].rsplit('\n').next().unwrap_or_default();
+            let before = line
+                .trim_start_matches(|c: char| !c.is_alphanumeric())
+                .trim_end();
+            let opens = before.is_empty()
+                || before.ends_with(['·', '∙'])
+                || (sentences && before.ends_with(['.', '!', '?']));
+            let from = at + head.len();
+            opens.then(|| (from, own_body(&lower[from..])))
+        })
+}
+
+/// WHY A LOGIN WALL STANDS, AS ITS WORDS NAME IT (plan package UB-05): the credential refused,
+/// the path to the API blocked, or the remedy alone. Only a refused credential, or a wall that
+/// names no cause, is evidence against the login ([`Self::strikes`]): Claude Code 2.1.323 puts
+/// its sign-in remedy before any 401 or 403 it is answered with, Cloudflare's bot check among
+/// them ([`edge_block`]), and where the path was blocked nothing about the login was answered:
+/// the same login serves again once the path does, and a sign-in run against the same block
+/// meets it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StrikeCause {
+    /// The credential was refused: by a 401 (Claude Code's `API Error: 401 …`, Codex's
+    /// `unexpected status 401 Unauthorized: …`), by words that name it ([`CREDENTIAL_WORDS`]:
+    /// `Login expired`, `Not logged in`, `OAuth token revoked`, an invalid key, a token the API's
+    /// own body names expired or revoked), or by a 403 whose body names the credential it refused
+    /// ([`CREDENTIAL_PHRASES`]: `API Error: 403 {…"OAuth token does not meet scope requirement
+    /// user:profile"…}`).
+    LoginGone,
+    /// The path to the API was blocked and nothing about the credential was answered: a 403 whose
+    /// body names no credential (`API Error: 403 Forbidden`, its status alone, or the API's
+    /// `permission_error` body `Request not allowed`), or a page in the API's place (Cloudflare's
+    /// block or challenge page, [`edge_block`]; any HTML page or human check after a 403 or a 503,
+    /// [`BLOCK_PAGE_WORDS`]).
+    Blocked,
+    /// The remedy alone ([`crate::anchor!`]`("wall.login")`, `Please run /login`), or words that
+    /// name no cause. Claude Code prints the bare remedy where it holds no credential it can
+    /// use, and a blocked path carries its API error after it, so it stands as a strike; served
+    /// evidence newer than it outranks it in the login's fold.
+    Unclassified,
+}
+
+impl StrikeCause {
+    /// Whether the wall is evidence against its credential: a refused credential or a wall that
+    /// names no cause, never a blocked path, which is an observation of the path alone.
+    #[must_use]
+    pub const fn strikes(self) -> bool {
+        !matches!(self, Self::Blocked)
+    }
+
+    /// Its word, as a record or a log line names it.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::LoginGone => "login-gone",
+            Self::Blocked => "blocked",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// The words that name a refused credential wherever they stand in a login wall's own words
+/// ([`StrikeCause::LoginGone`]): Claude Code's own (`Login expired`, `Not logged in`, `OAuth
+/// token revoked`, `Invalid API key`) and the API's error bodies (`OAuth token has expired.`,
+/// `OAuth token has been revoked.`, `Invalid bearer token`, its `authentication_error` type),
+/// lowercased. Never read in the body after a printed 403 or 503, which may be the title of a
+/// page in the API's place (`API Error: 403 Your session token expired`, a proxy's): there the
+/// body names the credential by [`CREDENTIAL_PHRASES`] or names none.
+const CREDENTIAL_WORDS: &[&str] = &[
+    "login expired",
+    "not logged in",
+    "oauth token revoked",
+    "oauth session expired",
+    "token has been revoked",
+    "token has expired",
+    "token expired",
+    "invalid api key",
+    "invalid x-api-key",
+    "invalid bearer token",
+    "invalid auth token",
+    "authentication_error",
+    "your organization has disabled api key authentication",
+    "not signed in to the cloud gateway",
+    "gateway session expired",
+];
+
+/// The phrases by which a 403's body names the credential it refused ([`StrikeCause::LoginGone`]:
+/// `OAuth token does not meet scope requirement user:profile`, `OAuth token has been revoked.`,
+/// `OAuth authentication is currently not supported.`, `Invalid authentication credentials`,
+/// `This API key is not allowed …`), lowercased: whole phrases that name the vendor's
+/// credential, never a bare noun. Claude Code 2.1.323 reduces an HTML page in the API's place to
+/// its `<title>`, so a corporate proxy's or a firewall's page reaches the wall as its title alone,
+/// with no `<html` to mark it (`API Error: 403 Proxy Authentication Required`, `… 403 Zscaler
+/// Authentication Required`, `… 403 Invalid CSRF token`): a bare `token`, `oauth`, `scope` or
+/// `authenticat` would read such a title as the credential refused, strike a good login and start
+/// a sign-in that meets the same proxy. A 403 whose body names none of them is a blocked path. Read
+/// only in the 403's own body ([`own_body`]), never in the remedy or the sentence before it
+/// (`Failed to authenticate. API Error: 403 Forbidden`).
+const CREDENTIAL_PHRASES: &[&str] = &[
+    "oauth token",
+    "oauth session",
+    "oauth authentication",
+    "access token",
+    "bearer token",
+    "auth token",
+    "api key",
+    "api-key",
+    "authentication credentials",
+    "authentication_error",
+    "scope requirement",
+];
+
+/// The words of a page that answered in the API's place, past Cloudflare's own
+/// ([`EDGE_PAGE_WORDS`]): an HTML document, a human check ([`StrikeCause::Blocked`]),
+/// lowercased.
+const BLOCK_PAGE_WORDS: &[&str] = &[
+    "<!doctype html",
+    "<html",
+    "</html>",
+    "attention required!",
+    "verify you are human",
+    "checking your browser",
+    "captcha",
+];
+
+/// The diagnostics Codex's response error appends after its body (`unexpected status 401
+/// Unauthorized: {body}, url: …, cf-ray: …, request id: …, auth error: …, auth error code: …`),
+/// lowercased: no part of what the vendor answered. The `cf-ray` it names is the header every
+/// response through Cloudflare carries, the API's own refusal among them, never a page of
+/// Cloudflare's.
+const RESPONSE_DIAGNOSTICS: &[&str] = &[", url: ", ", cf-ray: ", ", request id: ", ", auth error"];
+
+/// Each `unexpected status` in `lower` (already lowercased), Codex's response error (`ERROR:
+/// unexpected status 401 Unauthorized: …`): as (where the body after it starts in `lower`, that
+/// body, its status first, cut at the diagnostics its error appends, [`RESPONSE_DIAGNOSTICS`], and
+/// at the reader's join, [`own_body`]).
+fn response_errors(lower: &str) -> impl Iterator<Item = (usize, &str)> {
+    lower.match_indices("unexpected status").map(|(at, head)| {
+        let from = at + head.len();
+        let rest = own_body(&lower[from..]);
+        let end = RESPONSE_DIAGNOSTICS
+            .iter()
+            .filter_map(|cut| rest.find(cut))
+            .min()
+            .unwrap_or(rest.len());
+        (from, &rest[..end])
+    })
+}
+
+/// A status a login wall's words print ([`strike_cause`]): after an `API Error` (`api`, Claude
+/// Code's; first in its body, or else carried by a page's title, [`titled_status`]) or Codex's
+/// `unexpected status`, with its own body, which starts at `from` in the wall's lowercased words.
+struct Printed<'a> {
+    code: Option<u16>,
+    body: &'a str,
+    from: usize,
+    api: bool,
+}
+
+impl Printed<'_> {
+    /// Whether the status is one a page in the API's place answers with (403, 503), whose body
+    /// may be that page's words rather than the vendor's.
+    const fn may_be_a_page(&self) -> bool {
+        matches!(self.code, Some(403 | 503))
+    }
+
+    /// Whether the byte at `at` of the wall's lowercased words lies in this status's own body.
+    fn holds(&self, at: usize) -> bool {
+        (self.from..self.from + self.body.len()).contains(&at)
+    }
+}
+
+/// `lower`, a login wall's words lowercased, up to the reader's join of a `/goal` echo
+/// ([`READER_JOIN`], then `Goal cleared after an unrecoverable error`, `Goal paused` or `Goal
+/// still active`): the wall's own words. Claude Code 2.1.323 clears a goal `(authentication
+/// failed)` at any 401 or 403 it is answered with, a blocked path's among them, and the echo
+/// quotes the person's goal: neither names what the API answered, and a goal that names a token
+/// expired or Cloudflare's `Ray ID` is the person's words.
+fn wall_own_words(lower: &str) -> &str {
+    let echoes = [
+        crate::anchor!("wall.goal_cleared"),
+        crate::anchor!("wall.goal_paused"),
+        crate::anchor!("wall.goal_still"),
+    ];
+    lower
+        .match_indices(READER_JOIN)
+        .find(|&(at, join)| {
+            let after = &lower[at + join.len()..];
+            echoes.iter().any(|echo| strip_ci(after, echo).is_some())
+        })
+        .map_or(lower, |(at, _)| &lower[..at])
+}
+
+/// THE CAUSE A LOGIN WALL'S TEXT NAMES ([`StrikeCause`]): `text` a wall's message as the screen
+/// joins it ([`Wall::message`]), a transcript's notice, or a one-shot run's error output (Claude
+/// Code's, or Codex's response error). Only the wall's own words are read: the text up to the
+/// reader's join of a `/goal` echo ([`wall_own_words`]). A status counts where it is printed:
+/// after an `API Error` that opens a line, a `·` segment or a sentence (first in its body, or a
+/// 401 or a 403 the page's title in its place carries, [`titled_status`]: `API Error: HTTP Status
+/// 403 – Forbidden`), or after Codex's `unexpected status`, and its body ends at the reader's join
+/// ([`own_body`]) and, for Codex's, where its diagnostics start ([`RESPONSE_DIAGNOSTICS`]). Read
+/// in this order, so the measured forms each land where they belong:
+/// - Cloudflare's page answering in the API's place ([`edge_block`]: `Please run /login · API
+///   Error: 403 Attention Required! | Cloudflare`): [`StrikeCause::Blocked`];
+/// - a printed 401 in either form, or any of [`CREDENTIAL_WORDS`] outside a printed 403's or
+///   503's body (`Please run /login · API Error: 401 Invalid bearer token`, `unexpected status
+///   401 Unauthorized: …, cf-ray: …`, `Login expired · Please run /login`):
+///   [`StrikeCause::LoginGone`];
+/// - a page in the API's place, its words ([`EDGE_PAGE_WORDS`], [`BLOCK_PAGE_WORDS`]) in the
+///   body after a printed 403 or 503: [`StrikeCause::Blocked`];
+/// - a 403 an `API Error` prints: [`StrikeCause::LoginGone`] where its body names the credential
+///   ([`CREDENTIAL_PHRASES`]: a 403 whose body names the token revoked, or short of its scope),
+///   else [`StrikeCause::Blocked`] (`Please run /login · API Error: 403 Forbidden`, the status
+///   alone Claude Code 2.1.323 puts its remedy before, or a proxy's page reduced to its title);
+/// - anything else, the bare remedy first among it: [`StrikeCause::Unclassified`].
+#[must_use]
+pub fn strike_cause(text: &str) -> StrikeCause {
+    let whole = text.replace('\u{2019}', "'").to_lowercase();
+    let lower = wall_own_words(&whole);
+    if edge_status(lower).is_some() {
+        return StrikeCause::Blocked;
+    }
+    let printed: Vec<Printed<'_>> = api_errors(lower, true)
+        .map(|(from, body)| (from, body, true))
+        .chain(response_errors(lower).map(|(from, body)| (from, body, false)))
+        .map(|(from, body, api)| Printed {
+            code: api_status(body).or_else(|| titled_status(body).filter(|_| api)),
+            body,
+            from,
+            api,
+        })
+        .collect();
+    let pages = || printed.iter().filter(|p| p.may_be_a_page());
+    let named = CREDENTIAL_WORDS.iter().any(|word| {
+        lower
+            .match_indices(word)
+            .any(|(at, _)| !pages().any(|p| p.holds(at)))
+    });
+    if named || printed.iter().any(|p| p.code == Some(401)) {
+        return StrikeCause::LoginGone;
+    }
+    if pages().any(|p| {
+        EDGE_PAGE_WORDS
+            .iter()
+            .chain(BLOCK_PAGE_WORDS)
+            .any(|word| p.body.contains(word))
+    }) {
+        return StrikeCause::Blocked;
+    }
+    match printed.iter().find(|p| p.api && p.code == Some(403)) {
+        Some(p)
+            if CREDENTIAL_PHRASES
+                .iter()
+                .any(|phrase| p.body.contains(phrase)) =>
+        {
+            StrikeCause::LoginGone
+        }
+        Some(_) => StrikeCause::Blocked,
+        None => StrikeCause::Unclassified,
+    }
 }
 
 /// The wall Cloudflare's page answering with `code` is ([`edge_block`]): the API's error, the

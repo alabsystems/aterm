@@ -312,7 +312,7 @@ fn closed_sdk_adoption_cannot_outlive_expiry_or_a_foreign_retake() {
                     .transfer_native_exec_claim(&original, 82, pending.closed_until, 31)
                     .is_none()
             );
-            assert!(!publish_lapse_supervisor(ctx, 50).published());
+            assert!(publish_lapse_supervisor(ctx, 50).published().is_none());
             assert_eq!(
                 ctx.meta
                     .lock()
@@ -329,7 +329,7 @@ fn closed_sdk_adoption_cannot_outlive_expiry_or_a_foreign_retake() {
                     .transfer_native_exec_claim(&original, 82, pending.closed_until, 50)
                     .is_none()
             );
-            assert!(publish_lapse_supervisor(ctx, 50).published());
+            assert!(publish_lapse_supervisor(ctx, 50).published().is_some());
             assert!(ctx.meta.lock().unwrap().live_claim(50).is_none());
         }
     }

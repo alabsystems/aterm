@@ -33,6 +33,141 @@ mod unix {
         );
     }
 
+    fn codex_package(layout: &Layout, build: u64) -> PathBuf {
+        let root = layout.build_dir("codex", build);
+        let exe = root.join("bin/codex");
+        file(&exe, b"#!/bin/sh\nexit 0\n");
+        std::fs::write(
+            root.join("codex-package.json"),
+            r#"{"layoutVersion":1,"entrypoint":"bin/codex","version":"0.11.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("alab-build.json"), b"{}").unwrap();
+        crate::store::mark_build_ready(&root).unwrap();
+        exe
+    }
+
+    #[test]
+    fn codex_adoption_resolves_the_guarded_primary_and_the_agent_twin() {
+        use std::os::unix::fs::symlink;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let layout = Layout {
+            prefix: scratch.path().canonicalize().unwrap(),
+        };
+        let old = codex_package(&layout, 2026111601);
+        let new = codex_package(&layout, 2026111701);
+        let tool = ToolName::new("codex").unwrap();
+        let primary = layout.shim(&tool);
+        let twin = layout.agent_shim(&tool);
+        let stable = crate::activate::exec_dir(&layout, "codex").join("codex");
+        let read = || selected_alab_entry(&layout, "codex");
+        let selected = Some((2026111701, new.clone()));
+        file(
+            &primary,
+            crate::platform::sh_shim_content_managed(
+                &new,
+                &crate::shim_env::ShimEnv::NONE,
+                &stable,
+                "",
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            read(),
+            selected,
+            "guard absent, legacy primary execs its direct target"
+        );
+        std::fs::create_dir_all(stable.parent().unwrap()).unwrap();
+        symlink(layout.prefix.as_path(), &stable).unwrap();
+        assert!(
+            read().is_none(),
+            "the shell tries to exec a searchable directory and never reaches its fallback"
+        );
+        std::fs::remove_file(&stable).unwrap();
+        symlink(&old, &stable).unwrap();
+        assert!(
+            read().is_none(),
+            "guard would exec A even though the primary declares B"
+        );
+        std::fs::remove_file(&stable).unwrap();
+        symlink(&new, &stable).unwrap();
+        file(&twin, crate::platform::sh_shim_content(&old).as_bytes());
+        assert!(read().is_none(), "an installed twin still launches A");
+        file(&twin, crate::platform::sh_shim_content(&stable).as_bytes());
+        let reroute = layout.reroute_dir().join("codex");
+        file(
+            &reroute,
+            crate::reroute::agents_stub_body_sh("codex", &layout.agents_dir()).as_bytes(),
+        );
+        assert_eq!(
+            read(),
+            selected,
+            "reroute, twin, stable entry and primary agree"
+        );
+        let foreign = scratch.path().join("foreign-codex");
+        file(&foreign, b"#!/bin/sh\nexit 0\n");
+        std::fs::remove_file(&stable).unwrap();
+        symlink(foreign, &stable).unwrap();
+        assert!(
+            read().is_none(),
+            "a foreign executable cannot inherit the store build"
+        );
+        std::fs::remove_file(&stable).unwrap();
+        assert!(
+            read().is_none(),
+            "the unconditional twin is broken although bin can fall back"
+        );
+        std::fs::remove_file(&twin).unwrap();
+        assert!(
+            read().is_none(),
+            "a reroute without a twin can choose an unknown PATH fallback"
+        );
+        std::fs::remove_file(&reroute).unwrap();
+        assert_eq!(read(), selected);
+    }
+
+    #[test]
+    fn codex_adoption_requires_positive_completion_and_admitted_launchers() {
+        use std::os::unix::fs::symlink;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let layout = Layout {
+            prefix: scratch.path().canonicalize().unwrap(),
+        };
+        let build = 2026111701;
+        let root = layout.build_dir("codex", build);
+        let exe = codex_package(&layout, build);
+        let marker = crate::store::ready_marker_path(&root).unwrap();
+        shim(&layout, "codex", &exe);
+        let read = || selected_alab_entry(&layout, "codex");
+        assert_eq!(read(), Some((build, exe.clone())));
+        std::fs::remove_file(&marker).unwrap();
+        assert!(
+            read().is_none() && ready_alab_entry(&layout, "codex", build).is_none(),
+            "entrypoint and package metadata alone do not establish a complete install"
+        );
+        let other = scratch.path().join("other-marker");
+        file(&other, b"ok\n");
+        symlink(other, &marker).unwrap();
+        assert!(
+            read().is_none() && ready_alab_entry(&layout, "codex", build).is_none(),
+            "an unreadable linked marker cannot establish a positive identity"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        crate::store::mark_build_ready(&root).unwrap();
+        file(
+            &layout.shim(&ToolName::new("codex").unwrap()),
+            format!(
+                "#!/bin/sh\nexit 1\nexec {} \"$@\"\n",
+                crate::platform::sh_shim_quote(&exe)
+            )
+            .as_bytes(),
+        );
+        assert!(
+            read().is_none(),
+            "an arbitrary wrapper can contain a plausible unexecuted fallback"
+        );
+    }
+
     fn build(layout: &Layout) -> PathBuf {
         let root = layout.build_dir("trust", 41);
         file(&root.join("bin/targo"), b"#!/bin/sh\nexit 99\n");

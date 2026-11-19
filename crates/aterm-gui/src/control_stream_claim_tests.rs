@@ -188,7 +188,7 @@ fn a_claim_record_renews_the_claim_and_moves_its_placements() {
         "the grant moved: aterm sends a `policy` record"
     );
     assert!(
-        policy.seq > stream.opening[1].seq,
+        policy.seq > stream.opening_end(),
         "numbered after the opening"
     );
     assert_eq!(
@@ -554,7 +554,8 @@ fn a_burst_of_claim_records_is_held_to_its_own_budget() {
 /// A CLOSED STREAM KEEPS ITS CLAIM THROUGH THE RE-EXEC GRACE (D28): the connection of a contract
 /// 4 claim closes, and the claim stands for 45 s more with the grace's end as its expiry. No
 /// placement is counted for the close. The stream's stand-down stands with it: the state the
-/// stream fed still decides the tab's agent word, and the screen reader's reading does not. The
+/// stream fed is kept and the screen reader's reading is not shown, and the tab reads `unknown`
+/// until the harness claims again (HX-15e). The
 /// same claimant claiming again inside the grace renews the claim (no expiry) and its reopened
 /// stream answers the kept `acked`. At the grace's end the lapse releases the claim and the
 /// screen reader feeds the tab again.
@@ -611,13 +612,14 @@ fn a_closed_stream_keeps_its_claim_through_the_reexec_grace() {
     };
     assert!(applied(expiry - 1), "the stream feeds `state` to the end");
     assert!(!applied(expiry), "and not past it");
-    // The screen reader stays stood down for the tab through the grace.
+    // The screen reader stays stood down for the tab through the grace, and what the harness
+    // does is unknown until it claims again (HX-15e).
     assert_eq!(fed(&rig, ONE), Some(StreamedState::Working));
     assert!(!screen(&rig, ONE, "idle"), "the reader's word is not shown");
     assert_eq!(
         timeline(&rig, ONE, |timeline| timeline.agent().word),
-        "busy",
-        "the stream's state still decides the word"
+        "unknown",
+        "aterm's reading of the closed stream decides the word"
     );
 
     // A second close of the same serial does not extend the grace.

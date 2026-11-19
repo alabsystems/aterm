@@ -155,8 +155,8 @@ fn append_history_at(handle: &Handle, command: Command, authored_ms: u64) -> Dig
 }
 
 /// The batches of [`aterm_journal::MAX_APPEND_RECORDS`] each open of [`append_bulk_at`] writes at
-/// most, 1,024 records: a 1,000-record bulk takes one open, as [`copy_registry`]'s copy of it into
-/// another Mac's store does.
+/// most, 1,024 records: a 1,000-record bulk takes one open, as each step of [`copy_registry`] takes
+/// one open for all it copies into a Mac's store.
 const BULK_OPEN_BATCHES: usize = 4;
 
 /// When an open of this file's bulk fixtures ([`append_bulk_at`], [`copy_registry`]) stops: an hour
@@ -251,47 +251,57 @@ fn append_bulk_at(handle: &Handle, count: usize, authored_ms: u64) -> (usize, Op
 
 /// Copy every record each of `lab`'s Macs holds into each other's registry store, parents first,
 /// in batches through each store's own admission and quotas: what a repair moves, without the
-/// mesh, whose per-batch store opens are tracker LT-B5R's.
+/// mesh, whose per-batch store opens are tracker LT-B5R's. The records go twice around the Macs:
+/// each Mac's store takes what it lacks of all the Mac before it holds, then hands on all it holds
+/// itself, so the last Mac holds every record after the first lap and each other Mac after the
+/// second, with one open of each store a step.
 fn copy_registry(lab: &Lab) {
+    let macs = lab.paths.len();
     let handle = |n: usize| Handle::at(lab.paths[n].clone(), &REGISTRY);
-    let held = |n: usize| {
-        application::observe_store_until(
-            &lab.paths[n],
-            handle(n).descriptor(),
+    let mut carried = application::observe_store_until(
+        &lab.paths[0],
+        handle(0).descriptor(),
+        bulk_open_deadline(),
+        |session, store, _| held_wires(session, store),
+    )
+    .unwrap();
+    let steps = 2 * macs - 2;
+    for step in 1..=steps {
+        let to = step % macs;
+        carried = application::with_store_until(
+            &lab.paths[to],
+            false,
+            handle(to).descriptor(),
             bulk_open_deadline(),
             |session, store, _| {
-                let ids: Vec<Digest> = store.inventory(session)?.copied().collect();
-                let ordered = store.causal_order_of(&ids);
-                let wires = store.replication_wires_unchecked(&ordered);
-                Ok(ordered.into_iter().zip(wires).collect::<Vec<_>>())
+                let have: BTreeSet<Digest> = store.inventory(session)?.copied().collect();
+                let lacking: Vec<&[u8]> = carried
+                    .iter()
+                    .filter(|(id, _)| !have.contains(id))
+                    .map(|(_, wire)| wire.as_slice())
+                    .collect();
+                for batch in lacking.chunks(aterm_journal::MAX_APPEND_RECORDS) {
+                    store.ingest_batch(session, batch)?;
+                }
+                if step == steps {
+                    return Ok(Vec::new());
+                }
+                held_wires(session, store)
             },
         )
-        .unwrap()
-    };
-    for from in 0..lab.paths.len() {
-        let records = held(from);
-        for to in (0..lab.paths.len()).filter(|to| *to != from) {
-            application::with_store_until(
-                &lab.paths[to],
-                false,
-                handle(to).descriptor(),
-                bulk_open_deadline(),
-                |session, store, _| {
-                    let have: BTreeSet<Digest> = store.inventory(session)?.copied().collect();
-                    let lacking: Vec<&[u8]> = records
-                        .iter()
-                        .filter(|(id, _)| !have.contains(id))
-                        .map(|(_, wire)| wire.as_slice())
-                        .collect();
-                    for batch in lacking.chunks(aterm_journal::MAX_APPEND_RECORDS) {
-                        store.ingest_batch(session, batch)?;
-                    }
-                    Ok(())
-                },
-            )
-            .unwrap();
-        }
+        .unwrap();
     }
+}
+
+/// Every record `store` holds, parents first, with its wire.
+fn held_wires(
+    session: &crate::table::Session<'_>,
+    store: &crate::table::store::Store,
+) -> Result<Vec<(Digest, Vec<u8>)>> {
+    let ids: Vec<Digest> = store.inventory(session)?.copied().collect();
+    let ordered = store.causal_order_of(&ids);
+    let wires = store.replication_wires_unchecked(&ordered);
+    Ok(ordered.into_iter().zip(wires).collect())
 }
 
 /// Signed records survive repair with causal order intact despite a backward clock. Hidden
@@ -2687,9 +2697,12 @@ fn every_ask(all: &[Entry], revision: Revision) -> Vec<Ask> {
 
 /// A page at a held revision reads no record again (tracker LT-25B): a reader that keeps its
 /// pages' order ([`Kept`]) reads the table once, and every page it asks at that revision after
-/// the first, of every filter, cursor, length and direction ([`every_ask`]), decodes no record
-/// ([`super::DECODED`]) and is the page its definition names ([`page_by_definition`]) and the
-/// page read with nothing kept. Once a record is written, the next page reads the new revision,
+/// the first, of every filter, length, direction and revision asked, from the top and after a
+/// cursor, decodes no record ([`super::DECODED`]) and is the page its definition names
+/// ([`page_by_definition`]) and the page read with nothing kept. The cut of the order a kept page
+/// is copied from is the defined page for every cursor too ([`every_ask`]): the served pages
+/// read from the top and after the middle entry, since a page reaches the kept order the same
+/// way whatever it asks. Once a record is written, the next page reads the new revision,
 /// says the table moved where it was asked at the old one, and holds the new record. A handle on
 /// the same table made at another place (another copy of its `const`) is served from the same
 /// kept order, and a page read with nothing kept, which takes its entries out of the order it
@@ -2706,7 +2719,7 @@ fn every_ask(all: &[Entry], revision: Revision) -> Vec<Ask> {
 /// of two: `Ask { .., limit: 2, .., newest_first: true }` (the entries of the left page in the
 /// other order). With the page asking after no sighting (tracker LT-25C), every page at the held
 /// revision opens the registry's store again: `a page at the held revision opened the
-/// registry's store left: 5376 right: 0`.
+/// registry's store left: 768 right: 0`.
 #[test]
 fn a_history_page_at_a_held_revision_reads_no_record_again() {
     use super::history::{Ask, Cut, Filter};
@@ -2735,6 +2748,25 @@ fn a_history_page_at_a_held_revision_reads_no_record_again() {
     assert_eq!(kept.revision(), Some(revision));
     assert_eq!(handle.revision().unwrap(), revision);
     let asks = every_ask(&all, revision);
+    // Every ask's page is cut from the order as its definition names it, and taken out of the
+    // order (a page read with nothing kept) or copied from it (a kept one), a page is one page.
+    for ask in &asks {
+        let cut = || Cut::of(&all, revision, ask);
+        assert_eq!(
+            cut().copied(&all),
+            page_by_definition(&all, revision, ask),
+            "{ask:?}"
+        );
+        assert_eq!(cut().taken(all.clone()), cut().copied(&all), "{ask:?}");
+    }
+    // Served at the held revision, the asks of every filter, direction, length and revision, from
+    // the top and after the middle entry: a page reaches the kept order the same way whatever it
+    // asks, and only the cut above reads the ask's cursor.
+    let middle = all[all.len() / 2].cursor();
+    let served: Vec<&Ask> = asks
+        .iter()
+        .filter(|ask| ask.after.is_none_or(|after| after == middle))
+        .collect();
     // The registry's data folder, whose opens a page at the held revision makes none of.
     let folder =
         application::observe_store(&handle.paths, handle.descriptor(), |session, _, scope| {
@@ -2751,7 +2783,7 @@ fn a_history_page_at_a_held_revision_reads_no_record_again() {
             Ok(())
         },
         || {
-            for ask in &asks {
+            for &ask in &served {
                 let decoded = super::DECODED.get();
                 let page = handle.history_page_kept(ask, &mut kept).unwrap();
                 assert_eq!(
@@ -2773,15 +2805,9 @@ fn a_history_page_at_a_held_revision_reads_no_record_again() {
     let now = crate::table::store::test_sightings();
     assert_eq!(
         (now.0 - sightings.0, now.1 - sightings.1),
-        (asks.len(), asks.len()),
+        (served.len(), served.len()),
         "each page at the held revision stood on the kept order's sighting"
     );
-    // Taken out of the order (a page read with nothing kept) or copied from it (a kept one), a
-    // page is one page.
-    for ask in &asks {
-        let cut = || Cut::of(&all, revision, ask);
-        assert_eq!(cut().taken(all.clone()), cut().copied(&all), "{ask:?}");
-    }
     // The kept order is the order a read with nothing kept serves, page for page.
     for ask in asks.iter().step_by(97) {
         assert_eq!(
@@ -4395,10 +4421,31 @@ fn a_read_after_a_final_checkpoint_opens_no_body_below_it() {
 }
 
 /// Three Macs write 21,000 operations under seven final checkpoints, as
-/// [`table_outlives_operation_cap_via_checkpoint_writes`] describes; answers the lab, each Mac's
-/// handle and how many operations were written.
-fn twenty_thousand_operations_under_checkpoints() -> (Lab, Vec<Handle>, usize) {
-    operations_under_checkpoints(7, 1_000)
+/// [`table_outlives_operation_cap_via_checkpoint_writes`] describes; answers the lab with how
+/// many operations were written, and each Mac's handle. The writes run once a process, whichever
+/// test asks first, every check of [`operations_under_checkpoints`] with them, and the Macs they
+/// leave are kept for the run: each caller holds them alone until it drops the guard, and puts
+/// back what it moves. They are not copied per caller, since a table's custody holds its folder's
+/// inode and refuses a copy as a moved table.
+fn twenty_thousand_operations_under_checkpoints()
+-> (std::sync::MutexGuard<'static, (Lab, usize)>, Vec<Handle>) {
+    static BUILT: std::sync::OnceLock<std::sync::Mutex<(Lab, usize)>> = std::sync::OnceLock::new();
+    let built = BUILT
+        .get_or_init(|| {
+            let (lab, _, written) = operations_under_checkpoints(7, 1_000);
+            aterm_spec::fs_lane::remove_at_exit(lab._home.path());
+            std::sync::Mutex::new((lab, written))
+        })
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    aterm_spec::fs_lane::join();
+    let macs = built
+        .0
+        .paths
+        .iter()
+        .map(|paths| Handle::at(paths.clone(), &REGISTRY))
+        .collect();
+    (built, macs)
 }
 
 /// Three Macs write `each` operations apiece in each of `rounds` rounds, each round under a final
@@ -4517,7 +4564,8 @@ fn operations_under_checkpoints(rounds: u64, each: usize) -> (Lab, Vec<Handle>, 
 /// the writers are refused at their quota.
 #[test]
 fn table_outlives_operation_cap_via_checkpoint_writes() {
-    let (lab, macs, written) = twenty_thousand_operations_under_checkpoints();
+    let (built, macs) = twenty_thousand_operations_under_checkpoints();
+    let (lab, written) = (&built.0, built.1);
     assert!(written > 20_000, "{written}");
     let held: Vec<usize> = macs
         .iter()
@@ -4688,7 +4736,8 @@ fn history_pages_at_100000_records_cost() {
 fn a_read_from_a_final_checkpoint_applies_only_the_records_above_it_and_equals_the_full_read_at_20000_operations()
  {
     use crate::crypto::test_cipher_constructions;
-    let (lab, macs, written) = twenty_thousand_operations_under_checkpoints();
+    let (built, macs) = twenty_thousand_operations_under_checkpoints();
+    let (lab, written) = (&built.0, built.1);
     assert!(written > 20_000, "{written}");
     let here = &macs[0];
     let below = application::observe_store(&lab.paths[0], here.descriptor(), |_, store, _| {
@@ -4708,10 +4757,21 @@ fn a_read_from_a_final_checkpoint_applies_only_the_records_above_it_and_equals_t
     let (floored, opened) = read();
     let cold = files_named(&lab._home.path().join("m1"), "cold");
     assert_eq!(cold.len(), 1, "{cold:?}");
-    let aside = cold[0].with_file_name("cold.aside");
-    std::fs::rename(&cold[0], &aside).unwrap();
+    // Put back for the next test of these Macs, whether or not the read below panics.
+    struct Aside([PathBuf; 2]);
+    impl Drop for Aside {
+        fn drop(&mut self) {
+            let [cold, aside] = &self.0;
+            let back = std::fs::rename(aside, cold);
+            if !std::thread::panicking() {
+                back.unwrap();
+            }
+        }
+    }
+    let aside = Aside([cold[0].clone(), cold[0].with_file_name("cold.aside")]);
+    std::fs::rename(&aside.0[0], &aside.0[1]).unwrap();
     let (full, opened_all) = read();
-    std::fs::rename(&aside, &cold[0]).unwrap();
+    drop(aside);
     assert_eq!(
         opened_all - opened,
         below - 1,
@@ -7614,6 +7674,451 @@ fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
             awaited.contains(&named) && awaited.contains(&later),
             "{awaited:?}"
         );
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// `table`'s state as `log` holds it, read from `base`, the state at `log`'s settled floor, and
+/// the records above that floor ([`crate::typed::state::State::fold`]); `resolved` is the whole
+/// log's resolution.
+fn state_above(
+    table: &'static Table,
+    log: &Log,
+    resolved: &Resolved,
+    base: &crate::typed::state::State,
+) -> crate::typed::state::State {
+    let frontier = log.settled_frontier().expect("the log has a settled floor");
+    let (eligible, merges) = log.eligible_and_merges();
+    let ops: Vec<Op> = eligible
+        .into_iter()
+        .filter(|(operation, _)| !log.is_settled(&operation.header.id))
+        .filter_map(|(operation, command)| Op::from_eligible(0, operation, command))
+        .collect();
+    let merges: Vec<(Actor, u64)> = merges
+        .into_iter()
+        .filter(|(actor, sequence)| {
+            frontier
+                .get(actor)
+                .is_none_or(|tip| *sequence > tip.sequence)
+        })
+        .collect();
+    crate::typed::state::State::fold(
+        table,
+        Some(base),
+        &ops,
+        &merges,
+        resolved.carried_records(),
+        log.unwritable(|id| !log.is_settled(id)),
+        |roster: &Digest, actor: &Actor| {
+            resolved.bindings.get(&(*roster, *actor)).copied().flatten()
+        },
+    )
+    .0
+}
+
+/// A read from the state at the floor equals the full read (tracker LT-B10D2, design §5, "The
+/// state at F serves every registry reader"). Mac 0 writes the second registry generation 20 days
+/// ago: 20 automatic records (machine facts and account observations), owner records, a schema
+/// row and an archived row carrying a record of the first generation. Its pass signs a checkpoint
+/// of all of it, final at once since Mac 0 is the only member whose frontier tip is recent. Above
+/// the floor it writes 8 more automatic records (the last 4 past its quota of 24), owner records,
+/// schema rows that raise one collection's version and split another's, a request id reused with
+/// another command, the same carried record archived again and a second one archived. Then:
+///
+/// - the state at the floor, read from exactly the cut, digests to the state the checkpoint
+///   signed (its cells and every part below), and does so still with a record above
+///   the floor unavailable here;
+/// - that state, with the records above the floor folded in, is the state the full read folds
+///   from every record: the owned rows of this generation and the carried rows apart, the quota
+///   counters, the schema rows and the facts (first writes, records touching a collection, the
+///   writers with refused history);
+/// - the full read's quota, schema, carried rows and facts are the ones the records say: the
+///   quota continues across the floor, the first machine-facts write is below it.
+///
+/// NEGATIVE CONTROL, run once: `State::fold` charging each writer from a fresh counter in place
+/// of its base's (`owned::charge(table, &mut Counter::default(), …)`) fails `the fold from the
+/// state at the floor`: the folded account row is `n` 37, a record past the quota, where the full
+/// read's is `n` 33. And `Log::as_of_cut` keeping every opaque writer of the whole log (its
+/// `opaque_authors` cloned) fails `the state at the floor is the cut's alone`: the writer of the
+/// unavailable record above the floor is a refused writer of the cut.
+#[test]
+fn a_view_from_the_state_at_the_floor_equals_the_full_read() {
+    use super::checkpoint::Signed;
+    use crate::{alab::registry::ACCOUNT_OBS, typed::SCHEMA};
+    use aterm_secrets::commons::hearing::{self, Ledger, Said};
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let now = aterm_time::unix_millis().unwrap();
+    let then = now - 20 * DAY;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let first = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY_2);
+    application::with_store(&lab.paths[0], true, here.descriptor(), |_, _, _| Ok(())).unwrap();
+    let me = keys::uuid32(&lab.machine(0));
+    let pk = "mc-0000000000000001";
+    let facts = |n: u64| Change {
+        collection: MACHINE_FACTS.name.into(),
+        key: me.clone(),
+        value: Some(json!({"r": 1, "n": n, "mac": pk, "label": format!("m{n}")})),
+    };
+    let observed = |account: &str, n: u64| Change {
+        collection: ACCOUNT_OBS.name.into(),
+        key: format!("{account}.{me}"),
+        value: Some(json!({"r": 1, "n": n})),
+    };
+    let schema = |collection: &str, version: u64, note: &str| Change {
+        collection: SCHEMA.into(),
+        key: collection.into(),
+        value: Some(json!({"r": version, "note": note})),
+    };
+    let write = |request: [u8; 16], changes: Vec<Change>, at: u64| {
+        append_history_at(
+            &here,
+            Command::Write {
+                request,
+                changes,
+                said: None,
+            },
+            at,
+        )
+    };
+    let numbered = |n: u64| {
+        let mut request = [0; 16];
+        request[..8].copy_from_slice(&n.to_le_bytes());
+        request
+    };
+    // Two first-generation records of Mac 0, never ingested: only archived rows carry them.
+    let (kept, kept_wire) = sealed_record(&first, 7, vec![observed("ac-carried1", 1)], 7_000);
+    let (later, later_wire) = sealed_record(&first, 8, vec![observed("ac-carried2", 1)], 8_000);
+
+    // At or below the floor.
+    let first_facts = write(numbered(1), vec![facts(1)], then);
+    for n in 2..=20 {
+        let change = if n % 2 == 0 {
+            facts(n)
+        } else {
+            observed("ac-0000000000000001", n)
+        };
+        write(numbered(n), vec![change], then + n);
+    }
+    write(
+        numbered(21),
+        vec![put(&MACHINE, MC, "nickname", json!("one"))],
+        then + 21,
+    );
+    write(numbered(22), vec![schema("machine", 1, "below")], then + 22);
+    archive(&here, 30, kept, &kept_wire);
+    write(
+        numbered(23),
+        vec![put(&MACHINE, MC, "location", json!("x"))],
+        then + 25,
+    );
+
+    let bootstrap = lab.bootstrap(0);
+    let access = bootstrap.access().unwrap().unwrap();
+    let mut ready = Ledger::new(bootstrap.trust());
+    for member in access.members() {
+        ready.record(
+            member.binding().actor(),
+            now,
+            Said::Version(hearing::READS_CHECKPOINTS),
+        );
+    }
+    assert_eq!(
+        here.checkpoint_every(&ready, now, 1).unwrap(),
+        Signed::Proposed
+    );
+    let floor = application::observe_store(&lab.paths[0], here.descriptor(), |_, store, _| {
+        Ok(store.floor().cloned())
+    })
+    .unwrap()
+    .expect("the pass records the final checkpoint as the floor");
+
+    // Above it.
+    for n in 31..=38 {
+        let change = if n % 2 == 0 {
+            facts(n)
+        } else {
+            observed("ac-0000000000000001", n)
+        };
+        write(numbered(n), vec![change], now + n);
+    }
+    let renamed = write(
+        numbered(39),
+        vec![put(&MACHINE, MC, "nickname", json!("two"))],
+        now + 39,
+    );
+    write(numbered(40), vec![schema("machine", 2, "above")], now + 40);
+    write(numbered(41), vec![schema("provider", 1, "one")], now + 41);
+    write(numbered(42), vec![schema("provider", 1, "two")], now + 42);
+    write(
+        [202; 16],
+        vec![put(&MACHINE, MC, "nickname", json!("c"))],
+        now + 43,
+    );
+    write(
+        [202; 16],
+        vec![put(&MACHINE, MC, "nickname", json!("d"))],
+        now + 44,
+    );
+    archive(&here, 50, kept, &kept_wire);
+    archive(&here, 51, later, &later_wire);
+
+    application::observe_store(&lab.paths[0], here.descriptor(), |session, store, scope| {
+        let table = REGISTRY_2.table;
+        let log = Log::read_with(session, store, scope, REGISTRY_2.decoder())?;
+        assert_eq!(
+            log.settled_frontier(),
+            Some(&floor.frontier),
+            "the settled floor"
+        );
+        let resolved = Resolved::read(table, session, &log)?;
+        let full = View::of(table, &log, &resolved);
+        let tips: BTreeSet<Digest> = floor.frontier.values().map(|tip| tip.digest).collect();
+        let mut cut = tips.clone();
+        for tip in &tips {
+            cut.extend(log.causal_index().ancestors(tip));
+        }
+
+        // The state at the floor is the state the checkpoint signed.
+        let (at_floor, claims) = super::checkpoint::at_cut(table, session, &log, &cut)?;
+        let base = at_floor.state.clone().settled(table);
+        let index = log.causal_index();
+        let cells = crate::checkpoint::cells_digest(&at_floor.cells, |id| {
+            index.get(id).map(|header| (header.actor, header.sequence))
+        })?;
+        assert_eq!(
+            super::checkpoint::digest(cells, &base, &claims)?,
+            floor.state,
+            "the state digest is what the checkpoint signs"
+        );
+
+        // A record above the floor this Mac cannot read leaves the state at it as it was.
+        assert_eq!(
+            super::checkpoint::state(table, session, &log.with_quarantined(&renamed), &cut)?,
+            floor.state,
+            "the state at the floor is the cut's alone"
+        );
+
+        // The fold from it is the full read's.
+        let folded = state_above(table, &log, &resolved, &base);
+        assert_eq!(folded, full.state, "the fold from the state at the floor");
+
+        // And the full read's parts are what the records say.
+        let actor = session.actor();
+        let counter = full.state.quota[&actor];
+        assert_eq!(
+            (counter.spent, full.quota.over.len()),
+            (Some(28), 4),
+            "the quota continues across the floor"
+        );
+        assert_eq!(
+            (base.quota[&actor].spent, base.quota[&actor].merges_after),
+            (Some(20), 0)
+        );
+        assert_eq!(
+            full.state.first[&(actor, MACHINE_FACTS.name.to_owned(), me.clone())].operation,
+            first_facts,
+            "the first machine-facts write is below the floor"
+        );
+        assert_eq!(
+            full.state.touched[&(actor, ACCOUNT_OBS.name.to_owned())],
+            9 + 4
+        );
+        assert!(
+            base.refused.is_empty() && full.state.refused.contains(&actor),
+            "the reused request id above the floor refuses its writer"
+        );
+        assert_eq!(
+            (full.schema("machine"), full.schema("provider")),
+            (
+                crate::typed::owned::SchemaState::One {
+                    version: 2,
+                    row: json!({"r": 2, "note": "above"})
+                },
+                crate::typed::owned::SchemaState::Split { version: 1 }
+            )
+        );
+        assert_eq!(base.carried_ids, BTreeSet::from([kept]));
+        assert_eq!(full.state.carried_ids, BTreeSet::from([kept, later]));
+        let accounts = &full.owned[ACCOUNT_OBS.name].rows;
+        assert!(
+            accounts.contains_key(&format!("ac-carried1.{me}"))
+                && accounts.contains_key(&format!("ac-carried2.{me}")),
+            "the carried rows: {:?}",
+            accounts.keys().collect::<Vec<_>>()
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A claim held across a final checkpoint reads from the state at the floor as from the full
+/// history (tracker LT-B10D3, design §5, "The state at F serves every registry reader"). Mac 0
+/// writes the registry's machines 20 days ago: A takes label `m7`, B contends for it, A releases
+/// it, B releases it by retiring, A retakes it, B is revived (which reasserts its `m7` after A's
+/// retake), A releases and retakes it again (after B's revival), and B writes `m7` again, so B's
+/// claim at the floor is a tenure that began at its revival and continues through a later write.
+/// D is born with `m5`. Its pass signs a checkpoint of all of it, final at once. Above the floor
+/// A writes `m7` again (its tenure from its last retake goes on), C is born with `m7`, B writes
+/// its row live again (it stays in the period its revival began), and D is retired and revived.
+/// Then:
+///
+/// - the claims at the floor (each claimed coordinate's latest writes with their tenures' starts
+///   and the rows' lifecycle there) are in the state the checkpoint signed;
+/// - a read of the records above the floor that takes every claim and lifecycle write at or
+///   below it from those claims projects the machines, claims and settlements included, as the
+///   read of every record does;
+/// - and that read is what the records say: B holds `m7` from its revival, before A's last
+///   retake and C's birth, and D holds `m5` again.
+///
+/// NEGATIVE CONTROL, run once: `Floor::at` keeping each latest write with `starts` of
+/// `Some(BTreeSet::from([id]))` (every kept write begins its tenure) fails `the claims from the
+/// floor`: B's tenure begins at its write after A's last retake, so A reads `m7`. And
+/// `Activity::read_inner` seeding no kept lifecycle write (`seed.kept.rows` unread) fails it too:
+/// B's live write above the floor then begins from the initial period, which its revival's claim
+/// is not in, so B's claim is withheld and A reads `m7`.
+#[test]
+fn a_claim_held_across_a_final_checkpoint_reads_from_the_state_at_the_floor() {
+    use super::checkpoint::Signed;
+    use aterm_secrets::commons::hearing::{self, Ledger, Said};
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let now = aterm_time::unix_millis().unwrap();
+    let then = now - 20 * DAY;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY_2);
+    application::with_store(&lab.paths[0], true, here.descriptor(), |_, _, _| Ok(())).unwrap();
+    let [a, b, c, d] = [
+        "mc-000000000000000a",
+        "mc-000000000000000b",
+        "mc-000000000000000c",
+        "mc-000000000000000d",
+    ];
+    let born = |pk: &str, label: &str| {
+        let mut row = machine(pk);
+        row[0] = put(&MACHINE, pk, "label", json!(label));
+        row
+    };
+    let label = |pk: &str, label: &str| vec![put(&MACHINE, pk, "label", json!(label))];
+    let lifecycle = |pk: &str, row: &str| vec![put(&MACHINE, pk, "row", json!(row))];
+    let mut written = 0_u64;
+    let mut write = |changes: Vec<Change>, at: u64| {
+        written += 1;
+        let mut request = [0; 16];
+        request[..8].copy_from_slice(&written.to_le_bytes());
+        append_history_at(
+            &here,
+            Command::Write {
+                request,
+                changes,
+                said: None,
+            },
+            at,
+        )
+    };
+
+    // At or below the floor.
+    write(born(a, "m7"), then + 1);
+    write(born(b, "m7"), then + 2);
+    write(label(a, "m8"), then + 3);
+    write(lifecycle(b, "retired"), then + 4);
+    write(label(a, "m7"), then + 5);
+    write(lifecycle(b, "live"), then + 6);
+    write(label(a, "m8"), then + 7);
+    write(label(a, "m7"), then + 8);
+    write(label(b, "m7"), then + 9);
+    write(born(d, "m5"), then + 10);
+
+    let bootstrap = lab.bootstrap(0);
+    let access = bootstrap.access().unwrap().unwrap();
+    let mut ready = Ledger::new(bootstrap.trust());
+    for member in access.members() {
+        ready.record(
+            member.binding().actor(),
+            now,
+            Said::Version(hearing::READS_CHECKPOINTS),
+        );
+    }
+    assert_eq!(
+        here.checkpoint_every(&ready, now, 1).unwrap(),
+        Signed::Proposed
+    );
+    let floor = application::observe_store(&lab.paths[0], here.descriptor(), |_, store, _| {
+        Ok(store.floor().cloned())
+    })
+    .unwrap()
+    .expect("the pass records the final checkpoint as the floor");
+
+    // Above it.
+    write(label(a, "m7"), now + 11);
+    write(born(c, "m7"), now + 12);
+    write(lifecycle(b, "live"), now + 13);
+    write(lifecycle(d, "retired"), now + 14);
+    write(lifecycle(d, "live"), now + 15);
+
+    application::observe_store(&lab.paths[0], here.descriptor(), |session, store, scope| {
+        let table = REGISTRY_2.table;
+        let log = Log::read_with(session, store, scope, REGISTRY_2.decoder())?;
+        assert_eq!(
+            log.settled_frontier(),
+            Some(&floor.frontier),
+            "the settled floor"
+        );
+        let full = View::read(table, session, &log)?;
+        let tips: BTreeSet<Digest> = floor.frontier.values().map(|tip| tip.digest).collect();
+        let mut cut = tips.clone();
+        for tip in &tips {
+            cut.extend(log.causal_index().ancestors(tip));
+        }
+
+        // The claims at the floor are in the state the checkpoint signed.
+        let (at_floor, claims) = super::checkpoint::at_cut(table, session, &log, &cut)?;
+        let index = log.causal_index();
+        let cells = crate::checkpoint::cells_digest(&at_floor.cells, |id| {
+            index.get(id).map(|header| (header.actor, header.sequence))
+        })?;
+        assert_eq!(
+            super::checkpoint::digest(cells, &at_floor.state.clone().settled(table), &claims)?,
+            floor.state,
+            "the state digest, claims included, is what the checkpoint signs"
+        );
+
+        // A read of the records above the floor, every claim and lifecycle write at or below it
+        // taken from the claims there.
+        let mut above = full.clone();
+        above.ops.retain(|op| !log.is_settled(&op.id));
+        assert_eq!(
+            (above.ops.len(), full.ops.len() - above.ops.len()),
+            (5, 10),
+            "the records above the floor, and those at or below it"
+        );
+        above.claims_floor = Some(std::sync::Arc::new(claims));
+        let (read, settled) = above.project_settled(&MACHINE);
+        let (whole, whole_settled) = full.project_settled(&MACHINE);
+        assert_eq!(read, whole, "the claims from the floor");
+        assert_eq!(
+            settled, whole_settled,
+            "and how each claimed column settled"
+        );
+        assert_eq!(above.project(&MACHINE), whole);
+
+        // And what the records say.
+        let label = |pk: &str| whole.rows[pk].get("label").cloned();
+        assert_eq!(
+            label(b),
+            Some(json!("m7")),
+            "B holds m7 from its revival, before A's last retake"
+        );
+        assert!(
+            [label(a), label(c)]
+                .iter()
+                .all(|held| held.is_some() && *held != Some(json!("m7"))),
+            "A and C read clash labels: {:?}",
+            [label(a), label(c)]
+        );
+        assert_eq!(label(d), Some(json!("m5")), "D is revived with its label");
         Ok(())
     })
     .unwrap();

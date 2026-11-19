@@ -350,6 +350,34 @@ impl FrontendMember<'_> {
 }
 
 impl FrontendIdentity {
+    pub(super) fn journal_data(&self) -> Vec<u8> {
+        aterm_json::to_vec(&aterm_json::json!({"sid":self.caller.sid,
+            "pid":self.process.pid,"birth":self.process.birth,
+            "image":[&self.process.image.path,self.process.image.device,self.process.image.inode],
+            "connection":self.connection.id,"member":self.member,"operation":self.operation}))
+        .expect("fixed Native controller journal data")
+    }
+    pub(super) fn process(&self) -> &Process {
+        &self.process
+    }
+    pub(super) fn on_control(&self, connection: &Connection, member: &str) -> bool {
+        self.connection.same(connection) && self.member == member
+    }
+    pub(super) fn with_foreground<T>(
+        &self,
+        master: BorrowedFd<'_>,
+        action: impl FnOnce(&FrontendMember<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let controller = FrontendController {
+            state: self.state.clone(),
+            caller: self.caller.clone(),
+            process: self.process.clone(),
+            connection: self.connection.clone(),
+            member: self.member.clone(),
+            operation: self.operation.clone(),
+        };
+        action(&controller.foreground(master)?)
+    }
     pub(super) fn check_current(&self) -> Result<(), Error> {
         FrontendController {
             state: self.state.clone(),

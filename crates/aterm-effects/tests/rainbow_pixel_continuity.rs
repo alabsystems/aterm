@@ -350,15 +350,13 @@ fn scan_ribbon_cell_holes(glow: &CursorGlow, term: &Terminal, row: u16) -> Optio
     None
 }
 
-fn make_glow_cfg(style: GlowStyle, ribbon_flat: bool, dark_theme: bool) -> GlowConfig {
+fn make_glow_cfg(style: GlowStyle, dark_theme: bool) -> GlowConfig {
     let (theme_fg, theme_bg) = if dark_theme {
         (0x00D0_D0D0, 0x0011_1318)
     } else {
         (0x001E_2028, 0x00F7_F5EE)
     };
     GlowConfig {
-        ribbon_tall: !ribbon_flat && style == GlowStyle::RainbowKitty,
-        ribbon_flat,
         dark_theme,
         theme_fg,
         theme_bg,
@@ -888,19 +886,17 @@ fn pixel_continuity_across_single_and_batched_typing_cadences() {
     ];
     let geoms = [(7, 15), (8, 16), (9, 19), (11, 22), (13, 26), (15, 28)];
     let styles = [
-        ("rk-tall-dark", GlowStyle::RainbowKitty, false, true),
-        ("rk-tall-light", GlowStyle::RainbowKitty, false, false),
-        ("rk-flat-dark", GlowStyle::RainbowKitty, true, true),
-        ("rk-flat-light", GlowStyle::RainbowKitty, true, false),
+        ("rk-tall-dark", GlowStyle::RainbowKitty, true),
+        ("rk-tall-light", GlowStyle::RainbowKitty, false),
     ];
     let dts_us = [4_100u64, 7_300, 16_667];
 
     let mut failures = Vec::new();
-    for &(sname, style, flat, dark) in &styles {
+    for &(sname, style, dark) in &styles {
         for &(cw, ch) in &geoms {
             for &dt_us in &dts_us {
                 for &(phrase, batch_pat) in phrases {
-                    let cfg = make_glow_cfg(style, flat, dark);
+                    let cfg = make_glow_cfg(style, dark);
                     let mut h = NativeHarness::new(24, 100, cw, ch, cfg, false);
                     h.feed(b"\x1b[6;3H$ ");
                     h.advance_us(16_667, 5, None, "init");
@@ -957,131 +953,119 @@ fn pixel_continuity_across_owners_phrase_and_word_boundary_pauses() {
     let mut cases = Vec::new();
     for &pause_at_space_ms in &pause_ms_cases {
         for coalesce_after_space in [1usize, 2, 3, 4] {
-            for flat in [false, true] {
-                cases.push((pause_at_space_ms, coalesce_after_space, flat));
-            }
+            cases.push((pause_at_space_ms, coalesce_after_space));
         }
     }
-    let runs = crate::common::par_map(
-        &cases,
-        |&(pause_at_space_ms, coalesce_after_space, flat)| {
-            aterm_spec::check::attempt(|| {
-                let mut failures = Vec::new();
-                let cfg = make_glow_cfg(GlowStyle::RainbowKitty, flat, true);
-                let mut h = NativeHarness::new(53, 113, 15, 28, cfg, false);
-                h.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
-                let mut comp = DiffComposer::new(53, 113, 48, true);
-                let (init_bytes, _) = comp.render_diff(None);
-                h.feed(&init_bytes);
-                h.advance_us(16_667, 47, None, "init");
+    let runs = crate::common::par_map(&cases, |&(pause_at_space_ms, coalesce_after_space)| {
+        aterm_spec::check::attempt(|| {
+            let mut failures = Vec::new();
+            let cfg = make_glow_cfg(GlowStyle::RainbowKitty, true);
+            let mut h = NativeHarness::new(53, 113, 15, 28, cfg, false);
+            h.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
+            let mut comp = DiffComposer::new(53, 113, 48, true);
+            let (init_bytes, _) = comp.render_diff(None);
+            h.feed(&init_bytes);
+            h.advance_us(16_667, 47, None, "init");
 
-                let chars: Vec<char> = phrase.chars().collect();
-                // Locate "shared state" boundary
-                let shared_end = phrase.find(" state.").expect("shared_end"); // index of ' ' before "state."
-                let mut i = 0usize;
-                while i < chars.len() {
-                    if i == shared_end && pause_at_space_ms > 0 {
-                        // Type ' ', render it, then pause before "state", OR pause before ' ' and coalesce!
+            let chars: Vec<char> = phrase.chars().collect();
+            // Locate "shared state" boundary
+            let shared_end = phrase.find(" state.").expect("shared_end"); // index of ' ' before "state."
+            let mut i = 0usize;
+            while i < chars.len() {
+                if i == shared_end && pause_at_space_ms > 0 {
+                    // Type ' ', render it, then pause before "state", OR pause before ' ' and coalesce!
+                    let frames = (pause_at_space_ms * 1000 / 16_667).max(1);
+                    for f in 0..frames {
+                        let tag = format!(
+                            "pause={pause_at_space_ms}ms coal={coalesce_after_space} hold={f}"
+                        );
+                        h.advance_us(16_667, 47, None, &tag);
+                    }
+                    let take = coalesce_after_space.min(chars.len() - i);
+                    for &c in &chars[i..i + take] {
+                        h.key_press(c);
+                        comp.apply_char(c);
+                    }
+                    let (bytes, (cr, cc)) = comp.render_diff(Some(i as u32));
+                    h.feed(&bytes);
+                    i += take;
+                    let tag = format!(
+                        "pause={pause_at_space_ms}ms coal={coalesce_after_space} after_space i={i}"
+                    );
+                    let lo = cc.saturating_sub(take as u16);
+                    h.advance_us(16_667, cr, Some((lo, cc)), &tag);
+                    continue;
+                }
+
+                h.key_press(chars[i]);
+                comp.apply_char(chars[i]);
+                let (bytes, (cr, cc)) = comp.render_diff(None);
+                h.feed(&bytes);
+                i += 1;
+                let tag = format!("pause={pause_at_space_ms}ms coal={coalesce_after_space} i={i}");
+                h.advance_us(16_667, cr, Some((cc.saturating_sub(1), cc)), &tag);
+            }
+
+            // Also test pausing AFTER typing ' ' (so ' ' belongs to Cohort A, then "state" starts Cohort B):
+            if pause_at_space_ms > 0 {
+                let mut h2 = NativeHarness::new(53, 113, 15, 28, cfg, false);
+                h2.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
+                let mut comp2 = DiffComposer::new(53, 113, 48, true);
+                let (b0, _) = comp2.render_diff(None);
+                h2.feed(&b0);
+                h2.advance_us(16_667, 47, None, "init2");
+                let mut j = 0usize;
+                while j < chars.len() {
+                    if j == shared_end + 1 {
                         let frames = (pause_at_space_ms * 1000 / 16_667).max(1);
                         for f in 0..frames {
                             let tag = format!(
-                                "pause={pause_at_space_ms}ms coal={coalesce_after_space} flat={flat} hold={f}"
+                                "post_space_pause={pause_at_space_ms}ms coal={coalesce_after_space} hold={f}"
                             );
-                            h.advance_us(16_667, 47, None, &tag);
+                            h2.advance_us(16_667, 47, None, &tag);
                         }
-                        let take = coalesce_after_space.min(chars.len() - i);
-                        for &c in &chars[i..i + take] {
-                            h.key_press(c);
-                            comp.apply_char(c);
+                        let take = coalesce_after_space.min(chars.len() - j);
+                        for &c in &chars[j..j + take] {
+                            h2.key_press(c);
+                            comp2.apply_char(c);
                         }
-                        let (bytes, (cr, cc)) = comp.render_diff(Some(i as u32));
-                        h.feed(&bytes);
-                        i += take;
+                        let (bytes, (cr, cc)) = comp2.render_diff(Some(j as u32));
+                        h2.feed(&bytes);
+                        j += take;
                         let tag = format!(
-                            "pause={pause_at_space_ms}ms coal={coalesce_after_space} flat={flat} after_space i={i}"
+                            "post_space_pause={pause_at_space_ms}ms coal={coalesce_after_space} j={j}"
                         );
-                        let lo = cc.saturating_sub(take as u16);
-                        h.advance_us(16_667, cr, Some((lo, cc)), &tag);
+                        h2.advance_us(16_667, cr, Some((cc.saturating_sub(take as u16), cc)), &tag);
                         continue;
                     }
-
-                    h.key_press(chars[i]);
-                    comp.apply_char(chars[i]);
-                    let (bytes, (cr, cc)) = comp.render_diff(None);
-                    h.feed(&bytes);
-                    i += 1;
+                    h2.key_press(chars[j]);
+                    comp2.apply_char(chars[j]);
+                    let (bytes, (cr, cc)) = comp2.render_diff(None);
+                    h2.feed(&bytes);
+                    j += 1;
                     let tag = format!(
-                        "pause={pause_at_space_ms}ms coal={coalesce_after_space} flat={flat} i={i}"
+                        "post_space_pause={pause_at_space_ms}ms coal={coalesce_after_space} j={j}"
                     );
-                    h.advance_us(16_667, cr, Some((cc.saturating_sub(1), cc)), &tag);
+                    h2.advance_us(16_667, cr, Some((cc.saturating_sub(1), cc)), &tag);
                 }
+                if !h2.gaps.is_empty() {
+                    failures.extend(h2.gaps.into_iter().take(3));
+                }
+            }
 
-                // Also test pausing AFTER typing ' ' (so ' ' belongs to Cohort A, then "state" starts Cohort B):
-                if pause_at_space_ms > 0 {
-                    let mut h2 = NativeHarness::new(53, 113, 15, 28, cfg, false);
-                    h2.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
-                    let mut comp2 = DiffComposer::new(53, 113, 48, true);
-                    let (b0, _) = comp2.render_diff(None);
-                    h2.feed(&b0);
-                    h2.advance_us(16_667, 47, None, "init2");
-                    let mut j = 0usize;
-                    while j < chars.len() {
-                        if j == shared_end + 1 {
-                            let frames = (pause_at_space_ms * 1000 / 16_667).max(1);
-                            for f in 0..frames {
-                                let tag = format!(
-                                    "post_space_pause={pause_at_space_ms}ms coal={coalesce_after_space} flat={flat} hold={f}"
-                                );
-                                h2.advance_us(16_667, 47, None, &tag);
-                            }
-                            let take = coalesce_after_space.min(chars.len() - j);
-                            for &c in &chars[j..j + take] {
-                                h2.key_press(c);
-                                comp2.apply_char(c);
-                            }
-                            let (bytes, (cr, cc)) = comp2.render_diff(Some(j as u32));
-                            h2.feed(&bytes);
-                            j += take;
-                            let tag = format!(
-                                "post_space_pause={pause_at_space_ms}ms coal={coalesce_after_space} flat={flat} j={j}"
-                            );
-                            h2.advance_us(
-                                16_667,
-                                cr,
-                                Some((cc.saturating_sub(take as u16), cc)),
-                                &tag,
-                            );
-                            continue;
-                        }
-                        h2.key_press(chars[j]);
-                        comp2.apply_char(chars[j]);
-                        let (bytes, (cr, cc)) = comp2.render_diff(None);
-                        h2.feed(&bytes);
-                        j += 1;
-                        let tag = format!(
-                            "post_space_pause={pause_at_space_ms}ms coal={coalesce_after_space} flat={flat} j={j}"
-                        );
-                        h2.advance_us(16_667, cr, Some((cc.saturating_sub(1), cc)), &tag);
-                    }
-                    if !h2.gaps.is_empty() {
-                        failures.extend(h2.gaps.into_iter().take(3));
-                    }
-                }
-
-                if !h.gaps.is_empty() {
-                    failures.extend(h.gaps.into_iter().take(3));
-                }
-                failures
-            })
-        },
-    );
+            if !h.gaps.is_empty() {
+                failures.extend(h.gaps.into_iter().take(3));
+            }
+            failures
+        })
+    });
     let failures: Vec<String> = cases
         .iter()
         .zip(runs)
-        .flat_map(|(&(pause, coalesce, flat), run)| {
+        .flat_map(|(&(pause, coalesce), run)| {
             run.unwrap_or_else(|why| {
                 vec![format!(
-                    "pause={pause}ms coal={coalesce} flat={flat}: the case panicked: {why}"
+                    "pause={pause}ms coal={coalesce}: the case panicked: {why}"
                 )]
             })
         })
@@ -1108,7 +1092,7 @@ fn pixel_continuity_across_tui_diff_spaces_status_prints_and_torn_frames() {
     for &visible_caret in &[true, false] {
         for &status_mode in &[0u8, 1, 2] {
             for &stall_us in &[0u64, 8_000, 200_000] {
-                let cfg = make_glow_cfg(GlowStyle::RainbowKitty, false, true);
+                let cfg = make_glow_cfg(GlowStyle::RainbowKitty, true);
                 let mut h = NativeHarness::new(53, 113, 15, 28, cfg, false);
                 h.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
                 let mut comp = DiffComposer::new(53, 113, 48, visible_caret);
@@ -1159,7 +1143,7 @@ fn pixel_continuity_across_tui_diff_spaces_status_prints_and_torn_frames() {
     // row 0 while status row 0 updates AND the user's typed keystroke echoes on composer row 47
     // (`echo_anchor_pass`, matching `zsh_isearch_band.rs`).
     {
-        let cfg = make_glow_cfg(GlowStyle::RainbowKitty, false, true);
+        let cfg = make_glow_cfg(GlowStyle::RainbowKitty, true);
         let mut h = NativeHarness::new(53, 113, 15, 28, cfg, false);
         h.feed(
             b"\x1b[?1049h\x1b[2J\x1b[H\x1b[1;2Hspin   0s\x1b[48;2H\xe2\x9d\xaf \x1b[1;13H\x1b[?25h",
@@ -1189,7 +1173,7 @@ fn pixel_continuity_across_tui_diff_spaces_status_prints_and_torn_frames() {
     // cursor-relative jumps, `ROW - 3` spinner, `cc_idle_frame` status erase, and 64-byte PTY
     // chunking across frames):
     for &pty_chunk in &[0usize, 64] {
-        let cfg = make_glow_cfg(GlowStyle::RainbowKitty, false, true);
+        let cfg = make_glow_cfg(GlowStyle::RainbowKitty, true);
         let mut h = NativeHarness::new(53, 113, 15, 28, cfg, false);
         let row: u16 = 47;
         let col0: u16 = 3;
@@ -1271,7 +1255,7 @@ fn pixel_continuity_across_tui_diff_spaces_status_prints_and_torn_frames() {
     // and 2-part split redraw (`head` without `?2026h` + 3ms split + `tail` CUP):
     for &hidden_caret in &[false, true] {
         for &cursor_cell in &[false, true] {
-            let cfg = make_glow_cfg(GlowStyle::RainbowKitty, false, true);
+            let cfg = make_glow_cfg(GlowStyle::RainbowKitty, true);
             let mut h = NativeHarness::new(53, 113, 15, 28, cfg, false);
             let row: u16 = 47;
             let col0: usize = 2;
@@ -1311,7 +1295,7 @@ fn pixel_continuity_across_tui_diff_spaces_status_prints_and_torn_frames() {
     // past `TYPE_HINT_FRESH_DUR`) before the rest of the batch arrived together:
     for &batch in &[" s", " st", " sta", " state"] {
         for &space_stall_us in &[0u64, 120_000, 220_000] {
-            let cfg = make_glow_cfg(GlowStyle::RainbowKitty, false, true);
+            let cfg = make_glow_cfg(GlowStyle::RainbowKitty, true);
             let mut h = NativeHarness::new(24, 100, 12, 24, cfg, false);
             h.feed(b"\x1b[6;3H> ");
             h.advance_us(16_667, 5, None, "init");
@@ -1346,7 +1330,7 @@ fn pixel_continuity_across_tui_diff_spaces_status_prints_and_torn_frames() {
     // 6. `InputEvent::Text` / glyph-less credit path (`ime_text_mode = true`) in a TUI
     // diff-renderer that skips unchanged spaces and coalesces frames:
     for &coal in &[1usize, 2, 3] {
-        let cfg = make_glow_cfg(GlowStyle::RainbowKitty, false, true);
+        let cfg = make_glow_cfg(GlowStyle::RainbowKitty, true);
         let mut h = NativeHarness::new(53, 113, 15, 28, cfg, false);
         h.ime_text_mode = true;
         h.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
@@ -1384,7 +1368,7 @@ fn pixel_continuity_across_tui_diff_spaces_status_prints_and_torn_frames() {
 #[test]
 fn pixel_continuity_across_backspaces_retypes_glides_and_wraps() {
     let mut failures = Vec::new();
-    let cfg = make_glow_cfg(GlowStyle::RainbowKitty, false, true);
+    let cfg = make_glow_cfg(GlowStyle::RainbowKitty, true);
 
     // 1. Backspace across space + word boundary and immediate retyping:
     for &erase_n in &[1usize, 2, 3, 5, 8] {

@@ -1033,9 +1033,11 @@ fn a_dump_holding_a_stored_mark_cannot_clear_a_password() {
     assert_eq!(row["password"], json!("real-password"));
 }
 
-/// NEGATIVE CONTROL: with `refuse_unfinished` out of the round, the peer's older row lands in
+/// NEGATIVE CONTROLS: with `refuse_unfinished` out of the round, the peer's older row lands in
 /// the partial dataset and stands through the rerun:
-/// `` called `Result::unwrap_err()` on an `Ok` value ``.
+/// `` called `Result::unwrap_err()` on an `Ok` value ``; observed, with
+/// `sync_fleet_round_with` handing its exchange `dialed.transport.stream()` uncounted,
+/// `` the fleet round's deadline counted Some(0) moves ``.
 #[test]
 fn no_round_feeds_a_dataset_a_cut_short_rekey_is_still_moving() {
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -1079,8 +1081,15 @@ fn no_round_feeds_a_dataset_a_cut_short_rekey_is_still_moving() {
     let rows = scan_table(&db.view(), "computers").unwrap();
     assert_eq!(rows["m1"]["notes"], json!("only here"));
     drop(db);
-    // Once it has finished, a round carries rows as before and both values show.
+    // Once it has finished, a round carries rows as before and both values show, its stream's
+    // bytes counted as its progress.
+    network::LAST_MOVES.with(std::cell::Cell::take);
     network::sync_fleet_round_with(&a, addr, &mut repair).unwrap();
+    let dialed = network::LAST_MOVES.with(std::cell::Cell::take);
+    assert!(
+        dialed.is_some_and(|moves| moves > 0),
+        "the fleet round's deadline counted {dialed:?} moves"
+    );
     stop.set();
     let _ = server.join();
     let db = Database::open(&a).unwrap();

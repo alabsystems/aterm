@@ -29,6 +29,8 @@ const SETTLE: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// The two sessions the tests host.
 const ONE: &str = "t0000000001";
 const TWO: &str = "t0000000002";
+/// A claim's child pid the stand-in kernel reads keep nothing of: the claim stands without it.
+const UNKEPT: u32 = 4999;
 /// A session no test hosts.
 const ELSEWHERE: &str = "t00000000zz";
 
@@ -135,9 +137,23 @@ struct Entered {
 
 /// The lanes' service: the shipping gates and reader over a real store, a frozen clock the test
 /// moves, the connections whose claims the lanes released, and what each stream lane entered.
+/// It is the world aterm's harness watchdog reads, too ([`crate::harness_watchdog::World`]).
 struct Service {
     store: Store,
     clock: AtomicU64,
+    /// The awake clock at the machine's last wake, plus one (`0`: none).
+    woke: AtomicU64,
+    /// What the kernel reports of the claimant's stop state.
+    stopped: Mutex<Option<bool>>,
+    /// The watchdog's `quiet=`, in milliseconds.
+    quiet_ms: AtomicU64,
+    /// The policy's `stall_term_after_s`, in milliseconds (`0`: never), which the progress watch
+    /// reads: 600 s, the policy's default, until a test says otherwise.
+    stall_after_ms: AtomicU64,
+    /// The policy's `stall_term`: on, the policy's default, until a test says otherwise.
+    stall_term: std::sync::atomic::AtomicBool,
+    /// What each watchdog act waited out, in order.
+    waited: Mutex<Vec<(crate::harness_watchdog::Act, crate::harness_watchdog::Hand)>>,
     released: Mutex<Vec<u64>>,
     entered: Mutex<Vec<Entered>>,
     /// What the stand-in proof answers a `claim` record's line: the claimant and the version of
@@ -149,6 +165,20 @@ struct Service {
     /// unchecked, so nothing agrees, until a test says otherwise.
     repo: Mutex<aterm_agent::harness::repo_work::RepoRead>,
     left: Mutex<aterm_agent::harness::leftover::LeftRead>,
+    /// Each relaunch's back-off, in order: waited out by nobody, as the awake clock is the test's.
+    paused: Mutex<Vec<Duration>>,
+    /// What happens on the tab while a relaunch waits its back-off, once per pause: a test's
+    /// stand-in for a person or another ending acting meanwhile.
+    meanwhile: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// What the kept child's snapshot reads as the watchdog ends its harness
+    /// ([`crate::harness_watchdog::World::snapshot`]): `None`, nothing.
+    snapshot: Mutex<Option<crate::session_timeline::Resume>>,
+    /// Each relaunch's words, as the typer was handed them.
+    typed: Mutex<Vec<Vec<String>>>,
+    /// Each relaunch's directory, as the typer was handed it.
+    typed_cwd: Mutex<Vec<Option<String>>>,
+    /// What the typer answers, one per line handed to it: past them, it types the line.
+    typer: Mutex<std::collections::VecDeque<aterm_agent::harness::relaunch_type::RunLineRefusal>>,
 }
 
 /// The version the stand-in proof admits: no claim and no record states it.
@@ -192,7 +222,7 @@ impl Service {
             super::super::serving_connection(),
             &|_, _| proof.clone(),
             &|_, word| {
-                Some(crate::harness_claim::KeptChild {
+                (word.pid != UNKEPT).then(|| crate::harness_claim::KeptChild {
                     pid: word.pid,
                     claimed_us: word.start_us,
                     birth: aterm_uds::process::Birth(word.start_us),
@@ -250,6 +280,105 @@ impl Service {
         match place_as(&handle, contract_no, &duties, conn, proven, row, login) {
             Ok(()) => "OK claim".to_string(),
             Err(refusal) => format!("ERR {}", refusal.trim_end()),
+        }
+    }
+}
+
+impl crate::harness_watchdog::World for Service {
+    fn awake_ms(&self) -> Option<u64> {
+        Some(self.clock.load(Ordering::Acquire))
+    }
+
+    fn woke_ms(&self) -> Option<u64> {
+        self.woke.load(Ordering::Acquire).checked_sub(1)
+    }
+
+    fn stopped(&self, _pid: u32) -> Option<bool> {
+        *self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The claimant is the shared stand-in every test proves: the watchdog reads it as gone,
+    /// so it never signals it.
+    fn alive(&self, _proven: &Proven) -> bool {
+        false
+    }
+
+    fn quiet(&self) -> Duration {
+        Duration::from_millis(self.quiet_ms.load(Ordering::Acquire))
+    }
+
+    fn look_again(&self) -> Duration {
+        Duration::from_millis(5)
+    }
+
+    fn stall_after(&self) -> Option<Duration> {
+        match self.stall_after_ms.load(Ordering::Acquire) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    fn stall_term(&self) -> bool {
+        self.stall_term.load(Ordering::Acquire)
+    }
+
+    fn waits(
+        &self,
+        _sid: &str,
+        act: crate::harness_watchdog::Act,
+        hand: crate::harness_watchdog::Hand,
+    ) {
+        self.waited
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((act, hand));
+    }
+
+    fn snapshot(&self, _sid: &str, _pid: u32) -> Option<crate::session_timeline::Resume> {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn pause(&self, _sid: &str, pause: Duration, stands: &dyn Fn() -> bool) -> bool {
+        self.paused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(pause);
+        if let Some(meanwhile) = self
+            .meanwhile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            meanwhile();
+        }
+        stands()
+    }
+
+    fn type_run(
+        &self,
+        _sid: &str,
+        words: &[String],
+        cwd: Option<&str>,
+    ) -> Result<(), aterm_agent::harness::relaunch_type::RunLineRefusal> {
+        self.typed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(words.to_vec());
+        self.typed_cwd
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(cwd.map(ToString::to_string));
+        match self
+            .typer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+        {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
         }
     }
 }
@@ -351,7 +480,7 @@ impl LaneService for Service {
             stream,
             buffered,
             &super::Services {
-                now_ms: &|| self.clock.load(Ordering::Acquire),
+                world: self,
                 claims: &|handle, rest| self.claim_line(handle, rest),
                 post: &|_| {},
                 landed: &|handle, proven| {
@@ -390,7 +519,8 @@ impl LaneService for Service {
 struct Client {
     stream: CtlStream,
     reader: BufReader<CtlStream>,
-    /// The records aterm sent as the stream opened: its `hand` and its `policy`.
+    /// The records aterm sent as the stream opened: its `hand`, its `want` where the tab's Out
+    /// ring held none of the claimant's conversation, and its `policy`.
     opening: Vec<Record>,
     /// aterm's own records heard since, oldest first, while the client waited for something
     /// else ([`Self::ack`]) or for one of them ([`Self::own`]).
@@ -427,9 +557,9 @@ impl Client {
             .unwrap_or_else(|| panic!("who answered {reply}"))
     }
 
-    /// Open `sid`'s stream, which must open: the reply's `(epoch, acked, in)`. The `hand` and
-    /// the `policy` aterm sends as every stream opens are read too, numbered after `in`, and
-    /// kept in [`Self::opening`].
+    /// Open `sid`'s stream, which must open: the reply's `(epoch, acked, in)`. The `hand`, the
+    /// `want` and the `policy` aterm sends as a stream opens are read too, numbered after `in`,
+    /// and kept in [`Self::opening`].
     fn open(&mut self, sid: &str) -> StreamReply {
         let reply = self.request(&format!("stream @{sid} v=1"));
         let opened = StreamReply::parse(&reply).unwrap_or_else(|error| panic!("{reply}: {error}"));
@@ -437,20 +567,40 @@ impl Client {
         opened
     }
 
-    /// Read the two records aterm sends as a stream opens, after the `OK` that said `opened`.
+    /// Read the records aterm sends as a stream opens, after the `OK` that said `opened`: its
+    /// `hand`, then a `want` where the tab's Out ring holds none of the claimant's conversation,
+    /// then its `policy`, which always comes and ends the opening.
     fn opened(&mut self, opened: &StreamReply) {
         let hand = self.own();
         assert!(
             matches!(hand.body, Body::Hand { .. }) && hand.seq == opened.sent + 1,
             "the opening hand: {hand:?}"
         );
-        let policy = self.own();
+        let mut opening = vec![hand];
+        let mut next = self.own();
+        if next.body == Body::Want {
+            assert_eq!(next.seq, opened.sent + 2, "the opening want");
+            opening.push(next);
+            next = self.own();
+        }
+        let seq = opened.sent + 1 + opening.len() as u64;
         assert_eq!(
-            (policy.seq, policy.body.clone()),
-            (opened.sent + 2, Body::Policy),
+            (next.seq, next.body.clone()),
+            (seq, Body::Policy),
             "the opening policy"
         );
-        self.opening = vec![hand, policy];
+        opening.push(next);
+        self.opening = opening;
+    }
+
+    /// Whether aterm asked for the conversation as the stream opened (`want`).
+    fn wanted(&self) -> bool {
+        self.opening.iter().any(|record| record.body == Body::Want)
+    }
+
+    /// The last record of the opening: its `policy`.
+    fn opening_end(&self) -> u64 {
+        self.opening.last().map_or(0, |record| record.seq)
     }
 
     /// The next line as a record of aterm's: `Ok` for one of its own, `Err` with the line for
@@ -543,6 +693,12 @@ impl Rig {
         let service = Arc::new(Service {
             store,
             clock: AtomicU64::new(1_000),
+            woke: AtomicU64::new(0),
+            stopped: Mutex::new(None),
+            quiet_ms: AtomicU64::new(0),
+            stall_after_ms: AtomicU64::new(600_000),
+            stall_term: std::sync::atomic::AtomicBool::new(true),
+            waited: Mutex::new(Vec::new()),
             released: Mutex::new(Vec::new()),
             entered: Mutex::new(Vec::new()),
             proof: Mutex::new(Some(crate::harness_claim::ClaimProof {
@@ -552,6 +708,12 @@ impl Rig {
             lines: Mutex::new(Vec::new()),
             repo: Mutex::new(aterm_agent::harness::repo_work::RepoRead::Unread),
             left: Mutex::new(aterm_agent::harness::leftover::LeftRead::Unchecked),
+            paused: Mutex::new(Vec::new()),
+            meanwhile: Mutex::new(None),
+            snapshot: Mutex::new(None),
+            typed: Mutex::new(Vec::new()),
+            typed_cwd: Mutex::new(Vec::new()),
+            typer: Mutex::new(std::collections::VecDeque::new()),
         });
         lanes.publish(Arc::clone(&service) as Arc<dyn LaneService>);
         started.activate();
@@ -642,16 +804,6 @@ impl Rig {
     }
 }
 
-/// A record of a kind the grant `state` covers and this aterm does not apply yet: a `msg`
-/// (HX-15h applies it, and names another kind here).
-fn unapplied() -> Body {
-    Body::Msg {
-        turn: None,
-        by: alab_wire::record::By::Harness,
-        text: "the stream split".to_string(),
-    }
-}
-
 fn title() -> Body {
     Body::Title {
         title: Some("the stream split".to_string()),
@@ -671,9 +823,10 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
     let opened = first.open(ONE);
     assert_eq!(opened.epoch, crate::control_auth::process_instance_id());
     assert_eq!((opened.acked, opened.sent), (0, 0));
-    assert_eq!(first.record(1, unapplied()), (1, None));
+    assert_eq!(first.record(1, title()), (1, None));
     assert_eq!(first.record(2, Body::Beat), (2, None));
     assert_eq!(first.record(3, title()), (3, None));
+    let first_opening = first.opening.len() as u64;
     drop(first);
     rig.ended(id);
 
@@ -684,8 +837,8 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
     assert_eq!(reopened.epoch, opened.epoch);
     assert_eq!(reopened.acked, 3, "the kept acked, not a fresh stream's");
     assert_eq!(
-        reopened.sent, 2,
-        "aterm's two opening records of the first stream, in the same epoch"
+        reopened.sent, first_opening,
+        "aterm's opening records of the first stream, in the same epoch"
     );
     let before = rig.state(ONE);
     assert_eq!(
@@ -700,7 +853,7 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
         "a resent record is applied once"
     );
     assert_eq!(resent.dropped, before.dropped + 2);
-    assert_eq!(again.record(4, unapplied()), (4, None), "acked+1 is taken");
+    assert_eq!(again.record(4, title()), (4, None), "acked+1 is taken");
     assert_eq!(rig.state(ONE).acked, 4);
 
     // A new epoch (another aterm instance) starts `in` at 0 and keeps what was acknowledged;
@@ -731,7 +884,7 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
     let fresh = stranger.open(ONE);
     assert_eq!((fresh.acked, fresh.sent), (0, 0));
     assert_eq!(
-        stranger.record(1, unapplied()),
+        stranger.record(1, title()),
         (1, None),
         "its first record is not a resend"
     );
@@ -858,7 +1011,7 @@ fn a_claim_gone_before_the_ok_closes_with_no_line() {
         &server,
         Vec::new(),
         &super::Services {
-            now_ms: &|| 0,
+            world: &crate::harness_watchdog::Live::POLICY,
             claims: &|_, _| String::new(),
             post: &|_| {},
             landed: &|_, _| {},
@@ -919,15 +1072,12 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
         resets_ms: None,
     };
     assert_eq!(client.record(6, wall), (6, Some("scope".to_string())));
-    assert_eq!(client.record(7, unapplied()), (7, None));
-    assert_eq!(rig.state(ONE).unapplied, 1, "the granted record was taken");
+    assert_eq!(client.record(7, title()), (7, None));
+    assert_eq!(rig.state(ONE).titles, 1, "the granted record was taken");
 
     // The budget: the burst is 500 at one instant. The two lines over the bound spent none of
     // it, and neither does a resend; five records did.
-    assert_eq!(
-        client.record(7, unapplied()),
-        (7, Some("applied".to_string()))
-    );
+    assert_eq!(client.record(7, title()), (7, Some("applied".to_string())));
     let burst = u64::from(RATE_BURST);
     for seq in 8..=burst + 2 {
         assert_eq!(client.record(seq, Body::Beat), (seq, None));
@@ -954,13 +1104,13 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
     // record dropped in between took nothing of what had come back.
     rig.service.clock.store(1_019, Ordering::Release);
     assert_eq!(
-        client.record(over + 1, unapplied()),
+        client.record(over + 1, title()),
         (over + 1, Some("rate".to_string()))
     );
     rig.service.clock.store(1_020, Ordering::Release);
-    assert_eq!(client.record(over + 2, unapplied()), (over + 2, None));
+    assert_eq!(client.record(over + 2, title()), (over + 2, None));
     assert_eq!(
-        client.record(over + 3, unapplied()),
+        client.record(over + 3, title()),
         (over + 3, Some("rate".to_string()))
     );
     // A sender a little over the rate (a record every 19 ms) keeps nearly all of them.
@@ -970,7 +1120,7 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
             .clock
             .store(1_020 + step * 19, Ordering::Release);
         let seq = over + 3 + step;
-        match client.record(seq, unapplied()) {
+        match client.record(seq, title()) {
             (acked, None) if acked == seq => taken += 1,
             (acked, Some(why)) if acked == seq && why == "rate" => {}
             other => panic!("record {seq}: {other:?}"),
@@ -1195,9 +1345,9 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     let mut gapped = rig.claimant(ONE, "state");
     let id = gapped.id();
     gapped.open(ONE);
-    assert_eq!(gapped.record(1, unapplied()), (1, None));
+    assert_eq!(gapped.record(1, title()), (1, None));
     assert_eq!(
-        gapped.record(2, unapplied()),
+        gapped.record(2, title()),
         (2, None),
         "acked+1 keeps it open"
     );
@@ -1205,7 +1355,7 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
         &Record {
             seq: 4,
             ms: 0,
-            body: unapplied(),
+            body: title(),
         }
         .line()
         .expect("a record line"),
@@ -1231,12 +1381,15 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
         assert_eq!(stray.raw(line), (seq, usage.clone()), "{line:?}");
     }
     assert_eq!(
-        stray.record(6, unapplied()),
+        stray.record(6, title()),
         (6, None),
         "the record behind them"
     );
     let state = rig.state(ONE);
-    assert_eq!((state.acked, state.dropped, state.unapplied), (6, 3, 3));
+    assert_eq!(
+        (state.acked, state.dropped, state.titles, state.unapplied),
+        (6, 3, 3, 0)
+    );
     drop(stray);
     rig.ended(id);
     // The harness's resend: it keeps what is above the `acked` it is told, so the unread lines
@@ -1269,7 +1422,7 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
         "claude-code-alab",
     )
     .expect("a renewal in place");
-    assert_eq!(moved.record(7, unapplied()), (7, None));
+    assert_eq!(moved.record(7, title()), (7, None));
     // The claim placed on another connection: the stream ends at its next look.
     let elsewhere = u64::MAX - 7;
     place(
@@ -1297,32 +1450,35 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     assert_eq!(meta.stream.as_ref().map(|state| state.acked), Some(7));
 }
 
-/// `title`, an unknown kind and the known kinds this aterm does not apply yet are each
-/// acknowledged with no `dropped`, counted where `meta` prints
-/// them, and left out of the applied kinds; `beat`, which is applied, is in them.
+/// `title` and an unknown kind are each acknowledged with no `dropped`, counted where `meta`
+/// prints them, and left out of the applied kinds; `beat`, which is applied, is in them. Every
+/// known kind a harness sends is applied since HX-15f (`session`) and HX-15i1 (`ask`, `asked`,
+/// `wall`), so `stream_unapplied` counts only a record the codec read and cannot write back,
+/// and stays 0 here.
 #[test]
-fn title_unknown_and_unapplied_records_are_acked_and_counted_in_meta() {
+fn title_and_unknown_records_are_acked_and_counted_in_meta() {
     let rig = Rig::new(2);
     let mut client = rig.claimant(ONE, "state");
     let quiet = "stream_epoch=- stream_acked=0 stream_in=0 stream_dropped=0 stream_unknown=0 \
                  stream_unapplied=0 stream_titles=0 stream_took=0 stream_refused=0 questions=";
     assert!(rig.meta(ONE).contains(quiet), "{}", rig.meta(ONE));
     let epoch = client.open(ONE).epoch;
+    let opening = client.opening.len();
 
     assert_eq!(client.record(1, title()), (1, None));
     assert_eq!(
         client.raw(r#"{"k":"hx99-later","seq":2,"ms":0,"run":"rm -rf /"}"#),
         (2, None)
     );
-    assert_eq!(client.record(3, unapplied()), (3, None));
-    assert_eq!(client.record(4, unapplied()), (4, None));
+    assert_eq!(client.record(3, title()), (3, None));
+    assert_eq!(client.record(4, title()), (4, None));
     assert_eq!(client.record(5, Body::Beat), (5, None));
 
     let meta = rig.meta(ONE);
-    // `in` counts aterm's two opening records.
+    // `in` counts aterm's opening records.
     let counted = format!(
-        " supervisor_proven=1 stream_epoch={epoch} stream_acked=5 stream_in=2 stream_dropped=0 \
-         stream_unknown=1 stream_unapplied=2 stream_titles=1 stream_took=0 stream_refused=0 \
+        " supervisor_proven=1 stream_epoch={epoch} stream_acked=5 stream_in={opening} stream_dropped=0 \
+         stream_unknown=1 stream_unapplied=0 stream_titles=3 stream_took=0 stream_refused=0 \
          questions="
     );
     assert!(meta.contains(&counted), "{meta}");
@@ -1354,6 +1510,26 @@ mod own;
 #[path = "control_stream_kinds_tests.rs"]
 mod kinds;
 
+/// The conversation records (`turn`, `tool`, `subagent`, `msg`, `diff`), the Out ring and
+/// `want` (HX-15h).
+#[path = "control_stream_conversation_tests.rs"]
+mod conversation;
+
+#[path = "control_stream_watchdog_tests.rs"]
+mod watchdog;
+
+/// The watchdog's relaunch with `<tool> run` and the `session` record (HX-15f).
+#[path = "control_stream_relaunch_tests.rs"]
+mod relaunch;
+
 /// The `act`, `need`, `clear`, `land`, `model` and `upgrade` records.
 #[path = "control_stream_acts_tests.rs"]
 mod acts;
+
+/// The memory ceiling's `restart` record to a harness holding `relaunch` (HX-15m).
+#[path = "control_stream_memory_tests.rs"]
+mod memory;
+
+/// The `ask`, `asked` and `wall` records and aterm's progress watch (HX-15i1).
+#[path = "control_stream_asks_tests.rs"]
+mod asks;

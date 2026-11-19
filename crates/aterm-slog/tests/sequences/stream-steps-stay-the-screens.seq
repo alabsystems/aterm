@@ -1,0 +1,27 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h: steps stay the screen's until HX-15i1. Under the stream's turn a box hangs from it; the
+# stream's end keeps the box the screen still shows, on the run (cont=); with no turn open a
+# dialog hangs on the run and opens no turn, and a new turn of the stream opens beside it.
+stream started 1 by=person
+see prompt bash:not-read-only
+expect open p1 approval par=t1 src=screen
+expect need=approval:bash
+at 1000 stream ended 1 interrupted
+expect close p1 approval out=gone src=harness
+expect close t1 turn out=interrupted src=harness
+expect open p2 approval par=r1 src=screen cont=p1
+expect need=approval:bash
+at 1500 see busy
+expect close p2 approval out=passed
+expect turn=none
+at 2000 see prompt question
+expect open p3 question par=r1 src=screen
+expect turn=none
+expect need=question
+at 3000 stream started 2 by=agent
+expect turn=t2
+at 3500 see busy
+expect close p3 question out=passed
+at 4000 stream ended 2 done
+expect close t2 turn out=done src=harness
+expect turn=none

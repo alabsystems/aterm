@@ -16,6 +16,8 @@ pub(super) struct Images {
     shell: fn(aterm_pty::ShellIdentity) -> Option<bool>,
     /// PID versions change on fork/reuse and exec. No process-name allow-list is involved.
     cache: std::collections::BTreeMap<(u32, i32), bool>,
+    /// The owner's pid, pid version, start and image the cache was proved against. Where the
+    /// owner is this process, they stand for its reads at every later call ([`Self::roots`]).
     own: Option<(u32, Option<i32>, Option<u64>, ImageFile)>,
 }
 
@@ -110,33 +112,53 @@ impl Images {
     /// Recheck start and loaded image around the read: PID reuse or an intervening exec supplies
     /// no proof. An installed update replacing the image pathname does not change either inode.
     /// A generation the cache holds unowned is read no further: no read after it could prove it
-    /// shared, and its entry would be put back unchanged.
+    /// shared, and its entry would be put back unchanged. The cache keeps the generations of the
+    /// call's rows outside this instance's trees, each by its sweep version or, where the sweep
+    /// read none, the version read here, and drops every other. A kept verdict stands for its
+    /// generation while it lives: the image and signature it was judged by are taken to stay
+    /// while the pid version stays, and macOS can clear a running process's `CS_VALID` with no
+    /// exec, which a kept verdict does not see. Where `self_pid` is this process, its own start,
+    /// pid version and image are kept from the first call whose image read and start or version
+    /// read answered, and not read again around the read: none of them moves but by an exec,
+    /// which runs this code from its start again. With none read again, no failed read of them
+    /// empties a later call's roots or clears the cache. The owner's signature is read at most
+    /// once a call, and only once a row is read that the owner's image under a pid version does
+    /// not prove; another process's is read only where it can decide its row: never where the
+    /// owner's is not one a copy could share ([`trusted`]), nor for a row the owner's image under
+    /// a pid version proves.
     pub(super) fn roots(
         &mut self,
         self_pid: u32,
         procs: &mut [ProcSample],
         tabs: &[TabRoot],
     ) -> Vec<SharedRoot> {
-        let own_start = self.read_start(self_pid);
-        let own_version = self.read_version(self_pid);
-        let Some(own) = self.read_image(self_pid) else {
-            return Vec::new();
+        let kept = self
+            .own
+            .filter(|own| own.0 == self_pid && self_pid == std::process::id());
+        let (own_version, own_start, own) = match kept {
+            Some((_, version, start, image)) => (version, start, image),
+            None => {
+                let own_start = self.read_start(self_pid);
+                let own_version = self.read_version(self_pid);
+                let Some(own) = self.read_image(self_pid) else {
+                    return Vec::new();
+                };
+                if own_start.is_none() && own_version.is_none() {
+                    return Vec::new();
+                }
+                (own_version, own_start, own)
+            }
         };
-        if own_start.is_none() && own_version.is_none() {
-            return Vec::new();
-        }
         let epoch = (self_pid, own_version, own_start, own);
         if self.own != Some(epoch) {
             self.cache.clear();
             self.own = Some(epoch);
         }
-        let own_signature = self.read_signature(self_pid);
+        let mut own_signature: Option<Option<Identity>> = None;
         let membership = attribute(procs, self_pid, tabs);
-        let present: std::collections::BTreeSet<_> = procs
-            .iter()
-            .filter_map(|p| Some((p.pid, p.version?)))
-            .collect();
-        self.cache.retain(|key, _| present.contains(key));
+        // The generations of this call's rows outside this instance's trees, each by its sweep
+        // version or the one read here.
+        let mut present = std::collections::BTreeSet::new();
         let roots = procs
             .iter_mut()
             .zip(membership)
@@ -145,6 +167,9 @@ impl Images {
                     return None;
                 }
                 let version = p.version.or_else(|| self.read_version(p.pid));
+                if let Some(version) = version {
+                    present.insert((p.pid, version));
+                }
                 let start = if version.is_some() {
                     p.start
                 } else {
@@ -162,19 +187,25 @@ impl Images {
                 }
                 let owned = cached.unwrap_or_else(|| {
                     let image = self.read_image(p.pid);
-                    let signed = own_signature
-                        .as_ref()
-                        .zip(self.read_signature(p.pid).as_ref())
-                        .is_some_and(|(own, other)| same_signature(own, other));
-                    let matches = image == Some(own) || signed;
-                    matches
+                    let same_image = image == Some(own);
+                    let signer = if same_image && version.is_some() {
+                        None
+                    } else {
+                        own_signature
+                            .get_or_insert_with(|| self.read_signature(self_pid))
+                            .as_ref()
+                            .filter(|own| trusted(own))
+                    };
+                    let signed = || {
+                        signer.is_some_and(|own| {
+                            self.read_signature(p.pid)
+                                .is_some_and(|other| same_signature(own, &other))
+                        })
+                    };
+                    let signed_first = signed();
+                    (same_image || signed_first)
                         && (version.is_some()
-                            || (self.read_image(p.pid) == image
-                                && (!signed
-                                    || own_signature
-                                        .as_ref()
-                                        .zip(self.read_signature(p.pid).as_ref())
-                                        .is_some_and(|(own, other)| same_signature(own, other)))))
+                            || (self.read_image(p.pid) == image && (!signed_first || signed())))
                 });
                 let stable = if let Some(version) = version {
                     self.read_version(p.pid) == Some(version)
@@ -200,9 +231,11 @@ impl Images {
                 }
             })
             .collect();
-        if self.read_start(self_pid) == own_start
-            && self.read_version(self_pid) == own_version
-            && self.read_image(self_pid) == Some(own)
+        self.cache.retain(|key, _| present.contains(key));
+        if self_pid == std::process::id()
+            || (self.read_start(self_pid) == own_start
+                && self.read_version(self_pid) == own_version
+                && self.read_image(self_pid) == Some(own))
         {
             roots
         } else {
@@ -222,19 +255,20 @@ fn loaded_image(pid: u32) -> Option<ImageFile> {
     }
 }
 
+/// A signature another process's can match ([`same_signature`]): valid, vouched for by a
+/// Developer ID, development, enterprise or App Store certificate, with a signing identifier and
+/// a team.
+fn trusted(id: &Identity) -> bool {
+    id.cs_status.is_some_and(|flags| flags & CS_VALID != 0)
+        && matches!(
+            id.voucher(),
+            Voucher::DeveloperId | Voucher::Development | Voucher::Enterprise | Voucher::AppStore
+        )
+        && id.signing_id.as_ref().is_some_and(|s| !s.is_empty())
+        && id.team.as_ref().is_some_and(|s| !s.is_empty())
+}
+
 fn same_signature(own: &Identity, other: &Identity) -> bool {
-    let trusted = |id: &Identity| {
-        id.cs_status.is_some_and(|flags| flags & CS_VALID != 0)
-            && matches!(
-                id.voucher(),
-                Voucher::DeveloperId
-                    | Voucher::Development
-                    | Voucher::Enterprise
-                    | Voucher::AppStore
-            )
-            && id.signing_id.as_ref().is_some_and(|s| !s.is_empty())
-            && id.team.as_ref().is_some_and(|s| !s.is_empty())
-    };
     trusted(own) && trusted(other) && own.signing_id == other.signing_id && own.team == other.team
 }
 

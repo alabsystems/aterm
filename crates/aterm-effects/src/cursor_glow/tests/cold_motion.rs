@@ -371,9 +371,8 @@ fn every_style_keeps_a_timestamp_only_relayout_dark() {
 #[test]
 fn rainbow_ribbon_vanishes_without_a_visible_step() {
     let g = geom();
-    let drain = |tall: bool| -> (i64, i64, u32, usize) {
-        let mut c = cfg(GlowStyle::RainbowKitty, true);
-        c.ribbon_tall = tall;
+    let drain = || -> (i64, i64, u32, usize) {
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -428,7 +427,7 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
                     gone += 1;
                     if std::env::var_os("RAINBOW_DRAIN_TRACE").is_some() {
                         println!(
-                            "tall={tall} f={f} cell={cell} vanished at cov={cov} \
+                            "f={f} cell={cell} vanished at cov={cov} \
                              total {prev}->{total} sparks={}",
                             glow.sparks.len()
                         );
@@ -445,7 +444,7 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
 
     const SPENT: u32 = 34;
 
-    let (peak, end, worst, most_gone) = drain(true);
+    let (peak, end, worst, most_gone) = drain();
     assert!(
         peak > 10_000,
         "the tall fixture must lay a real ribbon: {peak}"
@@ -460,22 +459,5 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
         most_gone <= 1,
         "the tall drain must retire cells one at a time, not in blocks: \
          {most_gone} went in one frame"
-    );
-
-    let (peak, end, worst, most_gone) = drain(false);
-    assert!(
-        peak > 10_000,
-        "the underline fixture must lay a real ribbon: {peak}"
-    );
-    assert_eq!(end, 0, "and it must be fully gone by the end");
-    assert!(
-        worst <= SPENT,
-        "the underline must ease out, not step: a cell vanished while \
-         still carrying {worst}/255 coverage"
-    );
-    assert!(
-        most_gone <= 1,
-        "the underline drain must retire cells one at a time, not in \
-         blocks: {most_gone} went in one frame"
     );
 }

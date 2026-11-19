@@ -3570,6 +3570,7 @@ fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
     assert_eq!(own.as_deref(), Some(bare.as_str()));
     let codex = Snapshot {
         run: crate::harness::relaunch::AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: PathBuf::from("/c"),
             home_env: None,
             self_claimed: None,
@@ -4116,6 +4117,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         cwd: "/".to_string(),
         version: Some("0.163.0".to_string()),
         run: crate::harness::relaunch::AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: codex_home.clone(),
             home_env: None,
             self_claimed,
@@ -5647,6 +5649,7 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
     );
     let mut codex = claude_snap(5200, START_NEW, &["codex", "resume", ID], Some(ID));
     codex.run = AgentRun::Codex(CodexRun {
+        selected_default: false,
         home: dir.join("codex"),
         home_env: None,
         self_claimed: None,

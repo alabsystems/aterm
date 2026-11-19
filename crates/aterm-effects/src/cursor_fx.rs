@@ -787,11 +787,10 @@ pub struct GlowSpelling {
     pub style: Option<GlowStyle>,
     /// The additive beam ([`crate::cursor_glow::style_has_beam_of`]).
     pub beam: bool,
-    /// The full-height ribbon body, the `rainbow` theme's: its band lies behind the typed
-    /// words with the vivid rail under them. `false` is the underline body, which no built-in
-    /// theme picks; every other style leaves it unread.
+    /// Carried into [`crate::cursor_glow::GlowConfig::ribbon_tall`], which no ribbon body reads:
+    /// the ribbon has one body, the tall one, since the underline and flat bodies were removed.
     pub ribbon_tall: bool,
-    /// The flat ribbon body, which no built-in theme picks.
+    /// Carried into [`crate::cursor_glow::GlowConfig::ribbon_flat`], which no ribbon body reads.
     pub ribbon_flat: bool,
     /// The classic wake's theme-following face (`classic mono`).
     pub classic_mono: bool,

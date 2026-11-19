@@ -2738,6 +2738,67 @@ fn nothing_else_is_brought_forward() {
 }
 
 #[test]
+fn restored_startup_preflight_reads_forward_and_offer_work_without_mutating_or_taking_the_lock() {
+    fn files(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let bytes = entry
+                    .file_type()
+                    .unwrap()
+                    .is_file()
+                    .then(|| std::fs::read(entry.path()).unwrap());
+                (entry.path(), bytes)
+            })
+            .collect()
+    }
+    let absent = aterm_tempfile::tempdir().unwrap();
+    let missing = absent.path().join("never-created");
+    assert!(!restored_setup_needs_startup_at(&missing).unwrap());
+    assert!(!missing.exists());
+
+    let restored = aterm_tempfile::tempdir().unwrap();
+    older_restored_setup(restored.path(), Some(Selection::all().workstation()));
+    revision::reserve(restored.path(), 44).unwrap();
+    let before = files(restored.path());
+    assert!(restored_setup_needs_startup_at(restored.path()).unwrap());
+    assert_eq!(
+        files(restored.path()),
+        before,
+        "preflight must not stage its predicted run"
+    );
+    assert!(!restored.path().join("profile.lock").exists());
+
+    let offered = bring_forward_restored_at(restored.path()).unwrap().unwrap();
+    assert!(
+        offered > 44,
+        "the canonical mutator honors the reserved revision floor"
+    );
+    let _held = HeldLock::take(restored.path()).unwrap();
+    let before = files(restored.path());
+    assert!(
+        restored_setup_needs_startup_at(restored.path()).unwrap(),
+        "the already-staged offer still needs startup, even with profile.lock held"
+    );
+    assert_eq!(files(restored.path()), before);
+    drop(_held);
+
+    let admitted = restored_after(&Plan::default());
+    leave_restored_as_is(admitted.path()).unwrap();
+    let before = files(admitted.path());
+    assert!(!restored_setup_needs_startup_at(admitted.path()).unwrap());
+    assert_eq!(files(admitted.path()), before);
+
+    let cancelled = aterm_tempfile::tempdir().unwrap();
+    save_automatic_plan(cancelled.path(), Selection::all().workstation()).unwrap();
+    write_legacy_cancel_at(cancelled.path());
+    let before = files(cancelled.path());
+    assert!(!restored_setup_needs_startup_at(cancelled.path()).unwrap());
+    assert_eq!(files(cancelled.path()), before);
+}
+
+#[test]
 fn permission_policy_never_takes_a_snapshot_that_changed_during_observation() {
     let root = aterm_tempfile::tempdir().unwrap();
     let plan = selected(&[Setting::Permissions]);

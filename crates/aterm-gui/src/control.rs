@@ -115,6 +115,8 @@ pub(crate) use control_media::SpawnAim;
 pub(crate) mod control_denials;
 #[path = "control_disk.rs"]
 pub(crate) mod control_disk;
+#[path = "control_hosted.rs"]
+mod control_hosted;
 #[path = "control_session.rs"]
 mod control_session;
 #[cfg(all(test, unix))]
@@ -3088,7 +3090,7 @@ impl control_lanes::LaneService for ControlWorkerContext {
             stream,
             buffered,
             &control_stream::Services {
-                now_ms: &control_stream::awake_now,
+                world: &crate::harness_watchdog::Live::POLICY,
                 claims: &|handle, rest| serve_stream_claim(handle, rest, &self.store, &self.proxy),
                 post: &|wake| {
                     let _ = self.proxy.send_event(wake);
@@ -5695,6 +5697,11 @@ fn dispatch_owner(
         },
         "native-focus" => control_query::cmd_native_focus(proxy, rest),
         "appnotice" => control_query::cmd_appnotice(proxy, rest),
+        // The run is placed by the process this connection's peer is, never by a word of the
+        // request ([`control_hosted`]).
+        "hosted" => control_hosted::cmd_hosted(store, rest, || {
+            crate::typed_by::Who::client(serving_peer_pid())
+        }),
         "notice" => control_query::cmd_notice(proxy, rest),
         #[cfg(unix)]
         "members" => control_query::cmd_members(proxy, rest),
@@ -5851,8 +5858,59 @@ fn dispatch_session(head: &Head<'_>, form: &Resolved, cx: &DispatchCx<'_>) -> Co
         .into();
     };
     let mut tail = ReplyTail::default();
-    let body = serve_session_verb(head, form, &target, front_active_session, cx, &mut tail);
+    let mut body = serve_session_verb(head, form, &target, front_active_session, cx, &mut tail);
+    if head.verb == "status" {
+        append_local_package_reading(&mut body, cx.scope, &target.3, || {
+            crate::quit_safety::foreground_pgrp(target.1)
+        });
+    }
     ControlReply::with_tail(body, tail)
+}
+
+/// The local instance reads its last package observation under the claim that owns it.
+fn append_local_package_reading(
+    body: &mut String,
+    scope: Scope,
+    ctx: &SessionCtx,
+    foreground: impl FnOnce() -> i32,
+) {
+    if scope != Scope::Owner
+        || serving_principal() != Principal::Instance
+        || crate::fabric::serving_driver().is_some()
+        || !body.starts_with("OK ")
+        || !body
+            .split_whitespace()
+            .any(|word| word == "supervisor_proven=1")
+    {
+        return;
+    }
+    let live_pgid = foreground();
+    let meta = ctx
+        .meta
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The main thread returned the base record before this read. A claim replaced while
+    // it was in flight must never contribute its sample to the previous holder's status.
+    if body
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("supervisor_revision="))
+        .and_then(|word| word.parse::<u64>().ok())
+        != Some(meta.supervisor_revision)
+    {
+        return;
+    }
+    let timeline = ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(fields) = timeline.codex_adoption_fields(&meta, crate::metrics::now_us(), live_pgid)
+        && let Some(end) = body.strip_suffix('\n').map(str::len)
+    {
+        body.truncate(end);
+        body.push(' ');
+        body.push_str(&fields);
+        body.push('\n');
+    }
 }
 
 /// `ERR refused private view: …`: what a read or a drive of a private document's front view

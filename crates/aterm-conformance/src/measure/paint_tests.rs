@@ -580,7 +580,6 @@ fn a_reach_row_is_red_for_a_body_too_short_or_too_tall() {
         "a row with no reach is not judged on one"
     );
     assert!(Reach::Tall.holds(usize::MAX, usize::MAX));
-    assert!(!Reach::Underline.holds(usize::MAX, usize::MAX));
     assert!(Companion::Pet.height_holds(usize::MAX, usize::MAX));
     assert!(Companion::Cat.height_holds(usize::MAX, usize::MAX));
 }
@@ -623,13 +622,6 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
     for style in [Style::Default, Style::Rainbow] {
         assert!(
             reach_row(Reach::Tall, style).validate().is_ok(),
-            "{style:?}"
-        );
-    }
-    // No style lays the underline body: the one rainbow theme is the tall band.
-    for style in [Style::Default, Style::Rainbow, Style::Off] {
-        assert!(
-            reach_row(Reach::Underline, style).validate().is_err(),
             "{style:?}"
         );
     }

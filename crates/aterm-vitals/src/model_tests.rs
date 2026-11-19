@@ -2571,6 +2571,443 @@ fn the_programs_kept_are_every_aterm_group_and_the_machines_busiest_and_largest(
     );
 }
 
+/// [`busiest_first`] as it read whole rows before [`RowKey`], for the oracle below.
+fn busiest_view_first(a: &ProcView, b: &ProcView) -> std::cmp::Ordering {
+    b.cores
+        .unwrap_or(-1.0)
+        .total_cmp(&a.cores.unwrap_or(-1.0))
+        .then(b.footprint.unwrap_or(0).cmp(&a.footprint.unwrap_or(0)))
+        .then(a.pid.cmp(&b.pid))
+}
+
+/// The rows the reading kept before [`keep_rows`] selected over [`RowKey`]s (a stable sort of
+/// every whole row, the kept rows cloned out of it), its laws' oracle.
+fn keep_rows_by_sorting_every_row(rows: Vec<ProcView>) -> Vec<ProcView> {
+    let (mut mine, mut rest): (Vec<ProcView>, Vec<ProcView>) =
+        rows.into_iter().partition(|r| r.scope.in_aterm());
+    mine.sort_by(busiest_view_first);
+    if mine.len() > ATERM_ROWS {
+        let mut by_foot = mine.split_off(ATERM_ROWS / 2);
+        by_foot.sort_by_key(|p| std::cmp::Reverse(p.footprint.unwrap_or(0)));
+        by_foot.truncate(ATERM_ROWS - mine.len());
+        mine.extend(by_foot);
+    }
+    rest.sort_by(busiest_view_first);
+    let mut kept: Vec<ProcView> = rest.iter().take(TOP_ROWS).cloned().collect();
+    let mut by_foot: Vec<&ProcView> = rest.iter().skip(TOP_ROWS).collect();
+    by_foot.sort_by_key(|p| std::cmp::Reverse(p.footprint.unwrap_or(0)));
+    let mut by_foot = by_foot.into_iter();
+    kept.extend(by_foot.by_ref().take(TOP_ROWS).cloned());
+    kept.extend(by_foot.filter(|p| p.gpu.is_some_and(|g| g > 0.0)).cloned());
+    mine.extend(kept);
+    mine.sort_by(busiest_view_first);
+    mine
+}
+
+/// What [`keep_rows`] reads of `row`.
+fn key_of(row: &ProcView) -> RowKey {
+    RowKey {
+        cores: row.cores,
+        footprint: row.footprint,
+        pid: row.pid,
+        scope: row.scope,
+        gpu: row.gpu,
+    }
+}
+
+/// A row of [`keep_rows`]' laws, named `r<tag>`: two outputs compare row by row by name, even
+/// where a NaN share makes `ProcView`'s `PartialEq` refuse.
+fn kept_row(
+    tag: usize,
+    pid: u32,
+    scope: RowScope,
+    cores: Option<f32>,
+    footprint: Option<u64>,
+    gpu: Option<f32>,
+) -> ProcView {
+    ProcView {
+        group: None,
+        energy_mw: None,
+        energy_read_span_ns: None,
+        scheduling: None,
+        cpu_accounting: CpuAccounting::default(),
+        pid,
+        ppid: 1,
+        pgid: 0,
+        name: format!("r{tag}"),
+        cores,
+        cpu_read_span_ns: None,
+        wait: None,
+        footprint,
+        peak: None,
+        read_bps: None,
+        write_bps: None,
+        state: ProcState::default(),
+        scope,
+        refused: cores.is_none(),
+        gpu,
+        birth_ms: None,
+    }
+}
+
+/// `n` rows drawn from `seed` (xorshift64*, the same on every run): about `aterm_pct` percent
+/// of them aterm's, with every tie [`busiest_first`] and the footprint order can meet (no
+/// share, `0.0` and `-0.0`, NaN, repeated shares and footprints, no footprint), and, where
+/// `pids` is nonzero, that many pids shared among all of them, so whole rows tie.
+fn drawn_rows(seed: u64, n: usize, aterm_pct: u64, pids: u32) -> Vec<ProcView> {
+    let mut state = seed | 1;
+    let mut below = |bound: u64| {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d) % bound
+    };
+    (0..n)
+        .map(|tag| {
+            let scope = if below(100) < aterm_pct {
+                [
+                    RowScope::SelfProc,
+                    RowScope::Tab(7),
+                    RowScope::Helper,
+                    RowScope::Shared,
+                ][below(4) as usize]
+            } else {
+                [RowScope::Others, RowScope::Services, RowScope::Unknown][below(3) as usize]
+            };
+            let cores = match below(8) {
+                0 => None,
+                1 => Some(0.0),
+                2 => Some(-0.0),
+                3 => Some(f32::NAN),
+                4 => Some(0.25),
+                _ => Some(below(400) as f32 / 100.0),
+            };
+            let footprint = match below(5) {
+                0 => None,
+                1 => Some(0),
+                2 => Some(64 << 20),
+                _ => Some(below(1 << 34)),
+            };
+            let gpu = match below(6) {
+                0 => Some(0.0),
+                1 => Some(0.3),
+                2 => Some(f32::NAN),
+                _ => None,
+            };
+            let pid = match pids {
+                0 => tag as u32 + 2,
+                _ => below(u64::from(pids)) as u32 + 2,
+            };
+            kept_row(tag, pid, scope, cores, footprint, gpu)
+        })
+        .collect()
+}
+
+/// [`keep_rows`] keeps the rows a stable sort of every row keeps, in its order: every count
+/// around [`TOP_ROWS`] and [`ATERM_ROWS`], few and many aterm rows, unique pids and pids
+/// shared until whole rows tie.
+#[test]
+fn keep_rows_keeps_the_rows_and_order_a_sort_of_every_row_keeps() {
+    let names = |rows: &[ProcView]| rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+    let selected = |rows: &[ProcView]| {
+        let keys: Vec<RowKey> = rows.iter().map(key_of).collect();
+        keep_rows(&keys)
+            .into_iter()
+            .map(|index| rows[index].name.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut cases = 0;
+    for n in [
+        0,
+        1,
+        TOP_ROWS - 1,
+        TOP_ROWS,
+        TOP_ROWS + 1,
+        2 * TOP_ROWS,
+        2 * TOP_ROWS + 1,
+        300,
+        760,
+        ATERM_ROWS + 3 * TOP_ROWS,
+        1500,
+    ] {
+        for aterm_pct in [0, 5, 50, 100] {
+            for pids in [0, 40] {
+                for seed in 1..=4_u64 {
+                    let rows = drawn_rows(seed * 7919 + n as u64, n, aterm_pct, pids);
+                    assert_eq!(
+                        selected(&rows),
+                        names(&keep_rows_by_sorting_every_row(rows)),
+                        "{n} rows, {aterm_pct}% aterm's, pids {pids}, seed {seed}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 11 * 4 * 2 * 4);
+}
+
+/// `n` rows shaped as a resting sweep's (xorshift64* from `seed`): one in twenty aterm's, busy
+/// and holding memory; of the rest, three in five the user's own, mostly idle, each with its
+/// footprint, and the others another user's, whose CPU and footprint the kernel refuses; three
+/// hold a GPU share.
+fn sweep_rows(seed: u64, n: usize) -> Vec<ProcView> {
+    let mut state = seed | 1;
+    let mut below = |bound: u64| {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d) % bound
+    };
+    (0..n)
+        .map(|tag| {
+            let pid = tag as u32 + 2;
+            let gpu = (tag % (n / 3).max(1) == 1).then_some(0.02);
+            match below(20) {
+                0 => kept_row(
+                    tag,
+                    pid,
+                    RowScope::Helper,
+                    Some(below(300) as f32 / 1000.0),
+                    Some(below(1 << 30)),
+                    gpu,
+                ),
+                1..=11 => {
+                    let cores = (below(4) == 0).then(|| below(50) as f32 / 1000.0);
+                    kept_row(
+                        tag,
+                        pid,
+                        RowScope::Others,
+                        Some(cores.unwrap_or(0.0)),
+                        Some(below(1 << 31)),
+                        gpu,
+                    )
+                }
+                _ => kept_row(tag, pid, RowScope::Services, None, None, gpu),
+            }
+        })
+        .collect()
+}
+
+/// The work [`keep_rows`] does on a resting sweep's 760 rows: it compares rows (calls
+/// [`busiest_first`]) at most six times per row, about five. A stable sort of every row, as the
+/// reading made before it selected, compares them about ten times per row, and moves every row
+/// as it does.
+#[test]
+fn keep_rows_compares_a_resting_sweeps_rows_at_most_six_times_each() {
+    let rows: Vec<RowKey> = sweep_rows(0x5eed, 760).iter().map(key_of).collect();
+    let before = ROW_COMPARES.with(std::cell::Cell::get);
+    let kept = keep_rows(&rows);
+    let compares = ROW_COMPARES.with(std::cell::Cell::get) - before;
+    assert_eq!(kept.len(), 168, "the rows a resting sweep keeps");
+    assert!(
+        compares <= 6 * rows.len() as u64,
+        "{compares} comparisons for {} rows",
+        rows.len()
+    );
+}
+
+/// A reading builds a row ([`proc_view`]: its name copied, its counters and scheduling) only for
+/// each process [`Snapshot::procs`] keeps, not for every process it sweeps: of a 760-process
+/// sweep, the 22 aterm and tab processes and the machine's 64 busiest and 64 largest others.
+#[test]
+fn a_reading_builds_a_row_only_for_each_process_it_keeps() {
+    let procs = |cpu_ms: u64| -> Vec<ProcSample> {
+        let mut procs = vec![
+            proc(100, 1, cpu_ms, 300, "aterm"),
+            proc(200, 100, cpu_ms, 5, "zsh"),
+        ];
+        procs.extend((0..20).map(|i| proc(300 + i, 200, cpu_ms, 10, "cargo")));
+        procs.extend((0..738).map(|i| {
+            let busy = cpu_ms * u64::from(i % 4);
+            proc(1000 + i, 1, busy, 20 + u64::from(i), &format!("other{i}"))
+        }));
+        procs
+    };
+    let mut vitals = Vitals::new();
+    vitals.absorb(&sample(10, &[100; 4], procs(10)));
+    let before = ROWS_BUILT.with(std::cell::Cell::get);
+    let snapshot = vitals.absorb(&sample(15, &[200; 4], procs(20)));
+    let built = ROWS_BUILT.with(std::cell::Cell::get) - before;
+    assert_eq!(snapshot.procs.len(), 22 + 2 * TOP_ROWS);
+    assert_eq!(
+        built,
+        snapshot.procs.len() as u64,
+        "of {} processes",
+        procs(0).len()
+    );
+}
+
+/// [`busiest_program_first`] spelled apart from it, for the oracle below.
+fn busiest_group_first(a: &ProgramGroup, b: &ProgramGroup) -> std::cmp::Ordering {
+    b.cores
+        .total_cmp(&a.cores)
+        .then(b.footprint.unwrap_or(0).cmp(&a.footprint.unwrap_or(0)))
+        .then(a.name.cmp(&b.name))
+}
+
+/// The programs the reading kept before [`keep_programs`] selected over indices (stable sorts of
+/// every whole group, the machine's others included), its laws' oracle.
+fn keep_programs_by_sorting_every_group(groups: Vec<ProgramGroup>) -> Vec<ProgramGroup> {
+    let (mut kept, mut rest): (Vec<ProgramGroup>, Vec<ProgramGroup>) = groups
+        .into_iter()
+        .partition(|g| g.scope != ProcScope::Other);
+    kept.sort_by(busiest_group_first);
+    if kept.len() > ATERM_ROWS {
+        let mut by_foot = kept.split_off(ATERM_ROWS / 2);
+        by_foot.sort_by_key(|g| std::cmp::Reverse(g.footprint.unwrap_or(0)));
+        by_foot.truncate(ATERM_ROWS - kept.len());
+        kept.extend(by_foot);
+    }
+    rest.sort_by(busiest_group_first);
+    let mut by_foot = rest.split_off(rest.len().min(TOP_ROWS));
+    by_foot.sort_by_key(|g| std::cmp::Reverse(g.footprint.unwrap_or(0)));
+    by_foot.truncate(TOP_ROWS);
+    kept.extend(rest);
+    kept.extend(by_foot);
+    kept.sort_by(busiest_group_first);
+    kept
+}
+
+/// `n` program groups drawn from `seed` (xorshift64*, the same on every run), each tagged by its
+/// index in `n` (which [`keep_programs`] does not read): about `aterm_pct` percent aterm's or a
+/// tab's, with every tie [`busiest_program_first`] and the footprint order can meet (`0.0` and
+/// `-0.0`, NaN, repeated cores and footprints, no footprint), and, where `names` is nonzero, that
+/// many names shared among all of them, so whole groups tie.
+fn drawn_groups(seed: u64, n: usize, aterm_pct: u64, names: u64) -> Vec<ProgramGroup> {
+    let mut state = seed | 1;
+    let mut below = |bound: u64| {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d) % bound
+    };
+    (0..n)
+        .map(|tag| {
+            let scope = if below(100) < aterm_pct {
+                [ProcScope::Aterm, ProcScope::Tab(7), ProcScope::Shared][below(3) as usize]
+            } else {
+                ProcScope::Other
+            };
+            let cores = match below(7) {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f32::NAN,
+                3 => 0.25,
+                _ => below(400) as f32 / 100.0,
+            };
+            let footprint = match below(5) {
+                0 => None,
+                1 => Some(0),
+                2 => Some(64 << 20),
+                _ => Some(below(1 << 34)),
+            };
+            let name = match names {
+                0 => format!("p{tag}"),
+                _ => format!("p{}", below(names)),
+            };
+            ProgramGroup {
+                name,
+                scope,
+                n: tag as u32,
+                cores,
+                footprint,
+                footprint_unread: 0,
+                born_ms: None,
+                unborn: 0,
+            }
+        })
+        .collect()
+}
+
+/// [`keep_programs`] keeps the groups a stable sort of every group keeps, in its order: every
+/// count around [`TOP_ROWS`] and [`ATERM_ROWS`], few and many aterm groups, unique names and
+/// names shared until whole groups tie.
+#[test]
+fn keep_programs_keeps_the_groups_and_order_a_sort_of_every_group_keeps() {
+    let tags = |groups: Vec<ProgramGroup>| groups.into_iter().map(|g| g.n).collect::<Vec<_>>();
+    let mut cases = 0;
+    for n in [
+        0,
+        1,
+        TOP_ROWS - 1,
+        TOP_ROWS,
+        TOP_ROWS + 1,
+        2 * TOP_ROWS,
+        2 * TOP_ROWS + 1,
+        300,
+        ATERM_ROWS + 3 * TOP_ROWS,
+        1500,
+    ] {
+        for aterm_pct in [0, 5, 50, 100] {
+            for names in [0, 30] {
+                for seed in 1..=4_u64 {
+                    let groups = drawn_groups(seed * 7919 + n as u64, n, aterm_pct, names);
+                    assert_eq!(
+                        tags(keep_programs(groups.clone())),
+                        tags(keep_programs_by_sorting_every_group(groups)),
+                        "{n} groups, {aterm_pct}% aterm's, names {names}, seed {seed}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 10 * 4 * 2 * 4);
+}
+
+/// The work [`keep_programs`] does on a resting machine's 300 programs (15 of them aterm's and
+/// its tabs', the others mostly idle, each with its own footprint): it compares groups (calls
+/// [`busiest_program_first`] or its footprint order) at most ten times per group, 2,624 times
+/// (1,487 by [`busiest_program_first`], 1,137 by footprint). The stable sorts of every group the
+/// reading made before it selected ([`keep_programs_by_sorting_every_group`]) compare them 3,200
+/// times (2,980 by [`busiest_program_first`], 220 by footprint) and move every group as they do;
+/// a full sort in place of the selection of the largest compares them 3,326 times.
+#[test]
+fn keep_programs_compares_a_resting_machines_programs_at_most_ten_times_each() {
+    let mut state = 0x5eed_u64;
+    let mut below = |bound: u64| {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d) % bound
+    };
+    let groups: Vec<ProgramGroup> = (0..300)
+        .map(|tag| {
+            let ours = tag % 20 == 0;
+            let cores = match (ours, below(4)) {
+                (true, _) => below(300) as f32 / 1000.0,
+                (false, 0) => below(50) as f32 / 1000.0,
+                _ => 0.0,
+            };
+            ProgramGroup {
+                name: format!("program{tag}"),
+                scope: if ours {
+                    ProcScope::Tab(7)
+                } else {
+                    ProcScope::Other
+                },
+                n: 1,
+                cores,
+                footprint: Some(below(1 << 31)),
+                footprint_unread: 0,
+                born_ms: None,
+                unborn: 0,
+            }
+        })
+        .collect();
+    let n = groups.len() as u64;
+    let before = PROGRAM_COMPARES.with(std::cell::Cell::get);
+    let kept = keep_programs(groups);
+    let compares = PROGRAM_COMPARES.with(std::cell::Cell::get) - before;
+    assert_eq!(
+        kept.len(),
+        15 + 2 * TOP_ROWS,
+        "the programs a resting machine keeps"
+    );
+    assert!(compares <= 10 * n, "{compares} comparisons for {n} groups");
+}
+
 #[test]
 fn a_large_idle_tab_worker_survives_the_process_and_program_display_caps() {
     let workers = |cpu_ms| {
@@ -2599,6 +3036,99 @@ fn a_large_idle_tab_worker_survives_the_process_and_program_display_caps() {
     assert_eq!(
         snapshot.aterm.unwrap().footprint,
         Some((8192 + ATERM_ROWS as u64) << 20)
+    );
+}
+
+/// The maps a reading keeps by pid, and by a pid and its kernel start, hash those ids as the
+/// workspace's keyless FxHash does ([`IdMap`], `aterm_hash::FxBuildHasher`), not with std's
+/// per-map SipHash key: the kernel assigns them, so ids made to collide need as many live
+/// processes, which the process table bounds, and each of the thirty-odd lookups and inserts a
+/// reading makes per swept process costs one multiply instead of SipHash's rounds.
+#[test]
+fn the_per_process_maps_hash_kernel_ids_without_a_key() {
+    use std::hash::BuildHasher;
+    let v = Vitals::new();
+    let fx = aterm_hash::FxBuildHasher;
+    let counted = window_counter(&v.rows.read_bytes, true, &[], Some(1.0), |p| p.disk_read);
+    for pid in [2_u32, 501, 77_088, u32::MAX] {
+        let want = fx.hash_one(pid);
+        for (map, got) in [
+            ("read_bytes", v.rows.read_bytes.hasher().hash_one(pid)),
+            ("written", v.rows.written.hasher().hash_one(pid)),
+            ("last_cpu", v.last_cpu.hasher().hash_one(pid)),
+            ("last_energy", v.last_energy.hasher().hash_one(pid)),
+            ("last_runnable", v.last_runnable.hasher().hash_one(pid)),
+            ("last_read_at", v.last_read_at.hasher().hash_one(pid)),
+            ("a window's counts", counted.hasher().hash_one(pid)),
+        ] {
+            assert_eq!(got, want, "{map}, pid {pid}");
+        }
+        let key = crate::delegated::ProcessKey { pid, start: 9 };
+        assert_eq!(
+            v.origins.hasher().hash_one(key),
+            fx.hash_one(key),
+            "origins"
+        );
+    }
+}
+
+/// The work [`attribute`]'s maps do, each keyed by a pid ([`IdMap`]): of a resting sweep's 724
+/// processes (launchd; aterm; two tabs' shells, one with 20 jobs beneath it, three deep; 400 of
+/// the user's own, 40 of them under an app; 300 services), `starts`, `parent`, `shells` and the
+/// memo `resolve` fills hash ids through [`crate::explain::IdHash`], one multiply a key, at least
+/// as often as the sweep's shape has them insert and look up ids: 6,574 times. That floor leaves
+/// out what std's table decides (the keys it moves as a map grows, and whether a lookup or a
+/// removal in an empty map hashes); with this toolchain's std the four hash 7,469 ids, the memo
+/// moving 892 keys as it grows and hashing its three removals while empty. A map put back on
+/// std's SipHash takes its hashes out of the count (`starts`: each process's pid kept and its
+/// parent's looked up, 1,448), leaving it under the floor.
+#[test]
+fn attributing_a_resting_sweep_hashes_every_pid_through_the_id_hasher() {
+    let mut procs = vec![
+        proc(1, 0, 0, 0, "launchd"),
+        proc(100, 1, 0, 0, "aterm"),
+        proc(200, 100, 0, 0, "zsh"),
+        proc(300, 100, 0, 0, "zsh"),
+    ];
+    procs.extend((0..20).map(|i| {
+        let parent = match i {
+            0 => 200,
+            1..=9 => 210,
+            _ => 211,
+        };
+        proc(210 + i, parent, 0, 0, "cargo")
+    }));
+    procs.push(proc(500, 1, 0, 0, "Safari"));
+    procs.extend((0..399).map(|i| {
+        let parent = if i < 40 { 500 } else { 1 };
+        proc(1000 + i, parent, 0, 0, "own")
+    }));
+    procs.extend((0..300).map(|i| proc(5000 + i, 1, 0, 0, "service")));
+    assert_eq!(procs.len(), 724);
+    let tabs = vec![tab(7, 200, "Tab 1", "cargo"), tab(8, 300, "Tab 2", "zsh")];
+    let before = crate::explain::ids_hashed();
+    let membership = attribute(&procs, 100, &tabs);
+    let hashed = crate::explain::ids_hashed() - before;
+    assert_eq!(membership.iter().filter(|m| m.tab == Some(0)).count(), 21);
+    let n = procs.len() as u64;
+    // `starts` keeps each pid and looks up each parent, `parent` keeps each pid and `shells`
+    // each tab's shell.
+    let kept = 2 * n + n + tabs.len() as u64;
+    // Every parent the sweep holds comes before its children in it, so `resolve` walks each
+    // process once, in its own call: it looks the process up in the memo (save the first walk,
+    // in an empty memo) and in `shells`, then in `parent` (save aterm and each shell, where a
+    // walk stops), on the way back in `shells` again and fills the memo, and reads the memo at
+    // the end; a walk that goes on to a parent other than launchd (that of each process whose
+    // parent's pid is above 1, the shells save) reads that parent's memo.
+    let shell = |pid: u32| tabs.iter().any(|t| t.shell_pid == pid);
+    let stops = 1 + tabs.len() as u64;
+    let goes_on = procs.iter().filter(|p| p.ppid > 1 && !shell(p.pid)).count() as u64;
+    let walked = 6 * n - 1 - stops + goes_on;
+    let floor = kept + walked;
+    assert_eq!(floor, 6_574, "the floor the sweep's shape gives");
+    assert!(
+        hashed >= floor,
+        "attribute's maps hash {hashed} ids through IdHash for 724 processes"
     );
 }
 

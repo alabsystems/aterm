@@ -237,8 +237,9 @@ fn scoped_relaunch_pid(ctx: &SessionCtx, now_us: u64) -> Option<u32> {
 }
 
 /// TELL A SCOPED HARNESS TO RESTART ITS CHILD for `cause`: the `restart` row `cause=<cause>`
-/// ([`write_restart_row`]). The `restart` verb's scoped event writes it, and so will the
-/// watchdog's beat and memory causes (D32).
+/// ([`write_restart_row`]). The `restart` verb's scoped event writes it, and so do the
+/// watchdog's beat and stall restarts ([`watchdog_restart`]) and the memory ceiling's
+/// ([`memory_restart`]) (D32).
 pub(crate) fn record_restart(ctx: &SessionCtx, cause: Cause) {
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     write_restart_row(ctx, meta, format!("cause={}", cause.word()));
@@ -324,10 +325,18 @@ pub(crate) fn record_scoped_restart(
     {
         return false;
     }
-    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    if scoped_restart_pid(&meta, crate::metrics::now_us(), account.is_some()).is_none() {
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let now_us = crate::metrics::now_us();
+    if scoped_restart_pid(&meta, now_us, account.is_some()).is_none() {
         return false;
     }
+    // The model rides the relaunch of this claimant, should the watchdog end it before it obeys
+    // (HX-15f, D21); a restart that names none replaces it, and a claim placed again (the
+    // harness obeyed) clears it (`SessionMeta::set_supervisor`).
+    meta.relaunch.model = model.and_then(|model| {
+        meta.live_scoped(now_us)
+            .map(|scoped| (scoped.proven.clone(), model.to_string()))
+    });
     let mut payload = format!("cause={cause}");
     if let Some(env) = account {
         let home = env
@@ -1096,7 +1105,25 @@ impl Stamped<'_> {
                 "restart @{sid}: pid {pgrp} is a scoped harness; sent restart event (cause={})",
                 cause.word()
             );
-            watch_scoped(ctx, state, pgrp, stamp, by, asked);
+            match stall_bound() {
+                Some(bound) => watch_scoped(
+                    ctx,
+                    state,
+                    pgrp,
+                    stamp,
+                    by,
+                    asked,
+                    Bound {
+                        cause,
+                        obey: bound,
+                        quiet: crate::harness_host::watchdog_quiet(),
+                    },
+                ),
+                None => aterm_log::info!(
+                    "restart: scoped harness pid {pgrp}: the policy's stall_term_after_s is 0; \
+                     not watched"
+                ),
+            }
             return format!("OK restarting pid {pgrp} cause={}\n", cause.word());
         }
         // A move that its own stamp would end is refused, the stamp taken back, where input waits
@@ -1157,24 +1184,34 @@ impl Stamped<'_> {
 /// What a scoped harness's `restart` is watched by ([`watch_scoped`]): the claim as it stood just
 /// before the event was sent ([`asked_of`]).
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Asked {
     /// How many claim lines the session had placed then
     /// ([`crate::session_timeline::SessionMeta::claim_placements`]), a renewal in place included.
     placements: u64,
     /// The child the claim kept then.
     child: Option<crate::harness_claim::KeptChild>,
+    /// Its holder and its scoped authority then: what aterm's harness watchdog ends once the
+    /// claimant ignored the restart and its group's signals left it gone
+    /// ([`crate::harness_watchdog::after_unobeyed`]).
+    claim: Option<(String, crate::harness_claim::Scoped)>,
 }
 
 /// [`Asked`] as `ctx`'s claim stands now: read before the event is recorded.
 #[cfg(unix)]
 fn asked_of(ctx: &SessionCtx) -> Asked {
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let now_us = crate::metrics::now_us();
+    let claim = meta.live_claim(now_us).and_then(|claim| {
+        claim
+            .scoped
+            .clone()
+            .map(|scoped| (claim.holder.clone(), scoped))
+    });
     Asked {
         placements: meta.claim_placements,
-        child: meta
-            .live_scoped(crate::metrics::now_us())
-            .and_then(|scoped| scoped.child),
+        child: claim.as_ref().and_then(|(_, scoped)| scoped.child),
+        claim,
     }
 }
 
@@ -1212,7 +1249,7 @@ impl Obeyed {
 /// every contract: a harness announces its claim again after each child start, and the same
 /// words renew in place, keeping the revision, so a moved revision would miss it.
 #[cfg(unix)]
-fn scoped_let_go(ctx: &SessionCtx, pgrp: i32, start: &str, asked: Asked) -> Option<Obeyed> {
+fn scoped_let_go(ctx: &SessionCtx, pgrp: i32, start: &str, asked: &Asked) -> Option<Obeyed> {
     if !leads(ctx.sink.master(), pgrp, start) {
         return Some(Obeyed::Left);
     }
@@ -1242,16 +1279,81 @@ fn scoped_let_go(ctx: &SessionCtx, pgrp: i32, start: &str, asked: Asked) -> Opti
     (placements != asked.placements).then_some(Obeyed::Reclaimed)
 }
 
+/// How a scoped watch waits ([`watch_scoped`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Bound {
+    /// The cause of the restart it watches: the `SIGTERM` of a restart aterm decided itself (the
+    /// beat's, the memory ceiling's) waits while its claimant is stopped ([`held_back`]).
+    cause: Cause,
+    /// How long the harness has to obey.
+    obey: Duration,
+    /// The `quiet=` its signals, and the watchdog's acts after them, wait out past that.
+    quiet: Duration,
+}
+
+/// The scoped watches running now ([`watch_scoped`]), each by the claimant it watches (its
+/// process group and kernel start), until its thread ends: a claimant one of them watches is
+/// told no restart of aterm's own beside it ([`watchdog_restart`], [`memory_restart`]).
+#[cfg(unix)]
+static SCOPED_WATCHES: std::sync::Mutex<Vec<(i32, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// One running scoped watch, listed in [`SCOPED_WATCHES`] while this lives.
+#[cfg(unix)]
+struct ScopedWatching((i32, String));
+
+#[cfg(unix)]
+impl ScopedWatching {
+    fn on(pgrp: i32, start: &str) -> Self {
+        let key = (pgrp, start.to_string());
+        SCOPED_WATCHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(key.clone());
+        Self(key)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ScopedWatching {
+    fn drop(&mut self) {
+        let mut listed = SCOPED_WATCHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = listed.iter().position(|key| *key == self.0) {
+            listed.swap_remove(at);
+        }
+    }
+}
+
+/// Whether a scoped watch runs on the claimant `pgrp` started at `start` ([`SCOPED_WATCHES`]).
+#[cfg(unix)]
+fn scoped_watched(pgrp: i32, start: &str) -> bool {
+    SCOPED_WATCHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(watched, at)| *watched == pgrp && at == start)
+}
+
 /// A SCOPED HARNESS THAT DOES NOT OBEY `restart` IS ENDED (`docs/DESIGN-harness-interface-2026-11-12.md`
-/// §2.2): after the event, a watch waits [`stall_bound`] for the harness `pgrp` to obey
-/// ([`scoped_let_go`]). Past the bound it waits while another hand holds the session
-/// ([`another_hand`]: a person's hold, another driver's turn or lease), as every restart waits
-/// for them, then renews the act's stamp (a stamp older than `relaunch::STALE_S` stands for
-/// nothing, and the bound outlasts it), sends `SIGTERM` to the claimant's process group,
-/// re-reading its lead first ([`term`]), and escalates to `SIGKILL` as any restart does
-/// ([`escalate`], [`kill`], which waits for no host read of a scoped harness). Restarting the tab
-/// after that is the watchdog's (HX-15). `asked` is the claim as it stood before the event
-/// ([`asked_of`]).
+/// §2.2): after the event, a watch waits `bound.obey` for the harness `pgrp` to obey
+/// ([`scoped_let_go`]): the policy's `stall_term_after_s` ([`stall_bound`]) for the verb's, the
+/// stall's and the memory ceiling's restart ([`memory_restart`]), three more beat periods for
+/// the watchdog's beat restart ([`crate::harness_watchdog::RESTART_BOUND`]). Past the bound it
+/// waits while a hand holds the session ([`crate::harness_watchdog::hand`]: a person's hold,
+/// another driver's turn or lease, a person's input younger than `bound.quiet`), as every act
+/// of the watchdog waits for them, and, for a restart aterm decided itself (the beat's, the
+/// memory ceiling's), while the kernel reports the claimant stopped (a stopped claimant is never
+/// ended for an act of aterm's own); then it renews the act's stamp (a stamp older than
+/// `relaunch::STALE_S` stands for nothing, and the bound outlasts it), sends `SIGTERM` to the
+/// claimant's process group, re-reading its lead first ([`term`]), and escalates to `SIGKILL` as
+/// any restart does ([`escalate`], [`kill`], which waits for no host read of a scoped harness).
+/// Where those signals went out, aterm's harness watchdog takes the tab
+/// ([`crate::harness_watchdog::after_unobeyed`], under the same `quiet=`): once the claimant is
+/// proven gone it skips the re-exec grace, ends the kept child and hands the tab to the
+/// relaunch. `asked` is the claim as it stood before the event ([`asked_of`]). The watch is
+/// listed while it runs ([`SCOPED_WATCHES`]).
 #[cfg(unix)]
 fn watch_scoped(
     ctx: &Arc<SessionCtx>,
@@ -1260,37 +1362,72 @@ fn watch_scoped(
     stamp: Stamp,
     by: aterm_slog::Actor,
     asked: Asked,
+    bound: Bound,
 ) {
-    let Some(bound) = stall_bound() else {
-        aterm_log::info!(
-            "restart: scoped harness pid {pgrp}: the policy's stall_term_after_s is 0; not watched"
-        );
-        return;
-    };
     let (grace, deadline) = (grace(), deadline());
     let weak = Arc::downgrade(ctx);
     let state = state.to_path_buf();
+    let watching = ScopedWatching::on(pgrp, &stamp.start);
     let spawned = std::thread::Builder::new()
         .name(format!("aterm-restart-scoped-{pgrp}"))
         .spawn(move || {
-            let said = watch_scoped_until(
+            let _watching = watching;
+            let claim = asked.claim.clone();
+            let outcome = watch_scoped_until(
                 &weak,
                 &state,
                 pgrp,
                 stamp,
                 by,
-                asked,
+                &asked,
                 bound,
                 (grace, deadline),
             );
-            aterm_log::info!("restart: scoped harness pid {pgrp}: {said}");
+            aterm_log::info!("restart: scoped harness pid {pgrp}: {}", outcome.words());
+            if outcome.signalled()
+                && let Some((holder, scoped)) = claim
+            {
+                crate::harness_watchdog::after_unobeyed(&weak, &holder, &scoped, bound.quiet);
+            }
         });
     if let Err(e) = spawned {
         aterm_log::warn!("restart: scoped harness pid {pgrp}'s watch could not start: {e}");
     }
 }
 
-/// [`watch_scoped`]'s thread: what it came to, in words.
+/// What a scoped watch came to ([`watch_scoped_until`]).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScopedOutcome {
+    /// The session is gone: nothing was sent.
+    SessionGone,
+    /// The harness obeyed or left: nothing was sent.
+    LetGo(&'static str),
+    /// Its group was signalled and the end is the escalation's: what that came to, in words.
+    Signalled(String),
+    /// Nothing was sent past the bound: why, in words.
+    Unsent(&'static str),
+}
+
+#[cfg(unix)]
+impl ScopedOutcome {
+    /// Whether its claimant's group was sent `SIGTERM` (and the escalation's `SIGKILL`).
+    pub(crate) const fn signalled(&self) -> bool {
+        matches!(self, Self::Signalled(_))
+    }
+
+    /// What it came to, in words, for the log.
+    pub(crate) fn words(&self) -> String {
+        match self {
+            Self::SessionGone => "its session is gone; nothing sent".to_string(),
+            Self::LetGo(why) => format!("let go: {why}; nothing sent"),
+            Self::Signalled(said) => said.clone(),
+            Self::Unsent(why) => (*why).to_string(),
+        }
+    }
+}
+
+/// [`watch_scoped`]'s thread: what it came to.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn watch_scoped_until(
@@ -1299,18 +1436,18 @@ fn watch_scoped_until(
     pgrp: i32,
     stamp: Stamp,
     by: aterm_slog::Actor,
-    asked: Asked,
-    bound: Duration,
+    asked: &Asked,
+    bound: Bound,
     (grace, deadline): (Duration, Duration),
-) -> String {
-    let until = Instant::now() + bound;
+) -> ScopedOutcome {
+    let until = Instant::now() + bound.obey;
     let pid = u32::try_from(pgrp).unwrap_or(0);
     loop {
         let Some(live) = ctx.upgrade() else {
-            return "its session is gone; nothing sent".to_string();
+            return ScopedOutcome::SessionGone;
         };
         if let Some(obeyed) = scoped_let_go(&live, pgrp, &stamp.start, asked) {
-            return format!("let go: {}; nothing sent", obeyed.words());
+            return ScopedOutcome::LetGo(obeyed.words());
         }
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -1320,56 +1457,446 @@ fn watch_scoped_until(
         // A claimant that ends is read at the next look.
         let _ = aterm_agent::harness::upgrade_wake::wait_exit(pid, left.min(look_again()));
     }
-    // Past the bound, a person's hold or another driver's hand still comes first: the SIGTERM
-    // waits for it to lift, the harness still let go if it obeys meanwhile.
-    let mut waited = false;
+    // Past the bound, a person's hold, another driver's hand, a person's input within `quiet`
+    // and a stopped claimant of aterm's own restart still come first: the SIGTERM waits for
+    // each to lift, the harness still let go if it obeys meanwhile.
+    let mut waited = None;
     let live = loop {
         let Some(live) = ctx.upgrade() else {
-            return "its session is gone; nothing sent".to_string();
+            return ScopedOutcome::SessionGone;
         };
         if let Some(obeyed) = scoped_let_go(&live, pgrp, &stamp.start, asked) {
-            return format!("let go: {}; nothing sent", obeyed.words());
+            return ScopedOutcome::LetGo(obeyed.words());
         }
-        if !another_hand(&live, crate::metrics::now_us()) {
+        let Some(held) = held_back(&live, pid, bound) else {
             break live;
-        }
-        if !waited {
+        };
+        if waited.replace(held) != Some(held) {
             aterm_log::info!(
-                "restart: scoped harness pid {pgrp}: past {}s, another hand holds its tab; its \
-                 SIGTERM waits",
-                bound.as_secs()
+                "restart: scoped harness pid {pgrp}: past {}s, its SIGTERM waits: {held}",
+                bound.obey.as_secs()
             );
-            waited = true;
         }
         drop(live);
         let _ = aterm_agent::harness::upgrade_wake::wait_exit(pid, look_again());
     };
     let sid = live.self_id.as_str().to_string();
+    // The kept child's snapshot, read again before its group's signals end it with the claimant:
+    // what the watchdog's relaunch resumes should the harness stay deaf (HX-15f, D22).
+    if let Some((_, scoped)) = &asked.claim {
+        crate::harness_watchdog::snapshot_before_end(&live, scoped);
+    }
     let stamp = renew(state, &sid, stamp);
+    term_scoped(
+        ctx,
+        live,
+        state,
+        pgrp,
+        &stamp,
+        by,
+        (grace, deadline),
+        &format!("ignored restart past {}s", bound.obey.as_secs()),
+    )
+}
+
+/// What holds a scoped watch's `SIGTERM` back past its bound, in words, `None` where nothing
+/// does: a hand on `live`'s tab ([`crate::harness_watchdog::hand`]: a person's hold, another
+/// hand, a person's input younger than `bound.quiet`), or, for a restart aterm decided itself
+/// (the watchdog's beat restart, the memory ceiling's), the claimant `pid` stopped (`SIGSTOP`,
+/// `SIGTSTP`): a stopped claimant is never ended for an act of aterm's own.
+#[cfg(unix)]
+fn held_back(live: &SessionCtx, pid: u32, bound: Bound) -> Option<&'static str> {
+    if let Some(hand) = crate::harness_watchdog::hand(live, crate::metrics::now_us(), bound.quiet) {
+        return Some(hand.words());
+    }
+    (matches!(bound.cause, Cause::Beat | Cause::Memory)
+        && crate::input_stall::claimant_stopped(pid) == Some(true))
+    .then_some("its claimant is stopped")
+}
+
+/// The end of a scoped harness's group by the act's `stamp`, standing on disk: `SIGTERM` to
+/// the group `pgrp` while it leads its tab at the stamp's start ([`term`]), then the escalation's
+/// `SIGKILL` ([`escalate`], a scoped watch, which waits for no host read). `live` is the session,
+/// let go before the escalation waits; `why` opens the words.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn term_scoped(
+    ctx: &Weak<SessionCtx>,
+    live: Arc<SessionCtx>,
+    state: &std::path::Path,
+    pgrp: i32,
+    stamp: &Stamp,
+    by: aterm_slog::Actor,
+    (grace, deadline): (Duration, Duration),
+    why: &str,
+) -> ScopedOutcome {
     let asker = crate::session_log::EndAsker {
         timeline: &live.timeline,
         by,
         from: None,
     };
     match term(live.sink.master(), &live.sink, pgrp, &stamp.start, asker) {
-        Signalled::Gone => "it left its tab before the SIGTERM; nothing sent".to_string(),
-        Signalled::Failed => "killpg refused its SIGTERM".to_string(),
+        Signalled::Gone => {
+            ScopedOutcome::Unsent("it left its tab before the SIGTERM; nothing sent")
+        }
+        Signalled::Failed => ScopedOutcome::Unsent("killpg refused its SIGTERM"),
         Signalled::Sent(_) => {
-            let Some(mut watch) = watch(state, pgrp, &stamp) else {
-                return format!(
-                    "ignored restart past {}s: sent SIGTERM; another watch ends it",
-                    bound.as_secs()
-                );
+            let Some(mut watch) = watch(state, pgrp, stamp) else {
+                return ScopedOutcome::Signalled(format!(
+                    "{why}: sent SIGTERM; another watch ends it"
+                ));
             };
             watch.scoped = true;
             drop(live);
-            format!(
-                "ignored restart past {}s: sent SIGTERM; {}",
-                bound.as_secs(),
+            ScopedOutcome::Signalled(format!(
+                "{why}: sent SIGTERM; {}",
                 escalate(ctx, &watch, grace, deadline)
-            )
+            ))
         }
     }
+}
+
+/// THE WATCHDOG'S RESTART of the scoped harness `proven` on `ctx`'s tab for `cause`: `beat`
+/// where its record stream missed its beats, `stall` where the progress watch found its agent
+/// stalled (`crate::harness_watchdog`): [`tell_scoped`] of that cause, given `bound` to obey and
+/// waiting out `quiet` past it; a `bound` of `None` (the policy's `stall_term_after_s = 0`)
+/// starts no watch. Whether the restart was written.
+#[cfg(unix)]
+pub(crate) fn watchdog_restart(
+    ctx: &Arc<SessionCtx>,
+    proven: &crate::harness_claim::Proven,
+    cause: Cause,
+    bound: Option<Duration>,
+    quiet: Duration,
+) -> bool {
+    tell_scoped(ctx, proven, cause, bound, quiet)
+}
+
+/// The memory ceiling's step ([`memory_restart`]) where the claimant was told to restart.
+#[cfg(unix)]
+pub(crate) const MEMORY_TOLD: &str = "relaunched:scoped-memory";
+
+/// The memory ceiling's step ([`memory_restart`]) where another restart of the claimant is
+/// watched still: nothing is written, and the loop asks again on its back-off.
+#[cfg(unix)]
+pub(crate) const MEMORY_WATCHED: &str = "wait:restart-watched";
+
+/// The memory ceiling's step ([`memory_restart`]) while the kernel reports the claimant stopped
+/// (`SIGSTOP`, `SIGTSTP`): a stopped harness cannot read the record, and the watch that follows
+/// would end it, so nothing is written and the loop asks again on its back-off.
+#[cfg(unix)]
+pub(crate) const MEMORY_STOPPED: &str = "wait:stopped";
+
+/// The memory ceiling's step ([`memory_restart`]) where no contract 4 claim holding `relaunch`
+/// stands on the tab when it acts.
+pub(crate) const MEMORY_UNCLAIMED: &str = "failed:scoped-memory-unclaimed";
+
+/// The claimant of `ctx`'s live claim at `now_us` where it is a contract 4 claim holding
+/// `relaunch`, which the memory ceiling restarts ([`memory_restart`]).
+#[cfg(unix)]
+fn memory_claimant(ctx: &SessionCtx, now_us: u64) -> Option<crate::harness_claim::Proven> {
+    use aterm_agent::harness::contract::{Scope, UNIVERSAL};
+    ctx.meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_scoped(now_us)
+        .filter(|scoped| {
+            scoped.claim.contract == UNIVERSAL && scoped.claim.scopes.contains(Scope::Relaunch)
+        })
+        .map(|scoped| scoped.proven.clone())
+}
+
+/// THE MEMORY CEILING'S RESTART of `ctx`'s tab (HX-15m, D18): where the tab's live claim is a
+/// contract 4 claim holding `relaunch`, its claimant runs (a stopped one is left alone, as the
+/// watchdog leaves every stopped tab) and no hand holds the tab
+/// ([`crate::harness_watchdog::hand`]: a person's hold, another hand, or a person's input
+/// younger than the policy's `human_grace_s`), [`tell_scoped`] of cause `memory`, watched for
+/// the policy's `stall_term_after_s` ([`stall_bound`]) as the `restart` verb's restart is, so a
+/// harness that does not obey is ended as any unobeyed restart is (a claimant that stops after
+/// it was told is not signalled while it stays stopped, [`held_back`]). The host's step:
+/// [`MEMORY_TOLD`]; [`MEMORY_STOPPED`] while the claimant is stopped, `wait:held`,
+/// `wait:another-hand` or `wait:person` while a hand holds the tab, and [`MEMORY_WATCHED`] while
+/// another restart of the claimant is watched, each asked again on the loop's back-off;
+/// [`MEMORY_UNCLAIMED`] where no such claim stands.
+#[cfg(unix)]
+pub(crate) fn memory_restart(ctx: &Arc<SessionCtx>) -> &'static str {
+    use crate::harness_watchdog::Hand;
+    let now_us = crate::metrics::now_us();
+    let Some(proven) = memory_claimant(ctx, now_us) else {
+        return MEMORY_UNCLAIMED;
+    };
+    if crate::input_stall::claimant_stopped(proven.pid) == Some(true) {
+        aterm_log::info!(
+            "restart @{}: the memory ceiling's restart of pid {} waits: its claimant is stopped",
+            ctx.self_id.as_str(),
+            proven.pid
+        );
+        return MEMORY_STOPPED;
+    }
+    let quiet = crate::harness_host::watchdog_quiet();
+    if let Some(hand) = crate::harness_watchdog::hand(ctx, now_us, quiet) {
+        aterm_log::info!(
+            "restart @{}: the memory ceiling's restart of pid {} waits: {}",
+            ctx.self_id.as_str(),
+            proven.pid,
+            hand.words()
+        );
+        return match hand {
+            Hand::Hold => "wait:held",
+            Hand::Another => "wait:another-hand",
+            Hand::Person => "wait:person",
+        };
+    }
+    if tell_scoped(ctx, &proven, Cause::Memory, stall_bound(), quiet) {
+        MEMORY_TOLD
+    } else {
+        MEMORY_WATCHED
+    }
+}
+
+/// Windows: no harness claims there (D2), so no claim holds `relaunch`.
+#[cfg(not(unix))]
+pub(crate) fn memory_restart(ctx: &Arc<SessionCtx>) -> &'static str {
+    let _ = ctx;
+    MEMORY_UNCLAIMED
+}
+
+/// TELL A SCOPED CLAIMANT TO RESTART, AN ACT OF ATERM'S OWN (the watchdog's beat or stall
+/// restart, the memory ceiling's): where the claimant `proven` leads `ctx`'s tab and a harness
+/// state directory is at hand, a stamp of `cause` is written (or the one standing for it
+/// joined), so its exit reads as aterm's; then the `restart cause=<cause>` row
+/// ([`record_restart`], which an open stream carries as a record) and HX-06's scoped watch, given
+/// `bound` to obey and waiting out `quiet` past it ([`watch_scoped`]); a `bound` of `None` (the
+/// policy's `stall_term_after_s` is 0) starts no watch. A claimant that does not lead its tab,
+/// or a tab with no state directory, is told and not watched: nothing would be signalled.
+/// Whether the restart was written: nothing is written while another restart of the same
+/// claimant is watched still (the verb's, the stall's, an earlier one of aterm's,
+/// [`SCOPED_WATCHES`]), since that watch ends a claimant that does not obey it, and a second
+/// restart would ask it to restart twice under two bounds. [`ACTING`] is held until the
+/// restart's own watch is listed ([`watch_scoped`]), so another act of aterm's own (the
+/// watchdog's on the stream's lane, the memory ceiling's on the worker's) cannot write a restart
+/// between this one's row and its watch.
+#[cfg(unix)]
+fn tell_scoped(
+    ctx: &Arc<SessionCtx>,
+    proven: &crate::harness_claim::Proven,
+    cause: Cause,
+    bound: Option<Duration>,
+    quiet: Duration,
+) -> bool {
+    let sid = ctx.self_id.as_str();
+    let word = cause.word();
+    let what = match cause {
+        Cause::Stall => "stalled",
+        Cause::Beat => "missed its beats",
+        Cause::Memory => "is past the memory ceiling",
+        Cause::Asked => "was asked to restart",
+    };
+    let one_act = ACTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if i32::try_from(proven.pid).is_ok_and(|pgrp| scoped_watched(pgrp, &proven.start)) {
+        drop(one_act);
+        aterm_log::info!(
+            "restart @{sid}: pid {} {what} (cause={word}); another restart of it is watched \
+             still, which ends it if it does not obey; nothing written",
+            proven.pid
+        );
+        return false;
+    }
+    let stamped = stamp_scoped(ctx, proven, cause);
+    let asked = asked_of(ctx);
+    record_restart(ctx, cause);
+    match (stamped, bound) {
+        (Ok((state, pgrp, stamp, _)), Some(obey)) => {
+            aterm_log::info!(
+                "restart @{sid}: pid {pgrp} {what}; sent restart event (cause={word})"
+            );
+            watch_scoped(
+                ctx,
+                &state,
+                pgrp,
+                stamp,
+                aterm_slog::Actor::Aterm,
+                asked,
+                Bound { cause, obey, quiet },
+            );
+        }
+        (Ok((_, pgrp, ..)), None) => aterm_log::info!(
+            "restart @{sid}: pid {pgrp} {what}; sent restart event (cause={word}), not watched: \
+             the policy ends no harness that ignores it (stall_term_after_s=0)"
+        ),
+        (Err(why), _) => aterm_log::info!(
+            "restart @{sid}: pid {} {what}; sent restart event (cause={word}), not watched: \
+             {why}",
+            proven.pid
+        ),
+    }
+    drop(one_act);
+    #[cfg(test)]
+    if let Some(between) = BETWEEN_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
+        between();
+    }
+    true
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static BETWEEN_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `between` once, on this test thread, where [`tell_scoped`] next lets go of [`ACTING`]
+/// having written its restart: the point at which another act of aterm's own on the same
+/// claimant can run.
+#[cfg(all(test, unix))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn between_for_test(between: Box<dyn FnOnce()>) {
+    BETWEEN_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(between));
+}
+
+/// What the watchdog's end of a live claimant's group came to ([`end_scoped_group`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupEnd {
+    /// Its group was sent `SIGTERM`, and the escalation's `SIGKILL` where it outlived that.
+    Signalled,
+    /// Nothing was sent: it does not lead its tab, no stamp could be written, or `killpg`
+    /// refused.
+    Unsent,
+    /// A claim stands on the tab (the claimant claimed again, or another supervisor did):
+    /// nothing was sent, and a stamp written for the act was taken back.
+    Claimed,
+}
+
+/// Whether a live claim stands on `ctx`'s tab now.
+#[cfg(unix)]
+fn claim_stands(ctx: &SessionCtx) -> bool {
+    ctx.meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_claim(crate::metrics::now_us())
+        .is_some()
+}
+
+/// THE WATCHDOG'S END OF A LIVE SCOPED CLAIMANT'S GROUP, past its claim's re-exec grace
+/// (`crate::harness_watchdog::end_harness`), whose claim lapsed: a stamp of cause `beat` for the
+/// claimant `proven` while it leads `ctx`'s tab ([`stamp_scoped_in`]; a standing stamp joined is
+/// renewed, so the escalation's `SIGKILL` can still be read by it, [`KILL_READ_MARGIN`]), then
+/// `SIGTERM` and `SIGKILL` to its group ([`term_scoped`]). Nothing is sent to a claimant that
+/// does not lead its tab at its kernel start, nor while any claim stands on the tab again (the
+/// claimant reconnected and claimed it, or another supervisor holds it), read under the act's
+/// lock before the stamp and again after it.
+#[cfg(unix)]
+pub(crate) fn end_scoped_group(
+    ctx: &Weak<SessionCtx>,
+    state: &std::path::Path,
+    proven: &crate::harness_claim::Proven,
+) -> GroupEnd {
+    let Some(live) = ctx.upgrade() else {
+        return GroupEnd::Unsent;
+    };
+    let sid = live.self_id.as_str().to_string();
+    // The act's lock covers its stamp, as a restart's does; the signals re-read the lead.
+    let one_act = ACTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if claim_stands(&live) {
+        drop(one_act);
+        aterm_log::info!(
+            "harness watchdog @{sid}: pid {} is not signalled: a claim stands on its tab again",
+            proven.pid
+        );
+        return GroupEnd::Claimed;
+    }
+    let stamped = stamp_scoped_in(&live, state, proven, Cause::Beat);
+    drop(one_act);
+    let (pgrp, stamp, wrote) = match stamped {
+        Ok(stamped) => stamped,
+        Err(why) => {
+            aterm_log::info!(
+                "harness watchdog @{sid}: pid {} is not signalled: {why}",
+                proven.pid
+            );
+            return GroupEnd::Unsent;
+        }
+    };
+    if claim_stands(&live) {
+        let said = take_back(state, &sid, &stamp, wrote);
+        aterm_log::info!(
+            "harness watchdog @{sid}: pid {pgrp} is not signalled: a claim stands on its tab \
+             again; {said}"
+        );
+        return GroupEnd::Claimed;
+    }
+    let stamp = if wrote {
+        stamp
+    } else {
+        renew(state, &sid, stamp)
+    };
+    let outcome = term_scoped(
+        ctx,
+        live,
+        state,
+        pgrp,
+        &stamp,
+        aterm_slog::Actor::Aterm,
+        (grace(), deadline()),
+        "past its re-exec grace",
+    );
+    aterm_log::info!("harness watchdog: pid {pgrp}: {}", outcome.words());
+    if outcome.signalled() {
+        GroupEnd::Signalled
+    } else {
+        GroupEnd::Unsent
+    }
+}
+
+/// [`stamp_scoped_in`] in the harness state directory at hand.
+#[cfg(unix)]
+fn stamp_scoped(
+    ctx: &SessionCtx,
+    proven: &crate::harness_claim::Proven,
+    cause: Cause,
+) -> Result<(std::path::PathBuf, i32, Stamp, bool), &'static str> {
+    let state = crate::harness_host::harness_state().ok_or("no harness state directory")?;
+    let (pgrp, stamp, wrote) = stamp_scoped_in(ctx, &state, proven, cause)?;
+    Ok((state, pgrp, stamp, wrote))
+}
+
+/// The stamp an act of aterm's own on the scoped claimant `proven` signals by: the one standing
+/// for it in `state` (another act's, joined), else a new one of `cause`, written; with whether
+/// this act wrote it. Refused where the claimant does not lead `ctx`'s tab at its kernel start.
+/// Under [`ACTING`].
+#[cfg(unix)]
+fn stamp_scoped_in(
+    ctx: &SessionCtx,
+    state: &std::path::Path,
+    proven: &crate::harness_claim::Proven,
+    cause: Cause,
+) -> Result<(i32, Stamp, bool), &'static str> {
+    let pgrp = i32::try_from(proven.pid).map_err(|_| "no pid")?;
+    if !leads(ctx.sink.master(), pgrp, &proven.start) {
+        return Err("it does not lead its tab");
+    }
+    let sid = ctx.self_id.as_str();
+    let now = aterm_time::unix_secs().unwrap_or(0);
+    if let Some(stamp) = restart_stamp::standing(state, sid, proven.pid, &proven.start, now) {
+        return Ok((pgrp, stamp, false));
+    }
+    let stamp = Stamp {
+        pid: proven.pid,
+        start: proven.start.clone(),
+        cause,
+        at: now,
+        wanted: None,
+        input: restart_stamp::input_host().map(|host| restart_stamp::Input {
+            host,
+            seq: ctx.human_input.seq(),
+        }),
+    };
+    restart_stamp::write(state, sid, &stamp).map_err(|_| "its stamp could not be written")?;
+    Ok((pgrp, stamp, true))
 }
 
 /// The answer of an act refused after [`begin`] (`why`: `exit-owner-not-ready`, `account-busy`),

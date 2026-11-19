@@ -67,6 +67,8 @@ pub(super) fn tree(root: &Path, targo: &Path, path: &OsStr, args: &[&str]) -> Re
         .args(["--color", "never"])
         .current_dir(root)
         .env("PATH", path);
+    #[cfg(test)]
+    tests::use_fixture_home(&mut cmd)?;
     capture(&mut cmd, crate::engine::PATIENCE, &mut crate::exec::ending)
 }
 

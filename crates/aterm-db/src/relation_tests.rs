@@ -78,7 +78,7 @@ const M12: [(&str, &str, &str); 56] = [
 ];
 
 /// What precedes the rows of the fixture's JSON machines answer.
-const JSON_HEAD: &str = r#"{"relation":"machines","sources":{"fleet_read":{"at":1799999980000,"state":"live","why":null},"journal":{"at":1800000000000,"state":"live","why":null},"network":{"at":1800000000000,"state":"live","why":null},"registry":{"at":1800000000000,"state":"live","why":null}},"unresolved_accounts":6,"shadowed":0,"#;
+const JSON_HEAD: &str = r#"{"relation":"machines","sources":{"fleet_read":{"at":1799999980000,"state":"live","why":null},"journal":{"at":1800000000000,"state":"live","why":null},"network":{"at":1800000000000,"state":"live","why":null},"own":{"at":1799999980000,"state":"live","why":null},"registry":{"at":1800000000000,"state":"live","why":null}},"unresolved_accounts":6,"shadowed":0,"#;
 
 #[test]
 fn a_fleet_relation_prints_by_the_shared_schema_types() {

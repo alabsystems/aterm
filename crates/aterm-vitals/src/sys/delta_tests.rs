@@ -58,16 +58,3 @@ fn a_new_key_is_a_change_and_events_are_never_folded() {
     assert_eq!(now.lines.len(), 2);
     assert_eq!(now.lines[1].key, "tab 2");
 }
-
-#[test]
-fn fnv_is_aterm_hashs_fold() {
-    for text in [
-        "",
-        "a",
-        "foobar",
-        "global 3.0 of 8 cores busy",
-        "é \u{1F600}",
-    ] {
-        assert_eq!(fnv(text), aterm_hash::fnv1a_64(text.as_bytes()), "{text:?}");
-    }
-}

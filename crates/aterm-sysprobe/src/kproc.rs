@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Kernel process records and arguments ([`record`], [`records`], [`argv`], [`ps_comm`],
-//! [`ps_args`], [`image_inode`]).
+//! Kernel process records and arguments ([`record`], [`records`], [`table`], [`argv`],
+//! [`ps_comm`], [`ps_args`], [`image_inode`]).
 
 /// One process's kernel record (`struct kinfo_proc`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +65,103 @@ pub fn record_read(pid: u32) -> std::io::Result<Option<Record>> {
 /// [`crate::exec_gate::close`], never a bare exec, which would wait on that thread for good.
 #[must_use]
 pub fn records() -> Option<Vec<Record>> {
-    imp::records()
+    table()?.records()
+}
+
+/// One read of the whole table (`KERN_PROC_ALL`): every record the kernel held at that read, as
+/// the kernel wrote them, so a reader parses only the records it asks for. `None` on the terms of
+/// [`records`].
+#[must_use]
+pub fn table() -> Option<Table> {
+    imp::table().map(Table)
+}
+
+/// One read of the whole process table ([`table`]), as the kernel wrote its records.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Table(Vec<u8>);
+
+impl std::fmt::Debug for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Table({} records)", self.0.len() / KINFO_SIZE)
+    }
+}
+
+/// `struct kinfo_proc`'s size, the stride of a [`Table`].
+const KINFO_SIZE: usize = crate::jobs::darwin::KINFO_SIZE;
+
+/// `kp_eproc.e_ucred.cr_uid`: the effective uid, `ps`'s `uid` column.
+const KINFO_EUID_AT: usize = 420;
+
+impl Table {
+    /// Each record of this read, as the kernel wrote it.
+    fn records_all(&self) -> impl Iterator<Item = &[u8; KINFO_SIZE]> {
+        self.0.as_chunks::<KINFO_SIZE>().0.iter()
+    }
+
+    /// Every record of this read; `None` where one does not parse, and off macOS.
+    #[must_use]
+    pub fn records(&self) -> Option<Vec<Record>> {
+        self.records_all().map(|r| imp::parse_record(r)).collect()
+    }
+
+    /// The records of this read whose pid `wanted` holds, only those parsed; one that does
+    /// not parse is left out, and off macOS every one is.
+    pub fn records_of(&self, wanted: impl Fn(u32) -> bool) -> impl Iterator<Item = Record> {
+        self.records_all()
+            .filter(move |r| read_u32(*r, crate::jobs::darwin::KINFO_PID_AT).is_some_and(&wanted))
+            .filter_map(|r| imp::parse_record(r))
+    }
+
+    /// Each record's pid, its parent's, and whether the kernel reaps its children for it
+    /// (`P_NOCLDWAIT`); `None` where one does not read.
+    pub(crate) fn reaps_unwaited(&self) -> Option<Vec<(u32, u32, bool)>> {
+        use crate::jobs::darwin::{KINFO_FLAG_AT, KINFO_PID_AT, KINFO_PPID_AT, P_NOCLDWAIT};
+        self.records_all()
+            .map(|r| {
+                let flag = read_u32(r, KINFO_FLAG_AT)?;
+                let ppid = read_u32(r, KINFO_PPID_AT)?;
+                Some((read_u32(r, KINFO_PID_AT)?, ppid, flag & P_NOCLDWAIT != 0))
+            })
+            .collect()
+    }
+
+    /// A table holding `rows` (each record, and whether the kernel reaps its children for it),
+    /// laid out as macOS's `kinfo_proc` lays them: a stand-in for a read of the table.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn of_records(rows: &[(Record, bool)]) -> Self {
+        use crate::jobs::darwin::{
+            KINFO_COMM_AT, KINFO_FLAG_AT, KINFO_PGID_AT, KINFO_PID_AT, KINFO_PPID_AT,
+            KINFO_START_SEC_AT, KINFO_START_USEC_AT, KINFO_STAT_AT, KINFO_TDEV_AT, KINFO_TPGID_AT,
+            NODEV, P_NOCLDWAIT,
+        };
+        let mut bytes = vec![0u8; rows.len() * KINFO_SIZE];
+        for (r, (record, reaps)) in bytes.as_chunks_mut::<KINFO_SIZE>().0.iter_mut().zip(rows) {
+            let mut put = |at: usize, word: &[u8]| r[at..at + word.len()].copy_from_slice(word);
+            put(KINFO_START_SEC_AT, &record.start_s.to_ne_bytes());
+            put(KINFO_START_USEC_AT, &record.start_us.to_ne_bytes());
+            put(
+                KINFO_FLAG_AT,
+                &(if *reaps { P_NOCLDWAIT } else { 0 }).to_ne_bytes(),
+            );
+            // `p_stat`: `SZOMB` (5) or `SRUN` (2), xnu's `sys/proc.h`.
+            put(KINFO_STAT_AT, &[if record.zombie { 5 } else { 2 }]);
+            put(KINFO_PID_AT, &record.pid.to_ne_bytes());
+            let comm = record.comm.as_bytes();
+            put(KINFO_COMM_AT, &comm[..comm.len().min(16)]);
+            put(KINFO_EUID_AT, &record.uid.to_ne_bytes());
+            put(KINFO_PPID_AT, &record.ppid.to_ne_bytes());
+            put(KINFO_PGID_AT, &record.pgid.to_ne_bytes());
+            let tdev = record.tty.map_or(NODEV, i32::cast_unsigned);
+            put(KINFO_TDEV_AT, &tdev.to_ne_bytes());
+            put(KINFO_TPGID_AT, &record.tpgid.to_ne_bytes());
+        }
+        Self(bytes)
+    }
+}
+
+fn read_u32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
 /// The signals `pid` ignores now (`p_sigignore`, bit `n - 1` for signal `n`); `None` when it is
@@ -195,7 +291,7 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ("KERN_ARGMAX", crate::procargs::KERN_ARGMAX as i64),
     (
         "offsetof(struct kinfo_proc, kp_eproc.e_ucred.cr_uid)",
-        imp::KINFO_EUID_AT as i64,
+        KINFO_EUID_AT as i64,
     ),
     ("MAXCOMLEN + 1", imp::COMM_LEN as i64),
     ("SZOMB", imp::SZOMB as i64),
@@ -231,18 +327,16 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
 ];
 
 #[cfg(target_os = "macos")]
-pub(crate) use imp::reaps_unwaited_all;
-
-#[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crate::jobs::darwin::{
-        KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_FLAG_AT, KINFO_PGID_AT, KINFO_PID_AT,
-        KINFO_PPID_AT, KINFO_SIGIGNORE_AT, KINFO_SIZE, KINFO_START_SEC_AT, KINFO_START_USEC_AT,
-        KINFO_STAT_AT, KINFO_TDEV_AT, KINFO_TPGID_AT, NODEV, P_NOCLDWAIT,
+        KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_PGID_AT, KINFO_PID_AT, KINFO_PPID_AT,
+        KINFO_SIGIGNORE_AT, KINFO_SIZE, KINFO_START_SEC_AT, KINFO_START_USEC_AT, KINFO_STAT_AT,
+        KINFO_TDEV_AT, KINFO_TPGID_AT, NODEV,
     };
 
     use super::{Locale, Record};
@@ -329,8 +423,6 @@ mod imp {
 
     /// `KERN_PROC_ALL` (`sys/sysctl.h`): every process's `kinfo_proc`.
     pub(super) const KERN_PROC_ALL: c_int = 0;
-    /// `kp_eproc.e_ucred.cr_uid`: the effective uid, `ps`'s `uid` column.
-    pub(super) const KINFO_EUID_AT: usize = 420;
     /// `p_comm`'s length, `MAXCOMLEN + 1`.
     pub(super) const COMM_LEN: usize = 17;
     /// `SZOMB` (`sys/proc.h`): `p_stat` of an exited, unreaped process.
@@ -358,7 +450,8 @@ mod imp {
         Some(u64::from_ne_bytes(b.get(at..at + 8)?.try_into().ok()?))
     }
 
-    fn parse(b: &[u8]) -> Option<Record> {
+    /// One `kinfo_proc` record's fields ([`super::Table`]).
+    pub(super) fn parse_record(b: &[u8]) -> Option<Record> {
         let comm = b.get(KINFO_COMM_AT..KINFO_COMM_AT + COMM_LEN)?;
         let end = comm.iter().position(|c| *c == 0).unwrap_or(COMM_LEN);
         let tty = (u32_at(b, KINFO_TDEV_AT)? != NODEV).then_some(i32_at(b, KINFO_TDEV_AT)?);
@@ -368,7 +461,7 @@ mod imp {
             pgid: i32_at(b, KINFO_PGID_AT)?,
             tpgid: i32_at(b, KINFO_TPGID_AT)?,
             tty,
-            uid: u32_at(b, KINFO_EUID_AT)?,
+            uid: u32_at(b, super::KINFO_EUID_AT)?,
             comm: String::from_utf8_lossy(&comm[..end]).into_owned(),
             start_s: u64_at(b, KINFO_START_SEC_AT)?,
             start_us: u32_at(b, KINFO_START_USEC_AT)?,
@@ -453,33 +546,12 @@ mod imp {
 
     pub(super) fn record_read(pid: u32) -> std::io::Result<Option<Record>> {
         kinfo(pid)?
-            .map(|buf| parse(&buf).ok_or_else(|| std::io::ErrorKind::InvalidData.into()))
+            .map(|buf| parse_record(&buf).ok_or_else(|| std::io::ErrorKind::InvalidData.into()))
             .transpose()
     }
 
     pub(super) fn ignored_signals(pid: u32) -> Option<u32> {
         u32_at(&kinfo(pid).ok()??, KINFO_SIGIGNORE_AT)
-    }
-
-    pub(super) fn records() -> Option<Vec<Record>> {
-        let buf = table()?;
-        let (records, _) = buf.as_chunks::<KINFO_SIZE>();
-        records.iter().map(|r| parse(r)).collect()
-    }
-
-    /// Each process's pid, its parent's, and whether the kernel reaps its children for it
-    /// (`P_NOCLDWAIT`), in one read of the table.
-    pub(crate) fn reaps_unwaited_all() -> Option<Vec<(u32, u32, bool)>> {
-        let buf = table()?;
-        let (records, _) = buf.as_chunks::<KINFO_SIZE>();
-        records
-            .iter()
-            .map(|r| {
-                let flag = u32_at(r, KINFO_FLAG_AT)?;
-                let ppid = u32_at(r, KINFO_PPID_AT)?;
-                Some((u32_at(r, KINFO_PID_AT)?, ppid, flag & P_NOCLDWAIT != 0))
-            })
-            .collect()
     }
 
     /// How long a read of the whole table is waited for ([`table`]). One read takes about 100 µs
@@ -506,7 +578,7 @@ mod imp {
     /// also where the kernel did not answer within [`table_wait`] or holds an earlier read (the
     /// lane is then stalled), and while an exec of this process has its gate closed
     /// ([`crate::exec_gate`]), which stalls nothing.
-    fn table() -> Option<Vec<u8>> {
+    pub(super) fn table() -> Option<Vec<u8>> {
         TABLE.ask_within((), table_wait()).answer().flatten()
     }
 
@@ -541,22 +613,70 @@ mod imp {
         read(&in_kernel)
     }
 
+    /// The bytes the table's last whole read answered, 0 before one did: the next read sizes its
+    /// buffer from them and asks the kernel for no size first ([`table_sized`]). Only the lane's
+    /// worker reads the table ([`TABLE`]), one read at a time.
+    static LAST_TABLE_LEN: AtomicUsize = AtomicUsize::new(0);
+
     /// [`table`]'s read itself, unbounded: one read inside the exec gate, whichever of its
     /// `sysctl`s the kernel holds.
     fn table_now(in_kernel: &Reading) -> Option<Vec<u8>> {
         crate::lane::mark("sysctl KERN_PROC_ALL", None);
-        let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0];
-        for _ in 0..4 {
-            let len = sysctl_len(in_kernel, &mut mib[..3])?;
+        table_sized(
+            &LAST_TABLE_LEN,
+            || sysctl_len(in_kernel, &mut [libc::CTL_KERN, KERN_PROC, KERN_PROC_ALL]),
+            |buf| {
+                sysctl_into(
+                    in_kernel,
+                    &mut [libc::CTL_KERN, KERN_PROC, KERN_PROC_ALL],
+                    buf,
+                )
+            },
+        )
+    }
+
+    /// The whole table, read by `read` (one `KERN_PROC_ALL` read into the buffer it is given:
+    /// the bytes it wrote, or the kernel's error). The buffer is the size `last` keeps (the bytes
+    /// the last whole read answered, which this updates) plus a slack of an eighth and 16
+    /// records. Where `last` keeps none, or the table outgrew that buffer (`ENOMEM`: xnu writes
+    /// the records that fit and refuses the rest), it asks `size` (the bytes the read would
+    /// answer, with the kernel's own slack) and reads into a buffer of that size plus the same
+    /// slack, up to four times, as a table that keeps growing may need. `None` where `size`
+    /// answers none, a read answers part of a record, or the kernel answers any other error. A
+    /// read that fits answers every record the kernel held at that read, whatever sized its
+    /// buffer: the size answer only sizes it. A table that outgrew the kept size and its slack
+    /// (by more than an eighth and 16 records since the last whole read, as under a burst of new
+    /// processes) costs one read more than a read sized first: the refused read, which walks the
+    /// whole table before xnu refuses it, then the size and the read, three `sysctl`s where a
+    /// read sized first makes two, and at most five reads where sizing before each makes four.
+    pub(super) fn table_sized(
+        last: &AtomicUsize,
+        mut size: impl FnMut() -> Option<usize>,
+        mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    ) -> Option<Vec<u8>> {
+        // `None`: the table outgrew `len` and its slack; `Some` is the read's answer.
+        let mut into = |len: usize| -> Option<Option<Vec<u8>>> {
             let mut buf = vec![0u8; len + len / 8 + KINFO_SIZE * 16];
-            match sysctl_into(in_kernel, &mut mib[..3], &mut buf) {
+            match read(&mut buf) {
                 Ok(n) if n % KINFO_SIZE == 0 => {
                     buf.truncate(n);
-                    return Some(buf);
+                    last.store(n, Ordering::Relaxed);
+                    Some(Some(buf))
                 }
-                Ok(_) => return None,
-                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {}
-                Err(_) => return None,
+                Ok(_) => Some(None),
+                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => None,
+                Err(_) => Some(None),
+            }
+        };
+        let kept = last.load(Ordering::Relaxed);
+        if kept > 0
+            && let Some(answer) = into(kept)
+        {
+            return answer;
+        }
+        for _ in 0..4 {
+            if let Some(answer) = into(size()?) {
+                return answer;
             }
         }
         None
@@ -618,7 +738,11 @@ mod imp {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
-    pub(super) fn records() -> Option<Vec<Record>> {
+    pub(super) fn table() -> Option<Vec<u8>> {
+        None
+    }
+
+    pub(super) fn parse_record(_record: &[u8]) -> Option<Record> {
         None
     }
 

@@ -17,6 +17,18 @@ pub const MAX_RESUME: usize = 16 * 1024;
 /// Maximum arguments or environment entries in one retained native command.
 pub const MAX_COMMAND_ITEMS: usize = 256;
 
+/// Whether `text` holds a `\n`, a `\r` or a NUL, the three terminators no word of a native
+/// request, reply or retained value may hold. It counts no other character: not a tab, VT, FF or
+/// NEL (U+0085), nor U+2028 or U+2029, each of which
+/// [`crate::supervise::limit::breaks_a_line`] counts. One byte scan each, since each is an ASCII
+/// byte that no other character's UTF-8 holds. A character-set search walks every character
+/// instead, a cost each request's encoding pays again where it checks itself by parsing what it
+/// wrote ([`Request::encode`]).
+pub(super) fn holds_a_terminator(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.contains(&b'\n') || bytes.contains(&b'\r') || bytes.contains(&0)
+}
+
 /// The billing authority used when planning a deferred model launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ColdBilling {
@@ -96,7 +108,7 @@ fn legacy_route(
 }
 
 fn bounded_cold_text(value: &str) -> bool {
-    value.len() <= MAX_PATH && !value.contains(['\0', '\r', '\n'])
+    value.len() <= MAX_PATH && !holds_a_terminator(value)
 }
 
 impl ColdIntent {
@@ -589,7 +601,7 @@ impl RestartCommand {
                 .as_ref()
                 .is_some_and(|names| names.len() > MAX_COMMAND_ITEMS)
             || line.len() > MAX_RESUME
-            || line.contains(['\r', '\n', '\0'])
+            || holds_a_terminator(&line)
             || self.image.path.first() != Some(&b'/')
             || self.image.path.len() > MAX_PATH
             || self.image.path.contains(&0)
@@ -639,7 +651,7 @@ impl RestartCommand {
     /// representations refuse instead of changing the retained command's identity.
     #[must_use]
     pub fn parse(encoded: &str) -> Option<Self> {
-        if encoded.len() > MAX_REQUEST || encoded.contains(['\n', '\r', '\0']) {
+        if encoded.len() > MAX_REQUEST || holds_a_terminator(encoded) {
             return None;
         }
         let mut words = BTreeMap::new();
@@ -1541,7 +1553,7 @@ impl Request {
     /// or capabilities, and non-native semantic duties refuse the complete request.
     #[must_use]
     pub fn parse(tail: &str) -> Option<Self> {
-        if tail.len() > MAX_REQUEST || tail.contains(['\n', '\r', '\0']) {
+        if tail.len() > MAX_REQUEST || holds_a_terminator(tail) {
             return None;
         }
         let mut split = tail.split_ascii_whitespace();
@@ -1735,8 +1747,7 @@ impl Request {
                     return None;
                 }
                 if let NativePlan::Restart { socket, .. } = &plan
-                    && (!std::path::Path::new(socket).is_absolute()
-                        || socket.contains(['\r', '\n', '\0']))
+                    && (!std::path::Path::new(socket).is_absolute() || holds_a_terminator(socket))
                 {
                     return None;
                 }

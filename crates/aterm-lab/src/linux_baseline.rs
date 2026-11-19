@@ -4,7 +4,6 @@
 //! Scripted Linux baseline session (`linux baseline`).
 //! STOCK EXCEPTION: the guest builds with rustup's stock toolchain, as [`crate::linux_proof`] does.
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -16,6 +15,7 @@ use crate::linux_xwire as xwire;
 use crate::{Fail, LAB, Res};
 
 mod deck;
+mod navigator;
 
 pub(crate) use deck::{row as deck_row, row_name as deck_row_name};
 
@@ -1394,6 +1394,8 @@ struct Session<'a> {
     results: PathBuf,
     rec: Recording,
     roles: Vec<(String, String)>,
+    dock: navigator::Dock,
+    hostname: String,
     end_terminal: Option<(String, Option<String>)>,
     marks: Vec<(&'static str, f64)>,
 }
@@ -1598,8 +1600,10 @@ impl Session<'_> {
             return;
         }
         let mut n = 0;
+        let mut in_dock = false;
+        let mut ancestors = Vec::new();
         for line in out.text.lines() {
-            if let Some((path, rest)) = node_parts(line) {
+            if let Some((path, mut rest)) = node_parts(line) {
                 n += 1;
                 if let Some(role) = node_role(&rest) {
                     let entry = (path.to_string(), role.to_string());
@@ -1610,6 +1614,27 @@ impl Session<'_> {
                         self.end_terminal = quoted_field(line, "text")
                             .map(|t| (t, proof::field(line, "caret").map(str::to_string)));
                     }
+                    let depth = proof::field(line, "depth").and_then(|v| v.parse::<usize>().ok());
+                    ancestors.truncate(depth.unwrap_or_default());
+                    let panel = role == "panel";
+                    in_dock = match depth {
+                        Some(2) => {
+                            role == "embedded"
+                                && quoted_field(line, "name").as_deref()
+                                    == Some(self.hostname.as_str())
+                        }
+                        Some(3..) => in_dock,
+                        _ => false,
+                    };
+                    if in_dock {
+                        self.dock.observe(path, &rest, &ancestors);
+                        let stable = navigator::node(&rest, &self.hostname);
+                        if stable != rest {
+                            self.rec.measured(&format!("atspi.live.{phase}.{n}"), &rest);
+                            rest = stable;
+                        }
+                    }
+                    ancestors.push((path, panel));
                 }
                 self.rec.behaviour(&format!("atspi.walk.{phase}.{n}"), rest);
                 self.rec.measured(&format!("atspi.path.{phase}.{n}"), path);
@@ -4336,6 +4361,10 @@ fn record_session(
         deck: false,
     };
     gui.prepare().map_err(|e| format!("scratch world: {e}"))?;
+    let hostname = up.sh(&["hostname".into()]);
+    if !hostname.ok() {
+        return Err(format!("guest hostname: {}", hostname.tail(2)));
+    }
     linux::start_baseline_screen(up, screen)?;
     let mut s = Session {
         gui,
@@ -4346,6 +4375,8 @@ fn record_session(
         results: results.to_path_buf(),
         rec: Recording::default(),
         roles: Vec::new(),
+        dock: navigator::Dock::default(),
+        hostname: hostname.text.trim().to_string(),
         end_terminal: None,
         marks: Vec::new(),
     };
@@ -4489,11 +4520,7 @@ fn record_session(
         .lines()
         .filter(|l| event_parts(l).is_some_and(|(p, _)| p == pid))
         .collect();
-    let kinds: BTreeSet<String> = lines
-        .iter()
-        .map(|l| event_kind(l, &s.roles))
-        .filter(|k| !k.starts_with("Object.PropertyChange:accessible-name@"))
-        .collect();
+    let kinds = navigator::event_kinds(&lines, &s.roles, &s.dock);
     s.rec.behaviour(
         "atspi.events.kinds",
         if kinds.is_empty() {

@@ -248,10 +248,11 @@ fn the_original_endpoint_expiring_during_postchecks_never_publishes_ready() {
         .unwrap()
         .finish()
         .unwrap();
-    // Allow the standard liveness budget for filesystem/cache setup. The SAME
-    // original endpoint must then actually expire inside the postcheck; this
-    // control asserts lifecycle ordering, not setup speed.
+    // The standard liveness budget for filesystem/cache setup. The SAME original
+    // endpoint then passes inside the postcheck, on this thread's endpoint clock;
+    // this control asserts lifecycle ordering, not setup speed.
     let endpoint = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let passed = std::cell::Cell::new(None);
     let attempt = MaterializationAttempt::create(
         world.path(),
         "attempt",
@@ -265,9 +266,7 @@ fn the_original_endpoint_expiring_during_postchecks_never_publishes_ready() {
     let error = completed
         .finish_with(|original| {
             entered.set(true);
-            while let Some(left) = endpoint.checked_duration_since(Instant::now()) {
-                std::thread::park_timeout(left);
-            }
+            passed.set(Some(super::super::workspace::Elapsed::to(endpoint)));
             assert_eq!(
                 original.check_current().unwrap_err().kind(),
                 io::ErrorKind::TimedOut
@@ -352,10 +351,11 @@ fn successful_transition_cannot_publish_after_original_endpoint() {
         .unwrap()
         .finish()
         .unwrap();
-    // Allow the standard liveness budget for filesystem/cache setup, then wait
-    // out this SAME original endpoint inside the actual transition. Its expiry
-    // defines the behavior; the fixture makes no setup-latency claim.
+    // The standard liveness budget for filesystem/cache setup; this SAME original
+    // endpoint then passes inside the actual transition, on this thread's endpoint
+    // clock. Its expiry defines the behavior; the fixture makes no setup-latency claim.
     let end = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let passed = std::cell::Cell::new(None);
     let attempt =
         MaterializationAttempt::create(world.path(), "attempt", vec![source.lend().unwrap()], end)
             .unwrap();
@@ -368,9 +368,7 @@ fn successful_transition_cannot_publish_after_original_endpoint() {
         |original| original.check_current(),
         |producer| {
             entered.set(true);
-            while let Some(left) = end.checked_duration_since(Instant::now()) {
-                std::thread::park_timeout(left);
-            }
+            passed.set(Some(super::super::workspace::Elapsed::to(end)));
             let owner = producer
                 .finish()
                 .expect("the actual producer transition succeeds");

@@ -223,7 +223,7 @@ impl ObservationDesk {
     }
 
     /// One owner alone performs reads, each answering the place and its own next time-only
-    /// change ([`aterm_netplace::keeper::read_projected`]). Requests and input changes arriving
+    /// change ([`aterm_netplace::keeper::read_projected_in`]). Requests and input changes arriving
     /// during I/O remain latched: each is taken as the read that answers it begins, never after.
     /// `watched` says whether the place's inputs are watched (the caller armed those watches
     /// before this).
@@ -418,9 +418,13 @@ fn follow(state: std::path::PathBuf) {
             let routes = watch_routes(&DESK, aterm_uds::network::RouteChanges::open());
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             let routes = None::<()>;
-            observe(&DESK, &state, files, routes, || {
-                aterm_netplace::keeper::read_projected(&state)
-            });
+            observe(
+                &DESK,
+                || aterm_netplace::record::dir(&state),
+                files,
+                routes,
+                aterm_netplace::keeper::read_projected_in,
+            );
         },
     );
     if let Err(e) = started {
@@ -465,27 +469,31 @@ fn watch_routes(
     aterm_netplace::watch::routes(changes, || desk.input_changed(), || desk.unwatched())
 }
 
-/// THE OBSERVATION OWNER over the state root `state`, on its thread until `desk` closes. The
+/// THE OBSERVATION OWNER of the place's folder, which `resolve` resolves (the window's:
+/// [`aterm_netplace::record::dir`] of its state root), on its thread until `desk` closes. The
 /// caller arms both of the place's watched inputs before this, so before its first read: the
 /// folder's files ([`watch_files`], pointed at the folder as each read resolves it, before
 /// reading) and the routes it reads live (`watch_routes`), which change with no file written
 /// whenever the keeper's record stays the same, and which no keeper writes while none keeps.
 /// Either missing, or the route socket failing later, puts the owner on
 /// [`aterm_netplace::keeper::UNWATCHED_EVERY`].
-/// `read` is the read itself (the window's: [`aterm_netplace::keeper::read_projected`]).
+/// `read` is the read itself in the folder resolved for it (the window's:
+/// [`aterm_netplace::keeper::read_projected_in`]): one resolution each read, which the watch is
+/// pointed at and the read reads.
 #[cfg(unix)]
 fn observe<R>(
     desk: &ObservationDesk,
-    state: &std::path::Path,
+    resolve: impl Fn() -> std::path::PathBuf,
     files: Option<aterm_netplace::watch::Watch>,
     routes: Option<R>,
-    mut read: impl FnMut() -> (Place, Option<u64>),
+    mut read: impl FnMut(&std::path::Path) -> (Place, Option<u64>),
 ) {
     desk.run(files.is_some() && routes.is_some(), || {
+        let dir = resolve();
         if let Some(files) = &files {
-            files.point(&aterm_netplace::record::dir(state));
+            files.point(&dir);
         }
-        let (place, due) = read();
+        let (place, due) = read(&dir);
         (Arc::new(place), due)
     });
     drop((files, routes));

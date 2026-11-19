@@ -4479,6 +4479,7 @@ fn a_held_tabs_record_is_its_own_agents() {
         argv: vec!["/opt/codex/bin/codex".into()],
         session: Some(THREAD.into()),
         run: Some(restore::RunRestore::Codex(restore::CodexRestore {
+            selected_default: false,
             home: "/opt/agents/codex".into(),
             home_env: None,
             embedded: true,

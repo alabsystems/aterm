@@ -118,14 +118,13 @@ fn every_bed_table_field_moves_the_bed_words() {
         "the same table, the same words"
     );
     assert_ne!(words(&BedInkLut::EMPTY), base, "an unsynced table is apart");
-    let (fg, bg, dark, tall) = bed.key.expect("a synced table has its key");
+    let key = bed.key.expect("a synced table has its key");
+    let (mut fg, mut bg, mut dark) = (key, key, key);
+    fg.0 ^= 1;
+    bg.1 ^= 1;
+    dark.2 = !dark.2;
     let mut mutants = Vec::new();
-    for (what, key) in [
-        ("fg", (fg ^ 1, bg, dark, tall)),
-        ("bg", (fg, bg ^ 1, dark, tall)),
-        ("dark", (fg, bg, !dark, tall)),
-        ("tall", (fg, bg, dark, !tall)),
-    ] {
+    for (what, key) in [("fg", fg), ("bg", bg), ("dark", dark)] {
         let mut keyed = bed;
         keyed.key = Some(key);
         mutants.push((what, keyed));

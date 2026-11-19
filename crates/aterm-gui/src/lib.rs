@@ -166,6 +166,7 @@ mod native_registry;
 pub use native_registry::open_measure::measure_local_registry;
 mod native_resources;
 mod native_session_policy;
+mod native_sheets;
 mod native_tables;
 mod native_tables_check;
 mod native_tables_choices;
@@ -334,6 +335,7 @@ mod close_confirm;
 mod close_sheet;
 #[cfg(target_os = "macos")]
 mod code_readahead;
+mod codex_adoption;
 mod codex_rollout_tap;
 mod command_registry;
 #[cfg(debug_assertions)]
@@ -792,6 +794,7 @@ mod messages_store;
 mod occupancy_host;
 mod occupancy_ring;
 mod occupancy_wakes;
+mod out_ring;
 mod owned_endpoint;
 mod owner_keys_save;
 mod palette;
@@ -969,6 +972,10 @@ mod harness_fact_verb;
 mod harness_policy_verb;
 mod harness_probe_verb;
 mod harness_recovery_verb;
+/// The harness watchdog: a contract 4 claim's missed beats and its ignored restarts
+/// (`docs/HARNESS-CONTRACT.md`, "The watchdog").
+#[cfg(unix)]
+mod harness_watchdog;
 mod kitty_animation;
 mod login_notice_verb;
 /// Rename This Mac…'s two fields and live line (`docs/DESIGN-machine-names-2026-11-04.md` §5.3).
@@ -9883,7 +9890,9 @@ impl Wake {
     /// `turn_lease` slot, ended a turn's input there (the turn's lease stops saying its driver
     /// may type), or submitted a turn into it, which leaves the lease as it was; where it took,
     /// released or handed back a turn's lease that names the session driving the turn, it posts
-    /// one for that driver too, whose own slot it leaves as it was. The handler
+    /// one for that driver too, whose own slot it leaves as it was. aterm's harness watchdog
+    /// posts one for a session whose harness it ended (`harness_watchdog::end_harness`), whose
+    /// need then reads `unsupervised`; it moves no lease either. The handler
     /// ([`App::on_presence_wake`]) takes `&mut App` and refreshes the named session's presence
     /// from the leases as they stand: the presence table and its supervisor deadline, the
     /// session's published need (its timeline's need, the need rechecks and ages, the API outage
@@ -17184,6 +17193,9 @@ impl App {
 
     /// The `Wake::MetaChanged` arm.
     pub(crate) fn on_meta_changed(&mut self, session: u64) {
+        self.observe_codex_claim(session, Instant::now());
+        // A claim's move may have armed a settle the loop must tick (the stream's stand-down).
+        self.note_slog_wake(session);
         self.hold_task_to_autopilot(session);
         let dropped = self.autopilot_timers.glass(session);
         self.index_autopilot_timer_unstamped(session, None);
@@ -20442,6 +20454,14 @@ impl ApplicationHandler<Wake> for App {
             );
         }
         self.fold_consent_lane_deadlines(Instant::now(), &mut deadline, &mut deadline_owner);
+        if let Some(at) = self.observe_codex_packages(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                at,
+                metrics::DeadlineOwner::SessionStatus,
+            );
+        }
         let status_held = self.tab_spawns.status_sweep_held_until(Instant::now());
         match status_held {
             Some(at) => fold_owned_deadline(

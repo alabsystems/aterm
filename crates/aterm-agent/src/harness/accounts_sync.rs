@@ -1031,8 +1031,13 @@ pub enum SheetColumn {
 /// the harness's own reading of the sheet takes it ([`parse_accounting_csv_for`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SheetCell {
-    /// Empty, `0`, `no` or `false`: not a member.
+    /// Empty: not a member.
     Absent,
+    /// `0`: not a member, because the provider banned the login's account there (the owner,
+    /// 2026-11-16); the importer keeps it as a `banned` account.
+    Zero,
+    /// `no` or `false`: not a member; the importer keeps the word as the login's note.
+    No,
     /// A member, with the vendor keys the cell names.
     Member(accounts::Vendor),
     /// A member the row's notes disqualify for this vendor (`kimi banned`), or for every vendor.
@@ -1068,13 +1073,14 @@ pub fn read_sheet_cell(column: SheetColumn, cell: &str, notes: &str) -> SheetCel
         SheetColumn::Meta => (plain(), notes_disqualify_at(META_NOTES, notes)),
     };
     match member {
+        Member::No if cell.is_empty() => SheetCell::Absent,
+        Member::No if matches!(cell, "0" | "0.0") => SheetCell::Zero,
         Member::No
-            if cell.is_empty()
-                || ["0", "0.0", "no", "false"]
-                    .iter()
-                    .any(|word| cell.eq_ignore_ascii_case(word)) =>
+            if ["no", "false"]
+                .iter()
+                .any(|word| cell.eq_ignore_ascii_case(word)) =>
         {
-            SheetCell::Absent
+            SheetCell::No
         }
         Member::No => SheetCell::Unread,
         Member::Held if disqualified => SheetCell::Disqualified(accounts::Vendor::default()),
@@ -1802,8 +1808,11 @@ pub(crate) fn unlisted_login_notes(
 ) -> Vec<super::journal::Note> {
     let working = match outcome {
         crate::ai::store::Outcome::Worked => true,
-        crate::ai::store::Outcome::Ended(_) => false,
-        crate::ai::store::Outcome::Limited(_) => return Vec::new(),
+        crate::ai::store::Outcome::Ended(why) if why.refuses_the_login() => false,
+        // A blocked path says nothing of the account's login (plan package UB-05).
+        crate::ai::store::Outcome::Ended(_) | crate::ai::store::Outcome::Limited(_) => {
+            return Vec::new();
+        }
     };
     let email = match cli {
         Cli::Claude => home.parent().and_then(home_default_email),
@@ -2200,6 +2209,24 @@ pub(crate) fn record_review_login(
             let label = &row.label;
             if logins.sign_in_receipts.get(label).copied() != witness.sign_in_receipt {
                 return Err("a newer sign-in superseded this review; nothing recorded".into());
+            }
+            // A run that met a blocked path (a bot check, a 403 named by its status alone, no
+            // answer) learned nothing of the login, on any route: it is the account's path
+            // observation, never a strike, and no login end is noted or staged (plan package
+            // UB-05).
+            if let Outcome::Ended(why) = outcome
+                && !why.refuses_the_login()
+            {
+                accounts::note_unreached(
+                    state,
+                    label,
+                    accounts::LoginObs::new(
+                        now,
+                        &format!("{}@{now}", why.word()),
+                        aterm_evidence::Source::Reading,
+                    ),
+                );
+                return Ok(Vec::new());
             }
             if matches!(outcome, Outcome::Ended(_)) && !had_a_login(cli, row, state, logins, home) {
                 return Ok(Vec::new());
@@ -21258,7 +21285,7 @@ pub(super) fn write_check_stop(store: &accounts::Store, check: &PendingCheck) ->
         &check.roster_path,
         check.at,
         &mut None,
-        |raw, _, logins| {
+        |raw, state, logins| {
             let Some(row) = raw.row(&check.row.label).filter(|row| {
                 accounts::checked_account(&accounts::check_of(&check.row, check.at), row)
             }) else {
@@ -21279,6 +21306,9 @@ pub(super) fn write_check_stop(store: &accounts::Store, check: &PendingCheck) ->
                 return Err("a login was made for the row since".into());
             }
             accounts::note_check_stop(logins, row, check.at);
+            // The page the sign-in met is its path's observation, never its login's (plan
+            // package UB-05).
+            accounts::note_sign_in_unreached(state, &row.label, check.at);
             Ok(Vec::new())
         },
     );

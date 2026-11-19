@@ -50,6 +50,65 @@ pub fn said_mark(tail: Option<&str>) -> Option<u64> {
     (!letters.is_empty()).then(|| aterm_hash::fnv1a_64(letters.as_bytes()))
 }
 
+/// How many replies each thread keeps Land's readings of ([`land_open_of`], [`land_hint_of`]).
+/// A point that judges a claim reads its reply's open work, the check it owes reads the same
+/// reply's first open clause, and each point after it reads them again while the reply stands;
+/// both are readings of the words alone ([`alab_policy::open_work::land_open_found`]).
+const REMEMBERED_REPLIES: usize = 8;
+
+/// The longest reply a thread keeps a reading of, so that its memory stays small.
+const REMEMBERED_REPLY_BYTES: usize = 64 * 1024;
+
+/// The readings of the last [`REMEMBERED_REPLIES`] replies a thread read one way, by their words.
+struct Remembered<T>(std::cell::RefCell<VecDeque<(String, T)>>);
+
+impl<T: Clone> Remembered<T> {
+    const fn new() -> Self {
+        Self(std::cell::RefCell::new(VecDeque::new()))
+    }
+
+    /// `read` of `tail`, or what it read of the same words before.
+    fn get_or(&self, tail: &str, read: impl FnOnce(&str) -> T) -> T {
+        if tail.len() > REMEMBERED_REPLY_BYTES {
+            return read(tail);
+        }
+        let known = self
+            .0
+            .borrow()
+            .iter()
+            .find(|(words, _)| words == tail)
+            .map(|(_, answer)| answer.clone());
+        known.unwrap_or_else(|| {
+            let answer = read(tail);
+            let mut known = self.0.borrow_mut();
+            if known.len() == REMEMBERED_REPLIES {
+                known.pop_front();
+            }
+            known.push_back((tail.to_owned(), answer.clone()));
+            answer
+        })
+    }
+}
+
+/// Land's open work in the reply `tail` ([`land_open_words`]), remembered by its words.
+fn land_open_of(tail: Option<&str>) -> Vec<&'static str> {
+    thread_local! {
+        static KNOWN: Remembered<Vec<&'static str>> = const { Remembered::new() };
+    }
+    tail.map_or_else(Vec::new, |t| {
+        KNOWN.with(|known| known.get_or(t, |t| land_open_words(Some(t))))
+    })
+}
+
+/// The owed check's clause of the reply `tail` ([`land_check::hint_clause`]), remembered by its
+/// words.
+fn land_hint_of(tail: &str) -> Option<String> {
+    thread_local! {
+        static KNOWN: Remembered<Option<String>> = const { Remembered::new() };
+    }
+    KNOWN.with(|known| known.get_or(tail, land_check::hint_clause))
+}
+
 /// THE REPLY A TURN SAID ([`TurnEndState::repeats`]): its words, or a read wall's kind and words, a word with a digit one number, a clock's `AM` or `PM` after it included.
 fn reply_mark(reading: &TurnEndReading) -> u64 {
     mark_of(reading, reading.wall)
@@ -2674,7 +2733,10 @@ impl TurnEndReading {
             phase: reading.phase.clone(),
             authoritative: reading.phase_authoritative,
             survey: reading.survey,
-            wall: reading.wall.as_ref().map(|w| w.kind),
+            wall: reading
+                .wall
+                .as_ref()
+                .map(|w| answered_wall(w.kind, &w.message)),
             resumes_by_itself: super::super::limit::resumes_by_itself(&message)
                 && auto_continue != Some(aterm_phase::AutoContinue::Unkept)
                 && !recorded,
@@ -2794,6 +2856,15 @@ impl TurnEndReading {
             && matches!(self.phase, Phase::Idle)
             && self.authoritative
             && self.login_screen.is_none()
+    }
+
+    /// Whether the wall's words are evidence against its login ([`aterm_phase::wall::strike_cause`]
+    /// of [`Self::wall_message`], plan package UB-05): a refused credential or the remedy alone,
+    /// never a blocked path (a 403 named by its status alone under the remedy, a page in the
+    /// API's place), which shows nothing of the login.
+    #[must_use]
+    pub fn login_wall_strikes(&self) -> bool {
+        aterm_phase::wall::strike_cause(&self.wall_message).strikes()
     }
 
     /// THE PROGRAM'S OWN STOP NOTICE an idle point with a task ends on ([`Self::fault`]): the
@@ -3008,6 +3079,32 @@ impl TurnEndAction {
             | TurnEndAction::Restart { rule_id, .. } => Some(rule_id),
             _ => None,
         }
+    }
+}
+
+/// THE WALL THIS POLICY ANSWERS FOR A WALL READ AS `kind` WITH THE WORDS `message` (plan package
+/// UB-05): a login wall whose words name a blocked path
+/// ([`aterm_phase::wall::StrikeCause::Blocked`]: a 403 whose body names no credential under
+/// Claude Code's sign-in remedy, `Please run /login · API Error: 403 Forbidden`) is the API's
+/// outage, as Cloudflare's page answering in the API's place is
+/// ([`aterm_phase::wall::edge_block`], which `aterm_phase::classify_wall` names a retried
+/// [`ApiCause::Server`] error with its status): nothing about the login was answered, the same
+/// login serves again once the path does, and a sign-in run against the same block meets it
+/// again. So it is waited out and tried again on the outage's ladder ([`outage_wait`]), tracked as
+/// the retry it is (never as a login wall, whose track counts the `/login` typed at it), and it
+/// answers no account move, tells the host no lost login and waits on no sign-in. Claude Code
+/// puts its remedy before a 401 or a 403 alone, and a 401 names the credential refused, so the
+/// status it keeps is the 403's. Every other wall is its own kind.
+#[must_use]
+pub fn answered_wall(kind: WallKind, message: &str) -> WallKind {
+    if kind == WallKind::Auth && !aterm_phase::wall::strike_cause(message).strikes() {
+        WallKind::ApiError {
+            code: Some(403),
+            retryable: true,
+            cause: ApiCause::Server,
+        }
+    } else {
+        kind
     }
 }
 
@@ -6715,9 +6812,7 @@ impl TurnEndState {
         self.land.check_owed = owed;
         self.land.answered = false;
         self.land.owed_mark = owed.then_some(mark);
-        self.land_hint = owed
-            .then(|| tail.and_then(land_check::hint_clause))
-            .flatten();
+        self.land_hint = owed.then(|| tail.and_then(land_hint_of)).flatten();
         self.land_owed_tail = owed.then(|| tail.map(land_check::audited)).flatten();
     }
 
@@ -8378,7 +8473,8 @@ impl TurnEndState {
     /// What this point says of the account move not answered yet. A sign-in menu drawn in place
     /// of the composer (`TurnEndReading::at_sign_in_menu`) is no point, but it answers the move
     /// all the same: no transcript stands there, so its lost login is the moved-to process's own
-    /// ([`AccountBad::SignedOut`]), unless an act is still awaited.
+    /// ([`AccountBad::SignedOut`]), unless an act is still awaited. A sign-in wall whose words
+    /// name a blocked path ([`Self::auth_wall_strikes`], plan package UB-05) answers nothing.
     #[must_use]
     pub fn account_answer(&self, reading: &TurnEndReading) -> Option<AccountAnswer> {
         self.account_answer_as(reading, self.account_asked, self.account_startup)
@@ -8422,8 +8518,12 @@ impl TurnEndState {
                 .map(|_| WallKind::Auth)
         });
         match wall {
+            // A sign-in wall whose words name a blocked path answers nothing of the moved-to
+            // login (plan package UB-05): the host would strike it and sign it in again against
+            // the same block; the move stays awaited until a turn on it is answered.
             Some(WallKind::Auth)
-                if (!self.login_left(reading) || self.ran_under_move(reading))
+                if self.auth_wall_strikes(reading.wall.is_some(), reading)
+                    && (!self.login_left(reading) || self.ran_under_move(reading))
                     && !(self.awaiting.is_some() && reading.worked.is_none()) =>
             {
                 Some(AccountAnswer::Bad(AccountBad::SignedOut))
@@ -8677,8 +8777,11 @@ impl TurnEndState {
     /// runs on, and nothing is advised, moved or typed for it. Lost at the program's sign-in
     /// wall drawn now (never one remembered) at a point or at a sign-in menu
     /// ([`TurnEndReading::at_sign_in_menu`]); not the wall a move left behind
-    /// ([`Self::login_left`]), nor one whose login is back here or in another tab. Served at a
-    /// point a turn worked to with no wall, no interrupt and no login dialog drawn over it.
+    /// ([`Self::login_left`]), nor one whose login is back here or in another tab, nor one whose
+    /// words name a blocked path ([`TurnEndReading::login_wall_strikes`]: a 403 named by its
+    /// status alone under the remedy, plan package UB-05), which shows nothing of the login.
+    /// Served at a point a turn worked to with no wall, no interrupt and no login dialog drawn
+    /// over it.
     #[must_use]
     pub fn login_seen(&self, reading: &TurnEndReading) -> Option<LoginSeen> {
         if reading.upgrading || reading.survey || !reading.authoritative {
@@ -8687,6 +8790,7 @@ impl TurnEndState {
         let at = reading.at_point(self.stale_input);
         if reading.wall == Some(WallKind::Auth) {
             return ((at || reading.at_sign_in_menu())
+                && reading.login_wall_strikes()
                 && !reading.wall_remembered
                 && !reading.login_back
                 && !self.login_left(reading)
@@ -8712,16 +8816,21 @@ impl TurnEndState {
     /// ([`TurnEndReading::at_sign_in_menu`]), which is no point; past a `/login` aterm typed and
     /// left ([`Self::login_typed_left`]) too, whose wall its `Login interrupted` stands below. Not
     /// over a move whose wall the session left, an answer still awaited, a login back in another
-    /// tab, or an upgrade's restart.
+    /// tab, or an upgrade's restart; nor over a wall whose words name a blocked path, drawn now
+    /// ([`TurnEndReading::login_wall_strikes`]) or the one a `/login` aterm typed and left stood
+    /// at, judged by the words it was read with ([`Self::auth_wall_strikes`]): nothing showed its
+    /// login ended, and a sign-in run against the same block would meet it again (plan package
+    /// UB-05).
     fn login_end_told(&self, reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {
         cfg.logins
             && reading.login_label.is_some()
             && moves_accounts(reading.program)
-            && (reading.wall == Some(WallKind::Auth)
+            && ((reading.wall == Some(WallKind::Auth) && reading.login_wall_strikes())
                 || (reading.wall.is_none()
                     && reading.login_screen.is_none()
                     && !reading.login_back
-                    && self.login_typed_left()))
+                    && self.login_typed_left()
+                    && self.auth_wall_strikes(false, reading)))
             && (reading.at_point(self.stale_input)
                 || (reading.at_sign_in_menu() && !reading.survey))
             && !reading.upgrading
@@ -8788,7 +8897,9 @@ impl TurnEndState {
                 | WallKind::ModelBucket { .. }),
             ) if rotates => Some(AccountPoint::Wall { kind }),
             Some(WallKind::Auth)
-                if self.login_left(reading) || self.account_answer_awaited(reading) =>
+                if self.login_left(reading)
+                    || self.account_answer_awaited(reading)
+                    || !self.auth_wall_strikes(shown.is_some(), reading) =>
             {
                 None
             }
@@ -8805,6 +8916,23 @@ impl TurnEndState {
             }
             _ => None,
         }
+    }
+
+    /// Whether the sign-in wall a point stands at is evidence against its login: the wall drawn
+    /// now (`shown`) by its words ([`TurnEndReading::login_wall_strikes`]), one only remembered by
+    /// the words it was read with. A blocked path (a 403 whose body names no credential under the
+    /// remedy, plan package UB-05) is no lost login: the host would record the login's end
+    /// (`accounts::Point::LostLogin`, `accounts::Point::LoginEnded`, a move's
+    /// [`AccountBad::SignedOut`]) and move or sign the row in again against the same block. Read
+    /// by the moving point ([`Self::point_moving`]), the move's answer
+    /// ([`Self::account_answer`]) and the roster row's lost login ([`Self::login_end_told`]).
+    fn auth_wall_strikes(&self, shown: bool, reading: &TurnEndReading) -> bool {
+        if shown {
+            return reading.login_wall_strikes();
+        }
+        self.wall
+            .as_ref()
+            .is_none_or(|t| aterm_phase::wall::strike_cause(&t.said).strikes())
     }
 
     /// Whether this point may take the accounts probe ([`RULE_USAGE_PROBE`]).
@@ -10095,7 +10223,7 @@ impl TurnEndState {
             let claim = self.done == 1 && !reading.interrupted;
             self.open = if claim {
                 match reading.autopilot {
-                    Autopilot::Land => land_open_words(tail),
+                    Autopilot::Land => land_open_of(tail),
                     Autopilot::Cruise | Autopilot::Off => {
                         tail.map_or_else(Vec::new, |t| open_work(Some(&needs::without_needs(t))))
                     }

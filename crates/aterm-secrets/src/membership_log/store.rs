@@ -745,6 +745,14 @@ impl Store {
         self.reading
     }
 
+    /// Draft from now on for a writer of format 2 that resolves its registers as `identity`
+    /// ([`Log::write_two`]): its log's `Put`s and `Delete`s sign as record version 2.
+    pub(crate) fn write_two(&mut self, identity: &crate::age::Identity) {
+        if let Some(log) = &mut self.log {
+            log.write_two(identity);
+        }
+    }
+
     /// This store, reading records at `reading` from now on: what a records file it recovers and
     /// a head it opens admit. A store is told its format by the node it is the store of; it
     /// decides none.
@@ -778,6 +786,22 @@ impl Store {
     #[must_use]
     pub const fn pinned_network(&self) -> Option<RecordId> {
         self.compiled
+    }
+
+    /// Seam (tests of other crates): a store that holds `log`, whole or rooted at a final
+    /// checkpoint ([`Log::adopt`]), and reads its records at `reading`. A store takes a rooted
+    /// log by no other way in this build: nothing prunes, and nothing reads a rewritten records
+    /// file ([`super::rooted`]'s "Not yet").
+    ///
+    /// # Errors
+    /// The store refuses `log`'s genesis ([`Store::insert`]).
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn test_holding(log: Log, reading: Reading) -> Result<Self> {
+        let mut store = Self::with_compiled(None);
+        store.insert(log.genesis().clone())?;
+        store.log = Some(log);
+        Ok(store.read_at(reading))
     }
 
     /// Keep an already-verified causal projection with this store's admission context.
@@ -1194,8 +1218,9 @@ impl Store {
     /// history summarize alike. None is sent: [`Store::complete_missing`] names held records
     /// alone, and a set-difference offer (the mesh's) that names a dropped id is sent no record
     /// for it, since the wires a peer is sent are held records'. A peer behind the cut then
-    /// differs from this log until it takes the root, which a records-only exchange cannot carry
-    /// (rooted.rs "Not yet"). A log with no root reads as before.
+    /// differs from this log until it takes the root, which a records-only exchange cannot
+    /// carry: aterm-db's `atdb/8` serves it beside the records (`control/frontier.rs`). A log
+    /// with no root reads as before.
     #[must_use]
     pub fn complete_inventory(&self) -> BTreeSet<RecordId> {
         self.log.as_ref().map_or_else(BTreeSet::new, |log| {

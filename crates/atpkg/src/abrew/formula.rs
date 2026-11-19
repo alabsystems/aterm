@@ -405,6 +405,8 @@ enum VersionPred {
     Ends,
     Starts,
     Includes,
+    /// `version.csv.length > N` (N in the literal).
+    CsvLenGt,
 }
 
 /// `<recv>.end_with?("lit")` and friends over an
@@ -412,6 +414,13 @@ enum VersionPred {
 /// literal) — syntax only.
 fn version_pred_parts(cond: &str) -> Option<(String, VersionPred, String)> {
     let cond = cond.trim();
+    if let Some((r, a)) = cond.split_once(".csv.length > ") {
+        let n = a.trim();
+        if r.trim() != "version" || n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        return Some((r.trim().to_string(), VersionPred::CsvLenGt, n.to_string()));
+    }
     let (recv, pred, args) = if let Some((r, a)) = cond.split_once(".end_with?(") {
         (r, VersionPred::Ends, a)
     } else if let Some((r, a)) = cond.split_once(".start_with?(") {
@@ -434,6 +443,9 @@ fn version_pred_value(version: &str, recv: &str, pred: VersionPred, lit: &str) -
         VersionPred::Ends => recv.ends_with(lit),
         VersionPred::Starts => recv.starts_with(lit),
         VersionPred::Includes => recv.contains(lit),
+        VersionPred::CsvLenGt => {
+            version.split(',').count() > lit.parse::<usize>().unwrap_or(usize::MAX)
+        }
     })
 }
 
@@ -501,6 +513,49 @@ fn version_ternary_value(version: &str, token: &str) -> Option<String> {
 /// quoted literal kept only when the version
 /// predicate holds. Parts: (literal, negate, recv,
 /// predicate, pred literal) — syntax only.
+/// A double-quoted string's raw inner span,
+/// tracking interpolation braces (and quotes
+/// inside them) so a nested `#{...}` does not end
+/// the string early.
+fn dq_string_span(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut inner_quote: Option<u8> = None;
+    let mut i = 1usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if depth == 0 {
+            if c == b'"' {
+                return Some((s[1..i].to_string(), &s[i + 1..]));
+            }
+            if c == b'#' && bytes.get(i + 1) == Some(&b'{') {
+                depth = 1;
+                i += 2;
+                continue;
+            }
+        } else if let Some(q) = inner_quote {
+            if c == q {
+                inner_quote = None;
+            }
+        } else if c == b'"' || c == b'\'' {
+            inner_quote = Some(c);
+        } else if c == b'{' {
+            depth += 1;
+        } else if c == b'}' {
+            depth -= 1;
+        }
+        i += 1;
+    }
+    None
+}
+
 fn version_conditional_string_parts(
     token: &str,
 ) -> Option<(String, bool, String, VersionPred, String)> {
@@ -508,10 +563,11 @@ fn version_conditional_string_parts(
     if !token.starts_with('"') {
         return None;
     }
-    let (lit, tail) = chain_str_arg(token)?;
-    if lit.contains("#{") {
-        return None;
-    }
+    let (lit, tail) = if token.contains("#{") {
+        dq_string_span(token)?
+    } else {
+        chain_str_arg(token)?
+    };
     let tail = tail.trim();
     let (negate, cond) = if let Some(c) = tail.strip_prefix("if ") {
         (false, c)
@@ -534,7 +590,82 @@ pub fn version_conditional_string_syntax(token: &str) -> bool {
 fn version_conditional_string_value(version: &str, token: &str) -> Option<String> {
     let (lit, negate, recv, pred, pred_lit) = version_conditional_string_parts(token)?;
     let truth = version_pred_value(version, &recv, pred, &pred_lit)?;
-    Some(if truth != negate { lit } else { String::new() })
+    if truth == negate {
+        return Some(String::new());
+    }
+    // Interpolate the kept literal against the
+    // version (`"/#{version.csv[1..].join("/")}"`).
+    let mut out = String::with_capacity(lit.len());
+    let mut rest = lit.as_str();
+    while let Some(i) = rest.find("#{") {
+        out.push_str(&rest[..i]);
+        let inner = &rest[i + 2..];
+        let mut depth = 1usize;
+        let mut j = 0usize;
+        let b = inner.as_bytes();
+        let mut quote: Option<u8> = None;
+        while j < b.len() {
+            let c = b[j];
+            if let Some(q) = quote {
+                if c == q && b.get(j.wrapping_sub(1)) != Some(&b'\\') {
+                    quote = None;
+                }
+            } else if c == b'"' || c == b'\'' {
+                quote = Some(c);
+            } else if c == b'{' {
+                depth += 1;
+            } else if c == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        out.push_str(&cask_version_token(version, inner[..j].trim())?);
+        rest = &inner[j + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// `version.csv[a..b].join("sep")` (and the
+/// open-ended / exclusive spellings).
+fn version_csv_range_join(version: &str, token: &str) -> Option<String> {
+    let rest = token.strip_prefix("version.csv[")?;
+    let close = rest.find(']')?;
+    let inside = rest[..close].trim();
+    let (a_s, excl, b_s) = match inside.split_once("...") {
+        Some((a, b)) => (a, true, b),
+        None => {
+            let (a, b) = inside.split_once("..")?;
+            (a, false, b)
+        }
+    };
+    let a: usize = a_s.trim().parse().ok()?;
+    let parts: Vec<&str> = version.split(',').collect();
+    if a > parts.len() {
+        return None;
+    }
+    let end = if b_s.trim().is_empty() {
+        parts.len()
+    } else {
+        let b: usize = b_s.trim().parse().ok()?;
+        if excl {
+            b.min(parts.len())
+        } else {
+            (b + 1).min(parts.len())
+        }
+    };
+    let rest = rest[close + 1..].trim().strip_prefix(".join(")?;
+    let (sep, tail) = chain_str_arg(rest.trim_start())?;
+    if tail.trim() != ")" {
+        return None;
+    }
+    Some(parts[a..end.max(a)].join(&sep))
 }
 
 /// `<head>.split("s")[.map { |x| x.rjust(n, "p") }]
@@ -737,6 +868,9 @@ fn version_split_map_join(version: &str, token: &str) -> Option<String> {
 }
 
 pub fn cask_version_token(version: &str, token: &str) -> Option<String> {
+    if let Some(v) = version_csv_range_join(version, token) {
+        return Some(v);
+    }
     if token.contains(".split(")
         && let Some(v) = version_split_map_join(version, token)
     {
@@ -988,10 +1122,63 @@ pub enum JsonKey {
     Idx(usize),
 }
 
+/// One interpolation part of a `ListMaxPageHop`
+/// render: literal text, the list maximum, or the
+/// hopped page's regex capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonHopPart {
+    Lit(String),
+    Max,
+    Date,
+    /// The hopped-from key's value
+    /// (`KeyHopDigMatch`).
+    Key,
+    /// The fetched document's regex capture
+    /// (`KeyHopDigMatch`).
+    Fetched,
+}
+
 /// The enumerable data-only shapes a `:json` block body
 /// can take (see `tap::parse_json_shape`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonShape {
+    /// `<list> = <dig>&.filter_map { |i| i["k"] }&.uniq`,
+    /// `<v> = list.max_by { Version.new }`, then a
+    /// literal `page_content` page's regex capture,
+    /// rendered together (eclipse-ide).
+    ListMaxPageHop {
+        path: Vec<JsonKey>,
+        key: String,
+        url: String,
+        cap: usize,
+        parts: Vec<JsonHopPart>,
+    },
+    /// `<v> = json["K"]`, fetch `pre#{v}post`,
+    /// parse it as JSON, dig, take regex capture
+    /// `cap`, render (firefox@nightly).
+    KeyHopDigMatch {
+        key: String,
+        url_pre: String,
+        url_post: String,
+        path: Vec<JsonKey>,
+        cap: usize,
+        parts: Vec<JsonHopPart>,
+    },
+    /// `<v> = json["K"]`; when `v` equals the
+    /// current csv first field the answer is the
+    /// current version, else fetch a links
+    /// document and take the first list item of a
+    /// given type whose URL field matches
+    /// (minecraft-server).
+    KeyCurrentGateDigMatch {
+        key: String,
+        url: String,
+        path: Vec<JsonKey>,
+        type_key: String,
+        type_val: String,
+        url_key: String,
+        cap: usize,
+    },
     /// `strategy :json, &:to_s` — the root value's
     /// Ruby `to_s`.
     RootToS,
@@ -1032,6 +1219,14 @@ pub enum JsonShape {
     /// fallback download URL).
     DigMatch {
         paths: Vec<Vec<JsonKey>>,
+        render: Box<JsonRender>,
+    },
+    /// A dug string is itself a JSON document; dig
+    /// again inside it and match the block regex
+    /// (kdocs).
+    DigParseMatch {
+        outer: Vec<JsonKey>,
+        inner: Vec<JsonKey>,
         render: Box<JsonRender>,
     },
     /// Several named dig matches (each with any
@@ -1790,6 +1985,65 @@ pub enum PageShape {
     },
     /// `parse_json(match[N])` then a dig.
     MatchJsonDig { cap: usize, path: Vec<JsonKey> },
+    /// A literal-regex capture parsed as JSON, dug,
+    /// then matched against the block regex and
+    /// rendered (popo).
+    MatchJsonDigMatch {
+        lit: (String, String),
+        cap: usize,
+        path: Vec<JsonKey>,
+        parts: Vec<HopFinalPart>,
+    },
+    /// A literal-regex capture parsed as JSON, dug
+    /// to a hash of file lists; each file's `field`
+    /// matches the block regex and renders with an
+    /// optional second field (the `Hop` part),
+    /// blank-guarded (lg-onscreen-control).
+    MatchJsonNestedMap {
+        lit: (String, String),
+        cap: usize,
+        path: Vec<JsonKey>,
+        field: String,
+        extra: Option<String>,
+        parts: Vec<HopFinalPart>,
+    },
+    /// `page.scan(/lit/).map { |m| t = m[idx];
+    /// t = t.gsub(/strip/, repl) until stable;
+    /// t[regex, cap] }` (ripx's tag stripping).
+    ScanStripMatch {
+        pat: String,
+        flags: String,
+        idx: usize,
+        strip: (String, String),
+        repl: String,
+        cap: usize,
+    },
+    /// The block-regex scan's lexical maximum; a
+    /// dotless maximum is remapped to the first
+    /// literal-scan candidate with the same
+    /// dotless form (font-kikai-chokoku-jis).
+    ScanDottedMax { lit: (String, String) },
+    /// Scan maximum by `Time.parse` of capture
+    /// `time_idx` (scan indexing); the winner's
+    /// first capture split on `sep` (limit 2)
+    /// into version/build, held back to the
+    /// current csv while within `step` builds
+    /// (bettertouchtool@alpha).
+    ScanTimeMaxThrottle {
+        time_idx: usize,
+        sep: String,
+        step: i64,
+    },
+    /// The block-regex scan maximum as a Version,
+    /// with an optional literal-regex capture
+    /// appended after a separator (hy-rpe2).
+    ScanMaxOptCap {
+        pat: String,
+        flags: String,
+        cap: usize,
+        sep: String,
+        tr: Option<(String, String)>,
+    },
     /// `page.split(/pat/).filter_map { |section|
     /// [next if section.match?(skip)] section[regex, 1] }`
     SplitCapture {
@@ -1872,6 +2126,45 @@ pub enum PageShape {
     /// page it names, and scan that with the block
     /// regex.
     HopScan(Box<HopScan>),
+    /// Pick a value from page one, fetch the named
+    /// URL's response headers, and render from a
+    /// header match (grafx, platinum-notes, linqpad).
+    HeaderHop(Box<HeaderHop>),
+}
+
+/// An intermediate page fetch + bracket
+/// extraction between a header hop's first pick
+/// and its headers request (mixed-in-key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidHop {
+    pub url_pre: String,
+    pub url_post: String,
+    pub lit: (String, String),
+    pub cap: usize,
+}
+
+/// A headers-hop page block reduced to data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderHop {
+    pub hop_re: Option<(String, String)>,
+    pub pick: HopPick,
+    pub target: HopTarget,
+    /// The header read first (lowercase).
+    pub header: String,
+    /// `(headers["a"] || headers["b"])` fallback.
+    pub fallback: Option<String>,
+    /// Render per response header set (the
+    /// `page_headers(...).map` form) instead of
+    /// over the merged headers.
+    pub per_set: bool,
+    /// Match the header with this literal regex
+    /// (capture 1) instead of the block regex.
+    pub lit_cap: Option<(String, String)>,
+    pub parts: Vec<HopFinalPart>,
+    /// A chained second pick through an
+    /// intermediate page (its value replaces the
+    /// first pick everywhere downstream).
+    pub mid: Option<MidHop>,
 }
 
 /// A reduced second-fetch page block: how the hop
@@ -1888,10 +2181,27 @@ pub struct HopScan {
     /// Stage 2 keeps only its last capture
     /// (`.scan(regex)&.flatten&.last`).
     pub last_only: bool,
+    /// Stage 2 instead single-matches the block
+    /// regex and renders this template over its
+    /// captures and the hop value.
+    pub final_match: Option<Vec<HopFinalPart>>,
+    /// Stage 2 instead scans and renders this
+    /// template per match (scan-indexed captures).
+    pub final_scan: Option<Vec<PagePart>>,
+}
+
+/// One part of a hop-scan final-match template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HopFinalPart {
+    Lit(String),
+    /// `match[N]`
+    Cap(usize),
+    /// The hop value itself.
+    Hop,
 }
 
 /// How a hop-scan picks its value from page one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HopPick {
     /// `page[/lit/, 1]`
     First,
@@ -1899,6 +2209,19 @@ pub enum HopPick {
     ScanLast,
     /// `page.scan(re).map { … }.max_by { Version.new }`
     ScanMax,
+    /// `page.scan(re).flatten.uniq.max` (lexical).
+    ScanLexMax,
+    /// `page.scan(re).max_by { |m| Version.new(m[K]) }
+    /// &.first`: the winning row's first capture,
+    /// keyed by scan capture K (0-based).
+    ScanMaxKey(usize),
+    /// `page.match(re)`: capture 1 of the first
+    /// match; the hop slot spells `#{var[1]}`.
+    MatchFirst,
+    /// Scan the hop regex inside a section of the
+    /// page delimited by this literal regex's whole
+    /// match, taking the Version maximum.
+    SectionScanMax { section: (String, String) },
 }
 
 /// How a hop-scan forms the second URL from the
@@ -1909,8 +2232,16 @@ pub enum HopTarget {
     JoinLiteral(String),
     /// `URI.join(@url, v)`
     JoinSelf,
-    /// `"<pre>#{v}<post>"`
+    /// `"<pre>#{v}<post>"` (`\u{2}` marks the spec
+    /// URL, from a `#{url}` interpolation).
     Template(String, String),
+    /// `URI.join(base, "<pre>#{v}<post>")`; `None`
+    /// base is `@url`.
+    JoinTemplate {
+        base: Option<String>,
+        pre: String,
+        post: String,
+    },
 }
 
 /// A two-stage directory-walk page block reduced
@@ -1927,6 +2258,13 @@ pub struct DirWalk {
     /// Try the last two directories (gnu-getopt)
     /// instead of only the newest.
     pub last_two: bool,
+    /// Try every stage-1 candidate in scan order
+    /// until one's stage-2 scan is non-empty
+    /// (qt-creator's lazy walk).
+    pub scan_order: bool,
+    /// `url.sub(needle, "<pre>#{v}<post>")` directory
+    /// URL formation instead of a join.
+    pub url_sub: Option<(String, String, String)>,
     /// Directory URL template around the (possibly
     /// `tr`-ed) stage-1 version: pre + version + post,
     /// joined onto the livecheck URL.
@@ -1975,6 +2313,9 @@ pub struct GhRelBlock {
     /// blank guard; renders read it as `GhRelPart::Local`.
     pub pre_capture: Option<GhRelCapture>,
     pub source: GhRelSource,
+    /// The `each` + `break` form: only the first
+    /// rendered version is returned.
+    pub first_only: bool,
     pub then: GhRelThen,
     /// `end.presence || release["tag_name"]&.[](/…/, 1)`
     /// on an assets `filter_map`: when a release's
@@ -2079,6 +2420,15 @@ pub enum GhRelThen {
     Template(Vec<GhRelPart>),
     /// `(a == b) ? then_parts : else_parts`.
     EqElse {
+        a: GhRelOp,
+        b: GhRelOp,
+        then: Vec<GhRelPart>,
+        els: Vec<GhRelPart>,
+    },
+    /// `if b && a != b then … else … end`: the
+    /// then-render when `b` participates and the
+    /// operands differ.
+    CapNeElse {
         a: GhRelOp,
         b: GhRelOp,
         then: Vec<GhRelPart>,

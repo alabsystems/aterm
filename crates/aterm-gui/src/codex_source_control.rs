@@ -80,6 +80,7 @@ impl Sequence {
 #[derive(Clone, PartialEq, Eq)]
 enum Action {
     Peer,
+    Retained(crate::native_session_policy::retained_control::Request),
     Context(context_control::Action),
     Rebind(rebind_control::Original),
     Resource(resource_control::Action),
@@ -264,6 +265,17 @@ impl Request {
             hex(value, 32).then(|| value.to_owned())
         };
         let action = match action {
+            action
+                if action.starts_with("controller-retained-")
+                    || action.starts_with("controller-source-selection-") =>
+            {
+                Action::Retained(
+                    crate::native_session_policy::retained_control::Request::parse(
+                        action,
+                        &mut fields,
+                    )?,
+                )
+            }
             "member-peer" => Action::Peer,
             "member-target-resource-ready" | "member-target-ack" => {
                 Action::Resource(resource_control::Action::parse(action, &mut fields)?)
@@ -634,6 +646,7 @@ impl Request {
     fn name(&self) -> &'static str {
         match self.action {
             Action::Peer => "member-peer",
+            Action::Retained(ref request) => request.name(),
             Action::Context(ref action) => action.name(),
             Action::Rebind(_) => "member-work-rebind",
             Action::Resource(ref action) => action.name(),
@@ -774,6 +787,25 @@ fn execute(
     let mut value = completed_envelope(request, caller, epoch, request.member.as_deref());
     let member = request.member.as_deref().unwrap_or("");
     match &request.action {
+        Action::Retained(retained) => {
+            let controller = registry.frontend_controller(
+                &peer,
+                connection,
+                member,
+                &retained.controller_operation,
+            )?;
+            let frontend = registry.service_frontend(&controller, scope)?;
+            let master = host.master.ok_or(registry::Error::Denied)?;
+            let result = host.ctx.native_policy.retained_request(
+                registry,
+                frontend,
+                master,
+                &request.operation,
+                &retained.action,
+            )?;
+            let object = value.as_object_mut().ok_or(registry::Error::Unavailable)?;
+            object.extend(result);
+        }
         Action::Peer
         | Action::Context(_)
         | Action::Rebind(_)
@@ -923,6 +955,9 @@ fn execute(
             controller_operation,
             settings,
         } => {
+            if registry.frontend_exec_peer(&peer)? {
+                return Err(registry::Error::Denied);
+            }
             let controller =
                 registry.frontend_controller(&peer, connection, member, controller_operation)?;
             let master = host.master.ok_or(registry::Error::Denied)?;
@@ -1537,7 +1572,7 @@ pub(super) fn serve(
         if let Some(scope) = lifetime.enter() {
             if matches!(
                 &request.action,
-                Action::ServiceStart { .. } | Action::ServiceAttach { .. }
+                Action::ServiceStart { .. } | Action::ServiceAttach { .. } | Action::Retained(_)
             ) {
                 // This dispatch retains the actual server-side PTY for the call.
                 // Never copy its descriptor number to an asynchronous worker.
@@ -1623,6 +1658,9 @@ pub(super) fn serve(
         Some(Err(registry::Error::Denied)) => "ERR codex-auth denied\n".into(),
         Some(Err(registry::Error::Stale)) => "ERR codex-auth stale\n".into(),
         Some(Err(registry::Error::Unsupported)) => "ERR codex-auth unsupported\n".into(),
+        Some(Err(registry::Error::Busy)) if matches!(&request.action, Action::Retained(_)) => {
+            "ERR codex-auth busy\n".into()
+        }
         Some(Err(registry::Error::Busy | registry::Error::Unavailable)) => UNAVAILABLE.into(),
         None => frame(
             "member-waiting",

@@ -1,0 +1,16 @@
+# claude-code 2.1.310 · HAND-BUILT 2026-11-17 for plan package UB-05 · the rows of the measured `claude-2.1.310-login-expired.txt` (a private headless aterm, 144x50, running the real Claude Code over a local stub of the API), its error row replaced by the form 2.1.310 draws an API error under its sign-in remedy in (`claude-2.1.310-wall-401-please-run-login.txt`: `⏺ Please run /login · API Error: <status> <body>` in column 0) and 2.1.323 a 403 in (m2, 2026-11-13), and the footer's `Not logged in · Run /login` dropped, since a credential is stored · a 403 whose body names the token revoked: `⏺ Please run /login · API Error: 403 {"type":"error","error":{"type":"permission_error","message":"OAuth token has been revoked."}}`
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.WYUY/proj
+
+
+❯ hi
+
+⏺ Please run /login · API Error: 403 {"type":"error","error":{"type":"permission_error","message":"OAuth token has been revoked."}}
+
+✻ Churned for 0s · done 12:56 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

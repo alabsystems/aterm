@@ -21,7 +21,11 @@ use std::{
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     path::Path,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -35,6 +39,106 @@ pub(crate) const WITHIN: Duration = Duration::from_secs(30);
 /// one-minute hang detector rather than being cut (as [`crate::control`]'s exchange does).
 #[cfg(test)]
 pub(crate) const WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// How long an exchange may go on: `window` with no byte moved on its stream, and `guard` in
+/// all, each counted from when its [`Deadline`] was armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Patience {
+    /// The longest the exchange may go with no byte moved.
+    pub(crate) window: Duration,
+    /// The longest the exchange may go, moving or not.
+    pub(crate) guard: Duration,
+}
+impl Patience {
+    /// A wall-clock deadline of `within`, whatever moves: the window is the guard.
+    pub(crate) const fn absolute(within: Duration) -> Self {
+        Self {
+            window: within,
+            guard: within,
+        }
+    }
+
+    /// A test's hang detector: an exchange that moves no byte for one
+    /// [`aterm_spec::wait::MUST_HAPPEN`] is cut, and one that keeps moving is cut at
+    /// [`aterm_spec::wait::WORKING_GUARD`]. A loaded machine stretches a working round's wall
+    /// time without bound, and does not stop it moving.
+    #[cfg(test)]
+    pub(crate) const HANG: Self = Self {
+        window: aterm_spec::wait::MUST_HAPPEN,
+        guard: aterm_spec::wait::WORKING_GUARD,
+    };
+
+    /// The last instant an exchange armed at `from` may run to: its guard.
+    pub(crate) fn horizon(self, from: Instant) -> Instant {
+        from + self.guard
+    }
+
+    /// The longest a watcher waits between two looks at the exchange's progress. Where the window
+    /// is the guard, progress changes nothing: one wait to the deadline.
+    fn look(self) -> Duration {
+        if self.window >= self.guard {
+            self.guard
+        } else {
+            self.window / 4
+        }
+    }
+}
+
+/// One exchange's patience: the product's absolute [`WITHIN`]; a unit test's
+/// [`Patience::HANG`].
+#[cfg(not(test))]
+pub(crate) const PATIENCE: Patience = Patience::absolute(WITHIN);
+/// One exchange's patience: the product's absolute [`WITHIN`]; a unit test's
+/// [`Patience::HANG`].
+#[cfg(test)]
+pub(crate) const PATIENCE: Patience = Patience::HANG;
+
+/// How long a watcher of an exchange armed at `started`, whose stream last moved at `moved`,
+/// waits from `now` before it looks again; `None` where the exchange has run out of patience
+/// and is cut now. It expires at the earlier of a window after its last move and its guard.
+fn watch(patience: Patience, started: Instant, moved: Instant, now: Instant) -> Option<Duration> {
+    let expires = (moved + patience.window).min(patience.horizon(started));
+    (now < expires).then(|| (expires - now).min(patience.look()))
+}
+
+/// The watcher's loop for an exchange armed at `started`: whether it finished within its
+/// patience. Each look reads the clock (`now`) and the stream's moves (`moves`), and waits
+/// (`wait`) as long as [`watch`] says for the exchange's completion: when it finished, and its
+/// moves then. A completion is judged at its own time, so a late watcher honours an early
+/// finish, not a late one; one whose moves are newer than the last look moved after it.
+fn finished(
+    patience: Patience,
+    started: Instant,
+    now: impl Fn() -> Instant,
+    moves: impl Fn() -> u64,
+    mut wait: impl FnMut(Duration) -> std::result::Result<(Instant, u64), mpsc::RecvTimeoutError>,
+) -> bool {
+    let (mut moved, mut seen) = (started, 0);
+    loop {
+        let at = now();
+        let count = moves();
+        if count != seen {
+            (moved, seen) = (at, count);
+        }
+        let next = watch(patience, started, moved, at);
+        match wait(next.unwrap_or(Duration::ZERO)) {
+            Ok((completed, count)) => {
+                let moved = if count == seen { moved } else { completed };
+                return watch(patience, started, moved, completed).is_some();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if next.is_some() => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TEST SEAM: the moves the last [`Deadline`] dropped on this thread had counted on its
+    /// stream ([`Deadline::progressing`]).
+    pub(crate) static LAST_MOVES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// How long [`serve_until`]'s listener gives a connection's TLS and both proofs: aterm-net's
 /// [`fleet::HANDSHAKE_WITHIN`].
 #[cfg(not(test))]
@@ -99,55 +203,107 @@ pub(crate) fn while_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T>
     }
 }
 
+/// An exchange's watcher: it shuts the exchange's socket once the exchange runs out of its
+/// [`Patience`], and lets it be once this drops first.
 pub(crate) struct Deadline {
-    done: mpsc::Sender<Instant>,
+    done: mpsc::Sender<(Instant, u64)>,
+    /// How many reads and writes of the exchange's stream moved a byte ([`Self::progressing`]).
+    moves: Arc<AtomicU64>,
     join: Option<thread::JoinHandle<()>>,
 }
 impl Deadline {
+    /// [`Self::arm_with`] at the exchange's [`PATIENCE`].
     pub(crate) fn arm(tcp: &TcpStream) -> Result<Self> {
-        Self::arm_within(tcp, WITHIN)
+        Self::arm_with(tcp, PATIENCE)
     }
 
-    /// [`Self::arm`] with its own deadline.
-    pub(crate) fn arm_within(tcp: &TcpStream, within: Duration) -> Result<Self> {
-        Self::arm_with_clock(tcp, within, Instant::now)
+    /// Watch `tcp`'s exchange with its own patience.
+    pub(crate) fn arm_with(tcp: &TcpStream, patience: Patience) -> Result<Self> {
+        Self::arm_with_clock(tcp, patience, Instant::now)
     }
 
     fn arm_with_clock(
         tcp: &TcpStream,
-        within: Duration,
+        patience: Patience,
         now: impl Fn() -> Instant + Send + 'static,
     ) -> Result<Self> {
         // Socket preparation and thread scheduling consume the original budget.
         let started = now();
         let socket = aterm_uds::kept_out(|| tcp.try_clone())?;
-        let (done, wait) = mpsc::channel::<Instant>();
+        let (done, completion) = mpsc::channel::<(Instant, u64)>();
+        let moves = Arc::new(AtomicU64::new(0));
+        let read = Arc::clone(&moves);
         let join = thread::Builder::new()
             .name("db-exchange-deadline".into())
             .spawn(move || {
-                let remaining = within.saturating_sub(now().saturating_duration_since(started));
-                // A queued cancellation keeps its own completion time: a late
-                // worker must honor an early finish, but not a late one.
-                let finished = wait
-                    .recv_timeout(remaining)
-                    .is_ok_and(|completed| completed.saturating_duration_since(started) < within);
-                if !finished {
+                let in_time = finished(
+                    patience,
+                    started,
+                    now,
+                    || read.load(Ordering::Relaxed),
+                    |within| completion.recv_timeout(within),
+                );
+                if !in_time {
                     let _ = socket.shutdown(Shutdown::Both);
                 }
             })?;
         crate::runtime::census::count(crate::runtime::census::Event::DeadlineSpawn);
         Ok(Self {
             done,
+            moves,
             join: Some(join),
         })
+    }
+
+    /// `stream`, each of whose reads and writes that moves a byte this deadline counts as the
+    /// exchange's progress.
+    pub(crate) fn progressing<'a, S>(&'a self, stream: &'a mut S) -> Progressing<'a, S> {
+        Progressing {
+            stream,
+            moves: &self.moves,
+        }
     }
 }
 impl Drop for Deadline {
     fn drop(&mut self) {
-        let _ = self.done.send(Instant::now());
+        let moves = self.moves.load(Ordering::Relaxed);
+        #[cfg(test)]
+        LAST_MOVES.with(|last| last.set(Some(moves)));
+        let _ = self.done.send((Instant::now(), moves));
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+/// An exchange's stream whose moves its [`Deadline`] counts ([`Deadline::progressing`]).
+pub(crate) struct Progressing<'a, S> {
+    stream: &'a mut S,
+    moves: &'a AtomicU64,
+}
+impl<S> Progressing<'_, S> {
+    fn moved(&self, bytes: usize) {
+        if bytes > 0 {
+            self.moves.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+impl<S: Read> Read for Progressing<'_, S> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.stream.read(bytes)?;
+        self.moved(read);
+        Ok(read)
+    }
+}
+impl<S: Write> Write for Progressing<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.stream.write(bytes)?;
+        self.moved(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
     }
 }
 
@@ -353,7 +509,7 @@ pub(crate) fn unretained(dir: &Path, remote: &BTreeSet<Digest>) -> Result<usize>
 pub fn serve_connection(dir: &Path, connection: Connection) -> Result<Report> {
     let (tcp, locality) = connection.into_parts();
     locality.recheck()?;
-    let _deadline = Deadline::arm(&tcp)?;
+    let deadline = Deadline::arm(&tcp)?;
     let credentials = Credentials::load(dir)?;
     let (secret, identity) = transport(&credentials)?;
     let mut accepted = fleet::server_handshake_as(
@@ -366,7 +522,7 @@ pub fn serve_connection(dir: &Path, connection: Connection) -> Result<Report> {
     )
     .map_err(|_| Error::new("database TLS peer authentication failed"))?;
     locality.recheck()?;
-    let stream = accepted.transport.stream();
+    let stream = &mut deadline.progressing(accepted.transport.stream());
     let result = server_exchange(
         dir,
         &credentials,
@@ -429,12 +585,12 @@ pub fn sync_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) -> Res
     let (tcp, locality) =
         Connection::connect(peer, scope(peer), Duration::from_secs(3))?.into_parts();
     locality.recheck()?;
-    let _deadline = Deadline::arm(&tcp)?;
+    let deadline = Deadline::arm(&tcp)?;
     let mut dialed =
         fleet::client_handshake_as(tcp, &secret, Some(&identity), FleetOp::Database, WITHIN)
             .map_err(|_| Error::new("database TLS peer authentication failed"))?;
     locality.recheck()?;
-    let stream = dialed.transport.stream();
+    let stream = &mut deadline.progressing(dialed.transport.stream());
     send_frame(stream, credentials.capability.bytes())?;
     let capability = receive_frame(stream, 256)?;
     let actor = authenticate(&credentials, dialed.peer.as_ref(), &capability)?;
@@ -557,11 +713,11 @@ pub fn sync_fleet_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) 
     crate::fleet_db::refuse_unfinished(dir)?;
     let (secret, identity) = transport(&credentials)?;
     let tcp = aterm_uds::connect_tcp(&peer, Duration::from_secs(3))?;
-    let _deadline = Deadline::arm(&tcp)?;
+    let deadline = Deadline::arm(&tcp)?;
     let mut dialed =
         fleet::client_handshake_as(tcp, &secret, Some(&identity), FleetOp::Database, WITHIN)
             .map_err(|_| Error::new("database TLS peer authentication failed"))?;
-    let stream = dialed.transport.stream();
+    let stream = &mut deadline.progressing(dialed.transport.stream());
     send_frame(stream, credentials.capability.bytes())?;
     let capability = receive_frame(stream, 256)?;
     let actor = authenticate(&credentials, dialed.peer.as_ref(), &capability)?;

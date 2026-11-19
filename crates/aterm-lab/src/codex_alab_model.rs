@@ -39,8 +39,15 @@ pub const LIMIT_CLEARED: [&str; 2] = [
 /// Legacy done-check prefix recognized for negative-control classification.
 pub const RETIRED_CHECK: &str = "If the task is finished and verified";
 
-/// Prefix of the dirty-repository suffix appended to Land nudges.
-pub const REPO_SUFFIX_HEAD: &str = "Your repository's local Git state still shows work";
+/// Read the counted Git facts from the nudge's `(repository: facts):` suffix.
+/// The installed package and the development host introduce this same evidence differently.
+pub(super) fn repo_finding(request: &str) -> Option<&str> {
+    let (summary, _) = request.rsplit_once("): ")?;
+    let (repo, facts) = summary.rsplit_once(": ")?;
+    let (_, path) = repo.rsplit_once(" (")?;
+    let (count, _) = facts.split_once(' ')?;
+    (!path.is_empty() && count.parse::<usize>().is_ok_and(|count| count != 0)).then_some(facts)
+}
 
 /// The tag a request carrying Land's contradiction gets (aterm's slice 4c), its words as aterm
 /// types them ([`contradiction_fault`]).
@@ -624,7 +631,7 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
     if user.contains(NEEDS_ACK) {
         name.push_str("+ack");
     }
-    if user.contains(REPO_SUFFIX_HEAD) {
+    if repo_finding(&user).is_some() {
         name.push_str("+repo");
     }
     if user.contains(turn_end::FACT_OPEN) {

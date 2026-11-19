@@ -403,7 +403,7 @@ fn followed(held: &MachineName, row: Option<&Nickname>) -> Option<MachineName> {
     }
     let looked = held.row != file::RowSeen::Never || held.nick_class == NickClass::Auto;
     let mut next = match row {
-        Some(row) if looked && held.nick != *row => {
+        Some(row) if looked && held.nick.display() != row.display() => {
             renicked(held, row.clone()).map_or_else(|| held.clone(), MachineName::made_own)
         }
         _ => held.clone(),
@@ -880,8 +880,15 @@ fn edit_name(
                 if renumbered && let Some(num) = next.num {
                     cells.push((Renamed::Label, num.to_string()));
                 }
-                if next.nick != base.nick || matches!(label, RowWrite::Nickname) {
-                    cells.push((Renamed::Nickname, next.nick.as_str().to_owned()));
+                if next.nick != base.nick
+                    || next.nick_class != base.nick_class
+                    || matches!(label, RowWrite::Nickname)
+                {
+                    // The file can keep a legacy spelling. The shared row compares its
+                    // displayed text to skip a write it already holds.
+                    let word = next.nick.as_str();
+                    let word = Nickname::registry_spelling(word).unwrap_or_else(|| word.to_owned());
+                    cells.push((Renamed::Nickname, word));
                 }
             }
             let refused = |cells: &[(Renamed, String)], why: String| -> io::Error {
@@ -1030,8 +1037,7 @@ fn change_claim(
     }
     if let Some(nick) = &to.nick {
         require_free_nick(&locked.taken, nick)?;
-        next.nick = nick.clone();
-        next.nick_class = NickClass::Chosen;
+        choose_nickname(&mut next, nick.clone());
     }
     revised(held, next)
 }
@@ -1506,9 +1512,9 @@ impl UndoTo {
                 Some(to.num),
                 &to.nick
                     .as_ref()
-                    .map_or_else(|| held.display_nick(), |nick| nick.as_str().to_owned()),
+                    .map_or_else(|| held.display_nick(), Nickname::display),
             ),
-            Self::Nickname(nick) => file::title_of(held.num, nick.as_str()),
+            Self::Nickname(nick) => file::title_of(held.num, &nick.display()),
         }
     }
 }
@@ -1772,18 +1778,28 @@ fn rename_books(state: &Path, now_ms: u64) -> io::Result<RenameBooks> {
     Ok(RenameBooks { view, names })
 }
 
+/// Apply a chosen nickname, keeping the stored spelling when the displayed words are the same.
+/// Explicitly choosing an automatic name still changes its provenance.
+fn choose_nickname(name: &mut MachineName, nick: Nickname) -> bool {
+    let respelled = name.nick != nick && name.nick.display() != nick.display();
+    let promoted = name.nick_class != NickClass::Chosen;
+    if respelled {
+        name.nick = nick;
+    }
+    name.nick_class = NickClass::Chosen;
+    respelled || promoted
+}
+
 /// `name` with the nickname `nick`: `chosen`, and the claim (NAME, class, `since`,
 /// `act`) as it was, so a nickname change never weakens the NAME's precedence (§5.4); `rev`
 /// rises for every changed nickname. `None` when `name` holds `nick` as a
 /// chosen nickname already.
 #[must_use]
 pub fn renicked(name: &MachineName, nick: Nickname) -> Option<MachineName> {
-    if name.nick == nick && name.nick_class == NickClass::Chosen {
+    let mut next = name.clone();
+    if !choose_nickname(&mut next, nick) {
         return None;
     }
-    let mut next = name.clone();
-    next.nick = nick;
-    next.nick_class = NickClass::Chosen;
     next.rev = name.rev.saturating_add(1);
     Some(next)
 }
@@ -1827,7 +1843,7 @@ pub fn set_nick<'a>(
             let nick = match to {
                 NickTo::Word(word) => word.clone(),
                 NickTo::Random => file::draw_nick(|noun| {
-                    in_view(&locked.taken, noun) || noun.eq_ignore_ascii_case(stored.nick.as_str())
+                    in_view(&locked.taken, noun) || Nickname::equivalent(noun, stored.nick.as_str())
                 })?,
             };
             change_nick(stored, nick, locked)
@@ -1911,10 +1927,9 @@ pub fn taken_in(state: &Path, me: Option<&str>) -> Vec<Nickname> {
 /// Whether `word` is one of the nicknames `taken`, in any case (§2.4).
 #[must_use]
 pub fn in_view(taken: &[Nickname], word: &str) -> bool {
-    let key = Nickname::canonical(word);
     taken
         .iter()
-        .any(|nick| Nickname::canonical(nick.as_str()) == key)
+        .any(|nick| Nickname::equivalent(nick.as_str(), word))
 }
 
 fn require_free_nick(taken: &[Nickname], nick: &Nickname) -> io::Result<()> {
@@ -1930,7 +1945,7 @@ fn nick_used(nick: &Nickname) -> Refused {
         Cause::Nickname,
         format!(
             "The name {} is already used by another machine.",
-            nick.as_str()
+            nick.display()
         ),
     )
 }

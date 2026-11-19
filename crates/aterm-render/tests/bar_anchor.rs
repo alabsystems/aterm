@@ -33,12 +33,7 @@ fn typed_bar_band(style: &str, look: Look, bar: bool, anchored: bool, band: bool
 }
 
 /// The ribbon styles whose band runs under the caret's cell (`Ribbon::plan_run`'s attach).
-const RIBBONS: [&str; 4] = [
-    "rainbow + cat",
-    "rainbow + dog",
-    "flat rainbow + cat",
-    "rainbow",
-];
+const RIBBONS: [&str; 3] = ["rainbow + cat", "rainbow + dog", "rainbow"];
 
 /// The light the effects add (frame over clean twin, summed channel steps over 12) across
 /// the caret's row band, in the columns `[x0 + a, x0 + b)` of the caret's cell's left edge `x0`.

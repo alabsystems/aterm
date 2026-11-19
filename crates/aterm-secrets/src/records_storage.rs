@@ -40,9 +40,10 @@ pub struct RecordsGeneration {
 }
 
 /// The rewrite of a layout's data, the second transition (`docs/DESIGN-vault-log-2026-11-14.md`
-/// step 4): dark, but for the generation a consumer reads (`rewrite::generation`). Its one
-/// caller outside the tests is a Mac that reads format 2 taking a served root into its file
-/// (`client::persist_stored`), which no running build is.
+/// step 4): dark, but for the generation a consumer reads (`rewrite::generation`). Its callers
+/// outside the tests are a Mac and a vault server that read format 2 taking a served root into
+/// their records file (`client::persist_stored`, `server::persist_stored`), which no running
+/// build is.
 #[cfg(unix)]
 pub(crate) mod rewrite;
 
@@ -235,6 +236,17 @@ impl Judged {
     /// What `entry`'s files show, each `lstat` `glance`'s where the caller looks through one
     /// ([`fsx::lstat_in`]).
     fn of(entry: &Path, witnesses: Witnesses, glance: Option<&fsx::Glance>) -> Result<Self> {
+        Self::of_files(entry, witnesses, glance, [HEADER, DATA])
+    }
+
+    /// [`Self::of`], the layout's header and data file being those `files` names: a rewritten
+    /// layout's pinned generation's (`rewrite::standing`), or `layout` and `current`.
+    fn of_files(
+        entry: &Path,
+        witnesses: Witnesses,
+        glance: Option<&fsx::Glance>,
+        files: [&str; 2],
+    ) -> Result<Self> {
         let parent_path = entry
             .parent()
             .ok_or_else(|| refused("no parent directory"))?;
@@ -257,8 +269,8 @@ impl Judged {
             ),
             witnesses,
             files: [
-                fsx::seen_if_present_in(glance, &entry.join(HEADER))?,
-                fsx::seen_if_present_in(glance, &entry.join(DATA))?,
+                fsx::seen_if_present_in(glance, &entry.join(files[0]))?,
+                fsx::seen_if_present_in(glance, &entry.join(files[1]))?,
             ],
         })
     }
@@ -573,7 +585,7 @@ fn side_path(entry: &Path, suffix: &str) -> Result<PathBuf> {
 /// `Intent`, `Copied`, `Prepared`, `Pinned`, then `Exchanged` once the predecessor's files are
 /// unlinked).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Step {
+pub(crate) enum Step {
     Intent,
     Copied,
     Prepared,

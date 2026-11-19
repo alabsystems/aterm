@@ -28,22 +28,14 @@ impl Mac {
     pub(in crate::membership_log) fn incarnation(self) -> [u8; 16] {
         [self.0; 16]
     }
-    pub(in crate::membership_log) fn identity(self) -> age::Identity {
-        age::Identity::from_secret_bytes([self.0 ^ 0x55; 32])
+    pub(in crate::membership_log) fn identity(self) -> &'static age::Identity {
+        tag_identity(self.0)
     }
     pub(in crate::membership_log) fn id(self) -> MemberId {
-        self.request().binding().actor()
+        tag_request(self.0).binding().actor()
     }
     pub(in crate::membership_log) fn request(self) -> Request {
-        Request::create(
-            [2; 16],
-            [3; 32],
-            [self.0; 16],
-            self.incarnation(),
-            &self.identity(),
-            &self.seed(),
-        )
-        .unwrap()
+        tag_request(self.0).clone()
     }
     pub(in crate::membership_log) fn entrant(self) -> Entrant {
         Entrant {
@@ -53,6 +45,35 @@ impl Mac {
             label: format!("m{}", self.0),
         }
     }
+}
+
+/// The identity of the Mac tagged `tag`, from the secret `[tag ^ 0x55; 32]`, made once: deriving
+/// its public key is a curve operation, which the random vaults would otherwise pay on every read.
+pub(in crate::membership_log) fn tag_identity(tag: u8) -> &'static age::Identity {
+    static IDENTITIES: [std::sync::OnceLock<age::Identity>; 256] =
+        [const { std::sync::OnceLock::new() }; 256];
+    IDENTITIES[usize::from(tag)].get_or_init(|| age::Identity::from_secret_bytes([tag ^ 0x55; 32]))
+}
+
+/// The request of the Mac tagged `tag`, made once. Every input follows from the tag (network
+/// `[2; 16]`, authority `[3; 32]`, machine and incarnation `[tag; 16]`, [`tag_identity`], seed
+/// `[tag; 32]`), so the tag is the whole key; making one costs four curve operations (the writer
+/// key, its signature, the decode's verification and the identity), which every record a test
+/// drafts for a Mac (its actor) would otherwise pay.
+pub(in crate::membership_log) fn tag_request(tag: u8) -> &'static Request {
+    static REQUESTS: [std::sync::OnceLock<Request>; 256] =
+        [const { std::sync::OnceLock::new() }; 256];
+    REQUESTS[usize::from(tag)].get_or_init(|| {
+        Request::create(
+            [2; 16],
+            [3; 32],
+            [tag; 16],
+            [tag; 16],
+            tag_identity(tag),
+            &[tag; 32],
+        )
+        .unwrap()
+    })
 }
 
 /// A log founded by `macs`, its genesis authored at 1 ms.
@@ -296,8 +317,8 @@ fn vault_checkpoint_two_proposers_write_one_body() {
     assert_eq!(cut_day(two_logs.now), Some(T));
     assert_eq!(cut_day(two_logs.now - HOUR - 1), Some(T - DAY_MS));
     let (ea, eb) = two_logs.epochs;
-    let keys_a = two_logs.p.unwrap_epochs(&A.identity()).unwrap();
-    let keys_b = two_logs.q.unwrap_epochs(&B.identity()).unwrap();
+    let keys_a = two_logs.p.unwrap_epochs(A.identity()).unwrap();
+    let keys_b = two_logs.q.unwrap_epochs(B.identity()).unwrap();
     assert!(keys_a.contains_key(&ea) && !keys_a.contains_key(&eb));
     assert!(keys_b.contains_key(&eb) && !keys_b.contains_key(&ea));
 

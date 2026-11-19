@@ -72,7 +72,8 @@ const STAND_IN: CoalProbe = CoalProbe {
         if opts.coalitions {
             count(|r| r.swept += 1);
         }
-        aterm_sysprobe::processes_keeping(opts, ids)
+        // No table: the reading's births read the stand-in kernel's.
+        aterm_sysprobe::processes_keeping(opts, ids).map(|sweep| (sweep, None))
     },
     coalitions: || {
         count(|r| r.coalitions += 1);
@@ -277,7 +278,7 @@ fn whole_readings_materialize_existing_coalitions_without_repeating_signature_de
             .then(|| ids.of(pid, Some(1), || Some(1)))
             .flatten();
         ids.end_sweep();
-        Some(aterm_sysprobe::Sweep {
+        let sweep = aterm_sysprobe::Sweep {
             procs: vec![aterm_sysprobe::ProcessReading {
                 pid,
                 start: Some(1),
@@ -290,7 +291,8 @@ fn whole_readings_materialize_existing_coalitions_without_repeating_signature_de
                 ..aterm_sysprobe::ProcessReading::default()
             }],
             truncated: false,
-        })
+        };
+        Some((sweep, None))
     };
     let reads = || {
         let r = READS.get();
@@ -607,7 +609,7 @@ fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
         coalitions: true,
         ..aterm_sysprobe::SweepOpts::default()
     };
-    let sweep = (kernel.sweep)(opts, &mut ids).expect("a sweep");
+    let (sweep, _) = (kernel.sweep)(opts, &mut ids).expect("a sweep");
     let row = sweep
         .procs
         .iter()
@@ -620,7 +622,7 @@ fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
         Some((swept_version, coalition)),
         "kept for the next"
     );
-    let again = (kernel.sweep)(opts, &mut ids).expect("a second sweep");
+    let (again, _) = (kernel.sweep)(opts, &mut ids).expect("a second sweep");
     let row_again = again.procs.iter().find(|p| p.pid == me).expect("swept");
     assert_eq!(
         (row_again.coalition, row_again.version),
@@ -857,11 +859,11 @@ fn a_leads_pid_version_reaches_the_split_from_the_sweep() {
     };
     const NO_VERSION_SWEPT: CoalProbe = CoalProbe {
         sweep: |opts, ids| {
-            let mut sweep = (LIVE.sweep)(opts, ids)?;
+            let (mut sweep, table) = (LIVE.sweep)(opts, ids)?;
             for p in &mut sweep.procs {
                 p.version = None;
             }
-            Some(sweep)
+            Some((sweep, table))
         },
         ..LIVE
     };
@@ -908,7 +910,7 @@ fn a_readings_wall_clock_is_read_before_its_sweep() {
                 aterm_uds::deadline::poll_yield();
             }
             LISTED_MS.set(Some(began));
-            Some(aterm_sysprobe::Sweep::default())
+            Some((aterm_sysprobe::Sweep::default(), None))
         },
         ..STAND_IN
     };
@@ -1013,7 +1015,7 @@ fn tick_details_at(
         ..Sample::default()
     };
     let read = (split.probe.coalitions)().expect("the stand-in's list");
-    split.fill(&mut sample, read, now, details);
+    split.fill(&mut sample, read, now, details, None);
     sample
 }
 
@@ -1327,10 +1329,11 @@ const FOREIGN: CoalProbe = CoalProbe {
                 .collect()
         });
         procs.push(own);
-        Some(aterm_sysprobe::Sweep {
+        let sweep = aterm_sysprobe::Sweep {
             procs,
             truncated: false,
-        })
+        };
+        Some((sweep, None))
     },
     ..STAND_IN
 };
@@ -1782,7 +1785,7 @@ fn a_kept_birth_is_carried_without_a_read() {
             procs: Some(procs.to_vec()),
             ..Sample::default()
         };
-        split.births(&mut s, now);
+        split.births(&mut s, now, None);
         (births(&s), READS.take().births)
     };
     let given = ProcSample {
@@ -1822,7 +1825,7 @@ fn births_read_between_split_ticks_outlast_the_split_gap() {
         procs: Some(procs.clone()),
         ..Sample::default()
     };
-    split.births(&mut between, t0 + half);
+    split.births(&mut between, t0 + half, None);
     let s = tick_at(&mut split, procs, t0 + half * 2);
     assert_eq!(births(&s), [Some(2_000), Some(1_000)]);
     let r = READS.take();
@@ -1831,6 +1834,177 @@ fn births_read_between_split_ticks_outlast_the_split_gap() {
         (0, 2),
         "the births were read inside their window; the leads' were not"
     );
+}
+
+/// A READING'S BIRTHS ARE READ FROM ITS SWEEP'S TABLE: where the reading's sweep read the whole
+/// process table ([`aterm_sysprobe::processes_keeping_table`]), each unread birth is read from
+/// it, past [`BIRTHS_AT_ONCE`] unread and below, and the kernel is asked for no record and no
+/// table; each birth is the one the kernel's readers give for the same records. NEGATIVE
+/// CONTROL: births that read past the sweep's table (as before 2026-11-18) read the table again
+/// past [`BIRTHS_AT_ONCE`] (one table for thirteen) and each record below it (three records for
+/// three), which the first assertion refuses.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_readings_births_are_read_from_its_sweeps_table() {
+    let now = Instant::now();
+    for n in [13, 3] {
+        let rows = born_rows(2_000, n);
+        held_by_the_kernel(&rows);
+        let table = table_of(&rows);
+        let procs: Vec<ProcSample> = rows
+            .iter()
+            .map(|(pid, name, _)| swept(*pid, 1, name, u64::from(*pid)))
+            .collect();
+        let read = |swept: Option<&aterm_sysprobe::kproc::Table>| {
+            let mut split = SplitReader::new(STAND_IN, gauge());
+            READS.take();
+            let mut s = Sample {
+                procs: Some(procs.clone()),
+                ..Sample::default()
+            };
+            split.births(&mut s, now, swept);
+            let r = READS.take();
+            (births(&s), r.births, r.tables)
+        };
+        let born: Vec<Option<i64>> = rows.iter().map(|(_, _, ms)| Some(*ms)).collect();
+        assert_eq!(
+            read(Some(&table)),
+            (born.clone(), 0, 0),
+            "{n} unread: each from the sweep's table, no kernel read"
+        );
+        let unread = usize::try_from(n).expect("a count");
+        let kernels = if unread > BIRTHS_AT_ONCE {
+            (0, 1)
+        } else {
+            (unread, 0)
+        };
+        assert_eq!(
+            read(None),
+            (born, kernels.0, kernels.1),
+            "{n} unread, no table swept: the same births, from the kernel's readers"
+        );
+    }
+}
+
+/// `n` processes from `first`: each one's pid, name and birth (unix ms).
+#[cfg(target_os = "macos")]
+fn born_rows(first: u32, n: u32) -> Vec<(u32, String, i64)> {
+    (0..n)
+        .map(|i| {
+            (
+                first + i,
+                format!("p{i}"),
+                1_700_000_000_000 + i64::from(i) * 1_001,
+            )
+        })
+        .collect()
+}
+
+/// The stand-in kernel's records ([`KERNEL`]) are `rows`, so a birth read past a sweep's table
+/// reads the same birth.
+#[cfg(target_os = "macos")]
+fn held_by_the_kernel(rows: &[(u32, String, i64)]) {
+    let stood: Vec<(u32, &str, i64, bool)> = rows
+        .iter()
+        .map(|(pid, name, ms)| (*pid, name.as_str(), *ms, false))
+        .collect();
+    kernel(&stood);
+}
+
+/// A read of the whole table holding `rows`' records, each a child of launchd.
+#[cfg(target_os = "macos")]
+fn table_of(rows: &[(u32, String, i64)]) -> aterm_sysprobe::kproc::Table {
+    let records: Vec<(aterm_sysprobe::kproc::Record, bool)> = rows
+        .iter()
+        .map(|(pid, name, ms)| {
+            let record = aterm_sysprobe::kproc::Record {
+                pid: *pid,
+                ppid: 1,
+                pgid: 0,
+                tpgid: 0,
+                tty: None,
+                uid: 501,
+                comm: name.clone(),
+                start_s: u64::try_from(ms / 1_000).expect("a start"),
+                start_us: u32::try_from(ms % 1_000 * 1_000).expect("its microseconds"),
+                zombie: false,
+            };
+            (record, false)
+        })
+        .collect();
+    aterm_sysprobe::kproc::Table::of_records(&records)
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// [`TABLED`]'s processes: each one's pid, name and birth (unix ms).
+    static TABLED_ROWS: RefCell<Vec<(u32, String, i64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The stand-in kernel with a sweep of [`TABLED_ROWS`], none with a birth of its own (macOS's
+/// sweep reads none), that hands on a read of the whole table holding their records, as the
+/// kernel's sweep does where it reads one ([`aterm_sysprobe::processes_keeping_table`]).
+#[cfg(target_os = "macos")]
+const TABLED: CoalProbe = CoalProbe {
+    sweep: |_, _| {
+        count(|r| r.sweeps += 1);
+        let rows = TABLED_ROWS.with_borrow(Clone::clone);
+        let procs = rows
+            .iter()
+            .map(|(pid, name, _)| aterm_sysprobe::ProcessReading {
+                pid: *pid,
+                ppid: 1,
+                name: name.clone(),
+                start: Some(u64::from(*pid)),
+                uid: Some(501),
+                ..aterm_sysprobe::ProcessReading::default()
+            })
+            .collect();
+        let sweep = aterm_sysprobe::Sweep {
+            procs,
+            truncated: false,
+        };
+        Some((sweep, Some(table_of(&rows))))
+    },
+    ..STAND_IN
+};
+
+/// A READING HANDS ITS SWEEP'S TABLE TO ITS BIRTHS: a whole reading ([`Reader::read`], its
+/// process reads made by `read_procs`, whose answer carries the sweep's table) whose sweep read
+/// the whole table reads each unread birth there, past [`BIRTHS_AT_ONCE`] unread and below: it
+/// reads the table no second time ([`CoalProbe::births`]) and no process's own record
+/// ([`CoalProbe::birth`]), and each birth is its record's. NEGATIVE CONTROL: a reader that hands
+/// its births no table (`None`) reads the table again for thirteen unread, which the counts
+/// refuse.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_readings_sweep_hands_its_table_to_its_births() {
+    for n in [13, 3] {
+        let rows = born_rows(3_000, n);
+        held_by_the_kernel(&rows);
+        TABLED_ROWS.set(rows.clone());
+        let mut reader = Reader::new(Arc::default());
+        reader.split = SplitReader::new(TABLED, gauge());
+        READS.take();
+        let _ = reader.read(&bars());
+        let r = READS.take();
+        assert_eq!(
+            (r.sweeps, r.tables, r.births),
+            (1, 0, 0),
+            "{n} unread: one sweep, no second read of the table and no record read"
+        );
+        let born: Vec<(u32, Option<i64>)> = rows
+            .iter()
+            .map(|(pid, _, _)| (*pid, reader.split.births.get(pid).map(|b| b.ms)))
+            .collect();
+        assert_eq!(
+            born,
+            rows.iter()
+                .map(|(pid, _, ms)| (*pid, Some(*ms)))
+                .collect::<Vec<_>>(),
+            "{n} unread: each birth its record's"
+        );
+    }
 }
 
 /// A Mac whose coalitions lane is off still reads births: they need no
@@ -1937,14 +2111,15 @@ fn a_swept_rows_owner_places_it_among_the_persons_or_the_services() {
                 birth_ms: Some(1_700_000_000_000),
                 ..aterm_sysprobe::ProcessReading::default()
             };
-            Some(aterm_sysprobe::Sweep {
+            let sweep = aterm_sysprobe::Sweep {
                 procs: vec![
                     row(MINE, Some(OWN)),
                     row(SERVICE, Some(0)),
                     row(UNREAD, None),
                 ],
                 truncated: false,
-            })
+            };
+            Some((sweep, None))
         },
         ..STAND_IN
     };
@@ -1974,7 +2149,7 @@ fn a_swept_rows_owner_places_it_among_the_persons_or_the_services() {
         [Some(aterm_vitals::model::RowScope::Unknown); 3]
     );
 
-    let swept = (SWEPT.sweep)(
+    let (swept, _) = (SWEPT.sweep)(
         aterm_sysprobe::SweepOpts::default(),
         &mut aterm_sysprobe::coalitions::CoalitionIds::default(),
     )
@@ -2029,7 +2204,7 @@ fn a_whole_readings_sweep_names_windows_compressed_memory() {
     const STORE: u64 = 1 << 20;
     const SWEPT: CoalProbe = CoalProbe {
         sweep: |_, _| {
-            Some(aterm_sysprobe::Sweep {
+            let sweep = aterm_sysprobe::Sweep {
                 procs: vec![aterm_sysprobe::ProcessReading {
                     pid: 0x7fff_f040,
                     name: aterm_sysprobe::windows::MEMORY_COMPRESSION.to_owned(),
@@ -2038,7 +2213,8 @@ fn a_whole_readings_sweep_names_windows_compressed_memory() {
                     ..aterm_sysprobe::ProcessReading::default()
                 }],
                 truncated: false,
-            })
+            };
+            Some((sweep, None))
         },
         ..STAND_IN
     };

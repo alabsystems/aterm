@@ -312,3 +312,71 @@ fn close_only_copies_preserve_the_original_inode_when_its_name_is_replaced() {
     assert_eq!(identity(reacquired.metadata().unwrap()), original);
     drop(unrelated);
 }
+
+thread_local! {
+    /// The errors this thread's test laid as its next blocking takes' answers ([`laid_take`]).
+    pub(super) static LAID_TAKES: std::cell::RefCell<std::collections::VecDeque<std::io::Error>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// This thread's laid takes, cleared when it drops, so a law that fails leaves none for the
+/// next test run on the same thread.
+struct Laid;
+
+impl Laid {
+    /// Lay `kinds` as this thread's next blocking takes' answers, in that order.
+    fn lay(kinds: &[std::io::ErrorKind]) -> Self {
+        LAID_TAKES.with(|laid| {
+            laid.borrow_mut()
+                .extend(kinds.iter().map(|&kind| std::io::Error::from(kind)));
+        });
+        Self
+    }
+
+    /// How many of them no take has answered yet.
+    fn left(&self) -> usize {
+        LAID_TAKES.with(|laid| laid.borrow().len())
+    }
+}
+
+impl Drop for Laid {
+    fn drop(&mut self) {
+        LAID_TAKES.with(|laid| laid.borrow_mut().clear());
+    }
+}
+
+/// A blocking take a signal ends (`Interrupted`, what `flock` answers where the signal's handler
+/// did not ask to restart) is taken again on the same descriptor until the lock is held, and any
+/// other refusal is answered at once. Each `Interrupted` is laid as one take's answer through the
+/// take's test seam ([`laid_take`]), ahead of the take's own `flock`. NEGATIVE CONTROL, by hand:
+/// without the retry, the first laid `Interrupted` was `lock`'s answer.
+#[test]
+fn a_lock_wait_a_signal_ends_is_waited_through_on_the_same_descriptor() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let path = world.path().join("interrupted.lock");
+    let file = create(&path);
+    let fd = file.as_raw_fd();
+    let laid = Laid::lay(&[
+        std::io::ErrorKind::Interrupted,
+        std::io::ErrorKind::Interrupted,
+    ]);
+    let held = RecordLock::lock(file, 0).expect("a take a signal ended is taken again");
+    assert_eq!(laid.left(), 0, "each laid take was answered");
+    drop(laid);
+    assert_eq!(
+        held.as_raw_fd(),
+        fd,
+        "the lock is held on the descriptor it was given"
+    );
+    assert_blocked(&path);
+    drop(held);
+
+    let laid = Laid::lay(&[std::io::ErrorKind::PermissionDenied]);
+    let refused = RecordLock::lock(open(&path), 0);
+    assert_eq!(laid.left(), 0, "the laid take was answered");
+    drop(laid);
+    assert!(
+        matches!(&refused, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "a refusal that is no signal is answered at once: {refused:?}"
+    );
+}

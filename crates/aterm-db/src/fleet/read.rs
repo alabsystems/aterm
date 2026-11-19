@@ -1015,6 +1015,9 @@ pub struct Sighted {
     pub answered: Option<At<Answered>>,
     /// That answer proved no node key this Mac binds ([`MachineSeen::unproven()`]).
     pub unproven: bool,
+    /// Its load, cores busy and verdicts as the answers of its proof state last said each, so a
+    /// later answer that leaves one unread does not blank it ([`Kept`]).
+    pub kept: Kept,
     /// The newest read that named it found it silent: its reason token, and that read's time.
     /// `None` once it answers again.
     pub silent: Option<At<Option<String>>>,
@@ -1024,6 +1027,79 @@ pub struct Sighted {
 
 /// How long a machine no read names stays held: past it, it has left the book this Mac reads.
 pub const SIGHTED_KEEP_MS: u64 = 2 * 3_600_000;
+
+/// How long a machine's load, cores busy and verdicts are given from the read that heard them,
+/// then unread (FP-D10): three of the glance's one-minute reads, so the answer that carries no
+/// rate (its first, or one after a gap past the look's 90 s window) does not blank the band's
+/// fill, while a figure nobody has heard for three minutes is not drawn as now.
+pub const LOOK_KEEP_MS: u64 = 180_000;
+
+/// A machine's load, cores busy and verdicts, each with the time of the read that last heard
+/// it. An answer replaces each figure it says and leaves each it does not, each verdict on its
+/// own (an answer with no rate judges no CPU verdict and still judges the other three); the
+/// fold gives each for [`LOOK_KEEP_MS`] from its read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kept {
+    /// Its system-load score.
+    pub load: Option<At<Load>>,
+    /// Its cores busy ×100, of its cores.
+    pub cpu: Pair<u64>,
+    /// Its own verdict: CPU at its limit.
+    pub cpu_limit: Option<At<bool>>,
+    /// Memory at its limit.
+    pub mem_limit: Option<At<bool>>,
+    /// Disk at its limit.
+    pub disk_limit: Option<At<bool>>,
+    /// GPU at its limit.
+    pub gpu_limit: Option<At<bool>>,
+}
+
+impl Kept {
+    /// Nothing kept.
+    pub const UNREAD: Self = Self {
+        load: None,
+        cpu: Pair::UNREAD,
+        cpu_limit: None,
+        mem_limit: None,
+        disk_limit: None,
+        gpu_limit: None,
+    };
+
+    /// These figures after a look read at `at`: each it says replaces the kept one.
+    fn take(&mut self, look: &Look, at: u64) {
+        let read = |value: Option<u64>| value.map(|value| At::new(value, at));
+        if let Some(load) = look.load {
+            self.load = Some(At::new(load, at));
+        }
+        if let Some(used) = read(look.cpu_busy_x100) {
+            self.cpu.used = Some(used);
+        }
+        if let Some(cores) = read(look.cores) {
+            self.cpu.capacity = Some(cores);
+        }
+        let limits = look.limits;
+        for (kept, judged) in [
+            (&mut self.cpu_limit, limits.cpu),
+            (&mut self.mem_limit, limits.mem),
+            (&mut self.disk_limit, limits.disk),
+            (&mut self.gpu_limit, limits.gpu),
+        ] {
+            if let Some(judged) = judged {
+                *kept = Some(At::new(judged, at));
+            }
+        }
+    }
+}
+
+/// This machine's own reading, made in process from its deck's vitals and offered to the fold
+/// apart from any survey answer (FP-D10): its look, and its home volume's free space. The fold
+/// draws this Mac's column, pairs, verdicts and load from it, never from this Mac's own answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Own {
+    pub look: Look,
+    /// Its home volume's free space, MiB.
+    pub home_free_mb: Option<u64>,
+}
 
 /// What the reads so far say: each machine's last answer and whether the newest read heard it.
 /// It is the folder's memory between reads, bounded by the book (256 peers and this Mac) and by
@@ -1040,8 +1116,10 @@ pub struct Latest {
 }
 
 impl Latest {
-    /// These reads and `read`: a machine that answered takes its new answer, one that was silent
-    /// keeps its last answer beside the silence, one the read does not name keeps what it had,
+    /// These reads and `read`: a machine that answered takes its new answer, and each figure of
+    /// its look the answer says replaces the one [`Kept`] (an answer of another proof state
+    /// than the last first drops what was kept, as a rate is never taken across them); one that
+    /// was silent keeps its last answer beside the silence, one the read does not name keeps what it had,
     /// and one no read has named for [`SIGHTED_KEEP_MS`] is dropped. A read that asked no peer
     /// ([`Read::fleet`]) drops none: no peer left the book by going unasked.
     #[must_use]
@@ -1055,6 +1133,7 @@ impl Latest {
                 label: None,
                 answered: None,
                 unproven: false,
+                kept: Kept::UNREAD,
                 silent: None,
                 named_ms: at,
             });
@@ -1076,6 +1155,12 @@ impl Latest {
                         .as_ref()
                         .filter(|_| entry.unproven == seen.unproven);
                     answered.rate_since(then, at);
+                    // A claim's figures never stand under a proven row, nor a proven one's
+                    // under a claim's: what was kept goes with a change of proof state.
+                    if entry.answered.is_some() && entry.unproven != seen.unproven {
+                        entry.kept = Kept::UNREAD;
+                    }
+                    entry.kept.take(&answered.look, at);
                     entry.answered = Some(At::new(*answered, at));
                     entry.unproven = seen.unproven;
                     entry.silent = None;

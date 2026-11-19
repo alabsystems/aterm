@@ -1544,9 +1544,11 @@ pub(crate) fn fetch_record_frames_sync(
 /// A records pull that can reuse exact immutable owners already held in memory, each frame
 /// read at `reading`: the format the puller reads its records at (a vault server's,
 /// `server::Shared::records_reading`), or a follow copy's where it asks a peer again stating
-/// format 2 (`crate::membership_log::follow`). It asks for no served frame
-/// ([`RECORDS_SERVED_HEADER`]): its one caller is the vault server's peer pull, whose records
-/// file has no rewritten form to hold a root in.
+/// format 2 (`crate::membership_log::follow`). Its one caller is the vault server's peer pull.
+/// A pull that reads format 2 asks for a served frame and takes the one the peer sends
+/// ([`RECORDS_SERVED_HEADER`], [`Pull::takes_served`]), which the server takes into a
+/// rewritten records file (`server::persist_stored`); a pull that reads format 1, every pull
+/// of a server whose mark names no later format or whose build reads none, asks for none.
 #[cfg(unix)]
 #[expect(
     clippy::too_many_arguments,
@@ -1570,7 +1572,7 @@ pub(crate) fn fetch_record_frames_with_known(
         bound,
         limit: crate::membership_log::REPLY_CAP,
         reading,
-        served: false,
+        served: true,
     };
     pull_record_frames(url, pull, known)
 }

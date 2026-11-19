@@ -134,8 +134,9 @@ pub(crate) fn install_proxy(proxy: EventLoopProxy<Wake>) {
 }
 
 /// Asks the loop to read `session`'s presence again ([`Wake::LeaseChanged`]): a lease in its
-/// slot or one that names it as a turn's driver moved, its turn's input ended, or a turn into it
-/// submitted (`Wake::only_observes` lists who posts it).
+/// slot or one that names it as a turn's driver moved, its turn's input ended, a turn into it
+/// submitted, or aterm's harness watchdog ended its harness (`Wake::only_observes` lists who
+/// posts it).
 pub(crate) fn post_lease_changed(session: &SessionId) {
     #[cfg(test)]
     LEASE_WAKES.with(|w| w.borrow_mut().push(session.clone()));
@@ -748,10 +749,15 @@ pub(crate) fn classify<'a>(
     let phase = if !r.phase_authoritative {
         AgentPhase::Unknown
     } else if let Some(w) = r.wall {
-        subject = api_cause_words(w.kind)
+        // The wall the harness answers, never the screen's word for it (plan package UB-05): a
+        // login wall whose words name a blocked path (`Please run /login · API Error: 403
+        // Forbidden`) is waited out as the API's outage and signs nothing in, so it publishes
+        // that outage, never a login the harness would sign in again or a person should.
+        let kind = aterm_agent::supervise::policy::turn_end::answered_wall(w.kind, &w.message);
+        subject = api_cause_words(kind)
             .or((w.placement == aterm_phase::Placement::SignIn).then_some(SIGN_IN_SCREEN))
             .map(str::to_string);
-        wall(w.kind, w.reset)
+        wall(kind, w.reset)
     } else {
         match read {
             alab_policy::vocab::Phase::Busy => AgentPhase::Busy,

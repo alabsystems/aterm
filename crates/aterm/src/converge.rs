@@ -51,6 +51,10 @@ pub(crate) struct Live {
     /// the mesh on, where the node service hosts `bus.log` and the pass installs or renews no
     /// broker job, else the platform's supervisor; read once ([`Live::here`]).
     fabric_service: aterm_link::enable::Service,
+    /// The machine `sync.spotlight` reads and asks through in a test ([`Live::spotlight_on`]):
+    /// `None`, this Mac.
+    #[cfg(test)]
+    spotlight: Option<std::sync::Arc<dyn aterm_machines::port::System + Send + Sync>>,
 }
 
 impl Live {
@@ -61,7 +65,29 @@ impl Live {
             fabric_service: aterm_link::enable::Service::default_for(
                 aterm_types::mesh_switch::MESH,
             ),
+            #[cfg(test)]
+            spotlight: None,
         }
+    }
+
+    /// `sync.spotlight`'s reading and its ask of the root LAN broker, made through `sys`.
+    #[cfg(test)]
+    pub(crate) fn spotlight_on(
+        sys: std::sync::Arc<dyn aterm_machines::port::System + Send + Sync>,
+    ) -> Self {
+        Self {
+            spotlight: Some(sys),
+            ..Self::here()
+        }
+    }
+
+    /// `read` over the machine `sync.spotlight` reads: this Mac's ([`aterm_machines::port::Live`]).
+    fn on_spotlight<T>(&self, read: impl FnOnce(&dyn aterm_machines::port::System) -> T) -> T {
+        #[cfg(test)]
+        if let Some(sys) = &self.spotlight {
+            return read(sys.as_ref());
+        }
+        read(&aterm_machines::port::Live::new())
     }
 }
 
@@ -1997,6 +2023,21 @@ impl Live {
 }
 
 impl Ports for Live {
+    fn spotlight(
+        &self,
+    ) -> Option<
+        Result<
+            std::collections::BTreeSet<PathBuf>,
+            aterm_types::macos_setup::spotlight_scope::Leave,
+        >,
+    > {
+        self.on_spotlight(aterm_machines::init_spotlight::broker_reading)
+    }
+
+    fn exclude_spotlight(&self) -> aterm_types::macos_setup::spotlight_scope::Pass {
+        self.on_spotlight(aterm_machines::init_spotlight::exclude_by_broker)
+    }
+
     fn identity_result_requested(&self) -> bool {
         aterm_secrets::converge::identity_result_requested()
     }

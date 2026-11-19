@@ -127,7 +127,12 @@ fn a_stamp_is_one_file_per_tab_written_whole() {
     assert_eq!(Stamp::from_json("{\"pid\":1}"), None, "a torn stamp");
     assert_eq!(Cause::parse("stall"), Some(Cause::Stall));
     assert_eq!(Cause::parse("asked"), Some(Cause::Asked));
+    assert_eq!(Cause::parse("beat"), Some(Cause::Beat));
+    assert_eq!(Cause::parse("memory"), Some(Cause::Memory));
     assert_eq!(Cause::parse("exit"), None);
+    for cause in [Cause::Stall, Cause::Asked, Cause::Beat, Cause::Memory] {
+        assert_eq!(Cause::parse(cause.word()), Some(cause), "{cause:?}");
+    }
 }
 
 #[test]

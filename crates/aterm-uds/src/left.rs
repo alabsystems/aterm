@@ -1012,6 +1012,9 @@ impl Reader {
                         horizon,
                         launchd: pass.launchd,
                         claims: pass.claims,
+                        // A run's kin are verify's to end, at the stage's end or at the next
+                        // run's start: the window names no kin and offers none.
+                        kin: None,
                     }
                     .judge(pid)
                         == Verdict::Proven

@@ -711,7 +711,25 @@ pub fn session_log_cursor_model() -> Model {
     }
 }
 
-/// TURN TRACKER: at most one open turn per agent run, driven by the screen verdict (design §2.4).
+/// TURN TRACKER: at most one open turn per agent run, driven by the screen verdict (design §2.4),
+/// or, once a harness's record stream applied `turn` (HX-15h, D29), by the stream alone.
+///
+/// THE STREAM SOURCE (`sf`, `TurnTracker::stream_turn` and `set_stream_turns`): while the stream
+/// feeds turns no screen verdict opens one and no rest arms a settle, so neither `Rest` nor
+/// `CtlTurn` closes one, and the transcript's end closes none (`TxClose`). `StreamStart` opens a
+/// turn, or takes the one open (a repeated `started` and a take write no turn record), and
+/// `StreamEnd` closes it (`cw = 13`); a `started` of a new number is `StreamEnd` then
+/// `StreamStart`. A screen step under the turn the stream closes, the screen still showing it, is
+/// opened again on the run (`cont=`), as the settle does for a wall; a survey only ever stands in a
+/// turn and ends with it. Steps stay the screen's, under the open turn or on the run where none is
+/// open, until HX-15i1. `StreamOn` is the host's word that the stream feeds turns (and a record
+/// that moves no turn); `StreamOff` hands turns back to the screen, arming the settle where it
+/// already reads at rest (a wall the transcript's judge refuted arms none). The program's end
+/// (`SeeGone`) still ends the turn. `sg` is a ghost: a turn some other source opened, or closed
+/// short of the program's end, while the stream fed them. The stream's actions run with no mutant
+/// on and under `Buggy = 3`, the stream's own faults: the screen's and the transcript's mutants
+/// (`Buggy = 1`, `2`) are caught without them, and beside them their reachable spaces grow past
+/// the interpreter's bound (dial 1's, 258042 states, measured 2026-11-18).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn turn_tracker_model() -> Model {
@@ -740,6 +758,8 @@ pub fn turn_tracker_model() -> Model {
             var pa = 0;
             var ba = 0;
             var bs = 0;
+            var sf = 0;
+            var sg = 0;
 
             action SeeBusy {
                 bk = if (step == 1 || step == 2) { 0 } else { bk };
@@ -749,7 +769,7 @@ pub fn turn_tracker_model() -> Model {
                 ab = if (step == 1 || step == 2) { 0 } else { ab };
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
                 rf = 0;
-                turn = 1;
+                turn = if sf == 1 { turn } else { 1 };
                 step = 0;
                 sturn = 0;
                 pend = 0;
@@ -766,9 +786,9 @@ pub fn turn_tracker_model() -> Model {
                 pd = if step == 1 && pd == 1 { 4 } else { if (1 > step || step > 2) && pd == 2 { 1 } else { if (1 > step || step > 2) && pd == 3 { 0 } else { pd } } };
                 pl = 0;
                 rf = 0;
-                turn = 1;
+                turn = if sf == 1 { turn } else { 1 };
                 step = 2;
-                sturn = 1;
+                sturn = if step == 2 { sturn } else { if sf == 1 { turn } else { 1 } };
                 pend = 0;
                 ticks = 0;
                 word = 3;
@@ -783,9 +803,9 @@ pub fn turn_tracker_model() -> Model {
                 pd = if step == 2 && pd == 1 { 4 } else { if (1 > step || step > 2) && pd == 2 { 1 } else { if (1 > step || step > 2) && pd == 3 { 0 } else { pd } } };
                 pl = 0;
                 rf = 0;
-                turn = 1;
+                turn = if sf == 1 { turn } else { 1 };
                 step = 1;
-                sturn = 1;
+                sturn = if step == 1 { sturn } else { if sf == 1 { turn } else { 1 } };
                 pend = 0;
                 ticks = 0;
                 word = 4;
@@ -798,9 +818,9 @@ pub fn turn_tracker_model() -> Model {
                 ab = 0;
                 pd = if pd == 1 { 4 } else { pd };
                 rf = 0;
-                turn = 1;
+                turn = if sf == 1 { turn } else { 1 };
                 step = 1;
-                sturn = 1;
+                sturn = if sf == 1 { turn } else { 1 };
                 pend = 0;
                 ticks = 0;
                 word = 4;
@@ -814,8 +834,16 @@ pub fn turn_tracker_model() -> Model {
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
                 rf = 0;
                 step = 3;
+                sturn = if step == 3 { sturn } else { turn };
+                pend = if sf == 1 { 0 } else { turn };
+                ticks = 0;
+                word = 5;
+            }
+            action SeeOtherWall when (step == 3) {
+                rf = 0;
+                step = 3;
                 sturn = turn;
-                pend = turn;
+                pend = if sf == 1 { 0 } else { turn };
                 ticks = 0;
                 word = 5;
             }
@@ -828,7 +856,7 @@ pub fn turn_tracker_model() -> Model {
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
                 rf = 0;
                 step = 4;
-                sturn = turn;
+                sturn = if step == 4 { sturn } else { turn };
                 pend = 0;
                 ticks = 0;
                 word = 6;
@@ -843,7 +871,7 @@ pub fn turn_tracker_model() -> Model {
                 rf = 0;
                 step = if turn == 1 { 5 } else { 0 };
                 sturn = turn;
-                pend = turn;
+                pend = if sf == 1 { 0 } else { turn };
                 ticks = 0;
                 word = 7;
             }
@@ -857,7 +885,7 @@ pub fn turn_tracker_model() -> Model {
                 rf = 0;
                 step = 0;
                 sturn = 0;
-                pend = turn;
+                pend = if sf == 1 { 0 } else { turn };
                 ticks = 0;
                 word = 2;
             }
@@ -871,7 +899,7 @@ pub fn turn_tracker_model() -> Model {
                 rf = 0;
                 step = 0;
                 sturn = 0;
-                pend = turn;
+                pend = if sf == 1 { 0 } else { turn };
                 ticks = 0;
                 word = 8;
             }
@@ -919,7 +947,7 @@ pub fn turn_tracker_model() -> Model {
                 step = if word == 5 { 3 } else { 0 };
                 sturn = 0;
             }
-            action TxClose when (turn == 1 && (step == 0 || sturn == 0)) {
+            action TxClose when (sf == 0 && turn == 1 && (step == 0 || sturn == 0)) {
                 turn = 0;
                 cw = 12;
                 cticks = 0;
@@ -933,6 +961,39 @@ pub fn turn_tracker_model() -> Model {
                 pend = 0;
                 ticks = 0;
                 rf = 1;
+            }
+
+            action StreamOn when (Buggy == 0 || Buggy == 3) {
+                sf = 1;
+                pend = 0;
+                ticks = 0;
+            }
+            action StreamOff when (Buggy == 0 || Buggy == 3) {
+                pend = if sf == 1 && turn == 1 && (word == 2 || (word == 5 && rf == 0) || word == 7 || word == 8) { 1 } else { pend };
+                ticks = if sf == 1 { 0 } else { ticks };
+                sf = 0;
+            }
+            action StreamStart when (Buggy == 0 || Buggy == 3) {
+                sf = 1;
+                turn = 1;
+                pend = 0;
+                ticks = 0;
+            }
+            action StreamEnd when ((Buggy == 0 || Buggy == 3) && turn == 1) {
+                bk = if sturn == 1 && (step == 1 || step == 2) { 0 } else { bk };
+                ba = if sturn == 1 && (step == 1 || step == 2) { 0 } else { ba };
+                bs = if sturn == 1 && (step == 1 || step == 2) { 0 } else { bs };
+                pp = if sturn == 1 && (step == 1 || step == 2) { 0 } else { pp };
+                ab = if sturn == 1 && (step == 1 || step == 2) { 0 } else { ab };
+                pd = if sturn == 1 && (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
+                step = if sturn == 1 && step == 5 { 0 } else { step };
+                sturn = 0;
+                sf = 1;
+                turn = 0;
+                cw = 13;
+                cticks = 0;
+                pend = 0;
+                ticks = 0;
             }
 
             action AdmitCtl when (pd == 0 && (1 > Buggy || Buggy > 1)) {
@@ -1088,13 +1149,39 @@ pub fn turn_tracker_model() -> Model {
                 ba = 3 - ba;
             }
 
+            action ScreenOpensUnderStream when (Buggy == 3 && sf == 1 && turn == 0) {
+                turn = 1;
+                sg = 1;
+            }
+            action TxClosesUnderStream when (Buggy == 3 && sf == 1 && turn == 1 && (step == 0 || sturn == 0)) {
+                turn = 0;
+                cw = 12;
+                cticks = 0;
+                sg = 1;
+            }
+            action StreamRestArms when (Buggy == 3 && sf == 1 && turn == 1 && pend == 0 && (word == 2 || (word == 5 && rf == 0) || word == 7 || word == 8)) {
+                pend = 1;
+                ticks = 0;
+            }
+            action StreamEndTakesWall when (Buggy == 3 && turn == 1 && step == 3 && sturn == 1) {
+                sf = 1;
+                turn = 0;
+                cw = 13;
+                cticks = 0;
+                step = 0;
+                sturn = 0;
+                pend = 0;
+                ticks = 0;
+                wg = 1;
+            }
+
             invariant AtMostOneOpenTurn: turn + extra <= 1;
             invariant UnknownNeverClosesATurn: cw > 0;
             invariant IdleClosesOnlyAfterSettle: 2 > cw || cw > 2 || Settle <= cticks;
-            invariant DialogStaysInTurn: 3 > word || word > 3 || turn == 1;
+            invariant DialogStaysInTurn: 3 > word || word > 3 || turn == 1 || (step == 2 && sturn == 0);
             invariant StepsNestInTheirTurn: sturn <= turn && sturn <= step;
             invariant StallNeverClosesATurn: 6 > cw || cw > 6;
-            invariant WallNeedOutlivesTxClose: wg == 0;
+            invariant WallNeedOutlivesItsTurn: wg == 0;
             invariant RefutedWallStaysShut: rf == 0 || ((3 > step || step > 3) && pend == 0);
             invariant ActNeverBindsNextBox: gn == 0;
             invariant AttributesOnce: ab == 0;
@@ -1102,6 +1189,8 @@ pub fn turn_tracker_model() -> Model {
             invariant PersonSupersedesAct: (bk == 2 || pp == 0) && (pl == 0 || 3 > pd || pd > 3);
             invariant ActorKeepsItsAct: 1 > bk || bk > 1 || bs == 2 || ba == bs;
             invariant HarnessActNotCtl: 1 > bk || bk > 1 || 2 > bs || bs > 2 || ba == 2;
+            invariant StreamTurnsNeverSettle: sf == 0 || pend == 0;
+            invariant OnlyTheStreamMovesItsTurns: sg == 0;
         }
     }
 }

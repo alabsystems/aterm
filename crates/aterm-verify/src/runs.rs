@@ -8,18 +8,20 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aterm_uds::process::{
     EndRefusal, Ended, Identity, boot_id, held_age, read_birth, read_lineage,
 };
 pub use aterm_uds::runs::{
-    Claims, GroupLine, Judge, Kernel, LiveKernel, Record, RunId, Verdict, append, canonical,
-    exe_word, header_text, launcher_alive, led_groups, may_match_birth, open_regular_write,
-    pct_decode, pct_encode, read_bounded_regular_text, read_records, records_dir, table, under_any,
+    Claims, GroupLine, Judge, Kernel, Kin, KinJudge, LiveKernel, Record, RunId, Verdict, append,
+    canonical, exe_word, header_text, kin_path, launcher_alive, led_groups, may_match_birth,
+    open_regular_write, pct_decode, pct_encode, read_bounded_regular_text, read_kin, read_records,
+    records_dir, table, under_any,
 };
+pub use runs_kin::KinCost;
 
 use crate::Ctx;
 use crate::findings::tally_words;
@@ -63,9 +65,15 @@ const NOTICE_TEXT_BYTES: usize = 400;
 /// at most [`POST_BOUND`] ([`within`]), where each is a `proc.auto-end` record. With no session
 /// id, no instance hosting it, or none that answers in time, nothing is told, and the receipt's
 /// line is the report.
+///
+/// The same path carries a run's start and end ([`crate::hosting::Host`]), which the instance
+/// answers with the session the run belongs to. There the variable finds the instance to ask and
+/// nothing more: the instance places the asking process by its lineage and never reads a name
+/// the request gives.
 #[derive(Clone, Debug, Default)]
 pub struct ToInstance {
-    /// The session verify runs in.
+    /// The session the environment names: it finds the instance to tell, and decides nothing
+    /// that instance answers.
     pub sid: Option<String>,
     /// The rendezvous whose graph names the instance hosting it.
     pub dir: Option<PathBuf>,
@@ -75,11 +83,18 @@ impl ToInstance {
     /// The session this process's environment names, in this user's rendezvous.
     #[must_use]
     pub fn from_env() -> Self {
+        Self::of(
+            &|key| std::env::var(key).ok(),
+            aterm_uds::control_socket_dir(),
+        )
+    }
+
+    /// The session the environment `env` reads names, in the rendezvous `dir`.
+    #[must_use]
+    pub fn of(env: &dyn Fn(&str) -> Option<String>, dir: Option<PathBuf>) -> Self {
         Self {
-            sid: std::env::var(aterm_types::domain::ENV_PARENT_SESSION_ID)
-                .ok()
-                .filter(|sid| !sid.is_empty()),
-            dir: aterm_uds::control_socket_dir(),
+            sid: env(aterm_types::domain::ENV_PARENT_SESSION_ID).filter(|sid| !sid.is_empty()),
+            dir,
         }
     }
 }
@@ -90,7 +105,7 @@ impl Poster for ToInstance {
             (self.sid.clone(), self.dir.clone(), lines.is_empty())
         {
             let lines = lines.to_vec();
-            within(POST_BOUND, move || {
+            let _ = within(POST_BOUND, move || {
                 let _ = tell(&dir, &sid, &lines, Instant::now() + POST_BOUND);
             });
         }
@@ -99,19 +114,19 @@ impl Poster for ToInstance {
 
 /// Runs `post` on a thread of its own and waits for it at most `bound`: a connect the kernel
 /// blocks (a Linux listener whose backlog is full while its instance is stopped) or a reply that
-/// comes in pieces holds that thread, never the pass that posts. A thread that does not start
-/// tells nothing.
-fn within(bound: Duration, post: impl FnOnce() + Send + 'static) {
+/// comes in pieces holds that thread, never the pass that posts. What `post` returned, where it
+/// returned within `bound`; a thread that does not start tells nothing and returns nothing.
+pub(crate) fn within<T: Send + 'static>(
+    bound: Duration,
+    post: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     let (done, finished) = std::sync::mpsc::channel();
     let started = std::thread::Builder::new()
         .name("verify-post".to_owned())
         .spawn(move || {
-            post();
-            let _ = done.send(());
+            let _ = done.send(post());
         });
-    if started.is_ok() {
-        let _ = finished.recv_timeout(bound);
-    }
+    started.ok().and_then(|_| finished.recv_timeout(bound).ok())
 }
 
 /// `line` as one `appnotice proc` text: control characters spaced, cut at a character boundary
@@ -131,6 +146,27 @@ fn notice_text(line: &str) -> String {
 /// instance token's `AUTH` (which answers nothing), on one connection; each answers one line,
 /// and every write and read is done by `deadline`.
 fn tell(dir: &Path, sid: &str, lines: &[String], deadline: Instant) -> std::io::Result<()> {
+    let requests: Vec<String> = lines
+        .iter()
+        .map(|line| format!("appnotice proc {}", notice_text(line)))
+        .collect();
+    converse(dir, sid, &requests, deadline).map(drop)
+}
+
+/// Each of `requests` (one request line each, no newline) to the instance `dir`'s graph says
+/// hosts `sid`, after the instance token's `AUTH` (which answers nothing), on one connection;
+/// each answers one line, and every write and read is done by `deadline`. The answers read by
+/// then, in order: fewer than the requests where the instance hung up or the deadline came.
+///
+/// # Errors
+/// `sid` is no session id, no instance in `dir` hosts it, or its socket or token did not open,
+/// take the requests or answer.
+pub(crate) fn converse(
+    dir: &Path,
+    sid: &str,
+    requests: &[String],
+    deadline: Instant,
+) -> std::io::Result<Vec<String>> {
     let sid = aterm_types::control_request::Sid::parse(sid)
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let sock = aterm_ctl::hosting_sock(dir, sid)
@@ -138,10 +174,11 @@ fn tell(dir: &Path, sid: &str, lines: &[String], deadline: Instant) -> std::io::
     let (stream, token) = aterm_ctl::connect_then_read_token(&sock)?;
     let token = token?;
     let mut request = format!("AUTH {token}\n");
-    for line in lines {
-        request.push_str(&format!("appnotice proc {}\n", notice_text(line)));
+    for line in requests {
+        request.push_str(line);
+        request.push('\n');
     }
-    tell_exchange(&stream, lines.len(), deadline, || {
+    tell_exchange(&stream, requests.len(), deadline, || {
         (&stream).write_all(request.as_bytes())?;
         (&stream).flush()
     })
@@ -152,7 +189,7 @@ fn tell_exchange(
     replies: usize,
     deadline: Instant,
     send: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Vec<String>> {
     let left = || {
         deadline
             .saturating_duration_since(Instant::now())
@@ -161,14 +198,16 @@ fn tell_exchange(
     stream.set_write_timeout(Some(left()))?;
     send()?;
     let mut reader = std::io::BufReader::new(NoticeReply { stream, deadline });
+    let mut answers = Vec::new();
     for _ in 0..replies {
         use std::io::Read as _;
         let mut reply = String::new();
         if (&mut reader).take(64 * 1024).read_line(&mut reply)? == 0 || Instant::now() >= deadline {
             break;
         }
+        answers.push(reply);
     }
-    Ok(())
+    Ok(answers)
 }
 
 struct NoticeReply<'a> {
@@ -189,22 +228,25 @@ pub struct Told {
     pub pid: i32,
     /// Its executable's word.
     pub word: String,
-    /// The witness that made it the run's: `group` (W-group) or `run` (W-run); C-tree held too.
+    /// The witness that made it the run's: `group` (W-group) or `run` (W-run), C-tree held too;
+    /// or `kin` (W-kin), which needs no C-tree.
     pub witness: &'static str,
     /// It outlived its `SIGTERM` and took a `SIGKILL`.
     pub killed: bool,
 }
 
 impl Told {
-    /// `verify ended <word> (pid <pid>), <what>: proof <witness>,tree; <signals>; gone`.
+    /// `verify ended <word> (pid <pid>), <what>: proof <witness>,tree; <signals>; gone`, the
+    /// proof `kin` alone for W-kin.
     fn line(&self, what: &str) -> String {
         let signals = if self.killed {
             "SIGTERM, then SIGKILL"
         } else {
             "SIGTERM"
         };
+        let tree = if self.witness == "kin" { "" } else { ",tree" };
         format!(
-            "verify ended {} (pid {}), {what}: proof {},tree; {signals}; gone",
+            "verify ended {} (pid {}), {what}: proof {}{tree}; {signals}; gone",
             self.word, self.pid, self.witness
         )
     }
@@ -242,7 +284,9 @@ pub struct Runs {
     may_forget: AtomicBool,
     /// Where the stage and run-end sweeps tell what they ended ([`Inert`] until
     /// [`Self::telling`]).
-    poster: Box<dyn Poster>,
+    poster: Arc<dyn Poster>,
+    /// The kin its test binaries left (W-kin): booked, kept in the sidecar, ended.
+    kin: runs_kin::KinLedger,
 }
 
 /// Why a cleanup pass left a candidate. These observations grant no signal authority.
@@ -385,6 +429,8 @@ pub struct RunEndReport {
     pub lines: Vec<String>,
     /// Every retained candidate, independently of the bounded console context.
     pub survivors: Vec<SurvivorObservation>,
+    /// What booking and ending the run's kin cost, and what it booked and ended.
+    pub kin: KinCost,
 }
 
 /// Bounded console context; every observation is retained separately for the durable log.
@@ -618,6 +664,20 @@ impl Runs {
         );
         let file = open_regular_write(&path, false).ok()?;
         aterm_uds::runs::write_record_text(&file, &header).ok()?;
+        // W-kin's spared directory: the locked toolchain's whole build, `bin`'s parent, which
+        // holds the `trustd` a build may leave serving the next one.
+        let spared = ctx
+            .tools
+            .stage2_dir
+            .parent()
+            .map(canonical)
+            .into_iter()
+            .collect();
+        let kin = runs_kin::KinLedger::new(
+            kin_path(&path),
+            read_lineage(pid).and_then(|l| l.tty),
+            spared,
+        );
         Some(Self {
             log: Mutex::new(file),
             path,
@@ -630,15 +690,35 @@ impl Runs {
             made: Mutex::new(BTreeMap::new()),
             said: Mutex::new(Vec::new()),
             may_forget: AtomicBool::new(false),
-            poster: Box::new(Inert),
+            poster: Arc::new(Inert),
+            kin,
         })
     }
 
     /// The record, its stage and run-end sweeps telling `poster` what they end.
     #[must_use]
     pub fn telling(mut self, poster: Box<dyn Poster>) -> Self {
-        self.poster = poster;
+        self.poster = Arc::from(poster);
         self
+    }
+
+    /// A test's seam: the run's kin ender, once started, judges and ends nothing, as verify did
+    /// before W-kin; call it before any stage runs.
+    #[cfg(test)]
+    pub(crate) fn sparing_kin(&self) {
+        self.kin.sparing();
+    }
+
+    /// Every kin the run booked.
+    #[cfg(test)]
+    pub(crate) fn kin_booked(&self) -> std::collections::BTreeSet<Kin> {
+        self.kin.all()
+    }
+
+    /// Wait for the run's kin ender to end what it was handed, as the run's end does first.
+    #[cfg(test)]
+    pub(crate) fn drain_kin(&self) {
+        self.kin.drain();
     }
 
     /// The canonical directories the run's builds write, under which a compiler's named stale
@@ -678,6 +758,9 @@ impl Runs {
     /// A stage group whose leader's reap never came is kept as its sweep found it,
     /// listed in part, never closed.
     pub fn end_of_run(&self, kernel: &impl Kernel) -> RunEndReport {
+        // Every test binary has left its run by now: what the ender was handed is ended first,
+        // so the run's sweep judges what it left.
+        self.kin.drain();
         let unreaped = self
             .swept
             .lock()
@@ -704,7 +787,9 @@ impl Runs {
                     })
                 })
                 .collect(),
+            kin: self.kin.cost(),
         };
+        report.lines.extend(self.kin.said());
         let line = match self.run_end_sweep(kernel) {
             Some(left) => {
                 self.may_forget.store(!left.leaves_any(), Ordering::Relaxed);
@@ -751,6 +836,8 @@ impl Runs {
                 .filter(|r| launcher_alive(r, kernel)),
         );
         let (pids, _) = table(kernel, self.id.pid)?;
+        let booked = self.kin.all();
+        let (tty, spared) = self.kin.judge_parts();
         let judge = Judge {
             kernel,
             roots: &self.roots,
@@ -760,6 +847,11 @@ impl Runs {
             horizon: u64::MAX,
             launchd: kernel.launchd_version(),
             claims: &claims,
+            kin: Some(KinJudge {
+                booked: &booked,
+                spared,
+                tty,
+            }),
         };
         Some(pass(&judge, &pids))
     }
@@ -785,10 +877,21 @@ impl Runs {
             aterm_uds::runs::write_line(&file, &format!("end at={}", kernel.now_ms()))?;
         }
         archive_record(&file, archive)?;
+        let kin = self.kin.file();
+        if let Some(kin) = &kin {
+            archive_record(kin, &kin_archive_path(archive))?;
+        }
         if may_forget {
             let (current, _) = aterm_uds::regular_file::open(&self.path)?;
             if crate::run_log::file_key(&current)? != crate::run_log::file_key(&file)? {
                 return Err(std::io::Error::other("original run-record path changed"));
+            }
+            if let Some(kin) = &kin {
+                let (current, _) = aterm_uds::regular_file::open(self.kin.path())?;
+                if crate::run_log::file_key(&current)? != crate::run_log::file_key(kin)? {
+                    return Err(std::io::Error::other("original kin sidecar path changed"));
+                }
+                std::fs::remove_file(self.kin.path())?;
             }
             std::fs::remove_file(&self.path)?;
         }
@@ -796,12 +899,20 @@ impl Runs {
     }
 }
 
-/// Exact raw-record companion of an admitted human log; it is diagnostic data, not custody.
+/// Exact raw-record companion of an admitted human log; it is diagnostic data, not custody. Its
+/// kin sidecar's companion is [`kin_archive_path`]. The log's pruner removes both with the log.
 #[must_use]
 pub fn archive_path(log: &Path) -> PathBuf {
     let mut path = log.as_os_str().to_os_string();
     path.push(".run");
     PathBuf::from(path)
+}
+
+/// The kin sidecar's companion of the record archive `archive` ([`archive_path`]): the same path
+/// with `.kin` for `.run`.
+#[must_use]
+pub fn kin_archive_path(archive: &Path) -> PathBuf {
+    archive.with_extension("kin")
 }
 
 #[cfg(any(unix, windows))]
@@ -902,6 +1013,24 @@ impl crate::exec::StageGroupEnd for Runs {
             self.settle_group(pgid, &report, last);
             drop(made);
         }
+    }
+
+    fn kin_seen(&self, pgid: u32, _label: &str, kin: &Kin) {
+        self.kin.book(self, pgid, std::iter::once(kin));
+    }
+
+    fn kin_spared(&self) -> &[PathBuf] {
+        self.kin.spared()
+    }
+
+    fn stage_left(
+        &self,
+        pgid: u32,
+        label: &str,
+        root: &Kin,
+        book: &std::collections::BTreeSet<Kin>,
+    ) {
+        self.kin.left(self, pgid, label, root, book);
     }
 }
 
@@ -1013,6 +1142,7 @@ fn pass<K: Kernel>(judge: &Judge<'_, K>, pids: &[i32]) -> Left {
             Verdict::Named => false,
             Verdict::Proven => true,
         };
+        let by_kin = proven && judge.proves_kin(pid);
         let executable = judge.kernel.exe(pid);
         let (fate, lin) = settle(judge.kernel, pid, |token| {
             proven.then(|| {
@@ -1035,7 +1165,13 @@ fn pass<K: Kernel>(judge: &Judge<'_, K>, pids: &[i32]) -> Left {
                 left.told.push(Told {
                     pid,
                     word: word.clone(),
-                    witness: if group { "group" } else { "run" },
+                    witness: if group {
+                        "group"
+                    } else if by_kin {
+                        "kin"
+                    } else {
+                        "run"
+                    },
                     killed,
                 });
                 left.ended.push(word);
@@ -1075,7 +1211,10 @@ pub fn program_check_line(
 }
 
 /// Sweep processes left behind by dead verify runs recorded in `dir`, and tell `poster` each
-/// one ended.
+/// one ended. A dead run's kin sidecar ([`kin_path`]) is read strictly and bounded
+/// ([`read_kin`]): one of the run its record names gives its kin to the run's judgment (W-kin),
+/// one that does not read whole gives none, and one held or refused keeps the record and the
+/// sidecar for a later pass. Each goes with its record; a sidecar whose record is gone goes too.
 pub fn end_dead_runs(
     dir: &Path,
     this_boot: &str,
@@ -1098,9 +1237,11 @@ pub fn end_dead_runs(
         if rec.boot == this_boot {
             records.push((path, rec));
         } else {
+            let _ = std::fs::remove_file(kin_path(&path));
             let _ = std::fs::remove_file(&path);
         }
     }
+    forget_lone_sidecars(dir);
     let (dead, live): (Vec<_>, Vec<_>) = records
         .into_iter()
         .partition(|(_, r)| !launcher_alive(r, kernel));
@@ -1126,6 +1267,20 @@ pub fn end_dead_runs(
                     continue;
                 }
             };
+        let sidecar = kin_path(path);
+        let kin = match read_kin(&sidecar) {
+            Ok(kin) => kin
+                .filter(|kin| kin.boot == rec.boot && Some(kin.id) == rec.id)
+                .map(|kin| (kin.kin.iter().copied().collect(), kin)),
+            Err(why) if why.kind() == std::io::ErrorKind::NotFound => None,
+            Err(why) => {
+                out(&format!(
+                    "could not read the kin of {}: {why}; record kept",
+                    dead_run_head(rec)
+                ));
+                continue;
+            }
+        };
         let groups = led_groups(rec, kernel);
         let judge = Judge {
             kernel,
@@ -1136,6 +1291,11 @@ pub fn end_dead_runs(
             horizon,
             launchd,
             claims: &claims,
+            kin: kin.as_ref().map(|(booked, kin)| KinJudge {
+                booked,
+                spared: &kin.spared,
+                tty: kin.tty,
+            }),
         };
         let left = pass(&judge, &pids);
         ended += left.ended.len();
@@ -1147,10 +1307,32 @@ pub fn end_dead_runs(
         poster.post(&told);
         out(&dead_run_line(rec, &left));
         if !left.leaves_any() {
+            let _ = std::fs::remove_file(&sidecar);
             let _ = std::fs::remove_file(path);
         }
     }
     ended
+}
+
+/// Remove each kin sidecar in `dir` whose record is gone (an older verify removed the record and
+/// knew no sidecar): no pass reads a sidecar without its record. A live run writes its record
+/// before its sidecar and removes its sidecar before its record, so no live run's is removed.
+fn forget_lone_sidecars(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "kin")
+            && entry.file_type().is_ok_and(|t| t.is_file())
+            && matches!(
+                std::fs::symlink_metadata(path.with_extension("run")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// `the verify run of pid <launcher> (<its first root>)`.
@@ -1235,6 +1417,9 @@ pub fn parse_build_dirs(output: &str) -> Vec<PathBuf> {
         .map(PathBuf::from)
         .collect()
 }
+
+#[path = "runs_kin.rs"]
+mod runs_kin;
 
 #[cfg(test)]
 #[path = "runs_tests.rs"]

@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The credential readers' tests (plan package SF-34): each client's real reader turns made-up
-//! login files into facts, and no byte of a value reaches them.
+//! The credential readers' tests (plan packages SF-34 and SF-34b): each client's real reader
+//! turns made-up login files into facts, and no byte of a value reaches them.
 
 use super::*;
 use crate::harness::accounts::{
-    Account, AccountRecords, Auth, Binding, Logins, Roster, TokensHere,
+    Account, AccountRecords, Auth, Binding, Logins, Roster, TokensHere, Vendor,
 };
 use crate::harness::accounts_tokens::{self, InVault, TokenRow, UsedOn, Verification};
+use crate::harness::cli::shared_provider;
 use crate::harness::codex_app_login::{self, RefusalReason};
 
 const NOW: i64 = 1_800_000_000;
@@ -85,6 +86,15 @@ fn records(rows: Vec<Row>, renewed: i64, served: i64) -> AccountRecords {
         logins,
         notes: Vec::new(),
     }
+}
+
+/// `rows` as a Grok Build, Kimi Code or agy store loads them ([`records`] with no credential
+/// context: only a Codex store turns `contextual_auth` on, and each word's projection stays
+/// `Legacy`), each renewed at `renewed` and last served at `served`.
+fn file_records(rows: Vec<Row>, renewed: i64, served: i64) -> AccountRecords {
+    let mut records = records(rows, renewed, served);
+    records.state.contextual_auth = false;
+    records
 }
 
 /// Each of `records`' rows' word on record taken of the credentials its login file holds now, as
@@ -745,4 +755,786 @@ fn each_clients_reader_states_its_credentials_facts_and_no_byte_of_its_value() {
     );
     let said = format!("{rows:?} {codex_rows:?}");
     assert_eq!(windows(&values, &said), Vec::<String>::new(), "{said}");
+}
+
+/// Writes `bytes` at `path`, its folder (and those above it) made private first.
+fn put(path: &std::path::Path, bytes: &[u8]) {
+    aterm_types::fs_restricted::ensure_private_dir(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// A made-up access token shaped as a JWT whose claims name `user` and `email`, signed `sig`, as
+/// Kimi Code's own token-subject reader takes one (`observe::kimi_named`).
+fn claims_token(user: &str, email: &str, sig: &str) -> String {
+    format!(
+        "{}.{}.{sig}",
+        b64url(br#"{"alg":"RS256","typ":"JWT"}"#),
+        b64url(format!(r#"{{"user_id":"{user}","email":"{email}"}}"#).as_bytes())
+    )
+}
+
+/// The lab key of `email`: each address its own.
+fn key_of(email: &str) -> String {
+    let hash = email.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("ac-{hash:016x}")
+}
+
+/// `label`'s Kimi Code row of the global account system, its login in `dir`.
+fn kimi_row(label: &str, dir: &std::path::Path) -> Row {
+    Row {
+        vendor: Vendor {
+            region: Some(Region::Global),
+            flow: None,
+        },
+        ..row(label, dir)
+    }
+}
+
+/// The lab key `row` is keyed by: its address's, else its label's.
+fn row_key(row: &Row) -> Key {
+    Key::new(&key_of(row.email.as_deref().unwrap_or(&row.label))).unwrap()
+}
+
+/// `label`'s row on its CLI's default login home: no directory of its own.
+fn default_row(label: &str) -> Row {
+    Row {
+        label: label.into(),
+        email: Some(format!("{label}@x.example")),
+        ..Row::default()
+    }
+}
+
+/// `cli`'s login rows of `records` (one read of `store`) at `NOW`, each with the facts [`read`]
+/// states of its credential, as the login source makes them.
+fn rows_of(
+    cli: Cli,
+    store: &Store,
+    records: &AccountRecords,
+) -> Vec<crate::harness::journal::LoginRow> {
+    let judged = Judged::of(store, records);
+    let none = SetupTokens::default();
+    let token = |row: &Row, key: &Key| read(cli, row, key, &judged, store, &none, NOW).facts;
+    crate::harness::journal::login_rows(
+        cli,
+        records,
+        &|_, email| Some(key_of(email)),
+        &|_| "linked",
+        &token,
+        NOW,
+    )
+}
+
+/// GROK BUILD, KIMI CODE AND AGY STATE THE TOKEN BEHIND EACH SIGN-IN WITHOUT ITS VALUE (plan
+/// package SF-34b), under the rule every client follows
+/// (`each_clients_reader_states_its_credentials_facts_and_no_byte_of_its_value`): each an `oauth`
+/// login in its `login-file`, the one in the row's own login home, issued at the renewal that
+/// made it, last used at its last served turn, with no refresh time, since no field their
+/// readers read states one; `valid` or `expiring` only where its login serves by its word on
+/// record. Each store's records are as it loads them, with no credential context
+/// ([`file_records`]).
+///
+/// Grok Build: gia's `auth.json` in her login home, and gdef's in the default home `~/.grok`,
+/// each holding a made-up `key`, `valid` with no end, since its reader reads none; gio's, whose
+/// record keeps its made-up tokens under names this reader does not read and states no `key`,
+/// and gsi's, the harness's own stand-in login, `valid` too, since the harness counts a non-empty
+/// file grok has not refused as a login grok starts on; gia's login in gus's place (its record
+/// names her address) states nothing for gus; gil's, over which grok drew its sign-in (its
+/// `auth.json.refused` newer than it), `refused`; gwen's, signed out here, `expired`; gem's,
+/// whose record states an empty `key`, `expired`; gia's with no word on record, `unknown`, its
+/// last use still its last served turn, as a store with no credential context keeps it. Kimi
+/// Code: kai's credential file of her region's slot, with a refresh token and an access token
+/// whose claims name her and whose end passed, `valid` with no end, since its CLI renews it;
+/// kai's file in kay's place states nothing for kay; kit's, an opaque access token with no
+/// refresh token, states its end, `expiring` 8 days before it, `valid` 60 days before it,
+/// `expired` past it; kev's, a row with no region and so no address (as the roster requires), in
+/// the file its connector names, `valid`; kim's, whose refresh grant the issuer refused (the
+/// refresh's record beside it, both tokens left empty), `refused`, and with that record gone
+/// `expired`, since the file holds no credential. agy: ana's grant with a refresh token, its
+/// access token's `expiry` past, `valid` with no end; abe's with none, its `expiry` written in a
+/// zone 8 hours behind UTC, states that end, `expiring`; amy's empty file, `expired`, since it
+/// holds no credential; adef's in the person's own home, `valid`. Every reading is compared
+/// whole, with the clock's turns, and the files each reader reads are named for a reader that
+/// stamps them. No 8-byte window of any made-up value is in any reading, nor in the login rows
+/// `login_rows` makes of them; the readers return no error text at all, only `Option`s of closed
+/// words and seconds.
+#[test]
+fn grok_kimi_and_agy_state_the_token_behind_each_sign_in_without_its_value() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let at = |t: i64| Some(u64::try_from(t).unwrap());
+    let json = |doc: &aterm_json::Value| doc.to_string().into_bytes();
+    let harness = scratch.path().join("harness");
+    let home = scratch.path().join("home");
+    aterm_types::fs_restricted::ensure_private_dir(&home).unwrap();
+    let none = SetupTokens::default();
+    let oauth = TokenFacts {
+        kind: Kind::OAuth,
+        kept: Some(Kept::LoginFile),
+        issued_at: at(NOW - 20 * DAY),
+        expires_at: None,
+        refreshed_at: None,
+        last_used: at(NOW - 900),
+        state: State::Valid,
+    };
+    let reading = |facts: TokenFacts| Reading {
+        facts: Some(facts),
+        turns: None,
+    };
+    let mut said = String::new();
+
+    // Grok Build.
+    let grok_key = concat!("gk-", "Vb3nKq8wZt1mXr6hLc9jPf2dGs5aYe7uNo4iRx0Qw");
+    let grok_doc = |user: &str, held: &str| {
+        json(&aterm_json::json!({"https://accounts.x.ai/sign-in": {
+            "key": held, "user_id": format!("grok-user-{user}"),
+            "email": format!("{user}@x.example")}}))
+    };
+    let grok_dir = |label: &str| scratch.path().join(format!("grok-{label}"));
+    put(
+        &grok_dir("gia").join("auth.json"),
+        &grok_doc("gia", grok_key),
+    );
+    put(
+        &grok_dir("gus").join("auth.json"),
+        &grok_doc("gia", grok_key),
+    );
+    put(
+        &grok_dir("gil").join("auth.json"),
+        &grok_doc("gil", grok_key),
+    );
+    put(
+        &grok_dir("gwen").join("auth.json"),
+        &grok_doc("gwen", grok_key),
+    );
+    put(&grok_dir("gem").join("auth.json"), &grok_doc("gem", ""));
+    // gio's record keeps its tokens under names this reader does not read, and states no `key`.
+    let grok_access = concat!("ga-", "Rt7wMq2xLz5tKb8nPc3hVf6dGs1aYe9uNo4iJx0Bm");
+    let grok_refresh = concat!("gr-", "Wn4wHq9xKz2tKb5nTc8hRf3dGs6aYe1uLo7iPx0Cv");
+    put(
+        &grok_dir("gio").join("auth.json"),
+        &json(&aterm_json::json!({"https://accounts.x.ai/sign-in": {
+            "user_id": "grok-user-gio", "email": "gio@x.example",
+            "access_token": grok_access, "refresh_token": grok_refresh}})),
+    );
+    // gsi's is the harness's own stand-in login (`grok_signin`'s tests sign in with it).
+    put(&grok_dir("gsi").join("auth.json"), br#"{"stand-in":true}"#);
+    put(
+        &home.join(".grok").join("auth.json"),
+        &grok_doc("gdef", grok_key),
+    );
+    // Grok drew its sign-in over gil's login after it was written.
+    let gil_file = grok_dir("gil").join("auth.json");
+    std::fs::File::options()
+        .write(true)
+        .open(&gil_file)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+        .unwrap();
+    crate::harness::grok_signin::mark_refused(&gil_file).unwrap();
+    let grok = accounts::Store::at_for(&harness, Cli::Grok, &home);
+    let gia = row("gia", &grok_dir("gia"));
+    let gus = row("gus", &grok_dir("gus"));
+    let gil = row("gil", &grok_dir("gil"));
+    let gwen = row("gwen", &grok_dir("gwen"));
+    let gem = row("gem", &grok_dir("gem"));
+    let gio = row("gio", &grok_dir("gio"));
+    let gsi = row("gsi", &grok_dir("gsi"));
+    let gdef = default_row("gdef");
+    let mut grok_records = file_records(
+        vec![
+            gia.clone(),
+            gus.clone(),
+            gil.clone(),
+            gwen.clone(),
+            gem.clone(),
+            gio.clone(),
+            gsi.clone(),
+            gdef.clone(),
+        ],
+        NOW - 20 * DAY,
+        NOW - 900,
+    );
+    grok_records.state.accounts.get_mut("gwen").unwrap().auth = Auth::SignedOut;
+    let mut grok_read = |row: &Row, records: &AccountRecords| {
+        let got = read(
+            Cli::Grok,
+            row,
+            &row_key(row),
+            &Judged::of(&grok, records),
+            &grok,
+            &none,
+            NOW,
+        );
+        said.push_str(&format!(" {got:?}"));
+        got
+    };
+    for (row, want, holds) in [
+        (
+            &gia,
+            reading(oauth),
+            "gia's login: no end, since its file states none",
+        ),
+        (
+            &gdef,
+            reading(oauth),
+            "the default home's login, in ~/.grok",
+        ),
+        (
+            &gus,
+            Reading::default(),
+            "gia's login in gus's place states nothing for gus",
+        ),
+        (
+            &gil,
+            reading(TokenFacts {
+                state: State::Refused,
+                ..oauth
+            }),
+            "a login grok refused",
+        ),
+        (
+            &gwen,
+            reading(TokenFacts {
+                state: State::Expired,
+                ..oauth
+            }),
+            "a login signed out here",
+        ),
+        (
+            &gem,
+            reading(TokenFacts {
+                state: State::Expired,
+                ..oauth
+            }),
+            "a login file whose record states an empty key",
+        ),
+        (
+            &gio,
+            reading(oauth),
+            "a login file that states no key: held, as the harness counts it",
+        ),
+        (
+            &gsi,
+            reading(oauth),
+            "the harness's own stand-in login: held, as the harness counts it",
+        ),
+    ] {
+        assert_eq!(grok_read(row, &grok_records), want, "{holds}");
+    }
+    let mut unseen = grok_records.clone();
+    unseen.state.accounts.get_mut("gia").unwrap().auth = Auth::Unseen;
+    assert_eq!(
+        grok_read(&gia, &unseen),
+        reading(TokenFacts {
+            state: State::Unknown,
+            ..oauth
+        }),
+        "no word on record says the login serves; its last served turn stands, as a store with \
+         no credential context keeps it"
+    );
+    assert_eq!(
+        files(Cli::Grok, &gia, &grok),
+        [
+            grok_dir("gia").join("auth.json"),
+            grok_dir("gia").join("auth.json.refused")
+        ],
+        "Grok's reader reads its auth.json and the refusal marker beside it"
+    );
+
+    // Kimi Code.
+    let kimi_access = claims_token(
+        "kimi-user-kai",
+        "kai@x.example",
+        "Mw8vQx3zRt6nKb1hLc4jPf9dGs2aYe7uWo5iNx0Hn",
+    );
+    let kimi_refresh = concat!("kr-", "Tz6wNq1xVm9tKb4nRc7hLf2dGs5aYe8uPo3iWx0Jk");
+    let kimi_opaque = concat!("ko-", "Pq2wXz7mRv4tKb9nLc1hJf6dGs3aYe8uNo5iMx0Vt");
+    let kimi_dir = |label: &str| scratch.path().join(format!("kimi-{label}"));
+    let kimi_file =
+        |label: &str| shared_provider::kimi_credential_path(&kimi_dir(label), Region::Global);
+    let kai_doc = json(&aterm_json::json!({
+        "access_token": kimi_access, "refresh_token": kimi_refresh, "token_type": "Bearer",
+        "expires_at": NOW - 60, "expires_in": 900, "scope": "kimi-code"}));
+    put(&kimi_file("kai"), &kai_doc);
+    put(&kimi_file("kay"), &kai_doc);
+    // kev's access token is no set of claims, so it names no account: the row's own home is
+    // what makes it hers.
+    put(
+        &kimi_dir("kev").join("credentials").join("kimi-code.json"),
+        &json(&aterm_json::json!({
+            "access_token": kimi_opaque, "refresh_token": kimi_refresh, "token_type": "Bearer",
+            "expires_at": NOW - 60, "expires_in": 900, "scope": "kimi-code"})),
+    );
+    // kim's refresh grant, refused by the issuer: the refresh records it and leaves both tokens
+    // empty.
+    drop(shared_provider::kimi_proof_fixture(
+        &kimi_dir("kim"),
+        Region::Global,
+        "kim@x.example",
+    ));
+    shared_provider::expire_kimi_pending(&kimi_dir("kim"), Region::Global).unwrap();
+    shared_provider::kimi_rejection_fixture(&kimi_dir("kim"), Region::Global, "kim@x.example");
+    let kimi = accounts::Store::at_for(&harness, Cli::Kimi, &home);
+    let kai = kimi_row("kai", &kimi_dir("kai"));
+    let kay = kimi_row("kay", &kimi_dir("kay"));
+    let kit = kimi_row("kit", &kimi_dir("kit"));
+    let kim = kimi_row("kim", &kimi_dir("kim"));
+    // A Kimi Code row with no region names no address, as the roster requires.
+    let kev = Row {
+        label: "kev".into(),
+        dir: Some(kimi_dir("kev").to_string_lossy().into_owned()),
+        ..Row::default()
+    };
+    let kimi_records = file_records(
+        vec![
+            kai.clone(),
+            kay.clone(),
+            kit.clone(),
+            kim.clone(),
+            kev.clone(),
+        ],
+        NOW - 20 * DAY,
+        NOW - 900,
+    );
+    let mut kimi_read = |row: &Row, now: i64| {
+        let got = read(
+            Cli::Kimi,
+            row,
+            &row_key(row),
+            &Judged::of(&kimi, &kimi_records),
+            &kimi,
+            &none,
+            now,
+        );
+        said.push_str(&format!(" {got:?}"));
+        got
+    };
+    assert_eq!(
+        kimi_read(&kai, NOW),
+        reading(oauth),
+        "a grant its CLI renews states no end, though its access token's passed"
+    );
+    assert_eq!(
+        kimi_read(&kay, NOW),
+        Reading::default(),
+        "kai's login in kay's place states nothing for kay"
+    );
+    assert_eq!(
+        kimi_read(&kev, NOW),
+        reading(oauth),
+        "a row with no region, in the file its connector names"
+    );
+    for (holds, end, expires_at, state, turns) in [
+        (
+            "8 days before its end",
+            NOW + 8 * DAY,
+            at(NOW + 8 * DAY),
+            State::Expiring,
+            Some(NOW + 8 * DAY),
+        ),
+        (
+            "60 days before its end",
+            NOW + 60 * DAY,
+            at(NOW + 60 * DAY),
+            State::Valid,
+            Some(NOW + 30 * DAY),
+        ),
+        (
+            "past its end",
+            NOW - DAY,
+            at(NOW - DAY),
+            State::Expired,
+            None,
+        ),
+    ] {
+        put(
+            &kimi_file("kit"),
+            &json(&aterm_json::json!({
+                "access_token": kimi_opaque, "refresh_token": "", "token_type": "Bearer",
+                "expires_at": end, "expires_in": 900, "scope": "kimi-code"})),
+        );
+        assert_eq!(
+            kimi_read(&kit, NOW),
+            Reading {
+                facts: Some(TokenFacts {
+                    expires_at,
+                    state,
+                    ..oauth
+                }),
+                turns,
+            },
+            "an access token held with no refresh token, {holds}"
+        );
+    }
+    assert_eq!(
+        kimi_read(&kim, NOW),
+        reading(TokenFacts {
+            state: State::Refused,
+            ..oauth
+        }),
+        "a grant the issuer refused, its refusal recorded beside it"
+    );
+    let refusal = shared_provider::kimi_rejection_file(&kimi_dir("kim"), Region::Global);
+    assert_eq!(
+        files(Cli::Kimi, &kim, &kimi),
+        [
+            kimi_file("kim"),
+            kimi_dir("kim").join("config.toml"),
+            refusal.clone()
+        ],
+        "Kimi's reader reads its region's credential file, and its configuration and refusal \
+         record for its refusal"
+    );
+    assert_eq!(
+        files(Cli::Kimi, &kev, &kimi),
+        [
+            kimi_dir("kev").join("credentials").join("kimi-code.json"),
+            kimi_dir("kev").join("credentials")
+        ],
+        "a row with no region: the file its connector names, and the folder the others are \
+         written into"
+    );
+    std::fs::remove_file(&refusal).unwrap();
+    assert_eq!(
+        kimi_read(&kim, NOW),
+        reading(TokenFacts {
+            state: State::Expired,
+            ..oauth
+        }),
+        "a file the refusal left with no credential, its record gone"
+    );
+
+    // agy.
+    let agy_access = concat!("ya-", "Hn5wRq2xZm8tKb3nVc6hLf1dGs9aYe4uPo7iWx0Ds");
+    let agy_refresh = concat!("yr-", "Kc9wTq4xNm1tKb6nZc3hLf8dGs2aYe5uPo7iRx0Fv");
+    let agy_grant = |dir: &std::path::Path| {
+        dir.join(".gemini")
+            .join("antigravity-cli")
+            .join("antigravity-oauth-token")
+    };
+    let agy_dir = |label: &str| scratch.path().join(format!("agy-{label}"));
+    let held = |label: &str| {
+        json(&aterm_json::json!({"auth_method": "consumer",
+            "id_token_email": format!("{label}@x.example"), "token": {
+            "access_token": agy_access, "token_type": "Bearer", "refresh_token": agy_refresh,
+            "expiry": aterm_types::rfc3339::format_rfc3339(u64::try_from(NOW - 60).unwrap())}}))
+    };
+    put(&agy_grant(&agy_dir("ana")), &held("ana"));
+    put(&agy_grant(&home), &held("adef"));
+    // abe's grant holds no refresh token, its end written 8 hours behind UTC, as Go writes a
+    // `time.Time` made in that zone.
+    let behind =
+        aterm_types::rfc3339::format_rfc3339(u64::try_from(NOW + 10 * DAY - 8 * 3600).unwrap())
+            .replace('Z', ".123456789-08:00");
+    put(
+        &agy_grant(&agy_dir("abe")),
+        &json(&aterm_json::json!({"auth_method": "consumer", "token": {
+            "access_token": agy_access, "token_type": "Bearer", "expiry": behind}})),
+    );
+    put(&agy_grant(&agy_dir("amy")), b"");
+    let agy = accounts::Store::at_for(&harness, Cli::Agy, &home);
+    let ana = row("ana", &agy_dir("ana"));
+    let abe = row("abe", &agy_dir("abe"));
+    let amy = row("amy", &agy_dir("amy"));
+    let adef = default_row("adef");
+    let agy_records = file_records(
+        vec![ana.clone(), abe.clone(), amy.clone(), adef.clone()],
+        NOW - 20 * DAY,
+        NOW - 900,
+    );
+    let mut agy_read = |row: &Row| {
+        let got = read(
+            Cli::Agy,
+            row,
+            &row_key(row),
+            &Judged::of(&agy, &agy_records),
+            &agy,
+            &none,
+            NOW,
+        );
+        said.push_str(&format!(" {got:?}"));
+        got
+    };
+    assert_eq!(
+        agy_read(&ana),
+        reading(oauth),
+        "a grant with a refresh token states no end, though its access token's passed"
+    );
+    assert_eq!(
+        agy_read(&adef),
+        reading(oauth),
+        "the person's own home's grant"
+    );
+    assert_eq!(
+        agy_read(&abe),
+        Reading {
+            facts: Some(TokenFacts {
+                expires_at: at(NOW + 10 * DAY),
+                state: State::Expiring,
+                ..oauth
+            }),
+            turns: Some(NOW + 10 * DAY),
+        },
+        "a grant with no refresh token states its access token's end, read in its zone"
+    );
+    assert_eq!(
+        agy_read(&amy),
+        reading(TokenFacts {
+            state: State::Expired,
+            ..oauth
+        }),
+        "an empty file holds no credential"
+    );
+    assert_eq!(
+        files(Cli::Agy, &ana, &agy),
+        [agy_grant(&agy_dir("ana"))],
+        "agy's reader reads its grant"
+    );
+
+    // No byte of a value in any reading, or in the rows made of them.
+    let values = [
+        grok_key,
+        grok_access,
+        grok_refresh,
+        kimi_access.as_str(),
+        kimi_refresh,
+        kimi_opaque,
+        agy_access,
+        agy_refresh,
+    ];
+    assert_eq!(windows(&values, &said), Vec::<String>::new(), "{said}");
+    let grok_rows = rows_of(Cli::Grok, &grok, &grok_records);
+    let kimi_rows = rows_of(Cli::Kimi, &kimi, &kimi_records);
+    let agy_rows = rows_of(Cli::Agy, &agy, &agy_records);
+    let stated = |rows: &[crate::harness::journal::LoginRow], email: &str| {
+        rows.iter()
+            .find(|row| row.account.as_str() == key_of(email))
+            .and_then(|row| row.token)
+    };
+    assert_eq!(stated(&grok_rows, "gia@x.example"), Some(oauth));
+    assert_eq!(stated(&grok_rows, "gus@x.example"), None);
+    assert_eq!(stated(&grok_rows, "gio@x.example"), Some(oauth));
+    assert_eq!(
+        stated(&kimi_rows, "kim@x.example").map(|facts| facts.state),
+        Some(State::Expired)
+    );
+    assert_eq!(
+        stated(&agy_rows, "abe@x.example").map(|facts| (facts.kind, facts.state)),
+        Some((Kind::OAuth, State::Expiring))
+    );
+    let said = format!("{grok_rows:?} {kimi_rows:?} {agy_rows:?}");
+    assert_eq!(windows(&values, &said), Vec::<String>::new(), "{said}");
+}
+
+/// A LOGIN FILE THESE READERS DO NOT READ STATES NOTHING AND NO BYTE OF IT: for each of Grok
+/// Build, Kimi Code and agy, a file that is not there, one larger than the readers read
+/// (`stored::MAX`), one cut off mid-value, one that is no JSON object, a link to a good one (the
+/// readers open no final link), and an agy grant with no `token`, each read through the row's
+/// reader as no facts at all; each file holds a made-up value, and no 8-byte window of it is in
+/// what the readers return.
+#[test]
+fn a_login_file_these_readers_do_not_read_states_nothing_and_no_byte_of_it() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let harness = scratch.path().join("harness");
+    let home = scratch.path().join("home");
+    aterm_types::fs_restricted::ensure_private_dir(&home).unwrap();
+    let value = concat!("bad-", "Zr4wLq9xTm2tKb7nHc5hVf3dGs8aYe1uPo6iNx0Wq");
+    let padded = format!(
+        r#"{{"key":"{value}","access_token":"{value}","token":{{"access_token":"{value}"}},"pad":"{}"}}"#,
+        "a".repeat(usize::try_from(stored::MAX).unwrap())
+    );
+    let good = format!(
+        r#"{{"key":"{value}","access_token":"{value}","token":{{"access_token":"{value}"}}}}"#
+    );
+    let string = format!(r#""{value}""#);
+    let mut said = String::new();
+    for cli in [Cli::Grok, Cli::Kimi, Cli::Agy] {
+        let store = accounts::Store::at_for(&harness, cli, &home);
+        let name = cli.connector().stores[0];
+        let mut rows = Vec::new();
+        for (label, bytes) in [
+            ("missing", None),
+            ("oversized", Some(padded.as_bytes())),
+            ("cut", Some(&good.as_bytes()[..good.len() / 2])),
+            ("string", Some(string.as_bytes())),
+            ("linked", None),
+            (
+                "tokenless",
+                Some(br#"{"auth_method":"consumer"}"#.as_slice()),
+            ),
+        ] {
+            // Only agy's grant needs a `token`. An object with no token is a Kimi file that holds
+            // no credential (`expired`, as kim's emptied one in the exit test), and a Grok file
+            // whose token its reader cannot read, held as the harness counts it (gio's there).
+            if label == "tokenless" && cli != Cli::Agy {
+                continue;
+            }
+            let dir = scratch.path().join(format!("{}-{label}", cli.id()));
+            aterm_types::fs_restricted::ensure_private_dir(&dir).unwrap();
+            let file = match cli {
+                Cli::Kimi => shared_provider::kimi_credential_path(&dir, Region::Global),
+                _ => dir.join(name),
+            };
+            if let Some(bytes) = bytes {
+                put(&file, bytes);
+            }
+            if label == "linked" {
+                let target = scratch.path().join(format!("{}-target.json", cli.id()));
+                std::fs::write(&target, &good).unwrap();
+                aterm_types::fs_restricted::ensure_private_dir(file.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(&target, &file).unwrap();
+            }
+            let row = Row {
+                vendor: Vendor {
+                    region: (cli == Cli::Kimi).then_some(Region::Global),
+                    flow: None,
+                },
+                ..row(label, &dir)
+            };
+            rows.push((label, row));
+        }
+        let all: Vec<Row> = rows.iter().map(|(_, row)| row.clone()).collect();
+        let records = file_records(all, NOW - 20 * DAY, NOW - 900);
+        let judged = Judged::of(&store, &records);
+        for (label, row) in &rows {
+            let read = read(
+                cli,
+                row,
+                &row_key(row),
+                &judged,
+                &store,
+                &SetupTokens::default(),
+                NOW,
+            );
+            assert_eq!(read, Reading::default(), "{} {label}", cli.id());
+            said.push_str(&format!(" {read:?}"));
+        }
+    }
+    for read in [
+        format!(
+            "{:?}",
+            stored::grok(&scratch.path().join("grok-cut").join("auth.json"), None)
+        ),
+        format!(
+            "{:?}",
+            stored::kimi(&scratch.path().join("grok-cut").join("auth.json"), None)
+        ),
+        format!(
+            "{:?}",
+            stored::agy(&scratch.path().join("grok-cut").join("auth.json"))
+        ),
+    ] {
+        assert_eq!(read, "None");
+        said.push_str(&read);
+    }
+    assert_eq!(windows(&[value], &said), Vec::<String>::new(), "{said}");
+}
+
+/// A LOGIN FILE IS READ AS LONG AS ITS LENGTH SAYS, OR NOT AT ALL: the readers read a file into
+/// one buffer the length its open file's metadata gave, and a file that grew after that (more
+/// bytes than it said) or shrank (fewer) is no file they read, since what they would parse is not
+/// the file that length described and the buffer would have to grow; a read that fails reads
+/// nothing, and one interrupted is made again.
+#[test]
+fn a_login_file_is_read_as_long_as_its_length_says_or_not_at_all() {
+    let file = br#"{"key":"made-up"}"#.as_slice();
+    let read = |len: usize| stored::whole(file, len).map(|bytes| bytes.expose().to_vec());
+    assert_eq!(read(file.len()), Some(file.to_vec()), "as long as it says");
+    assert_eq!(
+        read(file.len() - 1),
+        None,
+        "it grew after its length was read"
+    );
+    assert_eq!(read(0), None, "it grew from nothing");
+    assert_eq!(read(file.len() + 1), None, "it shrank");
+    assert_eq!(
+        stored::whole(b"".as_slice(), 0).map(|bytes| bytes.len()),
+        Some(0),
+        "an empty file"
+    );
+
+    /// A reader that is interrupted once, then reads `bytes` a byte at a time, then ends, or
+    /// fails where `fails`.
+    struct Torn<'a> {
+        interrupted: bool,
+        bytes: &'a [u8],
+        fails: bool,
+    }
+    impl std::io::Read for Torn<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            match self.bytes.split_first() {
+                Some((first, rest)) => {
+                    buf[0] = *first;
+                    self.bytes = rest;
+                    Ok(1)
+                }
+                None if self.fails => Err(std::io::ErrorKind::Other.into()),
+                None => Ok(0),
+            }
+        }
+    }
+    let torn = |fails: bool| {
+        stored::whole(
+            Torn {
+                interrupted: false,
+                bytes: file,
+                fails,
+            },
+            file.len(),
+        )
+        .map(|bytes| bytes.expose().to_vec())
+    };
+    assert_eq!(
+        torn(false),
+        Some(file.to_vec()),
+        "a read interrupted is made again"
+    );
+    assert_eq!(torn(true), None, "a read that fails reads nothing");
+}
+
+/// GO'S TIMES ARE READ IN ANY ZONE: agy's grant writes its end as Go's `time.Time` does, in the
+/// zone it was made in, with nanoseconds where it has any, so `Z` and a `+HH:MM` or `-HH:MM`
+/// offset each name the same second; a zone that is no offset, or out of range, names none, and
+/// Go's zero time is no end.
+#[test]
+fn go_times_are_read_in_any_zone() {
+    let utc = stored::rfc3339("2026-11-18T18:00:00Z").unwrap();
+    for text in [
+        "2026-11-18T18:00:00Z",
+        "2026-11-18T10:00:00-08:00",
+        "2026-11-18T10:00:00.987654321-08:00",
+        "2026-11-18T23:30:00+05:30",
+    ] {
+        assert_eq!(stored::rfc3339(text), Some(utc), "{text}");
+    }
+    for text in [
+        "2026-11-18T10:00:00+0800",
+        "2026-11-18T10:00:00-24:00",
+        "2026-11-18T10:00:00-08:60",
+        "2026-11-18T10:00:00*08:00",
+        "2026-11-18T10:00:00",
+        "",
+    ] {
+        assert_eq!(stored::rfc3339(text), None, "{text}");
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let grant = scratch.path().join("antigravity-oauth-token");
+    put(
+        &grant,
+        br#"{"auth_method":"consumer","token":{"access_token":"a","expiry":"0001-01-01T00:00:00Z"}}"#,
+    );
+    assert_eq!(
+        stored::agy(&grant),
+        Some(stored::Stored {
+            held: true,
+            refreshable: false,
+            expires_at: None,
+        }),
+        "Go's zero time is no end"
+    );
 }

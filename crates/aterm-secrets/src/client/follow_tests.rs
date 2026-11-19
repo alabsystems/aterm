@@ -37,6 +37,8 @@ struct Holding {
     /// What it states of its own records, on every reply; `None` for a server of a build
     /// before the fence, which states nothing and answers every GET.
     bound: Option<RecordsBound>,
+    /// It answers every records GET `500`, stating nothing, as a server that failed does.
+    failing: bool,
 }
 
 /// A records server on loopback that states a bound (format 2's, unless a test says another):
@@ -81,6 +83,9 @@ fn answer(holding: &mut Holding, head: &str) -> (&'static str, Vec<u8>) {
         })
     });
     holding.asked_served.push(served);
+    if holding.failing {
+        return ("500 Internal Server Error", Vec::new());
+    }
     let peer = stated.as_deref().and_then(RecordsBound::parse);
     if let Some(own) = holding.bound
         && !peer.is_some_and(|peer| own.can_exchange(peer))
@@ -130,6 +135,7 @@ impl Host {
             asked: Vec::new(),
             asked_served: Vec::new(),
             bound,
+            failing: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (held, stopping) = (Arc::clone(&holding), Arc::clone(&stop));
@@ -153,7 +159,8 @@ impl Host {
                 let reply = if line.starts_with("GET ") && line.contains("/records") {
                     let mut holding = held.lock().unwrap_or_else(PoisonError::into_inner);
                     let (status, body) = answer(&mut holding, &head);
-                    let states = holding.bound.map_or_else(String::new, |bound| {
+                    let bound = holding.bound.filter(|_| !holding.failing);
+                    let states = bound.map_or_else(String::new, |bound| {
                         format!("{}: {}\r\n", transport::RECORDS_BOUND_HEADER, bound.value())
                     });
                     let mut reply = format!(
@@ -971,6 +978,117 @@ fn vault_checkpoint_a_marked_mac_neither_feeds_nor_takes_the_members_lane() {
     );
 }
 
+/// A MAC REFUSED BELOW THE FENCE SAYS IT NEEDS AN UPDATE (tracker FL-148E3). A Mac whose build
+/// reads no format 2 pulls from its vault's source, which states format 2 and refuses it
+/// ([`crate::ErrorKind::LaterFormat`]). The pass keeps a note of that refusal beside the
+/// records ([`told_later_format`]), which `aterm fleet` reads as this Mac's own `needs update`
+/// (`aterm_agent::fleet_view::format_floor`); the note is the only file it writes: no mark is
+/// stored and the records file is what it was. A pass that the source answers at format 1
+/// again removes it, so a source's unsigned word moves the display only while the source says
+/// it; a pass in which the source failed and a peer answered leaves it. Once the Mac runs a
+/// build that reads format 2, the note an older build left reads as nothing, and the pass, which
+/// asks the source again stating format 2 (`follow_later_format`), removes it.
+///
+/// What an older reader sees: the sync's diagnostic line is the one this refusal always gave
+/// (`aterm-secrets-sync-v1 failed other`, which every reader parses as a failure of no named
+/// kind), and a successful sync's line is untouched, since the refusal reaches no sync's
+/// outcome; an older `aterm fleet` reads this Mac's format mark alone, which is absent, so it
+/// shows what it showed.
+///
+/// NEGATIVE CONTROLS, each run against this test and seen to fail:
+/// - `note_later_format` writing no note: ``a Mac refused below the fence says it needs an
+///   update``.
+/// - `records_pass` passing `pass.is_ok()` as whether the source was heard: ``a pass the source
+///   never answered keeps the note``.
+/// - `told_later_format` without its `!reads_later_format` guard: ``a build that reads format 2
+///   is told nothing by an older build's note``.
+/// - `note_later_format` removing the note only where the source was heard (no `|| follows`):
+///   ``a build that follows removes the note``.
+#[test]
+fn vault_checkpoint_a_mac_refused_below_the_fence_says_it_needs_an_update() {
+    use crate::sync_diagnostic::SyncDiagnostic;
+
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let mut seat = Seat::found();
+    seat.sign(false);
+    let host = Host::start(seat.store());
+    let dark = Mac::new(root.path(), "dark", &host, &seat, Faults::default());
+    let before = dark.file();
+    assert!(!told_later_format(&dark.paths));
+
+    let refused = dark
+        .pass()
+        .expect_err("format 1 and format 2 exchange nothing");
+    assert_eq!(refused.kind(), crate::ErrorKind::LaterFormat);
+    assert!(
+        told_later_format(&dark.paths),
+        "a Mac refused below the fence says it needs an update"
+    );
+    assert_eq!((dark.format(), dark.file()), (FORMAT_ONE, before.clone()));
+    assert!(!format_mark(&dark.paths).path().exists());
+    assert_eq!(
+        records_marked_format(&dark.paths).expect("the mark"),
+        FORMAT_ONE
+    );
+    let line = SyncDiagnostic::Failed(refused.kind()).line();
+    assert_eq!(line, "aterm-secrets-sync-v1 failed other");
+    assert_eq!(
+        SyncDiagnostic::parse(&line),
+        Some(SyncDiagnostic::Failed(crate::ErrorKind::Other))
+    );
+    let again = dark.pass().expect_err("refused again");
+    assert_eq!(again.kind(), crate::ErrorKind::LaterFormat);
+    assert!(
+        told_later_format(&dark.paths),
+        "the note stays while refused"
+    );
+
+    // The source fails while a peer answers: the pass succeeds, the source was not heard, and
+    // the note stays.
+    host.holding().failing = true;
+    let peer = Host::stating(seat.store(), Some(RecordsBound::uncrossed()));
+    let pass = dark.pass_beside(&[&peer]).expect("a peer answered");
+    assert!(pass.source_short, "{pass:?}");
+    assert!(
+        told_later_format(&dark.paths),
+        "a pass the source never answered keeps the note"
+    );
+    drop(peer);
+
+    // The source answers at format 1 again: the note goes.
+    host.holding().failing = false;
+    host.holding().bound = Some(RecordsBound::uncrossed());
+    dark.pass().expect("a pass at format 1");
+    assert!(
+        !told_later_format(&dark.paths),
+        "a source that answers takes the note back"
+    );
+    assert!(!dark.paths.later_format_file().exists());
+
+    // The source states format 2 again, and the note is back; then the Mac runs a build that
+    // reads format 2: the note an older build left says nothing from then on, and the pass that
+    // follows the source removes it.
+    host.holding().bound = Some(RecordsBound::here(false).at_format(FORMAT_TWO));
+    dark.pass().expect_err("refused again");
+    assert!(told_later_format(&dark.paths));
+    dark.suffers(follows());
+    assert!(
+        dark.paths.later_format_file().exists() && !told_later_format(&dark.paths),
+        "a build that reads format 2 is told nothing by an older build's note"
+    );
+    let asked = host.asked_formats().len();
+    let _ = dark.pass();
+    assert_eq!(
+        host.asked_formats()[asked..],
+        [Some(FORMAT_ONE), Some(FORMAT_TWO)],
+        "it follows the source"
+    );
+    assert!(
+        !dark.paths.later_format_file().exists(),
+        "a build that follows removes the note"
+    );
+}
+
 /// A Mac behind a format-2 vault's final checkpoint catches up from a pruned server, and its
 /// records file becomes a rewritten one. Its pull at format 1 is refused; it asks again
 /// stating format 2 and asking for a served frame, takes the server's records and the root it
@@ -979,7 +1097,8 @@ fn vault_checkpoint_a_marked_mac_neither_feeds_nor_takes_the_members_lane() {
 /// dropped in the file's frame, then the records. It reads the file back as the pruned log
 /// (the record that follows only the dropped one held, the dropped one known and not held),
 /// asks again naming the cut and is served nothing, and takes the vault's next record by an
-/// append to the same generation's file. A Mac whose build reads no format 2 asks for no
+/// append to the same generation's file. That write writes the pin again with its own bytes, so
+/// a watcher that took its files once hears it, however many rewrites since. A Mac whose build reads no format 2 asks for no
 /// served frame, and its file and entry are what they were; the same build on the followed
 /// Mac reads no rewritten layout and writes nothing.
 ///
@@ -991,6 +1110,8 @@ fn vault_checkpoint_a_marked_mac_neither_feeds_nor_takes_the_members_lane() {
 ///   a rooted store): ``the entry is a rewritten layout``, `left: 0` against `right: 1`.
 /// - `transport::Pull::takes_served` answering as its caller says, whatever the pull reads:
 ///   ``a build that reads no format 2 asks for no served frame``.
+/// - A write to a rewritten generation writing no pin again (`rewrite::Mutant::Unheard`):
+///   ``the write moves the pin the watcher names``, its stamps equal.
 #[test]
 fn vault_checkpoint_a_puller_takes_a_served_root_into_a_rewritten_file() {
     use crate::membership_log::stored::KEPT_MAGIC;
@@ -1066,7 +1187,21 @@ fn vault_checkpoint_a_puller_takes_a_served_root_into_a_rewritten_file() {
     assert_eq!(pass.added, 0, "{pass:?}");
     assert_eq!(mac.stored_file(), (1, file.clone()));
 
-    // The vault's next record is appended to the same generation's file.
+    // The vault's next record is written to the same generation's file, and the pin, which a
+    // watcher of this Mac's standing names, is written again, so the write wakes it.
+    let watched = mac.paths.records_watch_files();
+    let current = crate::records_storage::rewrite::data_path(&mac.paths.records_file())
+        .expect("the pinned generation")
+        .path;
+    assert!(
+        !watched.contains(&current),
+        "no watcher names a file whose name a rewrite changes"
+    );
+    let pin = crate::records_storage::standing_files(&mac.paths.records_file()).expect("its files")
+        [1]
+    .clone();
+    assert!(watched.contains(&pin));
+    let seen = fsx::stamp_if_present(&pin).expect("the pin's stamp");
     let mut peer = vault.peer.clone();
     assert_eq!(
         peer.ingest_records(vec![vault.next.clone()]).expect("held"),
@@ -1079,6 +1214,16 @@ fn vault_checkpoint_a_puller_takes_a_served_root_into_a_rewritten_file() {
     let wire = vault.next.wire_bytes().expect("the record's bytes");
     assert_eq!(generation, 1);
     assert_eq!(grown, [&file[..], &wire[..]].concat(), "an append");
+    assert_ne!(
+        fsx::stamp_if_present(&pin).expect("the pin's stamp"),
+        seen,
+        "the write moves the pin the watcher names"
+    );
+    assert_eq!(
+        mac.paths.records_generation().expect("the generation"),
+        named,
+        "the pin selects what it selected"
+    );
     assert!(
         load_records(&mac.paths)
             .expect("the store")
@@ -1423,4 +1568,153 @@ fn vault_checkpoint_a_rewrite_drops_no_record_its_store_was_read_without() {
     let store = load_records(&mac.paths).expect("the store");
     assert!(store.holds(vault.stray.id()) && store.holds(&vault.slept));
     assert!(host.holding().asked.is_empty(), "no server was asked");
+}
+
+/// Every reader of a Mac's records entry that names its data file or judges its selection reads
+/// a rewritten entry where the Mac reads format 2 (its format mark names it, on a build that
+/// reads it), and selects as it always did everywhere else. A Mac takes a served root into a
+/// rewritten file; then each reader is walked over it:
+/// - `Paths::records_data_file` names the pinned generation's file. aterm-db's moved-home check
+///   (`runtime/moved.rs`, the digest of that file), aterm-agent's fleet log (`fleet_log.rs`,
+///   its stamp) and census (`fleet_census.rs`, `is_file`) and `client::remove`'s look
+///   ([`remove::records_stamp`], and the node loop's watch) name it there: their crates' tests
+///   cannot build a rewritten entry (the gate's seam, [`Faults::follows`], is this crate's
+///   tests'), so this test makes each of their calls on what it names.
+/// - The vault memos' stamps (`vault_memo::stamp_inputs`) and the seat ask's memo
+///   ([`seat_ask::mark`]) stamp it, and an append to the generation's file moves both.
+/// - `client::genesis`'s private-realm read reads it, frame and records, strictly
+///   ([`crate::membership_log::Store::framed_strictly`]).
+///
+/// The same build on the Mac with the gate shut refuses each, as it did before, and a Mac that
+/// never followed selects and stamps exactly as format 1 does.
+///
+/// NEGATIVE CONTROLS, each a change to the code run against this test and seen to fail:
+/// - `Paths::records_data_file` selecting as format 1 alone: ``the data file is the pinned
+///   generation's``, a refused layout.
+/// - `vault_memo`'s `records_standing` calling `records_storage::standing`: ``the vault memo
+///   stamps a rewritten entry``.
+/// - `seat_ask::mark` calling `records_storage::standing`: ``the seat ask stamps a rewritten
+///   entry``.
+/// - `records_storage::rewrite::standing` judging the files named `layout` and `current`:
+///   ``an append moves the entry's standing``.
+/// - `client::genesis::private_realm` selecting as format 1 (`records_storage::selected`):
+///   ``the private-realm read reads a rewritten entry``, a refused layout.
+/// - `Store::framed_strictly` decoding the file whole, frame included: ``the private-realm
+///   read reads a rewritten entry``.
+#[test]
+fn vault_checkpoint_every_reader_of_a_rewritten_entry_reads_it() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let vault = crate::membership_log::pruned_vault();
+    let host = Host::start(vault.peer.clone());
+
+    // A Mac that never followed selects and stamps as format 1 does.
+    let dark = Mac::of_vault(
+        root.path(),
+        "dark",
+        &host,
+        &vault.founder,
+        &vault.behind,
+        Faults::default(),
+    );
+    let entry = dark.paths.records_file();
+    assert_eq!(
+        dark.paths.records_data_file().expect("the records file"),
+        crate::records_storage::reader_path(&entry).expect("the format-1 selection")
+    );
+    assert!(
+        records_standing(&dark.paths, None) == crate::records_storage::standing(&entry, None),
+        "a Mac that never followed stamps its entry as format 1 does"
+    );
+
+    let mac = Mac::of_vault(
+        root.path(),
+        "mac",
+        &host,
+        &vault.founder,
+        &vault.behind,
+        follows(),
+    );
+    mac.pass().expect("a pass that follows");
+    let entry = mac.paths.records_file();
+    let custody = crate::records_storage::rewrite::data_path(&entry).expect("the layout");
+    assert_eq!(custody.generation, 1, "the entry is a rewritten layout");
+    let file = std::fs::read(&custody.path).expect("the file");
+
+    // The readers that name the data file.
+    let data = mac.paths.records_data_file();
+    assert_eq!(
+        data.as_ref().ok(),
+        Some(&custody.path),
+        "the data file is the pinned generation's: {data:?}"
+    );
+    let data = data.expect("named");
+    assert!(data.is_file(), "the census finds a records file");
+    assert_eq!(
+        std::fs::read(&data).expect("read"),
+        file,
+        "its digest is the file's"
+    );
+    let stamp = remove::records_stamp(&mac.paths).expect("the node loop's look stamps it");
+    assert_eq!(stamp.len, file.len() as u64);
+
+    // The readers that stamp its selection.
+    let memo = || vault_memo::stamp_inputs(&mac.paths, vault_memo::inputs);
+    let memo_before = memo().expect("the vault memo stamps a rewritten entry");
+    let seat_before = seat_ask::mark(&mac.paths).expect("the seat ask stamps a rewritten entry");
+    let records_before = records_standing(&mac.paths, None).expect("the entry stands");
+    assert!(
+        memo().expect("stamped") == memo_before,
+        "an unchanged entry stamps the same"
+    );
+
+    // The private-realm read: the vault is no ALab one, and every record of the file places.
+    let config = config(&mac.paths).expect("read").expect("a vault");
+    let realm = genesis::private_realm(&mac.paths, &config);
+    assert!(
+        matches!(realm, Ok(true)),
+        "the private-realm read reads a rewritten entry: {realm:?}"
+    );
+
+    // The vault's next record is appended to the generation's file in place, as the records
+    // writer appends (nothing else in the folder changes), which moves every stamp.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&custody.path)
+        .and_then(|mut file| file.write_all(&vault.next.wire_bytes().expect("the record's bytes")))
+        .expect("an append");
+    assert!(
+        load_records(&mac.paths)
+            .expect("the store")
+            .holds(vault.next.id()),
+        "the appended record reads"
+    );
+    assert_eq!(
+        mac.paths.records_data_file().expect("named"),
+        custody.path,
+        "an append keeps the generation"
+    );
+    assert!(
+        records_standing(&mac.paths, None).expect("the entry stands") != records_before,
+        "an append moves the entry's standing"
+    );
+    assert!(
+        memo().expect("stamped") != memo_before,
+        "an append moves the memo's stamps"
+    );
+    assert!(
+        seat_ask::mark(&mac.paths).expect("stamped") != seat_before,
+        "an append moves the seat ask's stamp"
+    );
+    assert!(
+        remove::records_stamp(&mac.paths).expect("stamped") != stamp,
+        "an append moves the node loop's look"
+    );
+
+    // The same build with the gate shut reads no rewritten layout: each reader refuses.
+    mac.suffers(Faults::default());
+    assert!(mac.paths.records_data_file().is_err());
+    assert!(remove::records_stamp(&mac.paths).is_none());
+    assert!(memo().is_none() && seat_ask::mark(&mac.paths).is_none());
+    assert!(genesis::private_realm(&mac.paths, &config).is_err());
+    mac.suffers(follows());
 }

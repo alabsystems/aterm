@@ -3517,15 +3517,14 @@ impl Stardust {
         }
         let g = ctx.geom;
         let ch = g.ch as f32;
-        // The sky is never below the glyph row's top: under `underline` the
-        // band's top lies among the letters, where a star reads as an
+        // The sky is never below the glyph row's top, where a star reads as an
         // apostrophe on paper. Above the row's top it is in the row above's
         // foot (a pixel clear of the row's top at any cell height), which the
         // probe certified blank.
         let cell_top = f32::from(g.origin_y) + f32::from(row) * ch;
         let top = match ribbon.band(row, col) {
             Some(b) => b.top,
-            None => default_band_top(g, ctx.cfg, row),
+            None => default_band_top(g, row),
         }
         .min(cell_top);
         let j = mix32(seed ^ SALT_JITTER);
@@ -4077,7 +4076,7 @@ impl Stardust {
             let (y0, y1) = if v.row == prev_row {
                 row_y
             } else {
-                let bottom = v.bottom_px(g, ctx.cfg);
+                let bottom = v.bottom_px(g);
                 let top = bottom - tall;
                 prev_row = v.row;
                 row_y = (top.round() as i32, bottom.round() as i32);
@@ -4807,14 +4806,10 @@ const fn fan_ray(a: f32, reach: f32, up: f32, down: f32, j: f32) -> (f32, f32) {
 }
 
 #[inline]
-const fn default_band_top(geom: Geom, cfg: &Config, row: u16) -> f32 {
+const fn default_band_top(geom: Geom, row: u16) -> f32 {
     let ch = geom.ch as f32;
     let cell_top = geom.origin_y as f32 + row as f32 * ch;
-    if cfg.ribbon_tall {
-        cell_top + ch - super::ribbon::TALL_UP_CH * ch
-    } else {
-        cell_top + (SKY_TOP_CH + SKY_BOTTOM_CH) * ch
-    }
+    cell_top + ch - super::ribbon::TALL_UP_CH * ch
 }
 
 /// One halo: a radial peak split into per-cell-row [`RainHalo`] quads sharing one centre and
@@ -4988,13 +4983,13 @@ impl Veil {
     }
 
     /// The window Y the veil's box ends at (exclusive) and its falloff centres on: the row's sky
-    /// band anchor ([`default_band_top`], the ribbon's top under `tall`), never below the glyph
-    /// row's top, so under `underline` the veil still sits wholly above the text.
+    /// band anchor ([`default_band_top`], the ribbon's top), never below the glyph row's top, so
+    /// the veil sits wholly above the text.
     #[inline]
     #[must_use]
-    pub const fn bottom_px(&self, geom: Geom, cfg: &Config) -> f32 {
+    pub const fn bottom_px(&self, geom: Geom) -> f32 {
         let cell_top = geom.origin_y as f32 + self.row as f32 * geom.ch as f32;
-        default_band_top(geom, cfg, self.row).min(cell_top)
+        default_band_top(geom, self.row).min(cell_top)
     }
 }
 

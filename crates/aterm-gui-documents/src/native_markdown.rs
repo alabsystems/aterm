@@ -3,7 +3,7 @@
 
 //! Deterministic, non-web Markdown document model for native tab views.
 
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkdownDocument {
@@ -16,6 +16,8 @@ pub struct MarkdownDocument {
     /// Styled spans of each prose block's display text (heading, paragraph, list item, quote).
     block_styles: std::collections::BTreeMap<usize, Vec<(Range<usize>, InlineStyle)>>,
     anchors: std::collections::BTreeMap<String, usize>,
+    /// Sorted (later block index, shared quote depth) for joined boundaries.
+    quote_continuations: Vec<(usize, usize)>,
     /// Exact UTF-8 byte length of the canonical source used to build this projection.
     pub source_len: usize,
     /// Canonical UTF-8 byte offset of every physical source line.
@@ -41,8 +43,8 @@ pub enum MarkdownBlock {
         source: Range<usize>,
     },
     Quote {
-        text: String,
-        source: Range<usize>,
+        depth: usize,
+        block: Box<MarkdownBlock>,
     },
     CodeBlock {
         language: Option<String>,
@@ -50,8 +52,7 @@ pub enum MarkdownBlock {
         source: Range<usize>,
     },
     Table {
-        header: Vec<String>,
-        rows: Vec<Vec<String>>,
+        table: MarkdownTable,
         source: Range<usize>,
     },
     ThematicBreak {
@@ -61,15 +62,35 @@ pub enum MarkdownBlock {
 
 impl MarkdownBlock {
     #[inline]
-    pub const fn source(&self) -> &Range<usize> {
-        match self {
+    pub fn content(&self) -> &Self {
+        let mut leaf = self;
+        while let Self::Quote { block, .. } = leaf {
+            leaf = block;
+        }
+        leaf
+    }
+
+    #[inline]
+    pub fn quote_depth(&self) -> usize {
+        let mut leaf = self;
+        let mut total = 0usize;
+        while let Self::Quote { depth, block } = leaf {
+            total = total.saturating_add(*depth);
+            leaf = block;
+        }
+        total
+    }
+
+    #[inline]
+    pub fn source(&self) -> &Range<usize> {
+        match self.content() {
             Self::Heading { source, .. }
             | Self::Paragraph { source, .. }
             | Self::ListItem { source, .. }
-            | Self::Quote { source, .. }
             | Self::CodeBlock { source, .. }
             | Self::Table { source, .. }
             | Self::ThematicBreak { source } => source,
+            Self::Quote { .. } => unreachable!("content returns a leaf"),
         }
     }
 }
@@ -85,7 +106,7 @@ pub struct HeadingRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkdownLink {
     pub label: String,
-    pub destination: String,
+    pub destination: Arc<str>,
     pub source: Range<usize>,
     pub policy: LinkPolicy,
 }
@@ -93,7 +114,7 @@ pub struct MarkdownLink {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkdownImage {
     pub alt: Option<String>,
-    pub source_uri: String,
+    pub source_uri: Arc<str>,
     pub source: Range<usize>,
     pub remote: bool,
 }
@@ -202,7 +223,7 @@ pub fn reduce_image_action(image: &MarkdownImage, user_initiated: bool) -> Markd
                 .any(|c| c.is_whitespace() || c.is_control());
         return if safe && user_initiated {
             MarkdownImageAction::OpenRemote {
-                uri: image.source_uri.clone(),
+                uri: image.source_uri.to_string(),
             }
         } else if safe {
             MarkdownImageAction::Denied {
@@ -361,194 +382,258 @@ pub fn parse(source: &str) -> MarkdownDocument {
 /// HTML comment opener still shows there outside the code the readers found.
 fn read_document(source: &str, display_source: &str) -> (MarkdownDocument, bool) {
     let lines = source_lines(display_source);
+    // In multiline prose and definitions the markers occupy whitespace. Table
+    // cells and fence bodies use the individual lines, without that padding.
+    let mut padded = None;
+    for line in &lines {
+        if line.quote_depth > 0 {
+            mask_source_range(&mut padded, display_source, line.whole_start..line.start);
+        }
+    }
+    let padded = padded.map(|bytes| String::from_utf8(bytes).expect("masked ASCII quote markers"));
+    let inline_source = padded.as_deref().unwrap_or(display_source);
+    let mut found = Found::default();
+    let first = read_blocks(source, display_source, inline_source, &lines, &mut found);
+    if found.references.is_empty() {
+        return first;
+    }
+    drop(first);
+    read_blocks(source, display_source, inline_source, &lines, &mut found)
+}
+
+/// The block reader recognizes definitions only at the beginning of a paragraph.
+/// When it finds any, a second reading can resolve references before their definitions.
+fn read_blocks(
+    source: &str,
+    display_source: &str,
+    inline_source: &str,
+    all_lines: &[SourceLine<'_>],
+    found: &mut Found,
+) -> (MarkdownDocument, bool) {
     let mut blocks = Vec::new();
     let mut outline = Vec::new();
-    let mut found = Found::default();
     let mut block_styles = std::collections::BTreeMap::new();
     let mut anchors = std::collections::BTreeMap::new();
     let mut heading_ids = std::collections::BTreeMap::<String, usize>::new();
+    let mut make_heading = |level, text: String, source: Range<usize>| {
+        let base = slug(&text);
+        let count = heading_ids.entry(base.clone()).or_insert(0);
+        let id = if *count == 0 {
+            base
+        } else {
+            format!("{base}-{}", *count + 1)
+        };
+        *count += 1;
+        outline.push(HeadingRef {
+            level,
+            id: id.clone(),
+            text: text.clone(),
+            source_start: source.start,
+        });
+        anchors.insert(id.clone(), source.start);
+        MarkdownBlock::Heading {
+            level,
+            id,
+            text,
+            source,
+        }
+    };
     let mut i = 0usize;
 
-    while i < lines.len() {
-        let line = &lines[i];
-        let trimmed = line.text.trim();
-        if trimmed.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        if let Some(fence) = fence_start(trimmed) {
-            let start = line.start;
-            let language = trimmed[fence.len()..].trim();
-            let language = (!language.is_empty()).then(|| language.to_string());
-            i += 1;
-            let mut code = String::new();
-            let mut end = line.end;
-            while i < lines.len() {
-                let candidate = &lines[i];
-                end = candidate.end;
-                if is_fence_close(candidate.text, fence) {
-                    i += 1;
-                    break;
-                }
-                code.push_str(candidate.text);
-                if candidate.has_newline {
-                    code.push('\n');
-                }
-                i += 1;
-            }
-            blocks.push(MarkdownBlock::CodeBlock {
-                language,
-                code,
-                source: start..end,
-            });
-            continue;
-        }
-
-        if let Some((level, text)) = heading(trimmed) {
-            let at = line.start + (line.text.len() - line.text.trim_start().len()) + text.start;
-            let (text, styles) =
-                read_inline_text(&display_source[at..at + text.len()], at, Some(&mut found));
-            if !styles.is_empty() {
-                block_styles.insert(blocks.len(), styles);
-            }
-            let base = slug(&text);
-            let count = heading_ids.entry(base.clone()).or_insert(0);
-            let id = if *count == 0 {
-                base
+    while i < all_lines.len() {
+        let group = i;
+        let depth = all_lines[i].quote_depth;
+        let end_of_group = i + all_lines[i..]
+            .iter()
+            .take_while(|line| line.quote_depth == depth)
+            .count();
+        let lines = &all_lines[..end_of_group];
+        let before = blocks.len();
+        let wrap = |block| {
+            if depth == 0 {
+                block
             } else {
-                format!("{base}-{}", *count + 1)
-            };
-            *count += 1;
-            outline.push(HeadingRef {
-                level,
-                id: id.clone(),
-                text: text.clone(),
-                source_start: line.start,
-            });
-            anchors.insert(id.clone(), line.start);
-            blocks.push(MarkdownBlock::Heading {
-                level,
-                id,
-                text,
-                source: line.start..line.end,
-            });
-            i += 1;
-            continue;
-        }
-
-        if is_thematic(trimmed) {
-            blocks.push(MarkdownBlock::ThematicBreak {
-                source: line.start..line.end,
-            });
-            i += 1;
-            continue;
-        }
-
-        if i + 1 < lines.len() && is_table_separator(lines[i + 1].text.trim()) {
-            let start = line.start;
-            let header = read_table_row(display_source, line, &mut found);
-            i += 2;
-            let mut rows = Vec::new();
-            let mut end = lines[i - 1].end;
-            while i < lines.len() && lines[i].text.contains('|') && !lines[i].text.trim().is_empty()
-            {
-                rows.push(read_table_row(display_source, &lines[i], &mut found));
-                end = lines[i].end;
-                i += 1;
-            }
-            blocks.push(MarkdownBlock::Table {
-                header,
-                rows,
-                source: start..end,
-            });
-            continue;
-        }
-
-        if let Some((depth, ordinal, text)) = list_item(line.text) {
-            let at = line.start + line.text.len() - text.len();
-            let (text, styles) = read_inline_text(text, at, Some(&mut found));
-            if !styles.is_empty() {
-                block_styles.insert(blocks.len(), styles);
-            }
-            blocks.push(MarkdownBlock::ListItem {
-                depth,
-                ordinal,
-                text,
-                source: line.start..line.end,
-            });
-            i += 1;
-            continue;
-        }
-
-        if trimmed.starts_with('>') {
-            let start = line.start;
-            let mut end = line.end;
-            let mut markers = Vec::new();
-            while i < lines.len() {
-                let candidate = &lines[i];
-                let marker = candidate.text.len() - candidate.text.trim_start().len();
-                if !candidate.text[marker..].starts_with('>') {
-                    break;
+                MarkdownBlock::Quote {
+                    depth,
+                    block: Box::new(block),
                 }
-                markers.push(candidate.start - start + marker);
-                end = candidate.end;
+            }
+        };
+        while i < end_of_group {
+            let line = &lines[i];
+            let trimmed = line.text.trim();
+            if trimmed.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            if let Some(fence) = fence_start(trimmed) {
+                let start = line.whole_start;
+                let language = trimmed[fence.len()..].trim();
+                let language = (!language.is_empty()).then(|| language.to_string());
+                i += 1;
+                let mut code = String::new();
+                let mut end = line.end;
+                while let Some(candidate) =
+                    all_lines.get(i).filter(|next| next.quote_depth >= depth)
+                {
+                    // Any further markers inside this fence are literal code.
+                    let raw = &display_source
+                        [candidate.whole_start..candidate.end - usize::from(candidate.has_newline)];
+                    let content = if candidate.quote_depth == depth {
+                        candidate.text
+                    } else {
+                        quote_prefix(raw, depth).1
+                    };
+                    end = candidate.end;
+                    if is_fence_close(content, fence) {
+                        i += 1;
+                        break;
+                    }
+                    code.push_str(content);
+                    if candidate.has_newline {
+                        code.push('\n');
+                    }
+                    i += 1;
+                }
+                blocks.push(wrap(MarkdownBlock::CodeBlock {
+                    language,
+                    code,
+                    source: start..end,
+                }));
+                continue;
+            }
+
+            if let Some((level, text)) = heading(trimmed) {
+                let at = line.start + (line.text.len() - line.text.trim_start().len()) + text.start;
+                let (text, styles) =
+                    read_inline_text(&display_source[at..at + text.len()], at, Some(found));
+                if !styles.is_empty() {
+                    block_styles.insert(blocks.len(), styles);
+                }
+                blocks.push(wrap(make_heading(level, text, line.whole_start..line.end)));
+                i += 1;
+                continue;
+            }
+
+            if is_thematic(trimmed) {
+                blocks.push(wrap(MarkdownBlock::ThematicBreak {
+                    source: line.whole_start..line.end,
+                }));
+                i += 1;
+                continue;
+            }
+
+            if i + 1 < lines.len() && table_header(line.text, lines[i + 1].text) {
+                let first = i;
+                i += 2;
+                while i < lines.len() && lines[i].text.contains('|') {
+                    i += 1;
+                }
+                let table = MarkdownTable::read(&lines[first..i], found);
+                blocks.push(wrap(MarkdownBlock::Table {
+                    table,
+                    source: line.whole_start..lines[i - 1].end,
+                }));
+                continue;
+            }
+
+            if trimmed.starts_with('[')
+                && let Some(bytes) = found
+                    .references
+                    .read(&inline_source[line.start..lines[end_of_group - 1].end])
+            {
+                let end = line.start + bytes;
+                i += lines[i..].partition_point(|candidate| candidate.start < end);
+                continue;
+            }
+
+            // List items and paragraphs have the same soft line breaks. Read their
+            // contiguous source so delimiters and link labels can span those breaks.
+            let first = i;
+            let start = line.start;
+            let item = list_item(line.text);
+            let content_start =
+                item.map_or(start, |(_, _, text)| start + line.text.len() - text.len());
+            while paragraph_continues_after(lines, i) {
                 i += 1;
             }
-            // The quote reads as one text: its lines with their `>` markers read as spaces,
-            // byte for byte in place, so every range found in it is canonical.
-            let mut quote = display_source.as_bytes()[start..end].to_vec();
-            for marker in markers {
-                quote[marker] = b' ';
-            }
-            let quote = String::from_utf8(quote).expect("an ASCII marker replaced by a space");
-            let (text, styles) = read_inline_text(&quote, start, Some(&mut found));
+            let end = lines[i].end;
+            i += 1;
+            let body = &inline_source[start..end];
+            let body = if item.is_some() {
+                let indent = content_start - start;
+                let contents = lines[first..i].iter().map(|candidate| {
+                    let prefix = if candidate.start == start {
+                        indent
+                    } else {
+                        candidate
+                            .text
+                            .bytes()
+                            .take(indent)
+                            .take_while(|&b| b == b' ')
+                            .count()
+                    };
+                    (candidate.start - start + prefix, &candidate.text[prefix..])
+                });
+                hide_container_definitions(body, contents, &mut found.references)
+            } else {
+                Cow::Borrowed(body)
+            };
+            let (text, styles) =
+                read_inline_text(&body[content_start - start..], content_start, Some(found));
             if !styles.is_empty() {
                 block_styles.insert(blocks.len(), styles);
             }
-            blocks.push(MarkdownBlock::Quote {
-                text,
-                source: start..end,
-            });
-            continue;
-        }
-
-        let start = line.start;
-        let mut end = line.end;
-        i += 1;
-        while i < lines.len() {
-            let candidate = &lines[i];
-            let candidate_trimmed = candidate.text.trim();
-            if candidate_trimmed.is_empty()
-                || heading(candidate_trimmed).is_some()
-                || fence_start(candidate_trimmed).is_some()
-                || list_item(candidate.text).is_some()
-                || candidate_trimmed.starts_with('>')
-                || is_thematic(candidate_trimmed)
-                || (i + 1 < lines.len() && is_table_separator(lines[i + 1].text.trim()))
-            {
-                break;
+            if let Some((depth, ordinal, _)) = item {
+                blocks.push(wrap(MarkdownBlock::ListItem {
+                    depth,
+                    ordinal,
+                    text,
+                    source: line.whole_start..end,
+                }));
+                continue;
             }
-            end = candidate.end;
-            i += 1;
+            if let Some(level) = lines.get(i).and_then(|next| setext_level(next.text.trim())) {
+                blocks.push(wrap(make_heading(
+                    level,
+                    text,
+                    line.whole_start..lines[i].end,
+                )));
+                i += 1;
+                continue;
+            }
+            blocks.push(wrap(MarkdownBlock::Paragraph {
+                text,
+                source: line.whole_start..end,
+            }));
         }
-        let (text, styles) = read_inline_text(&display_source[start..end], start, Some(&mut found));
-        if !styles.is_empty() {
-            block_styles.insert(blocks.len(), styles);
+        // A deeper neighbor already represents this enclosing quote. A blank
+        // group beside it separates leaves and has no paragraph of its own.
+        if depth > 0
+            && before == blocks.len()
+            && all_lines[..group]
+                .last()
+                .is_none_or(|prev| prev.quote_depth <= depth)
+            && all_lines
+                .get(end_of_group)
+                .is_none_or(|next| next.quote_depth <= depth)
+        {
+            blocks.push(wrap(MarkdownBlock::Paragraph {
+                text: String::new(),
+                source: lines[group].whole_start..lines[end_of_group - 1].end,
+            }));
         }
-        blocks.push(MarkdownBlock::Paragraph {
-            text,
-            source: start..end,
-        });
     }
 
     let shows_a_comment = shows_a_comment(display_source, &blocks, &found.runs);
     let document = MarkdownDocument {
+        quote_continuations: quote_continuations(&blocks, all_lines),
         blocks,
         outline,
-        links: found.links,
-        images: found.images,
-        inline_runs: found.runs,
+        links: std::mem::take(&mut found.links),
+        images: std::mem::take(&mut found.images),
+        inline_runs: std::mem::take(&mut found.runs),
         block_styles,
         anchors,
         source_len: source.len(),
@@ -561,14 +646,88 @@ fn read_document(source: &str, display_source: &str) -> (MarkdownDocument, bool)
     (document, shows_a_comment)
 }
 
-/// The lowered cells of the table row `line` of `source`, each read on its own.
-fn read_table_row(source: &str, line: &SourceLine<'_>, found: &mut Found) -> Vec<String> {
-    table_cell_ranges(line.text)
-        .map(|cell| {
-            let at = line.start + cell.start;
-            read_inline_text(&source[at..line.start + cell.end], at, Some(found)).0
-        })
-        .collect()
+fn quote_continuations(blocks: &[MarkdownBlock], lines: &[SourceLine<'_>]) -> Vec<(usize, usize)> {
+    let mut joined = Vec::new();
+    let mut lines = lines.iter().peekable();
+    for (before, pair) in blocks.windows(2).enumerate() {
+        let mut depth = pair[0].quote_depth().min(pair[1].quote_depth());
+        if depth == 0 {
+            continue;
+        }
+        let end = pair[0].source().end;
+        let start = pair[1].source().start;
+        if end < start {
+            // A marker-only line can leave an outer quote open while closing
+            // an inner one. An unquoted blank closes every level.
+            while let Some(line) = lines.next_if(|line| line.whole_start < start) {
+                if line.whole_start >= end {
+                    depth = depth.min(line.quote_depth);
+                }
+            }
+        }
+        if depth > 0 {
+            joined.push((before + 1, depth));
+        }
+    }
+    joined
+}
+
+mod references;
+mod table;
+pub use table::MarkdownTable;
+
+/// Definitions belong to the paragraph inside its container. Each line gives the offset
+/// of its content after the marker or continuation indent. Keep the bytes of every
+/// remaining link and style at their original positions, including on wrapped lines.
+fn hide_container_definitions<'a, 'line>(
+    source: &'a str,
+    lines: impl Iterator<Item = (usize, &'line str)>,
+    definitions: &mut references::Definitions,
+) -> Cow<'a, str> {
+    let mut masked = None;
+    let mut hidden_through = 0;
+    let mut paragraph_start = true;
+    let mut open_fence = None;
+    for (at, content) in lines {
+        if at < hidden_through {
+            continue;
+        }
+        let trimmed = content.trim();
+        let after_spaces = content.trim_start_matches(' ');
+        let indented = content.len() - after_spaces.len() > 3 || after_spaces.starts_with('\t');
+        if let Some(fence) = open_fence {
+            if !indented && is_fence_close(content, fence) {
+                open_fence = None;
+                paragraph_start = true;
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            paragraph_start = true;
+            continue;
+        }
+        if indented {
+            // At a paragraph start this is code. Within prose it continues that prose.
+            continue;
+        }
+        if let Some(fence) = fence_start(trimmed) {
+            open_fence = Some(fence);
+            continue;
+        }
+        if paragraph_start
+            && trimmed.starts_with('[')
+            && let Some(bytes) = definitions.read(&source[at..])
+        {
+            hidden_through = at + bytes;
+            mask_source_range(&mut masked, source, at..hidden_through);
+            continue;
+        }
+        paragraph_start = heading(trimmed).is_some()
+            || trimmed.starts_with(['-', '*', '_']) && is_thematic(trimmed);
+    }
+    masked.map_or(Cow::Borrowed(source), |bytes| {
+        Cow::Owned(String::from_utf8(bytes).expect("definition masking preserves UTF-8"))
+    })
 }
 
 /// Whether an HTML comment opener shows in `display_source` outside the code the readers found:
@@ -580,7 +739,7 @@ fn shows_a_comment(
 ) -> bool {
     let mut code = blocks
         .iter()
-        .filter_map(|block| match block {
+        .filter_map(|block| match block.content() {
             MarkdownBlock::CodeBlock { source, .. } => Some(source.clone()),
             _ => None,
         })
@@ -609,6 +768,7 @@ pub struct InlineStyle {
     pub strike: bool,
     pub code: bool,
     pub link: bool,
+    pub link_index: Option<usize>,
 }
 
 impl InlineStyle {
@@ -618,18 +778,27 @@ impl InlineStyle {
     }
 
     #[inline]
-    const fn merged(self, other: Self) -> Self {
+    fn merged(self, other: Self) -> Self {
         Self {
             strong: self.strong || other.strong,
             emphasis: self.emphasis || other.emphasis,
             strike: self.strike || other.strike,
             code: self.code || other.code,
             link: self.link || other.link,
+            link_index: other.link_index.or(self.link_index),
         }
     }
 }
 
 impl MarkdownDocument {
+    /// Number of outer quote levels continuing from the previous block into
+    /// block `index`. The first block and out-of-range indices return zero.
+    pub fn quote_continuation(&self, index: usize) -> usize {
+        self.quote_continuations
+            .binary_search_by_key(&index, |&(block, _)| block)
+            .map_or(0, |slot| self.quote_continuations[slot].1)
+    }
+
     /// The styled spans of block `index`'s display text, clipped to its first `len` bytes.
     pub fn block_styles(&self, index: usize, len: usize) -> Vec<(Range<usize>, InlineStyle)> {
         self.block_styles
@@ -669,7 +838,11 @@ pub fn local_anchor(document: &MarkdownDocument, destination: &str) -> Option<us
     if id.len() > 512 {
         return None;
     }
-    document.anchors.get(id).copied()
+    if id.contains('%') {
+        document.anchors.get(&percent_decode_utf8(id)?).copied()
+    } else {
+        document.anchors.get(id).copied()
+    }
 }
 
 /// Produce a bounded, active-centered outline window.
@@ -805,7 +978,6 @@ pub enum BlockShape {
     ListItem {
         depth: usize,
     },
-    Quote,
     /// A fenced block: `labelled` when it names a language, which paints above its text;
     /// `dense` in the narrow source pane.
     Code {
@@ -824,7 +996,7 @@ impl BlockShape {
             MarkdownBlock::Heading { level, .. } => Self::Heading(*level),
             MarkdownBlock::Paragraph { .. } => Self::Paragraph,
             MarkdownBlock::ListItem { depth, .. } => Self::ListItem { depth: *depth },
-            MarkdownBlock::Quote { .. } => Self::Quote,
+            MarkdownBlock::Quote { block, .. } => Self::of(block),
             MarkdownBlock::CodeBlock { language, .. } => Self::Code {
                 labelled: language
                     .as_deref()
@@ -834,6 +1006,33 @@ impl BlockShape {
             MarkdownBlock::Table { .. } => Self::Table,
             MarkdownBlock::ThematicBreak { .. } => Self::Rule,
         }
+    }
+}
+
+/// The rails in the margin of a quoted block. They share at most one fifth of the column
+/// with each other, leaving the rest for the block's own list marker, table or prose.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct QuoteGutter {
+    pub rails: usize,
+    pub step: f32,
+}
+
+impl QuoteGutter {
+    #[must_use]
+    pub fn new(depth: usize, width: f32, ty: ReaderType) -> Self {
+        let budget = width.max(0.0) * 0.20;
+        // A shared outer rail keeps its x coordinate as inner quotes begin and end.
+        let capacity = ((budget / 10.0).floor() as usize).clamp(1, 4);
+        let step = (18.0 * ty.scale()).min(budget / capacity as f32);
+        Self {
+            rails: depth.min(capacity),
+            step,
+        }
+    }
+
+    #[must_use]
+    pub fn width(self) -> f32 {
+        self.rails as f32 * self.step
     }
 }
 
@@ -915,8 +1114,14 @@ impl BlockFrame {
 
 /// The frame of a block of `shape` at `ty`; `None` for a rule, which has no text.
 #[must_use]
-pub fn block_frame(shape: BlockShape, ty: ReaderType) -> Option<BlockFrame> {
+pub fn block_frame(
+    shape: BlockShape,
+    quote_depth: usize,
+    width: f32,
+    ty: ReaderType,
+) -> Option<BlockFrame> {
     let scale = ty.scale();
+    let gutter = QuoteGutter::new(quote_depth, width, ty);
     let frame = |step: ReaderStep, mono: bool, bold: bool, preserve_lines: bool, leading: f32| {
         let px = ty.px(step);
         BlockFrame {
@@ -933,7 +1138,7 @@ pub fn block_frame(shape: BlockShape, ty: ReaderType) -> Option<BlockFrame> {
             label_h: 0.0,
         }
     };
-    Some(match shape {
+    let mut result = match shape {
         BlockShape::Heading(1) => BlockFrame {
             inset_bottom: 16.0 * scale,
             ..frame(ReaderStep::Display, false, true, false, 1.32)
@@ -948,14 +1153,8 @@ pub fn block_frame(shape: BlockShape, ty: ReaderType) -> Option<BlockFrame> {
         },
         BlockShape::Paragraph => frame(ReaderStep::Body, false, false, false, 1.72),
         BlockShape::ListItem { depth } => BlockFrame {
-            inset_left: (28.0 + (depth as f32 * 16.0).min(64.0)) * scale,
-            ..frame(ReaderStep::Body, false, false, false, 1.66)
-        },
-        BlockShape::Quote => BlockFrame {
-            inset_left: 18.0 * scale,
-            inset_right: 12.0 * scale,
-            inset_top: 8.0 * scale,
-            inset_bottom: 8.0 * scale,
+            inset_left: ((28.0 + (depth as f32 * 16.0).min(64.0)) * scale)
+                .min((width - gutter.width()).max(0.0) * 0.5),
             ..frame(ReaderStep::Body, false, false, false, 1.66)
         },
         BlockShape::Code { labelled, dense } => {
@@ -990,7 +1189,15 @@ pub fn block_frame(shape: BlockShape, ty: ReaderType) -> Option<BlockFrame> {
             ..frame(ReaderStep::Body, true, false, true, 1.65)
         },
         BlockShape::Rule => return None,
-    })
+    };
+    result.inset_left += gutter.width();
+    Some(result)
+}
+
+/// The full text frame for a document block, with its quote margin fitted to the column.
+#[must_use]
+pub fn preview_frame(block: &MarkdownBlock, width: f32, ty: ReaderType) -> Option<BlockFrame> {
+    block_frame(BlockShape::of(block), block.quote_depth(), width, ty)
 }
 
 /// The height a rule's rectangle takes.
@@ -1013,7 +1220,7 @@ pub struct BlockMeasure {
 /// lays out is a row the painter draws and every row the painter draws can be scrolled to.
 #[must_use]
 pub fn measure_block(block: &MarkdownBlock, width: f32, ty: ReaderType) -> BlockMeasure {
-    let Some(frame) = block_frame(BlockShape::of(block), ty) else {
+    let Some(frame) = preview_frame(block, width, ty) else {
         let row_h = rule_height(ty);
         return BlockMeasure {
             rows: 1,
@@ -1022,7 +1229,7 @@ pub fn measure_block(block: &MarkdownBlock, width: f32, ty: ReaderType) -> Block
         };
     };
     let rows = reader_rows(
-        &block_paint_text(block),
+        &block_text_at_columns(block, frame.columns(width)),
         frame.columns(width),
         frame.preserve_lines,
     )
@@ -1031,6 +1238,13 @@ pub fn measure_block(block: &MarkdownBlock, width: f32, ty: ReaderType) -> Block
         rows,
         row_h: frame.line_h,
         height: frame.height(rows) + VISUAL_BLOCK_GAP,
+    }
+}
+
+pub fn block_text_at_columns(block: &MarkdownBlock, columns: usize) -> Cow<'_, str> {
+    match block.content() {
+        MarkdownBlock::Table { table, .. } => Cow::Owned(table.project(columns).0),
+        _ => block_paint_text(block),
     }
 }
 
@@ -1045,29 +1259,10 @@ pub fn block_paint_text(block: &MarkdownBlock) -> Cow<'_, str> {
         MarkdownBlock::Heading { text, .. }
         | MarkdownBlock::Paragraph { text, .. }
         | MarkdownBlock::ListItem { text, .. }
-        | MarkdownBlock::Quote { text, .. }
         | MarkdownBlock::CodeBlock { code: text, .. } => bounded_text(text, BLOCK_PAINT_LIMIT),
+        MarkdownBlock::Quote { block, .. } => block_paint_text(block),
         MarkdownBlock::ThematicBreak { .. } => Cow::Borrowed(""),
-        MarkdownBlock::Table { header, rows, .. } => {
-            let mut output = String::new();
-            for row in std::iter::once(header).chain(rows) {
-                for (index, cell) in row.iter().enumerate() {
-                    if index > 0 {
-                        output.push_str("  │  ");
-                    }
-                    let remaining = BLOCK_PAINT_LIMIT.saturating_sub(output.len());
-                    if remaining == 0 {
-                        break;
-                    }
-                    output.push_str(&bounded_text(cell, remaining));
-                }
-                if output.len() >= BLOCK_PAINT_LIMIT {
-                    break;
-                }
-                output.push('\n');
-            }
-            Cow::Owned(output)
-        }
+        MarkdownBlock::Table { table, .. } => Cow::Owned(table.project(usize::MAX).0),
     }
 }
 
@@ -1648,6 +1843,64 @@ pub fn wrap_reader_text_window(
     lines
 }
 
+/// An optional quoted title is separate from the path the opener receives.
+fn link_destination(raw: &str) -> &str {
+    let raw = raw.trim();
+    let (dest, title) = raw.split_once(char::is_whitespace).unwrap_or((raw, ""));
+    let title = title.trim();
+    if !title.is_empty()
+        && ![('"', '"'), ('\'', '\''), ('(', ')')]
+            .iter()
+            .any(|&(open, close)| {
+                title
+                    .strip_prefix(open)
+                    .is_some_and(|rest| rest.ends_with(close))
+            })
+    {
+        return raw;
+    }
+    dest.strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(dest)
+}
+
+/// Decode each authored escape once. A literal URL with an ordinary ampersand
+/// stays borrowed, and text produced by an escape is never scanned again.
+fn unescape_destination(value: &str) -> Cow<'_, str> {
+    let mut out = String::new();
+    let mut copied = 0;
+    for (index, marker) in value.match_indices(['\\', '&']) {
+        if index < copied {
+            continue;
+        }
+        let after = &value[index + 1..];
+        let replacement = if marker == "\\" {
+            after
+                .as_bytes()
+                .first()
+                .copied()
+                .filter(u8::is_ascii_punctuation)
+                .map(|byte| (char::from(byte), 1))
+        } else {
+            after
+                .bytes()
+                .take(20)
+                .position(|byte| byte == b';')
+                .and_then(|end| decode_entity(&after[..end]).map(|ch| (ch, end + 1)))
+        };
+        if let Some((ch, consumed)) = replacement {
+            out.push_str(&value[copied..index]);
+            out.push(ch);
+            copied = index + 1 + consumed;
+        }
+    }
+    if copied == 0 {
+        return Cow::Borrowed(value);
+    }
+    out.push_str(&value[copied..]);
+    Cow::Owned(out)
+}
+
 fn link_policy(destination: &str) -> LinkPolicy {
     if destination.is_empty()
         || destination
@@ -1683,38 +1936,48 @@ fn link_policy(destination: &str) -> LinkPolicy {
 #[derive(Clone, Copy)]
 struct SourceLine<'a> {
     text: &'a str,
+    /// Start of the physical line and of the content after the quote markers.
+    whole_start: usize,
     start: usize,
     end: usize,
     has_newline: bool,
+    quote_depth: usize,
+}
+
+/// Consume at most `limit` quote markers, each indented by up to three spaces
+/// and followed by one optional space or tab. Extra indentation belongs to the leaf.
+fn quote_prefix(mut text: &str, limit: usize) -> (usize, &str) {
+    let mut depth = 0;
+    while depth < limit {
+        let indent = text.bytes().take(3).take_while(|&b| b == b' ').count();
+        let Some(rest) = text[indent..].strip_prefix('>') else {
+            break;
+        };
+        text = rest.strip_prefix([' ', '\t']).unwrap_or(rest);
+        depth += 1;
+    }
+    (depth, text)
 }
 
 fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-    for segment in source.split_inclusive('\n') {
-        let has_newline = segment.ends_with('\n');
-        let text = segment.strip_suffix('\n').unwrap_or(segment);
-        let end = start.saturating_add(segment.len());
-        lines.push(SourceLine {
-            text,
-            start,
-            end,
-            has_newline,
-        });
-        start = end;
-    }
-    if source.is_empty() {
-        return lines;
-    }
-    if start < source.len() {
-        lines.push(SourceLine {
-            text: &source[start..],
-            start,
-            end: source.len(),
-            has_newline: false,
-        });
-    }
-    lines
+    let mut start = 0;
+    source
+        .split_inclusive('\n')
+        .map(|segment| {
+            let raw = segment.strip_suffix('\n').unwrap_or(segment);
+            let (quote_depth, text) = quote_prefix(raw, usize::MAX);
+            let line = SourceLine {
+                text,
+                whole_start: start,
+                start: start + raw.len() - text.len(),
+                end: start + segment.len(),
+                has_newline: segment.ends_with('\n'),
+                quote_depth,
+            };
+            start = line.end;
+            line
+        })
+        .collect()
 }
 
 /// Which comments [`mask_html_comments`] leaves in place.
@@ -1736,41 +1999,55 @@ enum CommentScan {
 /// where the readers find it, and a span is closed again before any line that starts another
 /// block. With [`CommentScan::HideAll`] no fence or span keeps a comment.
 fn mask_html_comments(source: &str, scan: CommentScan) -> Cow<'_, str> {
+    if !source.contains("<!--") {
+        return Cow::Borrowed(source);
+    }
     let keep_code = scan == CommentScan::KeepCode;
     let lines = source_lines(source);
     let mut code_ticks = CodeTicks::new(&lines);
     let mut masked = None::<Vec<u8>>;
-    let mut in_comment = false;
+    let mut comment_depth = None;
     let mut inline_code_ticks = None::<usize>;
-    let mut open_fence = None::<&str>;
+    let mut open_fence = None::<(usize, &str)>;
 
     for (at, line) in lines.iter().enumerate() {
         let bytes = line.text.as_bytes();
         let trimmed = line.text.trim();
 
-        if let Some(fence) = open_fence {
-            if is_fence_close(line.text, fence) {
-                open_fence = None;
+        if let Some((depth, fence)) = open_fence {
+            if line.quote_depth >= depth {
+                if line.quote_depth == depth && is_fence_close(line.text, fence) {
+                    open_fence = None;
+                }
+                continue;
             }
-            continue;
+            open_fence = None;
         }
         if keep_code
-            && !in_comment
+            && comment_depth.is_none()
             && inline_code_ticks.is_none()
             && let Some(fence) = fence_start(trimmed)
         {
-            open_fence = Some(fence);
+            open_fence = Some((line.quote_depth, fence));
             continue;
         }
 
+        // Markers deeper than the comment opener are hidden comment text.
+        if let Some(depth) = comment_depth.filter(|&depth| line.quote_depth > depth) {
+            let prefix = &source[line.whole_start..line.start];
+            let extra = quote_prefix(prefix, depth).1.len();
+            mask_source_range(&mut masked, source, line.start - extra..line.start);
+        }
         let mut index = 0usize;
         while index < bytes.len() {
-            if in_comment {
+            if comment_depth.is_some() {
                 let close = find_ascii(&bytes[index..], b"-->");
                 let end = close.map_or(bytes.len(), |relative| index + relative + 3);
                 mask_source_range(&mut masked, source, line.start + index..line.start + end);
                 index = end;
-                in_comment = close.is_none();
+                if close.is_some() {
+                    comment_depth = None;
+                }
                 continue;
             }
 
@@ -1788,7 +2065,7 @@ fn mask_html_comments(source: &str, scan: CommentScan) -> Cow<'_, str> {
             }
 
             if inline_code_ticks.is_none() && bytes[index..].starts_with(b"<!--") {
-                in_comment = true;
+                comment_depth = Some(line.quote_depth);
                 continue;
             }
             index += line.text[index..].chars().next().map_or(1, char::len_utf8);
@@ -1843,34 +2120,49 @@ impl<'s, 'l> CodeTicks<'s, 'l> {
     }
 }
 
-/// Whether `parse` reads line `at + 1` into the inline block of line `at`: a heading, rule, list
-/// item or table header is a block of one line, a quote runs over its `>` lines, and a paragraph
-/// line is followed by any line that starts no other block.
+/// Whether the paragraph or list item on line `at` continues on the following line.
+fn paragraph_continues_after(lines: &[SourceLine<'_>], at: usize) -> bool {
+    let Some(next) = lines.get(at + 1) else {
+        return false;
+    };
+    if next.quote_depth != lines[at].quote_depth {
+        return false;
+    }
+    let trimmed = next.text.trim();
+    if trimmed.is_empty()
+        || setext_level(trimmed).is_some()
+        || heading(trimmed).is_some()
+        || fence_start(trimmed).is_some()
+        || list_item(next.text).is_some()
+        || is_thematic(trimmed)
+        || lines.get(at + 2).is_some_and(|after| {
+            after.quote_depth == next.quote_depth && table_header(next.text, after.text)
+        })
+    {
+        return false;
+    }
+    // An empty marker has no paragraph to continue lazily. Its first text
+    // line must reach the item's content indent.
+    let previous = lines[at].text;
+    if let Some((_, _, text)) = list_item(previous)
+        && text.trim().is_empty()
+    {
+        return next.text.len() - next.text.trim_start().len() >= previous.len() - text.len();
+    }
+    true
+}
+
+/// Whether the code-span lookahead can cross the boundary after line `at`.
 fn joins_next_line(lines: &[SourceLine<'_>], at: usize) -> bool {
     let Some(next) = lines.get(at + 1) else {
         return false;
     };
-    let (this, next_trimmed) = (lines[at].text, next.text.trim());
+    let this = lines[at].text;
     let trimmed = this.trim();
-    if heading(trimmed).is_some()
-        || is_thematic(trimmed)
-        || is_table_separator(next_trimmed)
-        || list_item(this).is_some()
-    {
+    if heading(trimmed).is_some() || is_thematic(trimmed) || table_header(this, next.text) {
         return false;
     }
-    if trimmed.starts_with('>') {
-        return next_trimmed.starts_with('>');
-    }
-    !(next_trimmed.is_empty()
-        || heading(next_trimmed).is_some()
-        || fence_start(next_trimmed).is_some()
-        || list_item(next.text).is_some()
-        || next_trimmed.starts_with('>')
-        || is_thematic(next_trimmed)
-        || lines
-            .get(at + 2)
-            .is_some_and(|after| is_table_separator(after.text.trim())))
+    paragraph_continues_after(lines, at)
 }
 
 fn mask_source_range(masked: &mut Option<Vec<u8>>, source: &str, range: Range<usize>) {
@@ -1908,13 +2200,7 @@ fn is_backslash_escaped(bytes: &[u8], index: usize) -> bool {
         == 1
 }
 
-/// Lower inline Markdown into the authored reader text without changing the
-/// canonical source.
-fn lower_inline_text(source: &str) -> String {
-    normalize_display_whitespace(&lower_inline_segment(source, 0))
-}
-
-/// [`lower_inline_text`] plus the styled spans of the text it returns.
+/// Lower inline Markdown to display text and ordered style spans.
 pub fn lower_inline_text_styled(source: &str) -> (String, Vec<(Range<usize>, InlineStyle)>) {
     read_inline_text(source, 0, None)
 }
@@ -1923,61 +2209,51 @@ pub fn lower_inline_text_styled(source: &str) -> (String, Vec<(Range<usize>, Inl
 /// runs, each at its canonical source range.
 #[derive(Default)]
 struct Found {
+    references: references::Definitions,
     links: Vec<MarkdownLink>,
     images: Vec<MarkdownImage>,
     runs: Vec<MarkdownInlineRun>,
 }
 
 impl Found {
-    /// Record a link or image whose label is still to be read, and return the slot of its run
-    /// for [`Found::label`]. It is recorded before its label, so it precedes what the label holds.
-    fn open(
+    /// Insert the accepted link or image before the runs discovered in its label.
+    fn record_link_or_image(
         &mut self,
+        run_slot: usize,
         image: bool,
-        destination: &str,
+        target: references::Target,
         source: Range<usize>,
         content_source: Range<usize>,
-    ) -> usize {
+        label: String,
+    ) {
         let kind = if image {
             let index = self.images.len();
             self.images.push(MarkdownImage {
-                alt: None,
-                source_uri: destination.to_string(),
+                alt: (!content_source.is_empty()).then(|| label.clone()),
+                source_uri: target.destination,
                 source: source.clone(),
-                remote: matches!(link_policy(destination), LinkPolicy::ExplicitExternal),
+                remote: matches!(target.policy, LinkPolicy::ExplicitExternal),
             });
             MarkdownInlineKind::Image { index }
         } else {
             let index = self.links.len();
             self.links.push(MarkdownLink {
-                label: String::new(),
-                destination: destination.to_string(),
+                label: label.clone(),
+                destination: target.destination,
                 source: source.clone(),
-                policy: link_policy(destination),
+                policy: target.policy,
             });
             MarkdownInlineKind::Link { index }
         };
-        self.runs.push(MarkdownInlineRun {
-            kind,
-            text: String::new(),
-            source,
-            content_source,
-        });
-        self.runs.len() - 1
-    }
-
-    /// Give the run at `slot`, and the link or image it names, the lowered `label` read for it;
-    /// an image's alt text is `None` where its authored label is empty.
-    fn label(&mut self, slot: usize, label: String, authored: bool) {
-        let run = &mut self.runs[slot];
-        match run.kind {
-            MarkdownInlineKind::Image { index } => {
-                self.images[index].alt = authored.then(|| label.clone());
-            }
-            MarkdownInlineKind::Link { index } => self.links[index].label.clone_from(&label),
-            _ => {}
-        }
-        run.text = label;
+        self.runs.insert(
+            run_slot,
+            MarkdownInlineRun {
+                kind,
+                text: label,
+                source,
+                content_source,
+            },
+        );
     }
 }
 
@@ -1994,7 +2270,7 @@ fn read_inline_text(
     lower_segment_into(
         source,
         at,
-        0,
+        InlineNesting::default(),
         InlineStyle::default(),
         &mut raw,
         &mut spans,
@@ -2049,39 +2325,42 @@ fn read_inline_text(
 
 const MAX_INLINE_NESTING: usize = 32;
 
-fn lower_inline_segment(source: &str, depth: usize) -> String {
-    let mut out = String::with_capacity(source.len());
-    lower_segment_into(
-        source,
-        0,
-        depth,
-        InlineStyle::default(),
-        &mut out,
-        &mut Vec::new(),
-        None,
-    );
-    out
+#[derive(Clone, Copy, Default)]
+struct InlineNesting {
+    depth: usize,
+    image_description: bool,
+}
+
+impl InlineNesting {
+    fn child(self, image: bool) -> Self {
+        Self {
+            depth: self.depth + 1,
+            image_description: self.image_description || image,
+        }
+    }
 }
 
 /// The lowering pass over `source`, whose first byte is canonical byte `at`, appending to `out`.
 /// Each recognized construct records the range of `out` it emitted with its style merged over
 /// the enclosing `style` (nested constructs record their own, stronger spans);
-/// `lower_inline_text` discards them, `lower_inline_text_styled` keeps them. With `found`, each
+/// With `found`, each
 /// link, image, code span and emphasis is recorded there too, at its canonical range, in the
-/// order it starts.
+/// order it starts. Return whether this segment contains a link outside any image description
+/// nested in the segment: a link inside a label takes precedence over its enclosing brackets.
 fn lower_segment_into(
     source: &str,
     at: usize,
-    depth: usize,
+    nesting: InlineNesting,
     style: InlineStyle,
     out: &mut String,
     spans: &mut Vec<(Range<usize>, InlineStyle)>,
     mut found: Option<&mut Found>,
-) {
-    if depth >= MAX_INLINE_NESTING {
+) -> bool {
+    if nesting.depth >= MAX_INLINE_NESTING {
         out.push_str(source);
-        return;
+        return false;
     }
+    let mut contains_link = false;
     let bytes = source.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -2144,48 +2423,59 @@ fn lower_segment_into(
         let label_open = if image { index + 1 } else { index };
         if bytes.get(label_open) == Some(&b'[')
             && let Some(label_close) = find_balanced_close(source, label_open, b'[', b']')
-            && bytes.get(label_close + 1) == Some(&b'(')
-            && let Some(destination_close) =
-                find_balanced_close(source, label_close + 1, b'(', b')')
+            && let Some((end, target)) =
+                inline_link_target(source, label_open, label_close, found.as_deref())
         {
-            let inner = if image {
-                style
-            } else {
-                style.merged(InlineStyle {
-                    link: true,
-                    ..InlineStyle::default()
-                })
-            };
             let label = label_open + 1..label_close;
-            let slot = found.as_deref_mut().map(|found| {
-                found.open(
-                    image,
-                    source[label_close + 2..destination_close].trim(),
-                    at + index..at + destination_close + 1,
-                    at + label.start..at + label.end,
-                )
-            });
+            let run_slot = found.as_ref().map_or(0, |items| items.runs.len());
+            let span_start = spans.len();
             let start = out.len();
-            lower_segment_into(
+            let label_has_link = lower_segment_into(
                 &source[label.clone()],
                 at + label.start,
-                depth + 1,
-                inner,
+                nesting.child(image),
+                style,
                 out,
                 spans,
                 found.as_deref_mut(),
             );
-            if !image {
-                spans.push((start..out.len(), inner));
+            if !image && label_has_link {
+                // Keep the outer brackets literal. Parse their suffix independently, so
+                // a following shortcut reference can still stand on its own.
+                out.insert(start, '[');
+                for (range, _) in &mut spans[span_start..] {
+                    range.start += 1;
+                    range.end += 1;
+                }
+                out.push(']');
+                contains_link = true;
+                index = label_close + 1;
+                continue;
             }
-            if let (Some(found), Some(slot)) = (found.as_deref_mut(), slot) {
-                found.label(
-                    slot,
-                    normalize_display_whitespace(&out[start..]),
-                    !label.is_empty(),
-                );
+            contains_link |= !image;
+            if !nesting.image_description {
+                if !image {
+                    spans.push((
+                        start..out.len(),
+                        style.merged(InlineStyle {
+                            link: true,
+                            link_index: found.as_ref().map(|items| items.links.len()),
+                            ..InlineStyle::default()
+                        }),
+                    ));
+                }
+                if let Some(found) = found.as_deref_mut() {
+                    found.record_link_or_image(
+                        run_slot,
+                        image,
+                        target,
+                        at + index..at + end,
+                        at + label.start..at + label.end,
+                        normalize_display_whitespace(&out[start..]),
+                    );
+                }
             }
-            index = destination_close + 1;
+            index = end;
             continue;
         }
 
@@ -2239,10 +2529,10 @@ fn lower_segment_into(
                     found.runs.len() - 1
                 });
                 let start = out.len();
-                lower_segment_into(
+                contains_link |= lower_segment_into(
                     &source[content.clone()],
                     at + content.start,
-                    depth + 1,
+                    nesting.child(false),
                     inner,
                     out,
                     spans,
@@ -2265,30 +2555,31 @@ fn lower_segment_into(
         {
             let close = index + 1 + relative;
             let inside = &source[index + 1..close];
-            if is_autolink(inside) {
+            if let Some(destination) = autolink_destination(inside) {
+                contains_link = true;
                 let start = out.len();
                 out.push_str(inside);
+                if nesting.image_description {
+                    index = close + 1;
+                    continue;
+                }
                 spans.push((
                     start..out.len(),
                     style.merged(InlineStyle {
                         link: true,
+                        link_index: found.as_ref().map(|items| items.links.len()),
                         ..InlineStyle::default()
                     }),
                 ));
                 if let Some(found) = found.as_deref_mut() {
-                    let link = found.links.len();
-                    found.links.push(MarkdownLink {
-                        label: inside.to_string(),
-                        destination: inside.to_string(),
-                        source: at + index..at + close + 1,
-                        policy: link_policy(inside),
-                    });
-                    found.runs.push(MarkdownInlineRun {
-                        kind: MarkdownInlineKind::Link { index: link },
-                        text: inside.to_string(),
-                        source: at + index..at + close + 1,
-                        content_source: at + index + 1..at + close,
-                    });
+                    found.record_link_or_image(
+                        found.runs.len(),
+                        false,
+                        references::Target::new(&destination),
+                        at + index..at + close + 1,
+                        at + index + 1..at + close,
+                        inside.to_string(),
+                    );
                 }
                 index = close + 1;
                 continue;
@@ -2320,6 +2611,7 @@ fn lower_segment_into(
         out.push(character);
         index += character.len_utf8();
     }
+    contains_link
 }
 
 fn normalize_display_whitespace(source: &str) -> String {
@@ -2352,6 +2644,25 @@ fn find_exact_run(bytes: &[u8], mut index: usize, marker: u8, wanted: usize) -> 
         index += run;
     }
     None
+}
+
+fn inline_link_target(
+    source: &str,
+    open: usize,
+    close: usize,
+    found: Option<&Found>,
+) -> Option<(usize, references::Target)> {
+    if source.as_bytes().get(close + 1) == Some(&b'(')
+        && let Some(end) = find_balanced_close(source, close + 1, b'(', b')')
+    {
+        return Some((
+            end + 1,
+            references::Target::authored(link_destination(&source[close + 2..end])),
+        ));
+    }
+    found?
+        .references
+        .resolve(source, close, &source[open + 1..close])
 }
 
 fn find_balanced_close(source: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
@@ -2418,16 +2729,58 @@ fn find_emphasis_close(bytes: &[u8], mut index: usize, marker: u8, wanted: usize
     None
 }
 
-fn is_autolink(value: &str) -> bool {
-    matches!(link_policy(value), LinkPolicy::ExplicitExternal)
+/// CommonMark angle autolinks. An email address is displayed as authored, while
+/// URI delimiters in its local part stay mailbox data in the mailto destination.
+fn autolink_destination(value: &str) -> Option<Cow<'_, str>> {
+    if matches!(link_policy(value), LinkPolicy::ExplicitExternal) {
+        return Some(Cow::Borrowed(value));
+    }
+    let (local, domain) = value.split_once('@')?;
+    if local.is_empty()
+        || !local
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".!#$%&'*+/=?^_`{|}~-".contains(&byte))
+        || !domain.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            (1..=63).contains(&bytes.len())
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut uri = String::from("mailto:");
+    for byte in local.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~!$'*+".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    uri.push('@');
+    uri.push_str(domain);
+    Some(Cow::Owned(uri))
 }
 
 fn looks_like_html_tag(value: &str) -> bool {
     let candidate = value.trim_start_matches('/').trim_start_matches(['!', '?']);
-    candidate
-        .bytes()
-        .next()
-        .is_some_and(|byte| byte.is_ascii_alphabetic())
+    let bytes = candidate.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    let name = bytes
+        .iter()
+        .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'-')
+        .count();
+    matches!(&candidate[name..], "" | "/")
+        || bytes.get(name).is_some_and(u8::is_ascii_whitespace)
+        || value.starts_with('?') && value.ends_with('?')
 }
 
 fn decode_entity(entity: &str) -> Option<char> {
@@ -2452,6 +2805,14 @@ fn decode_entity(entity: &str) -> Option<char> {
             }
             char::from_u32(dec.parse().ok()?).filter(|&c| c != '\0')
         }
+        _ => None,
+    }
+}
+
+fn setext_level(line: &str) -> Option<u8> {
+    match line.as_bytes().first()? {
+        b'=' if line.bytes().all(|b| b == b'=') => Some(1),
+        b'-' if line.bytes().all(|b| b == b'-') => Some(2),
         _ => None,
     }
 }
@@ -2526,33 +2887,51 @@ fn list_item(line: &str) -> Option<(usize, Option<u64>, &str)> {
     Some((depth, Some(ordinal), text))
 }
 
-fn table_cells(line: &str) -> Vec<String> {
-    table_cell_ranges(line)
-        .map(|cell| lower_inline_text(&line[cell]))
-        .collect()
-}
-
-/// The range of `line` each cell of the table row is: split at `|` once the row is trimmed and
-/// its outer `|`s dropped, each cell trimmed.
 fn table_cell_ranges(line: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     let trimmed = line.trim();
-    let inner = trimmed.trim_matches('|');
-    let mut at = (line.len() - line.trim_start().len())
-        + (trimmed.len() - trimmed.trim_start_matches('|').len());
-    inner.split('|').map(move |cell| {
-        let start = at + (cell.len() - cell.trim_start().len());
-        at += cell.len() + 1;
-        start..start + cell.trim().len()
-    })
+    let offset = line.len() - line.trim_start().len();
+    let start = usize::from(trimmed.starts_with('|'));
+    let mut escaped = false;
+    trimmed
+        .bytes()
+        .enumerate()
+        .filter_map(move |(i, byte)| {
+            let boundary = i >= start && byte == b'|' && !escaped;
+            escaped = byte == b'\\' && !escaped;
+            boundary.then_some(i)
+        })
+        .chain(std::iter::once(trimmed.len()))
+        .scan(start, move |from, end| {
+            if *from > end || *from == trimmed.len() && trimmed.ends_with('|') {
+                return None;
+            }
+            let cell = &trimmed[*from..end];
+            let start = offset + *from + cell.len() - cell.trim_start().len();
+            *from = end + 1;
+            Some(start..start + cell.trim().len())
+        })
 }
 
-fn is_table_separator(line: &str) -> bool {
-    let cells = table_cells(line);
-    !cells.is_empty()
-        && cells.iter().all(|cell| {
-            let cell = cell.trim_matches(':').trim();
-            cell.len() >= 3 && cell.chars().all(|ch| ch == '-')
-        })
+fn table_header(line: &str, separator: &str) -> bool {
+    if !separator.contains('|')
+        || !separator
+            .trim()
+            .bytes()
+            .all(|b| matches!(b, b'-' | b':' | b'|' | b' ' | b'\t'))
+    {
+        return false;
+    }
+    let mut count = 0;
+    for cell in table_cell_ranges(separator) {
+        let marker = &separator[cell];
+        let marker = marker.strip_prefix(':').unwrap_or(marker);
+        let marker = marker.strip_suffix(':').unwrap_or(marker);
+        if marker.is_empty() || !marker.bytes().all(|b| b == b'-') {
+            return false;
+        }
+        count += 1;
+    }
+    count > 0 && table_cell_ranges(line).count() == count
 }
 
 fn slug(text: &str) -> String {

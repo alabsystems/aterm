@@ -678,13 +678,20 @@ impl ImageArt {
     }
 
     /// Straight-alpha RGBA8 rows of the art at exactly `w`×`h` device pixels.
-    pub(crate) fn bake(self, w: u32, h: u32) -> Vec<u8> {
-        match self {
+    pub(crate) fn bake(self, w: u32, h: u32) -> std::sync::Arc<[u8]> {
+        #[cfg(test)]
+        if let Some(pixels) = test_baked((self, w, h)) {
+            return pixels;
+        }
+        let pixels: std::sync::Arc<[u8]> = match self {
             Self::Road(road) => road.bake(w, h),
             Self::Cat(cat) => cat.bake(w, h),
         }
         .pixels()
-        .to_vec()
+        .into();
+        #[cfg(test)]
+        test_bake_keep((self, w, h), &pixels);
+        pixels
     }
 
     /// The art's bake at exactly `w`×`h` device pixels, if one is kept. Nothing bakes here: the
@@ -792,6 +799,52 @@ static BAKED_IMAGES: std::sync::Mutex<Kept> = std::sync::Mutex::new(Kept {
 thread_local! {
     /// A test thread's own bakes, so tests running side by side never evict each other's.
     static BAKED_IMAGES: std::sync::Mutex<Kept> = std::sync::Mutex::new(Kept::default());
+}
+
+/// Every test's bakes, newest (or most recently asked for) last, and their bytes: the next
+/// [`ImageArt::bake`] of the same art at the same device size, on any test thread, takes these
+/// pixels. A bake is a function of its art and its device size alone, so it is the bake that
+/// would be made. A System State test compiles each frame with a view of its own, and the view's
+/// drop releases what it drew (`system_state::prebake`), so without this each frame of a sweep
+/// baked its road and cat again. What the test threads keep ([`BAKED_IMAGES`]) is untouched.
+#[cfg(test)]
+static TEST_BAKES: std::sync::Mutex<(Vec<BakedImage>, usize)> =
+    std::sync::Mutex::new((Vec::new(), 0));
+
+/// How many bytes of bakes [`TEST_BAKES`] holds at most: the bakes asked for least recently go.
+#[cfg(test)]
+const TEST_BAKES_BUDGET: usize = 128 << 20;
+
+/// A test's earlier bake of `key`, if [`TEST_BAKES`] holds it.
+#[cfg(test)]
+fn test_baked(key: (ImageArt, u32, u32)) -> Option<std::sync::Arc<[u8]>> {
+    let mut bakes = TEST_BAKES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = bakes.0.iter().position(|(baked, _)| *baked == key)?;
+    let bake = bakes.0.remove(at);
+    let pixels = std::sync::Arc::clone(&bake.1);
+    bakes.0.push(bake);
+    Some(pixels)
+}
+
+/// Hold a test's bake of `key` in [`TEST_BAKES`], within its budget.
+#[cfg(test)]
+fn test_bake_keep(key: (ImageArt, u32, u32), pixels: &std::sync::Arc<[u8]>) {
+    let mut bakes = TEST_BAKES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (kept, bytes) = &mut *bakes;
+    // Two threads may bake one art at once: keep one.
+    if kept.iter().any(|(baked, _)| *baked == key) {
+        return;
+    }
+    kept.push((key, std::sync::Arc::clone(pixels)));
+    *bytes += pixels.len();
+    while *bytes > TEST_BAKES_BUDGET && kept.len() > 1 {
+        let (_, evicted) = kept.remove(0);
+        *bytes -= evicted.len();
+    }
 }
 
 /// Run `f` on the bakes kept.

@@ -16,7 +16,12 @@
 use crate::snapshot::{Column, PK, Source};
 use crate::{Dropped, File, Intent, Name, OwnerAct, Read, Root, Row, Status, exit};
 use aterm_json::{Map, Value};
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
+
+pub mod entry;
 
 /// A file this build compiles, as `ls` names it before any pass has run.
 #[derive(Clone, Copy, Debug)]
@@ -50,12 +55,17 @@ usage: aterm file <verb> [--json]
   ls                                     every shared file here, with its state
   cat <name> [--published]               the table as TSV, this Mac's queued writes over it
                                          (--published: the snapshot alone); the state on stderr
-  path <name>                            where its face is
+  export <name>                          editable published TSV on stdout with its baseline digest
+  import <name> <file> [--apply]         preview changed rows of an export, or queue them to sync
+  path <name> [--local]                  its editable face, or a generated local TSV with
+                                         this machine's queued and held writes
   schema <name>                          its columns: type, may be empty, source, the file a
                                          column's cells name rows of; the key and its handles
   status [<name>]                        state, why, revision, rows, face=written|edited|missing
   get <name> <row> [<column>]            one row or one cell; <row> is its key or its name
   rows <name> [--where col=val]... [--join <ref column>]
+  search <name> <text> [--where col=val]... [--join <ref column>]
+                                         find text in a key or displayed cell, ignoring case
   watch <name> [--timeout <seconds>] [--changes <n>]
                                          a line each time a pass records a new state or revision
   history <name> [--limit <n>]           its newest operations, without values
@@ -74,6 +84,7 @@ usage: aterm file <verb> [--json]
   commit <name>                          queue what the face's changed cells say
   restore <name>                         rewrite the face from the snapshot, keeping edits no
                                          commit took as <leaf>.rejected.<ext>
+  add --queue-only to a write to return after local acceptance and let the next pass publish
   a write verb takes --reason <line> and --evidence <piece>... (commit:<repo>@<commit>,
   path:<repo>:<path>, measure:<metric>=<n>, note:<text>, an https URL): its intent keeps them
   with who made it (the aterm session and agent its process descends from), and a table that
@@ -175,6 +186,10 @@ fn status_line(file: &File, status: &Status) -> String {
 }
 
 fn row_json(row: &Row) -> Value {
+    Value::Object(row_object(row))
+}
+
+fn row_object(row: &Row) -> Map {
     let mut object = Map::new();
     object.insert(PK.to_owned(), Value::from(row.pk.as_str()));
     object.insert("live".to_owned(), Value::from(row.live));
@@ -188,7 +203,7 @@ fn row_json(row: &Row) -> Value {
         ),
     );
     object.insert("values".to_owned(), Value::Object(row.values.clone()));
-    Value::Object(object)
+    object
 }
 
 fn table_json(file: &File, read: &Read, columns: &[String], rows: Vec<Value>) -> Value {
@@ -209,18 +224,14 @@ fn table_json(file: &File, read: &Read, columns: &[String], rows: Vec<Value>) ->
     Value::Object(object)
 }
 
-fn tsv(header: &[String], rows: &[Vec<String>]) -> String {
-    let mut text = String::new();
-    for line in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)) {
-        for (i, cell) in line.iter().enumerate() {
-            if i > 0 {
-                text.push('\t');
-            }
-            crate::snapshot::push_cell(&mut text, cell);
+fn tsv_line<'a>(text: &mut String, cells: impl Iterator<Item = &'a str>) {
+    for (i, cell) in cells.enumerate() {
+        if i > 0 {
+            text.push('\t');
         }
-        text.push('\n');
+        crate::snapshot::push_cell(text, cell);
     }
-    text
+    text.push('\n');
 }
 
 fn ls(root: &Root, known: &[Known], json: bool) -> Answer {
@@ -288,13 +299,50 @@ fn cat(file: &File, published: bool, json: bool) -> Answer {
             code: exit::OK,
         };
     }
+    let out = match read
+        .snapshot
+        .as_ref()
+        .map(crate::Snapshot::full_tsv)
+        .transpose()
+    {
+        Ok(text) => text.unwrap_or_default(),
+        Err(error) => return tsv_error(error),
+    };
     Answer {
-        out: read
-            .snapshot
-            .as_ref()
-            .map(crate::Snapshot::face)
-            .unwrap_or_default(),
+        out,
         err: format!("{}\n", status_line(file, &read.status)),
+        code: exit::OK,
+    }
+}
+
+fn tsv_error(error: std::io::Error) -> Answer {
+    Answer {
+        err: format!("{error}\n"),
+        code: exit::PROBLEMS,
+        ..Answer::default()
+    }
+}
+
+/// An editable snapshot carrying the identity of the baseline a later import must have.
+fn export(file: &File) -> Answer {
+    let (snapshot, status, stamp) = match file.editable_snapshot() {
+        Ok(Some(ready)) => ready,
+        Ok(None) => {
+            return Answer {
+                err: "no editable snapshot is available here\n".to_owned(),
+                code: exit::PROBLEMS,
+                ..Answer::default()
+            };
+        }
+        Err(error) => return tsv_error(error),
+    };
+    let out = match snapshot.export_tsv(&stamp) {
+        Ok(text) => text,
+        Err(error) => return tsv_error(error),
+    };
+    Answer {
+        out,
+        err: format!("{}\n", status_line(file, &status)),
         code: exit::OK,
     }
 }
@@ -436,6 +484,43 @@ fn schema(file: &File, json: bool) -> Answer {
         err,
         code: exit::OK,
     }
+}
+
+#[cfg(any(unix, windows))]
+fn local_path(file: &File, json: bool) -> Answer {
+    match file.local_tsv() {
+        Ok((path, status)) => {
+            let path = path.to_string_lossy().into_owned();
+            let (out, err) = if json {
+                let mut value = status_json(file, &status);
+                if let Some(fields) = value.as_object_mut() {
+                    fields.insert("path".to_owned(), Value::from(path));
+                    fields.insert("view".to_owned(), Value::from("local"));
+                }
+                (pretty(&value), String::new())
+            } else {
+                (
+                    format!("{path}\n"),
+                    format!("{}\n", status_line(file, &status)),
+                )
+            };
+            Answer {
+                out,
+                err,
+                code: exit::OK,
+            }
+        }
+        Err(error) => Answer {
+            out: String::new(),
+            err: format!("aterm file: {}: {error}\n", file.name()),
+            code: exit::PROBLEMS,
+        },
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_path(_: &File, _: bool) -> Answer {
+    Answer::usage("path --local requires a local filesystem")
 }
 
 fn path(root: &Root, file: &File, json: bool) -> Answer {
@@ -632,7 +717,8 @@ fn get(file: &File, rest: &[&str], json: bool) -> Answer {
     }
 }
 
-fn rows(root: &Root, file: &File, rest: &[&str], json: bool) -> Answer {
+fn rows(root: &Root, file: &File, rest: &[&str], json: bool, query: Option<&str>) -> Answer {
+    let query = query.map(str::to_lowercase);
     let mut filters: Vec<(&str, &str)> = Vec::new();
     let mut joins: Vec<&str> = Vec::new();
     let mut words = rest.iter();
@@ -668,7 +754,7 @@ fn rows(root: &Root, file: &File, rest: &[&str], json: bool) -> Answer {
         }
     }
     // Each joined file is read once: its rows by key, under `<ref column>.<its column>`.
-    let mut joined: Vec<(&str, Read)> = Vec::new();
+    let mut joined = Vec::new();
     for column in joins {
         let Some(other) = read
             .snapshot
@@ -694,9 +780,28 @@ fn rows(root: &Root, file: &File, rest: &[&str], json: bool) -> Answer {
                 .filter(|theirs| theirs.name != PK)
                 .map(|theirs| format!("{column}.{}", theirs.name)),
         );
-        joined.push((column, other));
+        let (columns, index) = other
+            .snapshot
+            .map(|snapshot| {
+                let index: BTreeMap<_, _> = snapshot
+                    .rows
+                    .into_iter()
+                    .map(|row| (row.pk.clone(), row))
+                    .collect();
+                let columns: Vec<_> = snapshot
+                    .columns
+                    .into_iter()
+                    .filter(|c| c.name != PK)
+                    .collect();
+                (columns, index)
+            })
+            .unwrap_or_default();
+        joined.push((column, columns, index));
     }
-    let mut lines = Vec::new();
+    let mut text = String::new();
+    if !json && read.snapshot.is_some() {
+        tsv_line(&mut text, header.iter().map(String::as_str));
+    }
     let mut values = Vec::new();
     for row in read.rows() {
         if !filters
@@ -705,32 +810,43 @@ fn rows(root: &Root, file: &File, rest: &[&str], json: bool) -> Answer {
         {
             continue;
         }
-        let mut line: Vec<String> = read
-            .columns()
-            .iter()
-            .map(|column| row.cell(&column.name).to_owned())
-            .collect();
-        let mut value = match row_json(row) {
-            Value::Object(object) => object,
-            _ => Map::new(),
+        let related = || {
+            joined.iter().flat_map(|(column, columns, index)| {
+                let theirs = index.get(row.cell(column));
+                columns
+                    .iter()
+                    .map(move |c| theirs.map_or("", |row| row.cell(&c.name)))
+            })
         };
-        for (column, other) in &joined {
-            let theirs = other
-                .rows()
-                .iter()
-                .find(|theirs| theirs.pk == row.cell(column));
-            let mut cells = Map::new();
-            for their_column in other.columns().iter().filter(|c| c.name != PK) {
-                let cell = theirs.map_or("", |theirs| theirs.cell(&their_column.name));
-                line.push(cell.to_owned());
-                if !cell.is_empty() {
-                    cells.insert(their_column.name.clone(), Value::from(cell));
-                }
+        if let Some(query) = &query {
+            let base =
+                std::iter::once(row.pk.as_str()).chain(row.cells.values().map(String::as_str));
+            if !base
+                .chain(related())
+                .any(|cell| cell.to_lowercase().contains(query))
+            {
+                continue;
             }
-            value.insert(format!("{column}.cells"), Value::Object(cells));
         }
-        lines.push(line);
-        values.push(Value::Object(value));
+        if json {
+            let mut object = row_object(row);
+            for (column, columns, index) in &joined {
+                let mut cells = Map::new();
+                if let Some(theirs) = index.get(row.cell(column)) {
+                    for name in columns.iter().map(|c| &c.name) {
+                        let cell = theirs.cell(name);
+                        if !cell.is_empty() {
+                            cells.insert(name.clone(), Value::from(cell));
+                        }
+                    }
+                }
+                object.insert(format!("{column}.cells"), Value::Object(cells));
+            }
+            values.push(Value::Object(object));
+        } else {
+            let cells = read.columns().iter().map(|c| row.cell(&c.name));
+            tsv_line(&mut text, cells.chain(related()));
+        }
     }
     if json {
         return Answer {
@@ -740,11 +856,7 @@ fn rows(root: &Root, file: &File, rest: &[&str], json: bool) -> Answer {
         };
     }
     Answer {
-        out: if read.snapshot.is_some() {
-            tsv(&header, &lines)
-        } else {
-            String::new()
-        },
+        out: text,
         err: format!("{}\n", status_line(file, &read.status)),
         code: exit::OK,
     }
@@ -977,7 +1089,10 @@ pub enum Run {
 /// is read too.
 #[must_use]
 pub fn run(root: &Root, known: &[Known], input: &[String]) -> Run {
-    let Words { json, rest } = words(input);
+    run_words(root, known, words(input))
+}
+
+fn run_words(root: &Root, known: &[Known], Words { json, rest }: Words<'_>) -> Run {
     let Some((&verb, rest)) = rest.split_first() else {
         return Run::Answer(Answer {
             out: USAGE.to_owned(),
@@ -1010,7 +1125,16 @@ pub fn run(root: &Root, known: &[Known], input: &[String]) -> Run {
                 (Ok(file), None) => cat(&file, published, json),
             }
         }
+        "export" => match (file(rest), only_name(rest, "export")) {
+            (Err(answer), _) | (Ok(_), Some(answer)) => answer,
+            (Ok(_), None) if json => Answer::usage("export writes a TSV"),
+            (Ok(file), None) => export(&file),
+        },
         "outbox" => outbox(root, known, rest, json),
+        "path" if matches!(rest, [_, "--local"]) => match file(rest) {
+            Ok(file) => local_path(&file, json),
+            Err(answer) => answer,
+        },
         "path" => match (file(rest), only_name(rest, "path")) {
             (Err(answer), _) | (Ok(_), Some(answer)) => answer,
             (Ok(file), None) => path(root, &file, json),
@@ -1030,8 +1154,15 @@ pub fn run(root: &Root, known: &[Known], input: &[String]) -> Run {
             Err(answer) => answer,
         },
         "rows" => match file(rest) {
-            Ok(file) => rows(root, &file, &rest[1..], json),
+            Ok(file) => rows(root, &file, &rest[1..], json, None),
             Err(answer) => answer,
+        },
+        "search" => match (file(rest), rest.get(1)) {
+            (Err(answer), _) => answer,
+            (Ok(file), Some(query)) if !query.trim().is_empty() => {
+                rows(root, &file, &rest[2..], json, Some(query))
+            }
+            _ => Answer::usage("search <name> <text> [--where col=val] [--join column]"),
         },
         "history" => match file(rest) {
             Ok(file) => history(&file, &rest[1..], json),

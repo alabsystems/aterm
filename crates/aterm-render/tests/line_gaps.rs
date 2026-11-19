@@ -15,10 +15,9 @@
 //! check gives the line). What lies in the line's rows is the line's, and a band laid there is
 //! what this check was written for.
 //!
-//! The ribbon's own tests count the quads it lays (`aterm-effects`'
-//! `the_body_s_band_parts_where_the_line_does`); this one reads pixels, so a layer those
+//! The ribbon's own tests count the quads it lays; this one reads pixels, so a layer those
 //! tests do not name cannot fill a gap unseen. It was written when one did: the rail was
-//! parted and the underline's body, a band in the same pixel rows, was not.
+//! parted and a second body's band, in the same pixel rows, was not.
 
 use crate::trail_film::{Lane, Take, film_replay};
 use crate::trail_letters_read::*;
@@ -27,8 +26,6 @@ use std::collections::HashMap;
 
 /// The flagship.
 const STYLE: &str = "rainbow + cat";
-/// The underline's body, whose band lies in the line's rows.
-const UNDERLINE_BODY: &str = "underline rainbow + cat";
 /// The judge's ring round a letter's ink, px (`aterm-effects`' `LETTER_GUARD_RING`).
 const RING: usize = 2;
 /// The least spread of a pixel's channels that reads as the vivid line (`lab trail-film`'s
@@ -134,15 +131,14 @@ fn gaps(style: &str, look: Look, caret: &[u8]) -> Gaps {
 }
 
 /// At a shell's prompt on the last row of a full page, on GitHub Light and on a dark page, with
-/// a bar and with an underline caret, in the flagship and in the underline's body: the vivid
-/// line lies under the typed words (on over half its rows' pixels under the cells with no
-/// descender, a share of the face's own cells, so a narrower face's line counts as SF Mono's
-/// does), and no vivid pixel of the trail lies in the line's rows within the judge's ring of a
-/// descender's ink or of the caret's cell.
+/// a bar and with an underline caret: the vivid line lies under the typed words (on over half
+/// its rows' pixels under the cells with no descender, a share of the face's own cells, so a
+/// narrower face's line counts as SF Mono's does), and no vivid pixel of the trail lies in the
+/// line's rows within the judge's ring of a descender's ink or of the caret's cell.
 ///
-/// Negative control: with the underline's body laid whole
-/// (`ribbon::with_body_band_whole`), as it was, GitHub Light's film holds its band's vivid
-/// pixels in the descenders' gaps and before the bar caret.
+/// Negative control: with the rail laid whole, parted round nothing
+/// (`ribbon::with_row_rail_whole`), GitHub Light's film holds its vivid pixels in the
+/// descenders' gaps and before the bar caret.
 #[test]
 fn the_line_under_typed_words_leaves_its_gaps_empty() {
     const BAR: &[u8] = b"\x1b[6 q";
@@ -152,8 +148,6 @@ fn the_line_under_typed_words_leaves_its_gaps_empty() {
         (STYLE, "github-light", GITHUB_LIGHT, "underline", UNDERLINE),
         (STYLE, "dark", DARK, "bar", BAR),
         (STYLE, "dark", DARK, "underline", UNDERLINE),
-        (UNDERLINE_BODY, "github-light", GITHUB_LIGHT, "bar", BAR),
-        (UNDERLINE_BODY, "dark", DARK, "bar", BAR),
     ];
     let (reads, whole) = std::thread::scope(|s| {
         let held: Vec<_> = films
@@ -161,8 +155,8 @@ fn the_line_under_typed_words_leaves_its_gaps_empty() {
             .map(|&(style, _, look, _, caret)| s.spawn(move || gaps(style, look, caret)))
             .collect();
         let control = s.spawn(|| {
-            aterm_effects::rainbow_kitty::ribbon::with_body_band_whole(|| {
-                gaps(UNDERLINE_BODY, GITHUB_LIGHT, BAR)
+            aterm_effects::rainbow_kitty::ribbon::with_row_rail_whole(|| {
+                gaps(STYLE, GITHUB_LIGHT, BAR)
             })
         });
         let reads: Vec<Gaps> = held
@@ -198,12 +192,12 @@ fn the_line_under_typed_words_leaves_its_gaps_empty() {
             read.frames
         );
     }
-    eprintln!("line_gaps control (the underline body's band whole, github-light, bar): {whole:?}");
+    eprintln!("line_gaps control (the rail whole, github-light, bar): {whole:?}");
     assert!(
         whole.in_gaps > 20 * whole.frames && whole.before_caret > 0,
-        "control: with the underline body's band whole GitHub Light's film reads {} vivid px \
-         in the descenders' gaps and {} before the caret over {} frames, so the reading does \
-         not see the band",
+        "control: with the rail whole GitHub Light's film reads {} vivid px in the \
+         descenders' gaps and {} before the caret over {} frames, so the reading does not see \
+         the rail",
         whole.in_gaps,
         whole.before_caret,
         whole.frames

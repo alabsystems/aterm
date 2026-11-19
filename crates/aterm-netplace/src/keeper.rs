@@ -453,28 +453,27 @@ fn candidate_loop(dir: &Path, sense: &dyn Sense, stop: &AtomicBool) {
 }
 
 /// What every reader steps: the record as written (its history), the evidence and the member
-/// book in the place's folder under `state`.
+/// book in the place's folder `dir` ([`record::dir`]).
 fn reader_inputs(
-    state: &Path,
+    dir: &Path,
 ) -> (
     crate::place::Record,
     crate::place::Evidence,
     Option<crate::place::Book>,
 ) {
-    let dir = record::dir(state);
-    let judged = aterm_uds::private_file::JudgedDir::judge(&dir).ok();
+    let judged = aterm_uds::private_file::JudgedDir::judge(dir).ok();
     let written = judged
         .as_ref()
         .and_then(record::read_in)
         .unwrap_or_default();
     let (evidence, book) = match judged.as_ref() {
         Some(judged) => (
-            crate::heard::read_for_place_in(&dir, judged),
+            crate::heard::read_for_place_in(dir, judged),
             crate::heard::read_book_in(judged),
         ),
         None => (
-            crate::heard::read_for_place(&dir),
-            crate::heard::read_book(&dir),
+            crate::heard::read_for_place(dir),
+            crate::heard::read_book(dir),
         ),
     };
     (written.record, evidence, book)
@@ -486,7 +485,7 @@ fn reader_inputs(
 /// This computation is always attributed to the reader, even when it continues a saved stay.
 #[must_use]
 pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
-    let (record, evidence, book) = reader_inputs(state);
+    let (record, evidence, book) = reader_inputs(&record::dir(state));
     step_owned(record, &facts, &evidence, book.as_ref(), now, None).1
 }
 
@@ -497,7 +496,12 @@ pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
 /// needs normalizing) is stepped through as the keeper does, never answered as a zero wait.
 #[must_use]
 pub fn read_projected_with(state: &Path, facts: Facts, now: u64) -> (Place, Option<u64>) {
-    let (record, evidence, book) = reader_inputs(state);
+    projected_in(&record::dir(state), facts, now)
+}
+
+/// [`read_projected_with`] in the place's folder `dir`.
+fn projected_in(dir: &Path, facts: Facts, now: u64) -> (Place, Option<u64>) {
+    let (record, evidence, book) = reader_inputs(dir);
     let mut projection =
         step_with_deadline_owned(record, &facts, &evidence, book.as_ref(), now, None);
     while projection.next_change_ms == Some(now) {
@@ -520,10 +524,12 @@ pub fn read(state: &Path) -> Place {
     read_with(state, crate::facts::reader_facts(), crate::unix_ms_now())
 }
 
-/// [`read_projected_with`] over current reader facts (or their script), at this clock.
+/// [`read_projected_with`] over current reader facts (or their script), at this clock, in the
+/// place's folder `dir` as its reader resolved it ([`record::dir`]): a reader that resolves the
+/// folder to watch it reads the same folder with no second resolution.
 #[must_use]
-pub fn read_projected(state: &Path) -> (Place, Option<u64>) {
-    read_projected_with(state, crate::facts::reader_facts(), crate::unix_ms_now())
+pub fn read_projected_in(dir: &Path) -> (Place, Option<u64>) {
+    projected_in(dir, crate::facts::reader_facts(), crate::unix_ms_now())
 }
 
 #[cfg(test)]

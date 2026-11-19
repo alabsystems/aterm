@@ -2682,7 +2682,7 @@ fn keep_older_pass(root: &Path) -> Result<(), String> {
 /// for ([`Progress::staged`]): a plan saved ahead of it (by a choice, or by this Restore, cut
 /// short before its progress) never ran. The progress is written whenever it is not bound to the
 /// Restore's plan, also when the plan is left as it was, so a Restore pressed again, or the
-/// next launch ([`bring_forward_restored_setup`]), finishes one cut short before its progress.
+/// next launch ([`bring_forward_restored_setup_observing`]), finishes one cut short before its progress.
 /// The Restore's record names that run's revision ([`Restored::run`]), so a choice made after the
 /// Restore and cut short before its own decision is told from a Restore cut short: its first
 /// write names it only when the plan is already the Restore's, so a plan a choice before the
@@ -2845,6 +2845,26 @@ fn carry_restored_run(
     publish_progress(next)
 }
 
+/// Whether this launch needs startup to inspect a Restore's pending follow-forward work.
+/// Uses the normal reads of this person's existing records and revision floor. It creates no
+/// lock or record.
+/// The observing startup entry point rechecks everything before publishing a checkpoint.
+///
+/// # Errors
+/// The person's scope, state root, setup records or revision floor cannot be resolved.
+pub fn restored_setup_needs_startup() -> Result<bool, String> {
+    let Some(root) = restored_setup_person_root()? else {
+        return Ok(false);
+    };
+    restored_setup_needs_startup_at(&root)
+}
+
+fn restored_setup_needs_startup_at(root: &Path) -> Result<bool, String> {
+    let records = Records::read(root)?;
+    Ok(restored_forward(&records, revision::floor(root)?).is_some()
+        || offer_waits(&records).is_some())
+}
+
 /// Bring forward a setup a Restore left with no admitted run to carry aterm's own permissions,
 /// which a Restore never withdraws (System State design §3.4): only a person's Stop, or an older
 /// aterm's Cancel, holds them. Startup calls it once the person is resolved, before it binds the
@@ -2874,27 +2894,19 @@ fn carry_restored_run(
 /// While another pass holds profile.lock it waits for it, at most [`CHOICE_LOCK_WAIT`], and then
 /// answers [`BroughtForward::Busy`], never "nothing to bring forward": the startup asks again
 /// once that pass lets go, so the permissions get their run in this launch.
-pub fn bring_forward_restored_setup() -> Result<BroughtForward, String> {
-    bring_forward_restored_setup_observing(|_| {})
-}
-
+///
 /// Report an exact checkpoint as soon as it is saved, even if a later record
 /// write fails. The callback runs under profile.lock; callers collect the target
 /// and hand it to their Stop owner after this function releases that lock.
 pub fn bring_forward_restored_setup_observing(
     published: impl FnMut(u64),
 ) -> Result<BroughtForward, String> {
-    if aterm_types::dirs::runs_under_private_state_root() {
+    let Some(root) = restored_setup_person_root()? else {
         return Ok(BroughtForward::Nothing);
-    }
-    match person_scope() {
-        PersonScope::Refused(_) => return Ok(BroughtForward::Nothing),
-        PersonScope::Unresolved(why) => return Err(why),
-        PersonScope::Person => {}
-    }
+    };
     let deadline = std::time::Instant::now() + CHOICE_LOCK_WAIT;
     bring_forward_waiting_observing(
-        &state_root()?,
+        &root,
         || {
             let more = std::time::Instant::now() < deadline;
             if more {
@@ -2906,7 +2918,18 @@ pub fn bring_forward_restored_setup_observing(
     )
 }
 
-/// What [`bring_forward_restored_setup`] did.
+fn restored_setup_person_root() -> Result<Option<PathBuf>, String> {
+    if aterm_types::dirs::runs_under_private_state_root() {
+        return Ok(None);
+    }
+    match person_scope() {
+        PersonScope::Refused(_) => Ok(None),
+        PersonScope::Unresolved(why) => Err(why),
+        PersonScope::Person => state_root().map(Some),
+    }
+}
+
+/// What [`bring_forward_restored_setup_observing`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BroughtForward {
     /// Nothing to bring forward, or nothing this process may change.
@@ -2921,7 +2944,7 @@ pub enum BroughtForward {
     Busy,
 }
 
-/// [`bring_forward_restored_setup`] at `root`. It reads first, so a Mac with nothing to bring
+/// [`bring_forward_restored_setup_observing`] at `root`. It reads first, so a Mac with nothing to bring
 /// forward gets no lock file and no write. While another holds profile.lock, `wait` waits a
 /// moment and says whether to ask for it again; once it says no, the answer is
 /// [`BroughtForward::Busy`].
@@ -2981,7 +3004,7 @@ fn bring_forward_restored_at(root: &Path) -> Result<Option<u64>, String> {
     })
 }
 
-/// What [`bring_forward_restored_with`] does for `records` ([`bring_forward_restored_setup`]).
+/// What [`bring_forward_restored_with`] does for `records` ([`bring_forward_restored_setup_observing`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Forward {
     /// Hand a choice staged since the Restore, cut short before its decision, to the launch's

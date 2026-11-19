@@ -297,8 +297,6 @@ pub fn glow_cfg_words(w: &mut impl Words, cfg: &GlowConfig) {
     w.put("theme_bg", u64::from(cfg.theme_bg));
     w.flag("beam", cfg.beam);
     w.f32("head_dx", cfg.head_dx);
-    w.flag("ribbon_tall", cfg.ribbon_tall);
-    w.flag("ribbon_flat", cfg.ribbon_flat);
     w.flag("classic_mono", cfg.classic_mono);
 }
 

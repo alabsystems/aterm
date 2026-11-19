@@ -1258,9 +1258,18 @@ fn front_door_main(
             }
             #[cfg(unix)]
             aterm_cli::Verb::File => aterm_db::file::command::main_entry(forwarded),
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            aterm_cli::Verb::File => aterm_file::cli::entry::retained_main(forwarded),
+            #[cfg(not(any(unix, windows)))]
             aterm_cli::Verb::File => {
-                eprintln!("aterm file: not available on this platform (Unix only)");
+                eprintln!("aterm file: not available on this platform");
+                ExitCode::from(2)
+            }
+            #[cfg(unix)]
+            aterm_cli::Verb::Goals => aterm_db::lab::tracker::command::main_entry(forwarded),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Goals => {
+                eprintln!("aterm goals: not available on this platform (Unix only)");
                 ExitCode::from(2)
             }
             aterm_cli::Verb::Email => aterm_agent::harness::email_cli::main_entry(forwarded),
@@ -2830,11 +2839,24 @@ struct Widened {
 /// watch widened, so a Stop pressed since its look, or asked for the plan it widened, stops the
 /// run it admitted.
 #[cfg(target_os = "macos")]
-fn run_startup_setup(mut widened: Option<Widened>) {
-    let running = StartupRunning::enter();
+fn run_startup_setup(widened: Option<Widened>) {
+    run_startup_setup_from(widened, None);
+}
+
+#[cfg(target_os = "macos")]
+fn run_startup_setup_from(mut widened: Option<Widened>, reserved: Option<u64>) {
+    if reserved.is_some_and(stop_covers) {
+        return;
+    }
+    let from_restore = reserved.is_some();
+    let running = if from_restore {
+        StartupRunning::hold()
+    } else {
+        StartupRunning::enter()
+    };
     let _operation = (setup_io().operation)();
     preload_setup_history();
-    run_repaired_startups(|reserved| {
+    run_repaired_startups(reserved.map(StartupSent::reserved), |reserved| {
         let mut password = None;
         let (prepared, mut sent, recovered) =
             prepare_first_run_doctor(reserved, |initial, on_begin| {
@@ -2850,6 +2872,9 @@ fn run_startup_setup(mut widened: Option<Widened>) {
                 password = answer.password.take();
                 answer
             });
+        if from_restore && stop_covers(sent.sent) {
+            return None;
+        }
         if let Some(widened) = widened.take() {
             sent.inherit_widened(&prepared, widened);
         }
@@ -2858,7 +2883,11 @@ fn run_startup_setup(mut widened: Option<Widened>) {
         recovery
     });
     drop(running);
-    read_again_if_unread();
+    // A Restore already owns its retries. The general status reread could start
+    // a fresh, unreserved repair after Stop retired this continuation.
+    if !from_restore {
+        read_again_if_unread();
+    }
 }
 
 /// Run what the startup prepared, keeping its watch maintenance.
@@ -2880,8 +2909,10 @@ fn run_prepared_startup_with(
 /// review starts on this same worker. Unchanged failures retain their own
 /// backoff, and a Stop covering the retired review withholds the fresh offer.
 #[cfg(target_os = "macos")]
-fn run_repaired_startups(mut attempt: impl FnMut(Option<StartupSent>) -> Option<StartupSent>) {
-    let mut reserved = None;
+fn run_repaired_startups(
+    mut reserved: Option<StartupSent>,
+    mut attempt: impl FnMut(Option<StartupSent>) -> Option<StartupSent>,
+) {
     while let Some(sent) = attempt(reserved.take()) {
         let Some(next) = StartupSent::continue_recovery(sent) else {
             return;
@@ -3584,6 +3615,15 @@ type StartupHandoff = Box<dyn FnOnce() + Send>;
 
 #[cfg(target_os = "macos")]
 impl StartupSent {
+    /// Use a number already reserved under the Stop ordering for this startup.
+    fn reserved(sent: u64) -> Self {
+        Self {
+            sent,
+            recovery: true,
+            ..Self::default()
+        }
+    }
+
     /// Reserve the next review in the same ordering as Stop. Its initial and
     /// pre-offer sends must never remint this continuation past a later Stop.
     fn reserve_recovery(from: u64) -> Option<Self> {
@@ -3591,10 +3631,7 @@ impl StartupSent {
         if stop_covers(from) {
             return None;
         }
-        let mut sent = Self::default();
-        sent.send();
-        sent.recovery = true;
-        Some(sent)
+        Some(Self::reserved(send_admission()))
     }
 
     fn continue_recovery(mut retired: Self) -> Option<Self> {
@@ -6687,10 +6724,8 @@ struct SetupIo {
     put_back: fn(u64) -> Result<bool, String>,
     /// Retain a follow-up request for the existing keeper, as the window records the grant.
     start_follow_up: fn(),
-    /// Bring forward a setup a Restore left with no admitted run to carry aterm's own
-    /// permissions (`aterm_cli::macos_doctor::bring_forward_restored_setup`): a run that waits
-    /// for the startup's offer, nothing, or a profile lock another pass holds.
-    bring_forward: fn() -> Result<aterm_cli::macos_doctor::BroughtForward, String>,
+    /// Read whether Restore left work for startup. The startup owns the writes.
+    restored_setup_needs_startup: fn() -> Result<bool, String>,
     /// Check again's look for the ALab vault, on the reading's worker
     /// (`aterm_cli::macos_doctor::look_for_the_vault_again`).
     look_again: fn(),
@@ -6698,10 +6733,10 @@ struct SetupIo {
     /// other tries afresh (`aterm_cli::macos_doctor::retry_parked_setup_stages`); nothing
     /// automatic calls it.
     lift_parks: fn() -> Result<(), String>,
-    /// Run the startup again on a thread of its own, as a launch runs it ([`start_startup_again`]).
-    start_startup: fn() -> bool,
-    /// Continue startup on a worker that has released its previous operation's leases.
-    start_startup_inline: fn(),
+    /// Run startup on a thread of its own with an optional existing Stop reservation.
+    start_startup: fn(Option<u64>) -> bool,
+    /// Continue a reserved startup on the worker that released the Restore's leases.
+    start_startup_inline: fn(u64),
     /// Whether another setup holds this Mac's setup records now
     /// (`aterm_cli::macos_doctor::setup_records_held`).
     records_held: fn() -> bool,
@@ -6748,11 +6783,11 @@ impl SetupIo {
         converge_setup: aterm_gui::converge_after_secrets_stage,
         put_back: aterm_cli::macos_doctor::put_back_held_initial_setup,
         start_follow_up: start_withheld_follow_up,
-        bring_forward: aterm_cli::macos_doctor::bring_forward_restored_setup,
+        restored_setup_needs_startup: aterm_cli::macos_doctor::restored_setup_needs_startup,
         look_again: aterm_cli::macos_doctor::look_for_the_vault_again,
         lift_parks: aterm_cli::macos_doctor::retry_parked_setup_stages,
         start_startup: start_startup_again,
-        start_startup_inline: || run_startup_setup(None),
+        start_startup_inline: |reserved| run_startup_setup_from(None, Some(reserved)),
         records_held: aterm_cli::macos_doctor::setup_records_held,
         vault_mark: || {
             aterm_secrets::client::Paths::live()
@@ -9624,7 +9659,7 @@ fn startup_went_on() {
     }
 }
 
-/// Startups running in this process ([`run_startup_setup`]).
+/// Setup startups and the Restore that owns its follow-up in this process.
 #[cfg(target_os = "macos")]
 static STARTUP_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -9639,8 +9674,13 @@ struct StartupRunning;
 #[cfg(target_os = "macos")]
 impl StartupRunning {
     fn enter() -> Self {
-        STARTUP_RUNS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let running = Self::hold();
         HEAL_STARTING.store(false, std::sync::atomic::Ordering::Release);
+        running
+    }
+
+    fn hold() -> Self {
+        STARTUP_RUNS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Self
     }
 }
@@ -9665,7 +9705,7 @@ fn heal_unread_setup() {
             aterm_log::info!(
                 "System State: the saved setup could not be read; setup reads it again"
             );
-            if !(setup_io().start_startup)() {
+            if !(setup_io().start_startup)(None) {
                 // No child can take over this reservation after a refused spawn.
                 HEAL_STARTING.store(false, std::sync::atomic::Ordering::Release);
             }
@@ -10596,13 +10636,13 @@ fn restore_initial_setup() -> bool {
     })
 }
 
-/// Run System State's Restore previous settings holding the setup slot (`busy`). `restore`
+/// Run System State's Restore previous settings holding the setup slot. `restore`
 /// takes the Restore's two hooks: the first says its own attempt found the records held by
 /// another setup, the second runs once it holds them, before its first write, and says whether
 /// it goes on (`aterm_cli::macos_doctor::restore_observed`).
 #[cfg(target_os = "macos")]
 fn run_setup_restore(
-    busy: InitialSetupBusy,
+    slot: InitialSetupBusy,
     mut restore: impl FnMut(
         &mut dyn FnMut(),
         &mut dyn FnMut() -> bool,
@@ -10610,6 +10650,11 @@ fn run_setup_restore(
         Option<aterm_cli::macos_doctor::Report>,
     >,
 ) {
+    // Keep Restore's status publications from starting a second, unreserved recovery.
+    // The setup slot drops first if the Restore unwinds.
+    let _handoff = StartupRunning::hold();
+    let busy = slot;
+    let reserved = reserve_restore_startup();
     let _operation = (setup_io().operation)();
     // A choice made after this Restore was pressed is the person's latest intent.
     let pressed = SETUP_APPLY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
@@ -10661,45 +10706,53 @@ fn run_setup_restore(
         Err(why) => restore_initial_setup_error(why, observation),
     }
     drop(busy);
-    offer_again_after_restore();
+    offer_again_after_restore(reserved);
+}
+
+#[cfg(target_os = "macos")]
+fn reserve_restore_startup() -> u64 {
+    let _run = SETUP_RUN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    send_admission()
 }
 
 /// After a Restore, with the setup slot let go: one that ended setup before any run of it was
 /// admitted (a Restore pressed while the launch's offer waited for its answer, which it lets go,
 /// or one before any setup ran here) left aterm's own permissions with no run to carry them. The
-/// Restore brought it forward under its own lock, and the startup offers it again now, as the
+/// startup brings it forward under its own lock and offers it again now, as the
 /// next launch would (System State design §3.4), so Full Disk Access, Developer Tools and the
 /// debugger go on in this launch with no press. The startup also runs when this
-/// finished a Restore cut short, or met the profile lock busy (the startup waits for it). A
-/// Restore whose admitted run carries the permissions leaves nothing for the offer and starts
-/// nothing.
+/// finished a Restore cut short or could not read its result. It keeps the Restore's Stop
+/// reservation through the background or inline continuation.
 #[cfg(target_os = "macos")]
-fn offer_again_after_restore() {
-    use aterm_cli::macos_doctor::BroughtForward;
+fn offer_again_after_restore(reserved: u64) {
+    if stop_covers(reserved) {
+        return;
+    }
     let io = setup_io();
-    match (io.bring_forward)() {
-        Ok(BroughtForward::Run(_) | BroughtForward::Busy) => {
-            if !(io.start_startup)() {
-                (io.start_startup_inline)();
-            }
+    let need_startup = match (io.restored_setup_needs_startup)() {
+        Ok(needed) => needed,
+        Err(why) => {
+            aterm_log::warn!("System State: could not read the restored setup: {why}");
+            !setup_is_newer(&why)
         }
-        Ok(BroughtForward::Nothing) => {}
-        Err(why) => aterm_log::warn!(
-            "System State: bringing the restored setup forward did not finish: {why}"
-        ),
+    };
+    if need_startup && !stop_covers(reserved) && !(io.start_startup)(Some(reserved)) {
+        (io.start_startup_inline)(reserved);
     }
 }
 
 /// The live [`SetupIo::start_startup`]: [`run_startup_setup`] on a thread of its own, as a
 /// launch starts it.
 #[cfg(target_os = "macos")]
-fn start_startup_again() -> bool {
+fn start_startup_again(reserved: Option<u64>) -> bool {
     let operation = (setup_io().operation)();
     match std::thread::Builder::new()
         .name("aterm-workstation-setup".into())
         .spawn(move || {
             let _operation = operation;
-            run_startup_setup(None);
+            run_startup_setup_from(None, reserved);
         }) {
         Ok(_) => true,
         Err(why) => {

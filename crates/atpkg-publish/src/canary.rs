@@ -22,7 +22,7 @@ pub const RECEIPT: &str = "train-receipt.toml";
 pub const SIGNATURE: &str = "train-receipt.toml.sig";
 /// Command line. A canary judges exactly the consumers named, and none when none is named.
 pub const SYNOPSIS: &str =
-    "canary trust=<N> --out DIR [--consumer NAME=CHECKOUT]… [--stage-receipt]";
+    "canary trust=<N> --out DIR [--consumer NAME=CHECKOUT … | --check-installed | --stage-receipt]";
 
 /// The line a receipt with no consumer row starts with: a TOML comment inside the signed bytes.
 pub const NO_CONSUMER: &str = "# no consumer named: this canary judged install integrity only";
@@ -165,6 +165,45 @@ pub fn check_receipt(ctx: &Ctx, quad: &VerifiedQuad, dir: &Path, build: u64) -> 
         }
     }
     Ok(receipt)
+}
+
+/// Authenticate this host's retained installation with the original signed canary evidence.
+fn check_installed(ctx: &Ctx, head: &VerifiedQuad, dir: &Path, build: u64) -> Result<()> {
+    let receipt = check_receipt(ctx, head, dir, build)?;
+    let host =
+        crate::triple::Triple::host().ok_or_else(|| Error::refused("no native canary target"))?;
+    let installed = receipt
+        .installed
+        .iter()
+        .find(|row| row.target == host.as_str())
+        .ok_or_else(|| Error::refused(format!("canary receipt has no installation for {host}")))?;
+    let layout = atpkg::Layout {
+        prefix: dir.join("prefix"),
+    };
+    let selected_tree = || -> Result<_> {
+        let root = atpkg::lookup::payload_root(&layout, "trust", build).ok_or_else(|| {
+            Error::refused(format!(
+                "canary has no canonical installed Trust {build} tree"
+            ))
+        })?;
+        let identity = atpkg::trust_lock::tree_identity(&root).ok_or_else(|| {
+            Error::refused(format!("cannot identify installed Trust {build} tree"))
+        })?;
+        Ok((root, identity))
+    };
+    let selected = selected_tree()?;
+    let root = &selected.0;
+    let actual = atpkg::tree_root(root).map_err(|e| Error::io(root.display(), &e))?;
+    if actual != installed.tree_root || selected_tree()? != selected {
+        return Err(Error::refused(format!(
+            "installed Trust {build} on {host} differs from the signed canary tree"
+        )));
+    }
+    Log::echo("atpkg-publish canary").say(format!(
+        "verified installed Trust {build} on {host} at {} (tree_root {actual})",
+        root.display()
+    ));
+    Ok(())
 }
 
 /// Injected native execution boundary; the real runner runs only the installed tree.
@@ -434,19 +473,28 @@ pub fn install(
     Ok(receipt)
 }
 
-/// What `canary` was asked to do: the build, where its evidence goes, the consumers it judges
-/// (exactly those named with `--consumer`, none when none is named) and whether it only
-/// stages an existing receipt.
+/// What to do with the canary evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Install the signed package, exercise it, and sign fresh local evidence.
+    Install,
+    /// Authenticate existing signed evidence and its installed native tree.
+    CheckInstalled,
+    /// Upload existing evidence before publication.
+    StageReceipt,
+}
+
+/// One canary command and the consumers named for a fresh installation.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     /// The Trust build.
     pub build: u64,
-    /// The fresh output folder.
+    /// The freshly created or retained canary output directory.
     pub out: PathBuf,
     /// Each consumer named with `--consumer NAME=CHECKOUT`.
     pub consumers: BTreeMap<String, PathBuf>,
-    /// `--stage-receipt`.
-    pub stage_existing: bool,
+    /// The requested operation.
+    pub mode: Mode,
 }
 
 /// Read `canary`'s arguments. A consumer is judged only where it is named: no checkout is
@@ -455,16 +503,28 @@ pub struct Request {
 ///
 /// # Errors
 /// A usage error: an unknown argument, a `--consumer` that is not `NAME=CHECKOUT`, a missing
-/// `trust=<N>` or `--out`, or `--stage-receipt` with a consumer.
+/// `trust=<N>` or `--out`, incompatible modes or a consumer for existing evidence.
 pub fn parse(args: &[String]) -> Result<Request> {
     let mut build = None;
     let mut out = None;
     let mut consumers = BTreeMap::new();
-    let mut stage_existing = false;
+    let mut mode = Mode::Install;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--stage-receipt" => stage_existing = true,
+            "--stage-receipt" | "--check-installed" => {
+                let selected = if args[i] == "--stage-receipt" {
+                    Mode::StageReceipt
+                } else {
+                    Mode::CheckInstalled
+                };
+                if mode != Mode::Install && mode != selected {
+                    return Err(Error::usage(
+                        "--stage-receipt and --check-installed are mutually exclusive",
+                    ));
+                }
+                mode = selected;
+            }
             "--out" => {
                 out = Some(PathBuf::from(crate::channel::flag_value(
                     args, &mut i, "--out",
@@ -486,20 +546,20 @@ pub fn parse(args: &[String]) -> Result<Request> {
     }
     let build = build.ok_or_else(|| Error::usage(SYNOPSIS))?;
     let out = out.ok_or_else(|| Error::usage(SYNOPSIS))?;
-    if stage_existing && !consumers.is_empty() {
+    if mode != Mode::Install && !consumers.is_empty() {
         return Err(Error::usage(
-            "--stage-receipt stages existing evidence; it takes no --consumer",
+            "checking or staging existing canary evidence takes no --consumer",
         ));
     }
     Ok(Request {
         build,
         out,
         consumers,
-        stage_existing,
+        mode,
     })
 }
 
-/// Install the staged pack, or stage an existing signed receipt without moving the index.
+/// Install the staged pack, authenticate an installed canary, or stage its signed receipt.
 /// The current head's roster authorizes a new build without pinning it first. Consumers are
 /// judged only where named ([`parse`]); with none named the receipt says so ([`NO_CONSUMER`]).
 ///
@@ -510,9 +570,9 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         build,
         out,
         consumers,
-        stage_existing,
+        mode,
     } = parse(args)?;
-    if stage_existing {
+    if mode == Mode::StageReceipt {
         stage_receipt(ctx, &out, build)?;
         Log::echo("atpkg-publish canary").say(format!(
             "staged verified canary evidence for Trust {build}; index unchanged"
@@ -521,6 +581,9 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     }
     let scratch = Scratch::new("train-canary")?;
     let (_, head) = quad::fetch_head(ctx, &ctx.index_slug(), &scratch.path().join("head"))?;
+    if mode == Mode::CheckInstalled {
+        return check_installed(ctx, &head, &out, build);
+    }
     let dir = scratch.path().join("pack");
     let slug = ctx.staging_slug("trust");
     let tag = upload::tag("trust", build);

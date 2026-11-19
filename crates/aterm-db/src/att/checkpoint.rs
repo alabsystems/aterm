@@ -4,11 +4,19 @@
 //! A typed table's checkpoints (docs/DESIGN-table-checkpoint-2026-11-15.md, tracker LT-B10B):
 //! what state a checkpoint of a typed table certifies, and the pass that signs one.
 //!
-//! The state is what [`View::read`] makes of the records at the cut: its cells (claims
-//! interpreted), its owned collections' rows and the records past the table's quota. Each part
-//! is a function of the cut and of the control history every member holds, so two writers at
-//! one cut digest the same state; what a view says of this Mac alone (what it awaits, what it
-//! refuses) is not part of it.
+//! The state (format 3, tracker LT-B10D3) is what [`View::read`] makes of the records at the cut:
+//! its cells (claims interpreted) and the parts a read folds ([`State`]): the owned rows of the
+//! current generation and the carried rows apart, each with its rank and operation, the log
+//! entries, each writer's quota counters (for a table that declares a quota), the schema rows and
+//! the per-writer facts its readers ask of every record; and its claims ([`Floors`]): for each
+//! claimed coordinate the cut's latest writes with their tenures' starts, and each row's
+//! lifecycle there, which a read of the records above the cut starts from. Each part is a function of the cut and of
+//! the control history every member holds, so two writers at one cut digest the same state; what
+//! a view says of this Mac alone (what it awaits, what it refuses) is not part of it. The records
+//! above the cut folded into the state at it ([`State::fold`]) make the state a read of every
+//! record makes; a read starts from it once every reader of a table's operations does (tracker
+//! LT-B10D4). The format's number is in the digest's domain, so a share of an earlier format never
+//! computes as this build's and is never seconded.
 //!
 //! The pass ([`Handle::checkpoint`]) runs from the node service's hearing tick, once per table,
 //! and signs at most one checkpoint each time. While any current member holds the version fence
@@ -36,6 +44,7 @@ use crate::{
     Result,
     checkpoint::{self, Body, History},
     documents::{application, log::Log},
+    typed::{claim::Floors, state::State},
 };
 use astream_wire::sync::{Actor, Digest};
 use aterm_secrets::commons::{
@@ -54,10 +63,12 @@ pub(crate) const AGE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 /// How many records a cut must hold beyond every one this Mac shared before it proposes another.
 pub(crate) const STRIDE: u64 = 1024;
 
-/// Domain separation for a typed table's state digest.
-const STATE_DOMAIN: &[u8] = b"aterm/att/checkpoint-state/1\0";
+/// Domain separation for a typed table's state digest; its number is the state's format.
+const STATE_DOMAIN: &[u8] = b"aterm/att/checkpoint-state/3\0";
 
-/// SHA-256 of the typed table's state at `cut` (a causally closed set of `log`'s records).
+/// SHA-256 of the typed table's state at `cut` (a causally closed set of `log`'s records): of
+/// its cells, of the parts a read folds ([`State`]) and of its claims ([`Floors`]), read from
+/// exactly the cut's records judged as a final checkpoint of the cut will be.
 ///
 /// # Errors
 /// The view's resolution refuses (as [`super::Resolved::read`]), a cell candidate has no header
@@ -68,44 +79,52 @@ pub(crate) fn state(
     log: &Log,
     cut: &BTreeSet<Digest>,
 ) -> Result<Digest> {
-    // The cut judged as a final checkpoint of it will be: what a read from it holds.
-    let view = View::read(table, session, &log.settled_at(cut).as_of_cut(cut))?;
+    let (view, claims) = at_cut(table, session, log, cut)?;
     let index = log.causal_index();
     let cells = checkpoint::cells_digest(&view.cells, |id| {
         index.get(id).map(|header| (header.actor, header.sequence))
     })?;
+    digest(cells, &view.state.settled(table), &claims)
+}
+
+/// The read of exactly `cut`'s records judged as a final checkpoint of the cut will be, and its
+/// claims ([`View::claims_at`]): what [`state`] digests.
+///
+/// # Errors
+/// As [`state`].
+pub(crate) fn at_cut(
+    table: &'static Table,
+    session: &crate::table::Session<'_>,
+    log: &Log,
+    cut: &BTreeSet<Digest>,
+) -> Result<(View, Floors)> {
+    let settled = log.settled_at(cut);
+    let frontier = settled
+        .settled_frontier()
+        .map(|frontier| {
+            frontier
+                .iter()
+                .map(|(actor, tip)| (*actor, tip.sequence))
+                .collect()
+        })
+        .unwrap_or_default();
+    let view = View::read(table, session, &settled.as_of_cut(cut))?;
+    let claims = view.claims_at(table, frontier);
+    Ok((view, claims))
+}
+
+/// The state digest a checkpoint signs: of `cells`, the cells' digest, `state`'s parts and
+/// `claims`.
+///
+/// # Errors
+/// A value does not encode.
+pub(crate) fn digest(cells: Digest, state: &State, claims: &Floors) -> Result<Digest> {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(STATE_DOMAIN);
     hash.update(cells);
-    hash.update((view.owned.len() as u64).to_le_bytes());
-    for (collection, read) in &view.owned {
-        put_text(&mut hash, collection);
-        hash.update((read.inert as u64).to_le_bytes());
-        hash.update((read.rows.len() as u64).to_le_bytes());
-        for (key, row) in &read.rows {
-            put_text(&mut hash, key);
-            hash.update(row.machine);
-            hash.update(row.actor);
-            let value = aterm_json::to_vec(&row.value)
-                .map_err(|_| crate::Error::new("an owned row's value does not encode"))?;
-            hash.update((value.len() as u64).to_le_bytes());
-            hash.update(value);
-            for part in [row.rank.0, row.rank.1, row.rank.2] {
-                hash.update(part.to_le_bytes());
-            }
-            hash.update(row.operation);
-        }
-    }
-    hash.update((view.quota.over.len() as u64).to_le_bytes());
-    for id in &view.quota.over {
-        hash.update(id);
-    }
+    state.digest_into(&mut hash)?;
+    claims.digest_into(&mut hash)?;
     Ok(hash.finalize())
-}
-
-fn put_text(hash: &mut aterm_digest::Sha256, text: &str) {
-    hash.update((text.len() as u64).to_le_bytes());
-    hash.update(text.as_bytes());
 }
 
 /// Whether `later`'s cut holds `earlier`'s: entrywise at or past it.

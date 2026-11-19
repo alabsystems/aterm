@@ -24,7 +24,7 @@
 //! a key that does not name its signer's machine is inert.
 //!
 //! A file is bound to one of three stores ([`Store`]): a collection of a table family the
-//! catalog declares (the registry's cells, `lab/tracker`'s logs), a collection of the lab
+//! catalog declares (the registry's cells, `lab/tracker`'s packages and logs), a collection of the lab
 //! journal's week ring (each Mac's own rows and events), or a fold of other files' projections,
 //! stored nowhere (a view). A log is appended by each Mac's own program, never through an
 //! outbox ([`Type::edited`]).
@@ -35,7 +35,7 @@ use crate::{
         registry::{ACCOUNT, MACHINE, PREFERENCE},
     },
     att::{self, Compiled},
-    lab::tracker::{MEASURE, NOTE},
+    lab::tracker::{MEASURE, NOTE, tables::PACKAGE},
     typed::{Collection, Kind, Ty, Writers},
 };
 use aterm_file::{Intent, Name};
@@ -569,8 +569,24 @@ pub const NOTES: Type = Type {
     handles: &[],
 };
 
-const COMPILED: [Type; 9] = checked([
-    ACCOUNTS, LINKS, MACHINES, LOGINS, USAGE, EVENTS, LIMITS, MEASURES, NOTES,
+/// `lab/packages`: the lab's packages (`lab/tracker`'s `package` rows,
+/// docs/DESIGN-lab-tracker-2026-11-14.md §3), named by the word each is planned under (`TK-12`).
+/// `aterm goals claim` and `done` write a package's state and who holds it through this file's
+/// outbox (`crate::lab::tracker::command`), as any owner's write of it goes.
+pub const PACKAGES: Type = Type {
+    name: "lab/packages",
+    about: "the lab's packages: lane, title, exit test, state and who holds each",
+    class: Class::Owner,
+    store: Store::Table {
+        family: &att::TRACKER,
+        collection: &PACKAGE,
+    },
+    computed: Computed::None,
+    handles: &["id"],
+};
+
+const COMPILED: [Type; 10] = checked([
+    ACCOUNTS, LINKS, MACHINES, LOGINS, USAGE, EVENTS, LIMITS, MEASURES, NOTES, PACKAGES,
 ]);
 
 /// Every shared file this build compiles; a view after the files it folds. `lab/emails`,

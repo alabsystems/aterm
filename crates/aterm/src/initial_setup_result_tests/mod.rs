@@ -890,20 +890,22 @@ struct Script {
     converge_lanes: usize,
     /// Converge passes the Secrets stage's end started.
     setup_converges: usize,
-    /// What bringing a restored setup forward found.
-    brought_forward: aterm_cli::macos_doctor::BroughtForward,
-    bring_forward_hold: bool,
-    bring_forward_reads: usize,
+    restored_setup_needs_startup: Result<bool, &'static str>,
+    restore_preflight_hold: bool,
+    restore_preflight_reads: usize,
     /// Check again's looks at the LAN.
     vault_looks: usize,
     /// Lifts of the run's parked stages a press of Check again asked for.
     lifts: usize,
     /// Startups run again in this process.
     startups: usize,
+    /// Admission number sent to each startup worker, if its caller reserved one.
+    startup_reservations: Vec<Option<u64>>,
     /// Whether each requested startup worker was accepted by the spawner.
     startup_spawns: VecDeque<bool>,
     /// Startup continuations on a released Restore worker.
     startups_inline: usize,
+    inline_startup_reservation: Option<u64>,
     /// The answers, one an ask, to whether another setup holds the records (none: no).
     records_held: VecDeque<bool>,
     /// The widened mark ([`SETUP_WIDENED`]) as each run started.
@@ -971,14 +973,16 @@ impl Script {
         mends: 0,
         converge_lanes: 0,
         setup_converges: 0,
-        brought_forward: aterm_cli::macos_doctor::BroughtForward::Nothing,
-        bring_forward_hold: false,
-        bring_forward_reads: 0,
+        restored_setup_needs_startup: Ok(false),
+        restore_preflight_hold: false,
+        restore_preflight_reads: 0,
         vault_looks: 0,
         lifts: 0,
         startups: 0,
+        startup_reservations: Vec::new(),
         startup_spawns: VecDeque::new(),
         startups_inline: 0,
+        inline_startup_reservation: None,
         records_held: VecDeque::new(),
         widened: Vec::new(),
         vault_mark: None,
@@ -1136,21 +1140,29 @@ impl TestIo {
             converge_setup: || change(|script| script.setup_converges += 1),
             put_back: |_| Ok(false),
             start_follow_up: || change(|script| script.follow_ups += 1),
-            bring_forward: || {
-                change(|script| script.bring_forward_reads += 1);
-                Ok(wait_while(script(), |script| script.bring_forward_hold).brought_forward)
+            restored_setup_needs_startup: || {
+                change(|script| script.restore_preflight_reads += 1);
+                wait_while(script(), |script| script.restore_preflight_hold)
+                    .restored_setup_needs_startup
+                    .map_err(str::to_owned)
             },
             look_again: || change(|script| script.vault_looks += 1),
             lift_parks: || {
                 change(|script| script.lifts += 1);
                 Ok(())
             },
-            start_startup: || {
+            start_startup: |reserved| {
                 let mut script = script();
                 script.startups += 1;
+                script.startup_reservations.push(reserved);
                 script.startup_spawns.pop_front().unwrap_or(true)
             },
-            start_startup_inline: || change(|script| script.startups_inline += 1),
+            start_startup_inline: |reserved| {
+                change(|script| {
+                    script.startups_inline += 1;
+                    script.inline_startup_reservation = Some(reserved);
+                });
+            },
             records_held: || script().records_held.pop_front().unwrap_or(false),
             vault_mark: || script().vault_mark,
             pending_repositories: || {
@@ -1360,7 +1372,7 @@ impl Drop for TestIo {
             script.authorize_hold = false;
             script.startup_backoff_hold = false;
             script.startup_answer_hold = false;
-            script.bring_forward_hold = false;
+            script.restore_preflight_hold = false;
             script.accounts_hold = false;
         });
         let deadline = Instant::now() + HANG;
@@ -1459,22 +1471,17 @@ fn recording_full_disk_access_granted_starts_the_follow_up_once() {
 }
 
 /// A Restore that left aterm's own permissions with no admitted run to carry them (one that
-/// let the launch's offer go unanswered) is offered again in this launch; so is one whose
-/// bring-forward met the profile lock busy, which the startup waits for. A Restore whose run
+/// let the launch's offer go unanswered) is offered again in this launch. A Restore whose run
 /// carries them starts nothing.
 #[test]
 fn a_restore_that_left_no_run_for_the_permissions_is_offered_again_in_this_launch() {
-    use aterm_cli::macos_doctor::BroughtForward;
     let _globals = globals();
     let _io = TestIo::install();
-    offer_again_after_restore();
-    assert_eq!(script().startups, 0, "nothing brought forward");
-    change(|script| script.brought_forward = BroughtForward::Run(3));
-    offer_again_after_restore();
+    offer_again_after_restore(reserve_restore_startup());
+    assert_eq!(script().startups, 0, "the saved setup needs no review");
+    change(|script| script.restored_setup_needs_startup = Ok(true));
+    offer_again_after_restore(reserve_restore_startup());
     assert_eq!(script().startups, 1);
-    change(|script| script.brought_forward = BroughtForward::Busy);
-    offer_again_after_restore();
-    assert_eq!(script().startups, 2, "the startup waits for the lock");
 }
 
 /// A launch whose setup has finished starts the follow-up with Full Disk Access on a thread

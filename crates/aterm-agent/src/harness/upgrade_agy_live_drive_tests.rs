@@ -1896,7 +1896,8 @@ fn an_agy_claim_holds_its_line_on_the_grace_its_sigterm_waited_out() {
         target: NEW_VERSION.to_string(),
         twin: rig.twin.clone(),
     };
-    use crate::harness::relaunch::{PromptLook, line_grace, line_held_by_status};
+    use crate::harness::relaunch::{line_grace, line_held_by_status};
+    use crate::harness::relaunch_type::PromptLook;
     let grace_s = rig.opts.human_grace_s;
     let key_status =
         |age_s: u64| format!("OK schema=1 hold=0 hand=- input=clear human_ms={age_s}000");

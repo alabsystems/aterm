@@ -38,6 +38,7 @@ impl Reads for Files {
             dir: false,
             symlink: false,
             id: None,
+            mode: 0o644,
         })
     }
 

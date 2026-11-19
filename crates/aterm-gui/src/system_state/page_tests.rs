@@ -1028,8 +1028,12 @@ fn every_collapsed_page_fits_900_by_644_with_no_scrolling() {
     assert!(carded > 3 && noted > 3, "the fixtures hold cards and notes");
 }
 
-/// Every fixture renders at the window sizes the captures use (120 × 48 and ~46 columns of a
-/// 13 pt terminal) and compact, collapsed and with each line open.
+/// Every fixture renders, collapsed and with each line open, at the default 900 × 644, at the
+/// window sizes the captures use (120 × 48 and ~46 columns of a 13 pt terminal) and compact, in
+/// the faces a test thread starts with: no UI face is prepared, so words set in the UI face
+/// measure in the embedded fallback, as on a host none of whose UI faces parse.
+/// [`no_text_is_cut_at_any_real_window_size`] renders these views at 900 × 644 too, but in the
+/// UI faces, so it does not stand for this test's renders there.
 #[test]
 fn every_fixture_renders_at_every_size_with_every_line_open() {
     for &name in FIXTURES {

@@ -300,15 +300,44 @@ fn read_pollfd(fd: BorrowedFd<'_>) -> libc::pollfd {
     }
 }
 
+// Rosetta can stop every thread that could wake an untimed poll while it waits
+// for the polling thread to acknowledge the stop. Returning to the translator
+// lets it finish. The caller still waits for descriptor readiness.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn indefinite_poll_millis() -> i32 {
+    static TIMEOUT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| match crate::process::translator().as_deref() {
+        Some("Rosetta") => 1_000,
+        _ => -1,
+    })
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+const fn indefinite_poll_millis() -> i32 {
+    -1
+}
+
 #[cfg_attr(trust_verify, trust::skip)]
 fn poll_set(fds: &mut [libc::pollfd], wait: Wait) -> io::Result<bool> {
     let count = fds
         .len()
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "readiness set too large"))?;
+    poll_set_with(fds, wait, |fds, timeout| {
+        // SAFETY: initialized pollfds outlive the call and name descriptors kept
+        // open by their callers' borrows. Poll retains no pointer; count matches.
+        unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) }
+    })
+}
+
+fn poll_set_with(
+    fds: &mut [libc::pollfd],
+    wait: Wait,
+    mut poll: impl FnMut(&mut [libc::pollfd], i32) -> i32,
+) -> io::Result<bool> {
     loop {
         let timeout = match wait {
-            Wait::Forever => -1,
+            Wait::Forever => indefinite_poll_millis(),
             Wait::Now => 0,
             Wait::Until(deadline) => {
                 let Some(remaining) = deadline
@@ -325,9 +354,7 @@ fn poll_set(fds: &mut [libc::pollfd], wait: Wait) -> io::Result<bool> {
         for fd in &mut *fds {
             fd.revents = 0;
         }
-        // SAFETY: initialized pollfds outlive the call and name descriptors kept
-        // open by their callers' borrows. Poll retains no pointer; count matches.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
+        let ready = poll(fds, timeout);
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {

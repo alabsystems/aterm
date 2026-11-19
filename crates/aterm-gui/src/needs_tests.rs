@@ -590,6 +590,18 @@ fn every_need_and_every_wait_has_its_row() {
             },
             (None, Some(Limit)),
         ),
+        (
+            "aterm's harness watchdog ended the tab's harness",
+            NeedFacts {
+                agent: agent("question"),
+                unsupervised: Some(crate::session_timeline::Unsupervised {
+                    at_us: 5,
+                    holder: "grok-alab@4242".to_string(),
+                }),
+                ..facts()
+            },
+            (Some(Unsupervised), None),
+        ),
     ];
     for (case, facts, want) in &table {
         let verdict = of(facts);
@@ -867,6 +879,15 @@ impl Gen {
                 Some(GrokSignin::SignedIn),
                 Some(GrokSignin::Idle),
                 Some(GrokSignin::Reading),
+            ]),
+            unsupervised: self.pick(&[
+                None,
+                None,
+                None,
+                Some(crate::session_timeline::Unsupervised {
+                    at_us: case,
+                    holder: "grok-alab@4242".to_string(),
+                }),
             ]),
         }
     }

@@ -4931,20 +4931,19 @@ fn page_states() -> Vec<(String, SetupStatus, bool)> {
 fn every_state_keeps_its_words_whole_and_apart_from_320_to_800() {
     use crate::native_appearance::{AppearancePreferences, install_preferences};
     let scenarios = page_states();
-    // Each state at each text size, with the vault open and shut, is one item, whose cuts are
-    // keyed by all three, so the items run side by side; a worker prepares its own fonts and
-    // text size, a thread's own in tests. Shut, the page holds the open view's words but the
-    // vault's fields, with the disclosure's row the open view leads with, so the shut view runs
-    // at every 32pt: a word cut in that shut row, in a band narrower than that, goes unseen.
-    let pages: Vec<(f32, usize, bool)> = [1.0_f32, 1.5, 2.0]
+    // Each state at each text size is one item, whose cuts are keyed by both and by the vault
+    // open or shut, so the items run side by side; a worker prepares its own fonts and text
+    // size, a thread's own in tests. Shut, the page holds the open view's words but the vault's
+    // fields, with the disclosure's row the open view leads with, so the shut view runs at every
+    // 32pt: a word cut in that shut row, in a band narrower than that, goes unseen. It runs right
+    // after the open view of its width, whose road and cat it draws, so it takes their bakes
+    // ([`crate::widget::ImageArt::bake`]).
+    let pages: Vec<(f32, usize)> = [1.0_f32, 1.5, 2.0]
         .into_iter()
-        .flat_map(|scale| {
-            (0..scenarios.len())
-                .flat_map(move |at| [true, false].map(move |vault_open| (scale, at, vault_open)))
-        })
+        .flat_map(|scale| (0..scenarios.len()).map(move |at| (scale, at)))
         .collect();
     let found = std::sync::Mutex::new(std::collections::BTreeMap::<String, Vec<String>>::new());
-    crate::native_settings::tests::on_workers(&pages, "words whole", |&(scale, at, vault_open)| {
+    crate::native_settings::tests::on_workers(&pages, "words whole", |&(scale, at)| {
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
         let _ = install_preferences(AppearancePreferences {
             text_scale: scale,
@@ -4954,48 +4953,49 @@ fn every_state_keeps_its_words_whole_and_apart_from_320_to_800() {
         let mut cut = std::collections::BTreeMap::<String, Vec<String>>::new();
         let mut width = 320.0_f32;
         while width <= 800.0 {
-            if !vault_open && (width - 320.0) % 32.0 != 0.0 {
-                width += 8.0;
-                continue;
-            }
-            let mut app = SystemStateApp::new(Plan::default());
-            app.publish(status.clone());
-            app.vault_open = Some(vault_open);
-            if *stop {
-                app.stopping = true;
-            }
-            let compiled = compile(&app, &SystemStateViewState::default(), width, 4000.0);
-            for failure in compiled.fit_failures() {
-                if failure.contains("kind=text-field") {
+            for vault_open in [true, false] {
+                if !vault_open && (width - 320.0) % 32.0 != 0.0 {
                     continue;
                 }
-                let key = format!("{scale}x {name} open={vault_open}");
-                let shape: String = failure
-                    .split_whitespace()
-                    .filter(|w| {
-                        w.starts_with("key=")
-                            || w.starts_with("a=")
-                            || w.starts_with("b=")
-                            || w.starts_with("paint-")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let entry = cut.entry(format!("{key} :: {shape}")).or_default();
-                if entry.len() < 3 {
-                    entry.push(format!("w={width}: {failure}"));
+                let mut app = SystemStateApp::new(Plan::default());
+                app.publish(status.clone());
+                app.vault_open = Some(vault_open);
+                if *stop {
+                    app.stopping = true;
                 }
-            }
-            for (key, audit) in
-                compiled.text_fit_cuts(|kind, _, clipped| kind != "text-field" && clipped)
-            {
-                let entry = cut
-                    .entry(format!(
-                        "{scale}x {name} open={vault_open} :: clip-truncated {}",
-                        key.as_str()
-                    ))
-                    .or_default();
-                if entry.len() < 3 {
-                    entry.push(format!("w={width}: {audit}"));
+                let compiled = compile(&app, &SystemStateViewState::default(), width, 4000.0);
+                for failure in compiled.fit_failures() {
+                    if failure.contains("kind=text-field") {
+                        continue;
+                    }
+                    let key = format!("{scale}x {name} open={vault_open}");
+                    let shape: String = failure
+                        .split_whitespace()
+                        .filter(|w| {
+                            w.starts_with("key=")
+                                || w.starts_with("a=")
+                                || w.starts_with("b=")
+                                || w.starts_with("paint-")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let entry = cut.entry(format!("{key} :: {shape}")).or_default();
+                    if entry.len() < 3 {
+                        entry.push(format!("w={width}: {failure}"));
+                    }
+                }
+                for (key, audit) in
+                    compiled.text_fit_cuts(|kind, _, clipped| kind != "text-field" && clipped)
+                {
+                    let entry = cut
+                        .entry(format!(
+                            "{scale}x {name} open={vault_open} :: clip-truncated {}",
+                            key.as_str()
+                        ))
+                        .or_default();
+                    if entry.len() < 3 {
+                        entry.push(format!("w={width}: {audit}"));
+                    }
                 }
             }
             width += 8.0;

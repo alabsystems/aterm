@@ -1081,4 +1081,4 @@ impl Item for LanBroker {
 
 #[cfg(test)]
 #[path = "lan_tests.rs"]
-mod tests;
+pub(crate) mod tests;

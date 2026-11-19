@@ -105,6 +105,32 @@ pub(crate) fn stall_term_after() -> Option<std::time::Duration> {
     }
 }
 
+/// The policy's `stall_term` in this instance ([`Switches::set`]): on until a policy is read,
+/// the policy's default.
+static STALL_TERM: AtomicBool = AtomicBool::new(true);
+
+/// WHETHER ATERM RESTARTS A STALLED AGENT: the policy's `stall_term` (on by default); `false`
+/// keeps a stall a warning (`docs/HARNESS-CONTRACT.md`, principle 3), as the built-in
+/// harness's stall remedy keeps it, so aterm's progress watch reads and raises the stall and
+/// writes no restart (`crate::harness_watchdog`).
+#[cfg(unix)]
+pub(crate) fn stall_term() -> bool {
+    STALL_TERM.load(Ordering::SeqCst)
+}
+
+/// The policy's `human_grace_s` in this instance ([`Switches::set`]): the policy's default until
+/// a policy is read.
+static HUMAN_GRACE_S: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(aterm_agent::supervise::config::DEFAULT_HUMAN_GRACE_S);
+
+/// HOW LONG A PERSON'S INPUT HOLDS ATERM'S HARNESS WATCHDOG BACK (its acts' `quiet=`,
+/// `crate::harness_watchdog`): the policy's `human_grace_s`, the grace the built-in stall
+/// remedy's `restart quiet=` passes too.
+#[cfg(unix)]
+pub(crate) fn watchdog_quiet() -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(HUMAN_GRACE_S.load(Ordering::SeqCst)))
+}
+
 /// The window switches read with no host at hand, as the last [`Switches::set`] stored them: a
 /// store that moves one rings the footer's [`crate::host_facts::Bell::Config`], which re-reads
 /// every session it watches, so the footer polls none of them.
@@ -445,6 +471,8 @@ impl Switches {
         self.ask.store(cfg.upgrade_ask, Ordering::SeqCst);
         UPGRADE_ASK.store(cfg.upgrade_ask, Ordering::SeqCst);
         STALL_TERM_AFTER_S.store(cfg.stall_term_after_s, Ordering::SeqCst);
+        STALL_TERM.store(cfg.stall_term, Ordering::SeqCst);
+        HUMAN_GRACE_S.store(cfg.human_grace_s, Ordering::SeqCst);
         *AGENTS_OFF.lock().unwrap_or_else(PoisonError::into_inner) = cfg.off.clone();
         // The pool's own switches (`accounts_for`, `logins_for`), which a launch and the
         // upkeep read too, and the host's: it moves and signs in only what it supervises here.
@@ -2956,6 +2984,9 @@ type ScopedFn = dyn Fn(&str) -> Option<crate::harness_claim::Scoped> + Send + Sy
 /// it restarts on): [`crate::restart_act::record_scoped_restart`].
 type ScopedRestartFn =
     dyn Fn(&str, &str, Option<&accounts_pool::LoginEnv>, Option<&str>) -> bool + Send + Sync;
+/// The memory ceiling's restart of session `sid`'s contract 4 claimant holding `relaunch`, the
+/// host's step back: [`crate::restart_act::memory_restart`].
+type ScopedMemoryRestartFn = dyn Fn(&str) -> &'static str + Send + Sync;
 type ObserveSnapshotFn = dyn Fn(&Snapshot) + Send + Sync;
 /// Prove every live contract 4 claim again where the registry changed ([`reprove_claims_now`]).
 type ReproveFn = dyn Fn() + Send + Sync;
@@ -4193,6 +4224,9 @@ pub(crate) struct Acts {
     /// Tell the scoped external harness to restart its child on another account or model
     /// ([`ScopedRestartFn`]).
     pub(crate) scoped_restart: Arc<ScopedRestartFn>,
+    /// Tell the contract 4 harness holding `relaunch` to restart its child for the memory
+    /// ceiling ([`ScopedMemoryRestartFn`]).
+    pub(crate) scoped_memory_restart: Arc<ScopedMemoryRestartFn>,
     /// Prove every live contract 4 claim again once the registry changed, dropping one that
     /// fails ([`reprove_claims_now`]); the activation loop calls it at every wake.
     pub(crate) reprove_claims: Arc<ReproveFn>,
@@ -5713,6 +5747,18 @@ impl WorkerIdle {
             .then_some(to)
     }
 
+    /// Whether this worker is on and the tab's live claim is a contract 4 claim holding
+    /// `relaunch`: its harness restarts its child when the restart record tells it to, which is
+    /// how the memory ceiling restarts it (HX-15m, [`crate::restart_act::memory_restart`]). A
+    /// contract 3 claim keeps what it had: no memory restart.
+    fn relaunch_claimant(&self) -> bool {
+        self.on()
+            && (self.hooks.acts.scoped)(&self.sid).is_some_and(|scoped| {
+                scoped.claim.contract == aterm_agent::harness::contract::UNIVERSAL
+                    && scoped.claim.scopes.contains(Scope::Relaunch)
+            })
+    }
+
     /// The pool's plan for the scoped harness's child at `point`, and the seat it read: only for a
     /// claim told an account move ([`crate::harness_claim::Scoped::hears_account_move`], granted
     /// `accounts`), since the move names the account's home; for any other claim no plan is made,
@@ -6687,12 +6733,16 @@ impl IdleHost for WorkerIdle {
     fn scoped_restart(&self, why: &Restart) -> bool {
         (matches!(why, Restart::Account { .. }) && self.scoped_pooled())
             || self.scoped_model(why).is_some()
+            || (matches!(why, Restart::Memory) && self.relaunch_claimant())
     }
 
-    /// Whether a built-in lane or a scoped harness that moves its child's account can restart
-    /// this agent, and `[harness] relaunch` allows it.
+    /// Whether a built-in lane, a scoped harness that moves its child's account, or a contract 4
+    /// harness holding `relaunch` ([`Self::relaunch_claimant`], which the memory ceiling
+    /// restarts through the restart record) can restart this agent, and `[harness] relaunch`
+    /// allows it.
     fn can_restart(&self) -> bool {
-        (self.relaunch_lane() || self.scoped_pooled()) && self.switches.relaunch()
+        (self.relaunch_lane() || self.scoped_pooled() || self.relaunch_claimant())
+            && self.switches.relaunch()
     }
 
     /// What the agent's own launch says of its model: the argv of the kept snapshot while its agent
@@ -6776,6 +6826,18 @@ impl IdleHost for WorkerIdle {
             .restart_left
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
+        if matches!(why, Restart::Memory) && self.relaunch_claimant() {
+            // THE MEMORY CEILING OF A HARNESS-LED TAB (HX-15m, D18): its contract 4 harness
+            // holding `relaunch` is told `restart cause=memory`, which its open stream carries
+            // as a record, and one that does not obey is ended as any unobeyed restart is
+            // (`crate::restart_act::memory_restart`).
+            if !self.switches.relaunch() {
+                return None;
+            }
+            let step = (self.hooks.acts.scoped_memory_restart)(&self.sid);
+            aterm_log::info!("harness @{}: memory ceiling: {step}", self.sid);
+            return self.on().then(|| RestartAnswer::unread(step));
+        }
         let scoped_model = self.scoped_model(why);
         let scoped = scoped_model.is_some()
             || (matches!(why, Restart::Account { .. }) && self.scoped_pooled());
@@ -14504,8 +14566,7 @@ fn self_claimed_exit(
     };
     // The snapshot the crash is relaunched from: the one read while it ran, else one read now at
     // the shell holding the tab, which is owed its line from then on.
-    let owe = |snap: Snapshot| {
-        let mut owed = snap.clone();
+    let owe = |mut owed: Snapshot| {
         if let Some(run) = owed.codex_mut() {
             run.self_claimed = Some(resume.clone());
         }
@@ -14517,7 +14578,7 @@ fn self_claimed_exit(
                 });
             }
         });
-        (snap, owed)
+        owed
     };
     let read_at_shell = || -> Result<Snapshot, SnapshotRefusal> {
         let snap = (hooks.acts.self_snapshot)(sid, copy, &resume)?;
@@ -14584,7 +14645,7 @@ fn self_claimed_exit(
         asked.map(|_| &line_grace as &dyn Fn() -> u32),
         GoneUnread::HandedBack,
         || {
-            let (snap, owed) = match &from {
+            let owed = match &from {
                 Some(read) => read,
                 None => match read_at_shell() {
                     Ok(snap) => &*from.insert(owe(snap)),
@@ -14629,7 +14690,7 @@ fn self_claimed_exit(
                     });
                 }
             });
-            let step = (hooks.acts.self_relaunch)(sid, grace, snap, next, asked);
+            let step = (hooks.acts.self_relaunch)(sid, grace, selected, next, asked);
             if relaunch::outcome(&step) == Outcome::Relaunched {
                 tell_kept(hooks, sid, copy.pid, &cold_use);
             }
@@ -22211,6 +22272,22 @@ fn scoped_now(store: &Store, sid: &str) -> Option<crate::harness_claim::Scoped> 
         })
 }
 
+/// [`Acts::scoped_memory_restart`], live: the memory ceiling's restart of tab `sid`'s contract 4
+/// claimant holding `relaunch` ([`crate::restart_act::memory_restart`]), its step back; a tab
+/// this store no longer hosts is told nothing ([`crate::restart_act::MEMORY_UNCLAIMED`]).
+fn scoped_memory_restart_now(store: &Store, sid: &str) -> &'static str {
+    let Some(ctx) = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .map(|h| Arc::clone(&h.ctx))
+    }) else {
+        return crate::restart_act::MEMORY_UNCLAIMED;
+    };
+    crate::restart_act::memory_restart(&ctx)
+}
+
 /// [`Acts::scoped_restart`], live: the event recorded on `sid`'s timeline
 /// ([`crate::restart_act::record_scoped_restart`]); an account move then waits up to 30 s for the
 /// same claimant to claim again naming the account's label in `login=`, its child's login claim.
@@ -23261,6 +23338,10 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
             Arc::new(move |sid, cause, account, model| {
                 scoped_restart_now(&store, sid, cause, account, model)
             })
+        },
+        scoped_memory_restart: {
+            let store = scoped_store.clone();
+            Arc::new(move |sid| scoped_memory_restart_now(&store, sid))
         },
         reprove_claims: {
             let store = scoped_store.clone();
@@ -26963,15 +27044,7 @@ fn codex_cold_at(
     let Some(pick) = admitted.pick else {
         return Ok(None);
     };
-    let mut moved = snap.clone();
-    let resume = moved
-        .codex_mut()
-        .and_then(|run| run.self_claimed.as_mut())
-        .ok_or("cold account resume disappeared")?;
-    resume.codex_auth_path = pick.value;
-    resume
-        .validate_structural()
-        .map_err(|why| format!("cold account resume refused: {why}"))?;
+    let moved = admitted_codex_login(snap, pick.value)?;
     if asked_taken {
         aterm_log::info!(
             "harness @{}: its restart asked for {}; its relaunch starts under it",
@@ -26986,6 +27059,25 @@ fn codex_cold_at(
         );
     }
     Ok(Some(moved))
+}
+
+/// The validated line owed after admission picks a login, including when another host resumes it.
+fn admitted_codex_login(snap: &Snapshot, auth_path: Option<String>) -> Result<Snapshot, String> {
+    let mut moved = snap.clone();
+    let Some(relaunch::CodexRun {
+        self_claimed: Some(resume),
+        selected_default,
+        ..
+    }) = moved.codex_mut()
+    else {
+        return Err("cold account resume disappeared".into());
+    };
+    *selected_default = auth_path.is_none();
+    resume.codex_auth_path = auth_path;
+    resume
+        .validate_structural()
+        .map_err(|why| format!("cold account resume refused: {why}"))?;
+    Ok(moved)
 }
 
 /// The roster of `seat` where it lists an account ([`roster_read`]).
@@ -33777,6 +33869,7 @@ impl Acts {
             tap_born: Arc::new(|_| None),
             account_restart: Arc::new(|_, _| None),
             scoped_restart: Arc::new(|_, _, _, _| false),
+            scoped_memory_restart: Arc::new(|_| crate::restart_act::MEMORY_UNCLAIMED),
             reprove_claims: Arc::new(|| {}),
             background: Arc::new(|_| false),
             account_made: Arc::new(|_, _, _| {}),
@@ -34099,7 +34192,7 @@ pub(crate) mod credit_claim;
 mod duty_tests;
 #[cfg(test)]
 #[path = "harness_host_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(

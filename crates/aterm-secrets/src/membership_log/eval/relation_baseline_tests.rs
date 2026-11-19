@@ -90,6 +90,7 @@ fn signed_candidate_groups_reach_the_record_bound() {
                     member: actors[target],
                     cutoff,
                 },
+                statement: None,
             }
             .sign(&[tag; 32], [tag; 16])
             .unwrap();

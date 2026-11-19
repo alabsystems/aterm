@@ -16008,6 +16008,13 @@ mod livecheck {
                                 }
                             );
                             super::super::tty::onoe!("Error: {name_s}: {raise_text}");
+                            // Fetch-failure messages follow
+                            // the Error line in the oracle.
+                            if !(messages.len() == 1 && messages[0] == *raise_text) {
+                                for m in messages {
+                                    println!("{m}");
+                                }
+                            }
                             print_resource_lines(&resources);
                         }
                     }
@@ -16657,8 +16664,10 @@ mod livecheck {
     }
 
     /// A spec's reference target, (is_cask, written name):
-    /// `Ok(None)` plain spec, `Ok(Some)` a pure reference
-    /// spec, `Err` outside the subset (ref mixed with other
+    /// `Ok(None)` plain spec, `Ok(Some)` a reference spec
+    /// (a local `regex` may ride along and overrides the
+    /// referenced spec's, as the oracle composes them),
+    /// `Err` outside the subset (ref mixed with other
     /// statements, both refs, a symbol other than a
     /// resource's `:parent`).
     fn spec_ref_target(spec: &LivecheckSpec) -> Result<Option<(bool, String)>, Outside> {
@@ -16674,7 +16683,6 @@ mod livecheck {
             (None, Some(name)) => (true, name.clone()),
         };
         let pure = spec.url.is_none()
-            && spec.regex.is_none()
             && spec.strategy.is_none()
             && spec.skip.is_none()
             && spec.throttle.is_none()
@@ -16756,6 +16764,9 @@ mod livecheck {
     fn follow_refs(prefix: &Prefix, api: &Api, start: &Pkg) -> Result<(Pkg, RefHops), RefFail> {
         let mut eff = start.clone();
         let mut hops: RefHops = Vec::new();
+        // The outermost local `regex` override, composed
+        // onto the referenced package's spec.
+        let mut override_regex: Option<(String, String)> = None;
         let mut seen: Vec<(bool, String)> = vec![(eff.is_cask, eff.full.clone())];
         while let Some(spec) = eff.spec.clone() {
             if spec_outside(&eff.spec) {
@@ -16765,6 +16776,11 @@ mod livecheck {
             else {
                 break;
             };
+            if override_regex.is_none()
+                && let Some(r) = &spec.regex
+            {
+                override_regex = Some((r.clone(), spec.regex_flags.clone()));
+            }
             if written == ":parent" || hops.len() >= 8 {
                 return Err(RefFail::Outside);
             }
@@ -16776,6 +16792,15 @@ mod livecheck {
             seen.push(key);
             hops.push((next.is_cask, next.leaf.clone(), None));
             eff = next;
+        }
+        if let Some((r, flags)) = override_regex {
+            match eff.spec.as_mut() {
+                Some(es) => {
+                    es.regex = Some(r);
+                    es.regex_flags = flags;
+                }
+                None => return Err(RefFail::Outside),
+            }
         }
         Ok((eff, hops))
     }
@@ -19674,6 +19699,7 @@ mod livecheck {
             post.as_ref(),
             &rp.headers,
             !rp.uncompressed,
+            &rp.own_version,
         );
         if !rp.gnome_filter {
             return found;
@@ -20416,6 +20442,7 @@ mod livecheck {
                 match &b.then {
                     GhRelThen::Template(parts) => part_sets.push(parts),
                     GhRelThen::EqElse { then, els, .. }
+                    | GhRelThen::CapNeElse { then, els, .. }
                     | GhRelThen::TruthyElse { then, els, .. } => {
                         part_sets.push(then);
                         part_sets.push(els);
@@ -20552,6 +20579,12 @@ mod livecheck {
                     }
                     GhRelThen::Template(parts) => parts_ok(parts),
                     GhRelThen::EqElse {
+                        a,
+                        b: bb,
+                        then,
+                        els,
+                    }
+                    | GhRelThen::CapNeElse {
                         a,
                         b: bb,
                         then,
@@ -21061,6 +21094,7 @@ mod livecheck {
                     let nested_render = match &block.shape {
                         super::super::formula::JsonShape::NestedFirstMatch { render, .. }
                         | super::super::formula::JsonShape::DigMatch { render, .. }
+                        | super::super::formula::JsonShape::DigParseMatch { render, .. }
                         | super::super::formula::JsonShape::EntriesFirstMatch { render, .. } => {
                             Some(render)
                         }
@@ -21939,6 +21973,44 @@ mod livecheck {
         Some(())
     }
 
+    /// Substitute `#{version...}` interpolations in
+    /// hop target templates of a page block (brew
+    /// evaluates the string when the block runs
+    /// against the checked unit).
+    fn page_block_substitute_versions(
+        block: &mut super::super::formula::PageBlock,
+        own: &str,
+        is_cask: bool,
+    ) -> Option<()> {
+        use super::super::formula::{HopTarget, PageShape};
+        fn sub_target(target: &mut HopTarget, own: &str, is_cask: bool) -> Option<()> {
+            match target {
+                HopTarget::Template(pre, post) => {
+                    *pre = substitute_version_tokens(pre, own, is_cask)?;
+                    *post = substitute_version_tokens(post, own, is_cask)?;
+                }
+                HopTarget::JoinTemplate { pre, post, .. } => {
+                    *pre = substitute_version_tokens(pre, own, is_cask)?;
+                    *post = substitute_version_tokens(post, own, is_cask)?;
+                }
+                HopTarget::JoinLiteral(_) | HopTarget::JoinSelf => {}
+            }
+            Some(())
+        }
+        match &mut block.shape {
+            PageShape::HopScan(hop) => sub_target(&mut hop.target, own, is_cask)?,
+            PageShape::HeaderHop(hop) => {
+                sub_target(&mut hop.target, own, is_cask)?;
+                if let Some(mid) = &mut hop.mid {
+                    mid.url_pre = substitute_version_tokens(&mid.url_pre, own, is_cask)?;
+                    mid.url_post = substitute_version_tokens(&mid.url_post, own, is_cask)?;
+                }
+            }
+            _ => {}
+        }
+        Some(())
+    }
+
     fn plan_urls(
         spec: Option<&LivecheckSpec>,
         urls: Vec<String>,
@@ -21954,6 +22026,7 @@ mod livecheck {
         let substituted: Option<LivecheckSpec> = match spec {
             Some(sp)
                 if sp.xml_block.is_some()
+                    || sp.page_block.is_some()
                     || sp.regex.as_ref().is_some_and(|r| {
                         r.contains("#{") || r.contains(super::super::formula::MAJOR_MINOR_SENTINEL)
                     }) =>
@@ -21973,6 +22046,9 @@ mod livecheck {
                 }
                 if let Some(xb) = &mut owned.xml_block {
                     xml_block_substitute_versions(xb, own_version, is_cask).ok_or(Outside)?;
+                }
+                if let Some(pb) = &mut owned.page_block {
+                    page_block_substitute_versions(pb, own_version, is_cask).ok_or(Outside)?;
                 }
                 Some(owned)
             }
@@ -22152,10 +22228,84 @@ mod livecheck {
                         super::super::formula::PageShape::ScanSelectLt(_) => {
                             rp.re.as_ref().is_some_and(|re| re.group_count == 1)
                         }
-                        super::super::formula::PageShape::HopScan(hop) => match &hop.hop_re {
-                            Some((pat, flags)) => lc_regex(pat, flags).is_ok_and(|re| re.has_group),
-                            None => true,
-                        },
+                        super::super::formula::PageShape::HopScan(hop) => {
+                            let hop_ok = match &hop.hop_re {
+                                Some((pat, flags)) => {
+                                    lc_regex(pat, flags).is_ok_and(|re| re.has_group)
+                                }
+                                None => true,
+                            } && match &hop.pick {
+                                super::super::formula::HopPick::SectionScanMax { section } => {
+                                    lc_regex(&section.0, &section.1).is_ok()
+                                }
+                                _ => true,
+                            };
+                            let final_ok = match &hop.final_match {
+                                None => true,
+                                Some(parts) => rp.re.as_ref().is_some_and(|re| {
+                                    use super::super::formula::HopFinalPart;
+                                    parts.iter().all(|p| match p {
+                                        HopFinalPart::Cap(n) => match n {
+                                            0 => true,
+                                            1 => re.has_group,
+                                            g => re
+                                                .extra_groups
+                                                .get(g - 2)
+                                                .is_some_and(Option::is_some),
+                                        },
+                                        _ => true,
+                                    })
+                                }),
+                            };
+                            // Scan-indexed: part N reads
+                            // capture N+1.
+                            let scan_ok = match &hop.final_scan {
+                                None => true,
+                                Some(parts) => rp.re.as_ref().is_some_and(|re| {
+                                    page_parts_caps_ok(parts, &|n| match n + 1 {
+                                        1 => re.has_group,
+                                        g => {
+                                            re.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                                        }
+                                    })
+                                }),
+                            };
+                            hop_ok && final_ok && scan_ok
+                        }
+                        super::super::formula::PageShape::HeaderHop(hop) => {
+                            use super::super::formula::HopFinalPart;
+                            let hop_ok = match &hop.hop_re {
+                                Some((pat, flags)) => {
+                                    lc_regex(pat, flags).is_ok_and(|re| re.has_group)
+                                }
+                                None => true,
+                            };
+                            let cap_ok = |re: &LcRegex, n: &usize| match n {
+                                0 => true,
+                                1 => re.has_group,
+                                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                            };
+                            let parts_ok = match &hop.lit_cap {
+                                Some((pat, flags)) => lc_regex(pat, flags).is_ok_and(|re| {
+                                    hop.parts.iter().all(|p| match p {
+                                        HopFinalPart::Cap(n) => cap_ok(&re, n),
+                                        _ => true,
+                                    })
+                                }),
+                                None => rp.re.as_ref().is_some_and(|re| {
+                                    hop.parts.iter().all(|p| match p {
+                                        HopFinalPart::Cap(n) => cap_ok(re, n),
+                                        _ => true,
+                                    })
+                                }),
+                            };
+                            let mid_ok = match &hop.mid {
+                                Some(mid) => lc_regex(&mid.lit.0, &mid.lit.1)
+                                    .is_ok_and(|re| cap_ok(&re, &mid.cap)),
+                                None => true,
+                            };
+                            hop_ok && parts_ok && mid_ok
+                        }
                         super::super::formula::PageShape::ScanGuardedFork {
                             skip_cap,
                             skip_pat,
@@ -22181,6 +22331,96 @@ mod livecheck {
                                 g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
                             })
                         }
+                        super::super::formula::PageShape::MatchJsonDigMatch {
+                            lit,
+                            cap,
+                            parts,
+                            ..
+                        } => {
+                            use super::super::formula::HopFinalPart;
+                            let lit_ok = lc_regex(&lit.0, &lit.1).is_ok_and(|re| match *cap {
+                                0 => true,
+                                1 => re.has_group,
+                                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                            });
+                            let parts_ok = rp.re.as_ref().is_some_and(|re| {
+                                parts.iter().all(|p| match p {
+                                    HopFinalPart::Cap(n) => match n {
+                                        0 => true,
+                                        1 => re.has_group,
+                                        g => {
+                                            re.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                                        }
+                                    },
+                                    _ => true,
+                                })
+                            });
+                            lit_ok && parts_ok
+                        }
+                        super::super::formula::PageShape::MatchJsonNestedMap {
+                            lit,
+                            cap,
+                            parts,
+                            ..
+                        } => {
+                            use super::super::formula::HopFinalPart;
+                            let lit_ok = lc_regex(&lit.0, &lit.1).is_ok_and(|re| match *cap {
+                                0 => true,
+                                1 => re.has_group,
+                                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                            });
+                            let parts_ok = rp.re.as_ref().is_some_and(|re| {
+                                parts.iter().all(|p| match p {
+                                    HopFinalPart::Cap(n) => match n {
+                                        0 => true,
+                                        1 => re.has_group,
+                                        g => {
+                                            re.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                                        }
+                                    },
+                                    _ => true,
+                                })
+                            });
+                            lit_ok && parts_ok
+                        }
+                        super::super::formula::PageShape::ScanStripMatch {
+                            pat,
+                            flags,
+                            idx,
+                            strip,
+                            cap,
+                            ..
+                        } => {
+                            let scan_ok = lc_regex(pat, flags).is_ok_and(|re| match idx + 1 {
+                                1 => re.has_group,
+                                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                            });
+                            let strip_ok =
+                                lc_regex(&strip.0, &strip.1).is_ok_and(|re| !re.whole.is_match(""));
+                            let cap_ok = rp.re.as_ref().is_some_and(|re| match *cap {
+                                0 => true,
+                                1 => re.has_group,
+                                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                            });
+                            scan_ok && strip_ok && cap_ok
+                        }
+                        super::super::formula::PageShape::ScanTimeMaxThrottle {
+                            time_idx, ..
+                        } => rp.re.as_ref().is_some_and(|re| match time_idx + 1 {
+                            1 => re.has_group,
+                            g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                        }),
+                        super::super::formula::PageShape::ScanDottedMax { lit } => {
+                            lc_regex(&lit.0, &lit.1).is_ok_and(|re| re.has_group)
+                                && rp.re.as_ref().is_some_and(|re| re.has_group)
+                        }
+                        super::super::formula::PageShape::ScanMaxOptCap {
+                            pat, flags, cap, ..
+                        } => lc_regex(pat, flags).is_ok_and(|re| match *cap {
+                            0 => true,
+                            1 => re.has_group,
+                            g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                        }),
                         super::super::formula::PageShape::SplitCapture { pat, flags, skip } => {
                             lc_regex(pat, flags).is_ok()
                                 && skip.as_ref().is_none_or(|(p, f)| lc_regex(p, f).is_ok())
@@ -22932,6 +23172,7 @@ mod livecheck {
                 post.as_ref(),
                 &rp.headers,
                 !rp.uncompressed,
+                &rp.own_version,
             ),
             Strat::Bitbucket => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
@@ -22979,6 +23220,7 @@ mod livecheck {
                 post.as_ref(),
                 &rp.headers,
                 !rp.uncompressed,
+                &rp.own_version,
             ),
             Strat::Hackage => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
@@ -23181,6 +23423,11 @@ mod livecheck {
             );
         }
         let mut last_messages: Option<Vec<String>> = None;
+        // Fetch-failure messages print after the
+        // outcome's Error line in the oracle; collect
+        // them for a checked outcome instead of
+        // printing inline (debug keeps inline order).
+        let mut pending_msgs: Vec<String> = Vec::new();
         let mut first_run = true;
         let spec_inspect = spec_regex_inspect(pkg.spec.as_ref(), &pkg.current, pkg.is_cask);
         for (original_url, plan) in plans {
@@ -23217,8 +23464,12 @@ mod livecheck {
                         );
                     }
                     if !json {
-                        for m in &msgs {
-                            println!("{m}");
+                        if debug {
+                            for m in &msgs {
+                                println!("{m}");
+                            }
+                        } else {
+                            pending_msgs.extend(msgs.iter().cloned());
                         }
                     }
                     last_messages = Some(msgs);
@@ -23387,6 +23638,11 @@ mod livecheck {
                 // No trailing blank: the blank before the
                 // status line (or the next entry's separator)
                 // is emitted by the caller.
+            }
+            if !json && !debug {
+                for m in &pending_msgs {
+                    println!("{m}");
+                }
             }
             return Outcome::Checked {
                 latest,
@@ -23873,6 +24129,151 @@ mod livecheck {
         }
     }
 
+    /// A headers hop: pick a value from page one,
+    /// fetch the named URL's headers, and render
+    /// from a header match (merged, or per response
+    /// set when `per_set`).
+    fn header_hop_found(
+        hop: &super::super::formula::HeaderHop,
+        content: &str,
+        url: &str,
+        re: &LcRegex,
+        hop_re: Option<&LcRegex>,
+        fin: String,
+    ) -> Found {
+        use super::super::formula::{HopFinalPart, HopPick, HopTarget};
+        let hre = hop_re.unwrap_or(re);
+        let scan_all = |text: &str| -> Vec<String> {
+            hre.whole
+                .find_iter(text)
+                .filter_map(|m| extract_group(hre, m.as_str()))
+                .collect()
+        };
+        let value = match &hop.pick {
+            HopPick::First | HopPick::MatchFirst => search_group1(hre, content),
+            HopPick::SectionScanMax { section } => lc_regex(&section.0, &section.1)
+                .ok()
+                .and_then(|sre| sre.whole.find(content).map(|m| m.as_str().to_string()))
+                .and_then(|text| {
+                    let mut vals = scan_all(&text);
+                    vals.sort();
+                    vals.dedup();
+                    vals.into_iter().max_by(|a, b| lc_cmp(false, a, b))
+                }),
+            HopPick::ScanLast => scan_all(content).pop(),
+            HopPick::ScanMax => scan_all(content)
+                .into_iter()
+                .max_by(|a, b| lc_cmp(false, a, b)),
+            HopPick::ScanLexMax => {
+                let mut vals = scan_all(content);
+                vals.sort();
+                vals.dedup();
+                vals.into_iter().max()
+            }
+            HopPick::ScanMaxKey(k) => {
+                let mut best: Option<(String, String)> = None;
+                for m in hre.whole.find_iter(content) {
+                    let groups = extract_groups(hre, m.as_str());
+                    let (Some(v), Some(key)) = (
+                        groups.first().cloned().flatten(),
+                        groups.get(*k).cloned().flatten(),
+                    ) else {
+                        continue;
+                    };
+                    if best
+                        .as_ref()
+                        .is_none_or(|(bk, _)| lc_cmp(false, &key, bk) == Ordering::Greater)
+                    {
+                        best = Some((key, v));
+                    }
+                }
+                best.map(|(_, v)| v)
+            }
+        };
+        let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+            return Found::Versions(Vec::new(), Some(fin));
+        };
+        // Chained second pick: fetch the page the
+        // first pick names and bracket a new hop
+        // value out of it.
+        let value = match &hop.mid {
+            None => value,
+            Some(mid) => {
+                let mid_url =
+                    format!("{}{value}{}", mid.url_pre, mid.url_post).replace('\u{2}', url);
+                let (mid_content, _) = match page_fetch(&mid_url, None, None, &[], true) {
+                    Ok(ok) => ok,
+                    Err(msgs) => return Found::Messages(msgs),
+                };
+                if mid_content.trim().is_empty() {
+                    return Found::Versions(Vec::new(), Some(fin));
+                }
+                let picked = lc_regex(&mid.lit.0, &mid.lit.1).ok().and_then(|lre| {
+                    search_groups(&lre, &mid_content)
+                        .and_then(|groups| groups.get(mid.cap).cloned().flatten())
+                });
+                match picked.filter(|v| !v.trim().is_empty()) {
+                    Some(v) => v,
+                    None => return Found::Versions(Vec::new(), Some(fin)),
+                }
+            }
+        };
+        let target = match &hop.target {
+            HopTarget::JoinLiteral(base) => uri_join(base, &value),
+            HopTarget::JoinSelf => uri_join(url, &value),
+            HopTarget::Template(pre, post) => format!("{pre}{value}{post}").replace('\u{2}', url),
+            HopTarget::JoinTemplate { base, pre, post } => uri_join(
+                base.as_deref().unwrap_or(url),
+                &format!("{pre}{value}{post}"),
+            ),
+        };
+        let text = page_headers_text(&target, None, None, &[]);
+        let lit_re = hop
+            .lit_cap
+            .as_ref()
+            .and_then(|(pat, flags)| lc_regex(pat, flags).ok());
+        let match_re: &LcRegex = lit_re.as_ref().unwrap_or(re);
+        let render = |groups: &[Option<String>]| -> String {
+            let mut rendered = String::new();
+            for part in &hop.parts {
+                match part {
+                    HopFinalPart::Lit(s) => rendered.push_str(s),
+                    HopFinalPart::Cap(n) => {
+                        if let Some(Some(g)) = groups.get(*n) {
+                            rendered.push_str(g);
+                        }
+                    }
+                    HopFinalPart::Hop => rendered.push_str(&value),
+                }
+            }
+            rendered
+        };
+        let mut out: Vec<String> = Vec::new();
+        if hop.per_set {
+            for set in response_header_sets(&text) {
+                let value_h = set
+                    .get(&hop.header)
+                    .or_else(|| hop.fallback.as_ref().and_then(|f| set.get(f)));
+                let Some(groups) = value_h.and_then(|v| search_groups(match_re, v)) else {
+                    continue;
+                };
+                let rendered = render(&groups);
+                if !out.contains(&rendered) {
+                    out.push(rendered);
+                }
+            }
+        } else {
+            let merged = merge_response_headers(&text);
+            if let Some(groups) = merged
+                .get(&hop.header)
+                .and_then(|v| search_groups(match_re, v))
+            {
+                out.push(render(&groups));
+            }
+        }
+        Found::Versions(out, Some(fin))
+    }
+
     /// `page_versions` with a reduced strategy block:
     /// Ruby's `page.scan(regex).map { … }` — first
     /// captures in scan order, transformed, then
@@ -23885,6 +24286,7 @@ mod livecheck {
         post: Option<&PostData<'_>>,
         headers: &[String],
         compressed: bool,
+        current: &str,
     ) -> Found {
         let Some(block) = block else {
             return page_versions(url, re, ua, post, headers, compressed);
@@ -23906,6 +24308,13 @@ mod livecheck {
             _ => None,
         };
         let hop_re = match &block.shape {
+            super::super::formula::PageShape::HeaderHop(hop) => match &hop.hop_re {
+                Some((pat, flags)) => match lc_regex(pat, flags) {
+                    Ok(re) => Some(re),
+                    Err(_) => return Found::Versions(Vec::new(), None),
+                },
+                None => None,
+            },
             super::super::formula::PageShape::HopScan(hop) => match &hop.hop_re {
                 Some((pat, flags)) => match lc_regex(pat, flags) {
                     Ok(re) => Some(re),
@@ -23917,6 +24326,9 @@ mod livecheck {
         };
         match page_fetch(url, ua, post, headers, compressed) {
             Ok((content, fin)) => {
+                if let super::super::formula::PageShape::HeaderHop(hop) = &block.shape {
+                    return header_hop_found(hop, &content, url, re, hop_re.as_ref(), fin);
+                }
                 // Hop-scan: pick a value from page one,
                 // fetch the page it names, and scan that
                 // instead. A missing/blank hop page is
@@ -23930,12 +24342,47 @@ mod livecheck {
                             .filter_map(|m| extract_group(hre, m.as_str()))
                             .collect()
                     };
-                    let value = match hop.pick {
-                        HopPick::First => search_group1(hre, &content),
+                    let value = match &hop.pick {
+                        HopPick::First | HopPick::MatchFirst => search_group1(hre, &content),
+                        HopPick::SectionScanMax { section } => lc_regex(&section.0, &section.1)
+                            .ok()
+                            .and_then(|sre| {
+                                sre.whole.find(&content).map(|m| m.as_str().to_string())
+                            })
+                            .and_then(|text| {
+                                let mut vals = scan_all(&text);
+                                vals.sort();
+                                vals.dedup();
+                                vals.into_iter().max_by(|a, b| lc_cmp(false, a, b))
+                            }),
                         HopPick::ScanLast => scan_all(&content).pop(),
                         HopPick::ScanMax => scan_all(&content)
                             .into_iter()
                             .max_by(|a, b| lc_cmp(false, a, b)),
+                        HopPick::ScanLexMax => {
+                            let mut vals = scan_all(&content);
+                            vals.sort();
+                            vals.dedup();
+                            vals.into_iter().max()
+                        }
+                        HopPick::ScanMaxKey(k) => {
+                            let mut best: Option<(String, String)> = None;
+                            for m in hre.whole.find_iter(&content) {
+                                let groups = extract_groups(hre, m.as_str());
+                                let (Some(value), Some(key)) = (
+                                    groups.first().cloned().flatten(),
+                                    groups.get(*k).cloned().flatten(),
+                                ) else {
+                                    continue;
+                                };
+                                if best.as_ref().is_none_or(|(bk, _)| {
+                                    lc_cmp(false, &key, bk) == Ordering::Greater
+                                }) {
+                                    best = Some((key, value));
+                                }
+                            }
+                            best.map(|(_, v)| v)
+                        }
                     };
                     let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
                         return Found::Versions(Vec::new(), Some(fin));
@@ -23943,7 +24390,13 @@ mod livecheck {
                     let target = match &hop.target {
                         HopTarget::JoinLiteral(base) => uri_join(base, &value),
                         HopTarget::JoinSelf => uri_join(url, &value),
-                        HopTarget::Template(pre, post) => format!("{pre}{value}{post}"),
+                        HopTarget::Template(pre, post) => {
+                            format!("{pre}{value}{post}").replace('\u{2}', url)
+                        }
+                        HopTarget::JoinTemplate { base, pre, post } => uri_join(
+                            base.as_deref().unwrap_or(url),
+                            &format!("{pre}{value}{post}"),
+                        ),
                     };
                     let c2 = match page_get(&target, ua) {
                         Ok((c2, _)) if !c2.trim().is_empty() => c2,
@@ -23952,6 +24405,36 @@ mod livecheck {
                     // `.flatten&.last`: the final
                     // capture verbatim (the scan
                     // loop's dedupe would move it).
+                    if let Some(parts) = &hop.final_match {
+                        use super::super::formula::HopFinalPart;
+                        let found = search_groups(re, &c2).map(|groups| {
+                            let mut rendered = String::new();
+                            for part in parts {
+                                match part {
+                                    HopFinalPart::Lit(s) => rendered.push_str(s),
+                                    HopFinalPart::Cap(n) => {
+                                        if let Some(Some(g)) = groups.get(*n) {
+                                            rendered.push_str(g);
+                                        }
+                                    }
+                                    HopFinalPart::Hop => rendered.push_str(&value),
+                                }
+                            }
+                            rendered
+                        });
+                        return Found::Versions(found.into_iter().collect(), Some(fin));
+                    }
+                    if let Some(parts) = &hop.final_scan {
+                        let mut out: Vec<String> = Vec::new();
+                        for m in re.whole.find_iter(&c2) {
+                            let groups = extract_groups(re, m.as_str());
+                            let rendered = page_render_parts(parts, &groups);
+                            if !out.contains(&rendered) {
+                                out.push(rendered);
+                            }
+                        }
+                        return Found::Versions(out, Some(fin));
+                    }
                     if hop.last_only {
                         let last = re
                             .whole
@@ -23976,6 +24459,348 @@ mod livecheck {
                         .and_then(|groups| groups.get(*cap).cloned().flatten())
                         .and_then(|text| aterm_json::from_str::<aterm_json::Value>(&text).ok())
                         .and_then(|root| json_dig_path(&root, path).and_then(json_interp));
+                    return Found::Versions(found.into_iter().collect(), Some(fin));
+                }
+                if let super::super::formula::PageShape::MatchJsonDigMatch {
+                    lit,
+                    cap,
+                    path,
+                    parts,
+                } = &block.shape
+                {
+                    use super::super::formula::HopFinalPart;
+                    let found = lc_regex(&lit.0, &lit.1).ok().and_then(|lre| {
+                        // The captured JSON text can be
+                        // long: extract capture 1 with the
+                        // exhaustive budget.
+                        let text = if *cap == 1 {
+                            lre.whole
+                                .find(&content)
+                                .and_then(|m| extract_group_limited(&lre, m.as_str(), 1 << 20))
+                        } else {
+                            search_groups(&lre, &content)
+                                .and_then(|groups| groups.get(*cap).cloned().flatten())
+                        };
+                        text.and_then(|text| aterm_json::from_str::<aterm_json::Value>(&text).ok())
+                            .and_then(|root| {
+                                json_dig_path(&root, path)
+                                    .and_then(|v| v.as_str().map(str::to_string))
+                            })
+                            .and_then(|text| search_groups(re, &text))
+                            .map(|groups| {
+                                let mut rendered = String::new();
+                                for part in parts {
+                                    match part {
+                                        HopFinalPart::Lit(s) => rendered.push_str(s),
+                                        HopFinalPart::Cap(n) => {
+                                            if let Some(Some(g)) = groups.get(*n) {
+                                                rendered.push_str(g);
+                                            }
+                                        }
+                                        HopFinalPart::Hop => {}
+                                    }
+                                }
+                                rendered
+                            })
+                    });
+                    return Found::Versions(found.into_iter().collect(), Some(fin));
+                }
+                if let super::super::formula::PageShape::MatchJsonNestedMap {
+                    lit,
+                    cap,
+                    path,
+                    field,
+                    extra,
+                    parts,
+                } = &block.shape
+                {
+                    use super::super::formula::HopFinalPart;
+                    let blank = |v: Option<&aterm_json::Value>| match v {
+                        None => true,
+                        Some(aterm_json::Value::Null) => true,
+                        Some(aterm_json::Value::Bool(false)) => true,
+                        Some(aterm_json::Value::String(s)) => s.trim().is_empty(),
+                        Some(aterm_json::Value::Array(a)) => a.is_empty(),
+                        Some(aterm_json::Value::Object(o)) => o.is_empty(),
+                        Some(_) => false,
+                    };
+                    let found: Vec<String> = lc_regex(&lit.0, &lit.1)
+                        .ok()
+                        .and_then(|lre| {
+                            let text = if *cap == 1 {
+                                lre.whole
+                                    .find(&content)
+                                    .and_then(|m| extract_group_limited(&lre, m.as_str(), 1 << 23))
+                            } else {
+                                search_groups(&lre, &content)
+                                    .and_then(|groups| groups.get(*cap).cloned().flatten())
+                            };
+                            text.and_then(|text| {
+                                aterm_json::from_str::<aterm_json::Value>(&text).ok()
+                            })
+                            .and_then(|root| json_dig_path(&root, path).cloned())
+                        })
+                        .map(|node| {
+                            let mut out: Vec<String> = Vec::new();
+                            let aterm_json::Value::Object(map) = node else {
+                                return out;
+                            };
+                            for files in map.values() {
+                                let aterm_json::Value::Array(files) = files else {
+                                    continue;
+                                };
+                                for file in files {
+                                    let aterm_json::Value::Object(file) = file else {
+                                        continue;
+                                    };
+                                    let Some(aterm_json::Value::String(name)) = file.get(field)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(groups) = search_groups(re, name) else {
+                                        continue;
+                                    };
+                                    let extra_val = match extra {
+                                        Some(f2) => {
+                                            let v = file.get(f2);
+                                            if blank(v) {
+                                                continue;
+                                            }
+                                            v.and_then(json_interp)
+                                        }
+                                        None => None,
+                                    };
+                                    let mut rendered = String::new();
+                                    for part in parts {
+                                        match part {
+                                            HopFinalPart::Lit(s) => rendered.push_str(s),
+                                            HopFinalPart::Cap(n) => {
+                                                if let Some(Some(g)) = groups.get(*n) {
+                                                    rendered.push_str(g);
+                                                }
+                                            }
+                                            HopFinalPart::Hop => {
+                                                if let Some(v) = &extra_val {
+                                                    rendered.push_str(v);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    out.push(rendered);
+                                }
+                            }
+                            out
+                        })
+                        .unwrap_or_default();
+                    return Found::Versions(found, Some(fin));
+                }
+                if let super::super::formula::PageShape::ScanStripMatch {
+                    pat,
+                    flags,
+                    idx,
+                    strip,
+                    repl,
+                    cap,
+                } = &block.shape
+                {
+                    let found: Vec<String> = lc_regex(pat, flags)
+                        .ok()
+                        .zip(lc_regex(&strip.0, &strip.1).ok())
+                        .map(|(lre, sre)| {
+                            let mut out: Vec<String> = Vec::new();
+                            for m in lre.whole.find_iter(&content) {
+                                let groups = extract_groups(&lre, m.as_str());
+                                // `extract_groups` omits the
+                                // whole match: scan index ==
+                                // position here.
+                                let Some(Some(mut text)) = groups.get(*idx).cloned() else {
+                                    continue;
+                                };
+                                // The oracle's fixed-point
+                                // strip loop, bounded.
+                                for _ in 0..128 {
+                                    let mut next = String::with_capacity(text.len());
+                                    let mut last = 0usize;
+                                    let mut zero_width = false;
+                                    for sm in sre.whole.find_iter(&text) {
+                                        if sm.start() == sm.end() {
+                                            zero_width = true;
+                                            break;
+                                        }
+                                        next.push_str(&text[last..sm.start()]);
+                                        next.push_str(repl);
+                                        last = sm.end();
+                                    }
+                                    if zero_width {
+                                        break;
+                                    }
+                                    next.push_str(&text[last..]);
+                                    if next == text {
+                                        break;
+                                    }
+                                    text = next;
+                                }
+                                if let Some(Some(g)) =
+                                    search_groups(re, &text).and_then(|gs| gs.get(*cap).cloned())
+                                {
+                                    out.push(g);
+                                }
+                            }
+                            out
+                        })
+                        .unwrap_or_default();
+                    return Found::Versions(found, Some(fin));
+                }
+                if let super::super::formula::PageShape::ScanDottedMax { lit } = &block.shape {
+                    // Ruby `Array#max` on strings is
+                    // lexical; scan index 0 is capture 1
+                    // (extract_groups omits the whole).
+                    let ver = re
+                        .whole
+                        .find_iter(&content)
+                        .filter_map(|m| extract_groups(re, m.as_str()).into_iter().next().flatten())
+                        .max();
+                    let found: Vec<String> = match ver {
+                        Some(ver) if ver.contains('.') => vec![ver],
+                        Some(ver) => lc_regex(&lit.0, &lit.1)
+                            .ok()
+                            .and_then(|lre| {
+                                lre.whole.find_iter(&content).find_map(|m| {
+                                    extract_groups(&lre, m.as_str())
+                                        .into_iter()
+                                        .next()
+                                        .flatten()
+                                        .filter(|cand| cand.replace('.', "") == ver)
+                                })
+                            })
+                            .into_iter()
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    return Found::Versions(found, Some(fin));
+                }
+                if let super::super::formula::PageShape::ScanTimeMaxThrottle {
+                    time_idx,
+                    sep,
+                    step,
+                } = &block.shape
+                {
+                    // `Time.parse` over the listing's
+                    // `YYYY-MM-DD HH:MM[:SS]` stamps, as
+                    // a numeric tuple; anything else is
+                    // the oracle's raise (no versions).
+                    let parse_stamp = |s: &str| -> Option<(i64, i64, i64, i64, i64, i64)> {
+                        let s = s.trim();
+                        let (date, time) = s.split_once([' ', 'T'])?;
+                        let mut d = date.split('-');
+                        let y: i64 = d.next()?.parse().ok()?;
+                        let mo: i64 = d.next()?.parse().ok()?;
+                        let da: i64 = d.next()?.parse().ok()?;
+                        if d.next().is_some() {
+                            return None;
+                        }
+                        let mut t = time.split(':');
+                        let h: i64 = t.next()?.parse().ok()?;
+                        let mi: i64 = t.next()?.parse().ok()?;
+                        let sec: i64 = t.next().map_or(Some(0), |v| v.parse().ok())?;
+                        if t.next().is_some() {
+                            return None;
+                        }
+                        Some((y, mo, da, h, mi, sec))
+                    };
+                    // Ruby `String#to_i` (0 when no
+                    // leading integer; nil also 0).
+                    let to_i = |s: Option<&str>| -> i64 {
+                        let s = s.unwrap_or_default().trim();
+                        let digits: String = s
+                            .strip_prefix(['+', '-'])
+                            .unwrap_or(s)
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect();
+                        if digits.is_empty() {
+                            0
+                        } else {
+                            let n: i64 = digits.parse().unwrap_or(i64::MAX);
+                            if s.starts_with('-') { -n } else { n }
+                        }
+                    };
+                    let mut best: Option<((i64, i64, i64, i64, i64, i64), String)> = None;
+                    let mut failed = false;
+                    for m in re.whole.find_iter(&content) {
+                        let groups = extract_groups(re, m.as_str());
+                        let (Some(Some(stamp)), Some(Some(first))) =
+                            (groups.get(*time_idx), groups.first())
+                        else {
+                            failed = true;
+                            break;
+                        };
+                        let Some(stamp) = parse_stamp(stamp) else {
+                            failed = true;
+                            break;
+                        };
+                        // Ruby `max_by` keeps the first
+                        // maximum on ties.
+                        if best.as_ref().is_none_or(|(b, _)| stamp > *b) {
+                            best = Some((stamp, first.clone()));
+                        }
+                    }
+                    let found: Vec<String> = if failed {
+                        Vec::new()
+                    } else {
+                        match best {
+                            None => Vec::new(),
+                            Some((_, first)) => {
+                                let (mut v, mut b): (String, Option<String>) =
+                                    match first.split_once(sep.as_str()) {
+                                        Some((a, rest)) => (a.to_string(), Some(rest.to_string())),
+                                        None => (first, None),
+                                    };
+                                let mut csv = current.split(',');
+                                let cv = csv.next().unwrap_or_default();
+                                let cb = csv.next();
+                                if b.is_some() && to_i(cb) + step > to_i(b.as_deref()) {
+                                    v = cv.to_string();
+                                    b = cb.map(str::to_string);
+                                }
+                                vec![format!("{v},{}", b.unwrap_or_default())]
+                            }
+                        }
+                    };
+                    return Found::Versions(found, Some(fin));
+                }
+                if let super::super::formula::PageShape::ScanMaxOptCap {
+                    pat,
+                    flags,
+                    cap,
+                    sep,
+                    tr,
+                } = &block.shape
+                {
+                    let vals: Vec<String> = re
+                        .whole
+                        .find_iter(&content)
+                        .filter_map(|m| extract_groups(re, m.as_str()).into_iter().next().flatten())
+                        .collect();
+                    let found = vals
+                        .into_iter()
+                        .max_by(|a, b| lc_cmp(false, a, b))
+                        .map(|max| {
+                            let extra = lc_regex(pat, flags).ok().and_then(|lre| {
+                                search_groups(&lre, &content)
+                                    .and_then(|groups| groups.get(*cap).cloned().flatten())
+                            });
+                            match extra {
+                                Some(extra) => {
+                                    let extra = match tr {
+                                        Some((from, to)) => ruby_tr(&extra, from, to),
+                                        None => extra,
+                                    };
+                                    format!("{max}{sep}{extra}")
+                                }
+                                None => max,
+                            }
+                        });
                     return Found::Versions(found.into_iter().collect(), Some(fin));
                 }
                 if let super::super::formula::PageShape::ScanExtreme(min) = &block.shape {
@@ -24639,11 +25464,15 @@ mod livecheck {
         if let Some(limit) = walk.reject_patch_ge {
             stage1.retain(|v| version_patch_value(v) < limit);
         }
-        stage1.sort_by(|a, b| super::super::formula::version_cmp(a, b));
+        if !walk.scan_order {
+            stage1.sort_by(|a, b| super::super::formula::version_cmp(a, b));
+        }
         if stage1.is_empty() {
             return Found::Versions(Vec::new(), Some(fin));
         }
-        let mut candidates: Vec<String> = if walk.last_two && stage1.len() > 1 {
+        let mut candidates: Vec<String> = if walk.scan_order {
+            stage1.clone()
+        } else if walk.last_two && stage1.len() > 1 {
             vec![
                 stage1[stage1.len() - 1].clone(),
                 stage1[stage1.len() - 2].clone(),
@@ -24658,7 +25487,12 @@ mod livecheck {
                 Some((from, to)) => ruby_tr(&cand, from, to),
                 None => cand.clone(),
             };
-            let dir_url = uri_join(url, &format!("{}{dir_name}{}", walk.dir_pre, walk.dir_post));
+            let dir_url = match &walk.url_sub {
+                Some((needle, pre, post)) => {
+                    url.replacen(needle.as_str(), &format!("{pre}{dir_name}{post}"), 1)
+                }
+                None => uri_join(url, &format!("{}{dir_name}{}", walk.dir_pre, walk.dir_post)),
+            };
             let page = page_get(&dir_url, ua).ok().map(|(c, _)| c);
             let Some(dir_content) = page.filter(|c| !c.trim().is_empty()) else {
                 match walk.blank {
@@ -24668,7 +25502,7 @@ mod livecheck {
                 }
             };
             dir_versions = scan_first(&dir_content, re2);
-            if !walk.last_two {
+            if !walk.last_two && !walk.scan_order {
                 return Found::Versions(dir_versions, Some(fin));
             }
             if !dir_versions.is_empty() {
@@ -24764,6 +25598,12 @@ mod livecheck {
             | PageShape::PageStrip
             | PageShape::ScanGuardedFork { .. }
             | PageShape::MatchJsonDig { .. }
+            | PageShape::MatchJsonDigMatch { .. }
+            | PageShape::MatchJsonNestedMap { .. }
+            | PageShape::ScanStripMatch { .. }
+            | PageShape::ScanDottedMax { .. }
+            | PageShape::ScanTimeMaxThrottle { .. }
+            | PageShape::ScanMaxOptCap { .. }
             | PageShape::SplitHeadChars { .. }
             | PageShape::SplitCapture { .. }
             | PageShape::SplitScan { .. }
@@ -24774,6 +25614,7 @@ mod livecheck {
             | PageShape::MatchTemplate(_)
             | PageShape::DirWalk(_)
             | PageShape::HopScan(_)
+            | PageShape::HeaderHop(_)
             | PageShape::FirstDate(_) => Ok(Some(v.to_string())),
         }
     }
@@ -26018,6 +26859,39 @@ mod livecheck {
                         }
                     }
                 }
+                JsonShape::DigParseMatch {
+                    outer,
+                    inner,
+                    render,
+                } => {
+                    if let Some(re) = &rp.re
+                        && let Some(text) = dig(&root, outer).and_then(|v| scalar(v).transpose())
+                    {
+                        let text = text?;
+                        if !text.trim().is_empty() {
+                            let Ok(inner_root) =
+                                aterm_json::from_slice::<aterm_json::Value>(text.as_bytes())
+                            else {
+                                return Err(Found::Raised(
+                                    "Content could not be parsed as JSON.".to_string(),
+                                ));
+                            };
+                            if let Some(groups) = dig(&inner_root, inner)
+                                .and_then(|v| v.as_str())
+                                .and_then(|t| search_groups(re, t))
+                            {
+                                out.extend(json_render_eval(
+                                    render,
+                                    &inner_root,
+                                    &inner_root,
+                                    &[],
+                                    Some(&groups),
+                                    rp,
+                                )?);
+                            }
+                        }
+                    }
+                }
                 JsonShape::EntriesFirstMatch {
                     path,
                     dig: inner_dig,
@@ -26128,6 +27002,177 @@ mod livecheck {
                                     out.push(format!("{outer_v},{rendered}"));
                                 } else {
                                     out.push(outer_v);
+                                }
+                            }
+                        }
+                    }
+                }
+                JsonShape::ListMaxPageHop {
+                    path,
+                    key,
+                    url,
+                    cap,
+                    parts,
+                } => {
+                    use super::super::formula::JsonHopPart;
+                    let mut labels: Vec<String> = Vec::new();
+                    if let Some(arr) = dig(&root, path).and_then(|v| v.as_array()) {
+                        for item in arr {
+                            if let Some(s) = item.get(key.as_str()).and_then(|v| v.as_str())
+                                && !labels.iter().any(|l| l == s)
+                            {
+                                labels.push(s.to_string());
+                            }
+                        }
+                    }
+                    let mut best: Option<String> = None;
+                    for l in labels {
+                        if best
+                            .as_ref()
+                            .is_none_or(|b| version_cmp(&l, b) == Ordering::Greater)
+                        {
+                            best = Some(l);
+                        }
+                    }
+                    if let Some(best) = best {
+                        let (page, _) = match page_fetch(url, None, None, &[], true) {
+                            Ok(ok) => ok,
+                            Err(msgs) => return Err(Found::Messages(msgs)),
+                        };
+                        if !page.trim().is_empty() {
+                            let date = rp
+                                .re
+                                .as_ref()
+                                .and_then(|re| search_groups(re, &page))
+                                .and_then(|g| g.get(*cap).cloned().flatten());
+                            if let Some(date) = date {
+                                let mut rendered = String::new();
+                                for part in parts {
+                                    match part {
+                                        JsonHopPart::Lit(s) => rendered.push_str(s),
+                                        JsonHopPart::Max => rendered.push_str(&best),
+                                        JsonHopPart::Date => rendered.push_str(&date),
+                                        JsonHopPart::Key | JsonHopPart::Fetched => {}
+                                    }
+                                }
+                                out.push(rendered);
+                            }
+                        }
+                    }
+                }
+                JsonShape::KeyHopDigMatch {
+                    key,
+                    url_pre,
+                    url_post,
+                    path,
+                    cap,
+                    parts,
+                } => {
+                    use super::super::formula::JsonHopPart;
+                    let blank = |v: Option<&aterm_json::Value>| match v {
+                        None => true,
+                        Some(aterm_json::Value::Null) => true,
+                        Some(aterm_json::Value::Bool(false)) => true,
+                        Some(aterm_json::Value::String(s)) => s.trim().is_empty(),
+                        Some(aterm_json::Value::Array(a)) => a.is_empty(),
+                        Some(aterm_json::Value::Object(o)) => o.is_empty(),
+                        Some(_) => false,
+                    };
+                    let key_val = root.as_object().and_then(|o| o.get(key.as_str()));
+                    if !blank(key_val)
+                        && let Some(key_str) = key_val.and_then(json_interp)
+                    {
+                        let url = format!("{url_pre}{key_str}{url_post}");
+                        let (page, _) = match page_fetch(&url, None, None, &[], true) {
+                            Ok(ok) => ok,
+                            Err(msgs) => return Err(Found::Messages(msgs)),
+                        };
+                        if !page.trim().is_empty()
+                            && let Ok(doc) = aterm_json::from_str::<aterm_json::Value>(&page)
+                            && let Some(text) =
+                                dig(&doc, path).and_then(|v| v.as_str().map(str::to_string))
+                            && let Some(fetched) = rp
+                                .re
+                                .as_ref()
+                                .and_then(|re| search_groups(re, &text))
+                                .and_then(|g| g.get(*cap).cloned().flatten())
+                            && !fetched.trim().is_empty()
+                        {
+                            let mut rendered = String::new();
+                            for part in parts {
+                                match part {
+                                    JsonHopPart::Lit(s) => rendered.push_str(s),
+                                    JsonHopPart::Key => rendered.push_str(&key_str),
+                                    JsonHopPart::Fetched => rendered.push_str(&fetched),
+                                    JsonHopPart::Max | JsonHopPart::Date => {}
+                                }
+                            }
+                            out.push(rendered);
+                        }
+                    }
+                }
+                JsonShape::KeyCurrentGateDigMatch {
+                    key,
+                    url,
+                    path,
+                    type_key,
+                    type_val,
+                    url_key,
+                    cap,
+                } => {
+                    let latest = root.as_object().and_then(|o| o.get(key.as_str()));
+                    // `next unless v`: only nil/false stop.
+                    let truthy = matches!(
+                        latest,
+                        Some(v) if !v.is_null() && v.as_bool() != Some(false)
+                    );
+                    if truthy {
+                        let latest_str = latest.and_then(json_interp);
+                        let csv_first = rp.own_version.split(',').next().unwrap_or_default();
+                        // Ruby `==` against the String
+                        // csv field: only a String latest
+                        // can be equal.
+                        let is_current = matches!(
+                            latest,
+                            Some(aterm_json::Value::String(s)) if s == csv_first
+                        );
+                        if is_current {
+                            out.push(rp.own_version.clone());
+                        } else if let Some(latest_str) = latest_str {
+                            let (page, _) = match page_fetch(url, None, None, &[], true) {
+                                Ok(ok) => ok,
+                                Err(msgs) => return Err(Found::Messages(msgs)),
+                            };
+                            if page.trim().is_empty() {
+                                out.push(latest_str);
+                            } else {
+                                let hash = aterm_json::from_str::<aterm_json::Value>(&page)
+                                    .ok()
+                                    .and_then(|doc| {
+                                        dig(&doc, path).and_then(|v| v.as_array()).and_then(
+                                            |items| {
+                                                items.iter().find_map(|item| {
+                                                    if item
+                                                        .get(type_key.as_str())
+                                                        .and_then(|v| v.as_str())
+                                                        != Some(type_val.as_str())
+                                                    {
+                                                        return None;
+                                                    }
+                                                    let text = item
+                                                        .get(url_key.as_str())
+                                                        .and_then(|v| v.as_str())?;
+                                                    search_groups(rp.re.as_ref()?, text)?
+                                                        .get(*cap)
+                                                        .cloned()
+                                                        .flatten()
+                                                })
+                                            },
+                                        )
+                                    });
+                                match hash {
+                                    Some(hash) => out.push(format!("{latest_str},{hash}")),
+                                    None => out.push(latest_str),
                                 }
                             }
                         }
@@ -29193,6 +30238,7 @@ mod livecheck {
                     name_skip: None,
                     pre_capture: None,
                     source: GhRelSource::TagName,
+                    first_only: false,
                     then: GhRelThen::Identity,
                     fallback_tag: None,
                     blank_emit_local: false,
@@ -29287,7 +30333,9 @@ mod livecheck {
             let mut part_sets: Vec<&[GhRelPart]> = Vec::new();
             match &block.then {
                 GhRelThen::Template(parts) => part_sets.push(parts),
-                GhRelThen::EqElse { then, els, .. } | GhRelThen::TruthyElse { then, els, .. } => {
+                GhRelThen::EqElse { then, els, .. }
+                | GhRelThen::CapNeElse { then, els, .. }
+                | GhRelThen::TruthyElse { then, els, .. } => {
                     part_sets.push(then);
                     part_sets.push(els);
                 }
@@ -29461,6 +30509,15 @@ mod livecheck {
                                         render(els, &groups)
                                     }
                                 }),
+                            GhRelThen::CapNeElse { a, b, then, els } => search_groups(re, text)
+                                .and_then(|groups| {
+                                    let bv = op_val(b, &groups);
+                                    if bv.is_some() && op_val(a, &groups) != bv {
+                                        render(then, &groups)
+                                    } else {
+                                        render(els, &groups)
+                                    }
+                                }),
                             GhRelThen::TruthyElse { cap, then, els } => search_groups(re, text)
                                 .and_then(|groups| {
                                     let truthy = groups.get(*cap).is_some_and(Option::is_some);
@@ -29517,6 +30574,9 @@ mod livecheck {
                             if !versions.contains(&v) {
                                 versions.push(v);
                             }
+                            if block.first_only {
+                                break;
+                            }
                         }
                     }
                     // `.presence ||` fallback to the tag.
@@ -29526,6 +30586,9 @@ mod livecheck {
                         && !versions.contains(&v)
                     {
                         versions.push(v);
+                    }
+                    if block.first_only && !versions.is_empty() {
+                        break;
                     }
                 }
                 Found::Versions(versions, None)

@@ -1202,7 +1202,10 @@ fn table_baseline<'a>(
         .into_iter()
         .filter_map(|name| columns.iter().find(|column| column.name == name))
         .collect();
-    super::face::Baseline::assemble(&super::face::Baseline::header_line(grid, &face), lines)
+    super::face::Baseline::assemble(
+        &super::face::Baseline::header_line(grid, &face, columns),
+        lines,
+    )
 }
 
 /// A table file's last projection in this process (package TK-09): the cells it was made from

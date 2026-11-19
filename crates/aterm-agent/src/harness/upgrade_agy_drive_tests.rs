@@ -13,7 +13,7 @@ use crate::harness::relaunch::{AgentRun, AgyRun, ExitCause, ExitRecord, Snapshot
 use crate::harness::upgrade_drive::load;
 use crate::supervise::ScratchDir;
 
-const TAB: &str = "s-0123456789abcdef4a67";
+const TAB: &str = "t0123454a67";
 const TOKEN: &str = "0badf00d0badf00d";
 const C1: &str = "eaeec4fb-4e43-47da-b46f-8a10c0fee186";
 const C2: &str = "5f2b9c3e-7d41-4a8e-9b2c-1e3d5f7a9b0c";

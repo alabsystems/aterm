@@ -179,10 +179,7 @@ fn legacy_store_package(layout: &Layout, target: &Path) -> bool {
         return false;
     };
     let root = layout.build_dir("codex", build);
-    crate::store::ready_marker_path(&root).is_some_and(|marker| {
-        crate::metadata_io::read_bounded_regular_utf8(&marker, 4 * 1024 * 1024).is_ok()
-            && crate::store::build_is_complete(&root)
-    })
+    crate::store::readably_complete(&root)
 }
 
 // A captured dev image can outlive its link marker; `producer_target` confers route authority.

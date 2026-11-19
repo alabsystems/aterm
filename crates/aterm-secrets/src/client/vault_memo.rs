@@ -1372,9 +1372,7 @@ pub fn token_view_inputs(paths: &Paths) -> Option<TokenViewInputs> {
 #[must_use]
 pub fn token_view_files(paths: &Paths) -> Vec<PathBuf> {
     let mut files = token_view_named(paths).unwrap_or_default();
-    if let Ok(records) = crate::records_storage::standing_files(&paths.records_file()) {
-        files.extend(records);
-    }
+    files.extend(paths.records_watch_files());
     files
 }
 
@@ -1570,9 +1568,10 @@ pub fn desk_stamped_files(paths: &Paths) -> Option<Vec<PathBuf>> {
     Some(files)
 }
 
-/// [`stamp_files`] of `inputs`, with the membership records' selection as it stands
-/// ([`records_storage::standing`](crate::records_storage::standing)). Records the selection
-/// refuses require a fresh read.
+/// [`stamp_files`] of `inputs`, with the membership records' selection as it stands, judged as
+/// this Mac's records reader selects (`client::records_standing`: a rewritten layout's pinned
+/// generation where the Mac reads format 2). Records the selection refuses require a fresh
+/// read.
 pub(super) fn stamp_inputs(
     paths: &Paths,
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
@@ -1637,18 +1636,15 @@ fn stamp_memo_inputs_with(
     })
 }
 
-/// The membership records' selection as it stands, where `records`; `Some(None)` where not, and
-/// `None` where it cannot be stamped.
+/// The membership records' selection as it stands (`client::records_standing`), where
+/// `records`; `Some(None)` where not, and `None` where it cannot be stamped.
 fn records_standing(
     paths: &Paths,
     records: bool,
     glance: Option<&fsx::Glance>,
 ) -> Option<Option<crate::records_storage::Standing>> {
     if records {
-        Some(Some(crate::records_storage::standing(
-            &paths.records_file(),
-            glance,
-        )?))
+        Some(Some(super::records_standing(paths, glance)?))
     } else {
         Some(None)
     }

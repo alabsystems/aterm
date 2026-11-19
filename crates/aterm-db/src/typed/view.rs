@@ -8,7 +8,8 @@ use super::{
     authority::Inert,
     cell::{self, Cells, Projection},
     grid,
-    owned::{self, LogRead, Op, OwnedRead, Quota, SchemaState},
+    owned::{LogRead, Op, OwnedRead, Quota, SchemaState},
+    state::State,
 };
 use crate::Result;
 use astream_wire::sync::Digest;
@@ -39,7 +40,7 @@ pub struct View {
     /// The owned collections' rows, past-quota records left out, each at its signer's own key.
     pub owned: BTreeMap<&'static str, OwnedRead>,
     /// The log collections' entries, past-quota records left out, each at its signer's own key
-    /// (`<uuid32>.<n>`, [`owned::read_log`]): a log of a catalog table read as its typed rows.
+    /// (`<uuid32>.<n>`, [`typed::owned::read_log`]): a log of a catalog table read as its typed rows.
     pub logs: BTreeMap<&'static str, LogRead>,
     /// No retained operation could still become visible here (`Log::awaited`: none waits on a
     /// causal parent that has not arrived, and this Mac's own writer has nothing withheld), so
@@ -56,6 +57,16 @@ pub struct View {
     /// Who signed each of [`Self::refused`] and why it is not projected, in its order: what
     /// [`Self::refused_words`] says. `complete` does not count them, so no write waits on them.
     pub refusals: Vec<Unread>,
+    /// What the read folded from its records, part by part ([`State`]): the owned, carried and
+    /// log rows above, each writer's quota counters, the schema rows and what readers ask of
+    /// every record, in the form a checkpoint's state holds them.
+    pub state: State,
+    /// The claims at the floor this read starts from ([`typed::claim::Floor`], tracker
+    /// LT-B10D3): where one is held, [`Self::ops`] are the records above it, and a projection of
+    /// a claimed collection reads every claim and lifecycle write at or below it from here. `None`
+    /// for a read that folds every record, which every read is until one starts from the state
+    /// at its settled floor (tracker LT-B10D4).
+    pub(crate) claims_floor: Option<std::sync::Arc<typed::claim::Floors>>,
     /// Where [`Self::cells`] stand among the cells this process keeps of the table, where they
     /// are exactly those cells (no write held inert, no claim interpreted): a reader that made
     /// something of the cells at an earlier mark asks which changed since
@@ -141,6 +152,8 @@ impl View {
             awaiting: Awaiting::NONE,
             refused: Vec::new(),
             refusals: Vec::new(),
+            state: State::default(),
+            claims_floor: None,
             #[cfg(any(unix, test))]
             cells_from: None,
         }
@@ -253,6 +266,7 @@ impl View {
                     .iter()
                     .filter(|op| !self.quota.over.contains(&op.id)),
                 &self.causal,
+                self.below(collection),
             )
         } else {
             cell::project(collection, &self.cells)
@@ -279,12 +293,54 @@ impl View {
                     .iter()
                     .filter(|op| !self.quota.over.contains(&op.id)),
                 &self.causal,
+                self.below(collection),
             )
         } else {
             (
                 cell::project(collection, &self.cells),
                 typed::claim::Settlements::new(),
             )
+        }
+    }
+
+    /// The floor's claims of `collection` this read starts from, if it starts from one
+    /// ([`Self::claims_floor`]).
+    fn below(&self, collection: &Collection) -> Option<typed::claim::Below<'_>> {
+        self.claims_floor.as_deref()?.below(collection.name)
+    }
+
+    /// The claims of each of `table`'s claimed collections at this read's cut, whose writers'
+    /// newest sequences are `frontier` ([`typed::claim::Floor`]): what the state at a floor
+    /// holds of them, and what a read of the records above it starts from.
+    #[must_use]
+    pub fn claims_at(
+        &self,
+        table: &Table,
+        frontier: BTreeMap<astream_wire::sync::Actor, u64>,
+    ) -> typed::claim::Floors {
+        let collections = table
+            .collections
+            .iter()
+            .filter(|collection| {
+                collection
+                    .columns
+                    .iter()
+                    .any(|column| column.claim.is_some())
+            })
+            .map(|collection| {
+                let floor = typed::claim::Floor::at(
+                    collection,
+                    self.ops
+                        .iter()
+                        .filter(|op| !self.quota.over.contains(&op.id)),
+                    &self.causal,
+                );
+                (collection.name, floor)
+            })
+            .collect();
+        typed::claim::Floors {
+            frontier,
+            collections,
         }
     }
 
@@ -326,6 +382,7 @@ impl View {
                         .iter()
                         .filter(|operation| !self.quota.over.contains(&operation.id)),
                     &self.causal,
+                    self.below(collection),
                 )?);
             }
         }
@@ -369,7 +426,7 @@ impl View {
 
     /// The stored schema row of `collection`: the highest version any eligible operation wrote.
     pub fn schema(&self, collection: &str) -> SchemaState {
-        owned::schema_state(&self.ops, collection)
+        self.state.schema_state(collection)
     }
 }
 

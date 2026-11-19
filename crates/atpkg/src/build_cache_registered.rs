@@ -2999,8 +2999,8 @@ fn with_miri<R>(
     })
 }
 
-/// Whether `cargo-miri`'s sysroot setup ([`super::MiriCall::setup`]) for `args`, the words typed,
-/// writes nothing atpkg could record or must protect. Setup (`setup.rs`) runs a Targo of its own
+/// The first location check that refuses `cargo-miri`'s sysroot setup ([`super::MiriCall::setup`]).
+/// Setup (`setup.rs`) runs a Targo of its own
 /// (`-Zjson-target-spec`, `RUSTC` its own) on the standard library's sources through
 /// `rustc-build-sysroot` (`build_from_source`, read at 0.5.14, the version `cargo-miri`'s lock
 /// pins): in a fresh workspace `tempfile` makes in the temporary folder (`Builder::tempdir`;
@@ -3027,57 +3027,75 @@ fn with_miri<R>(
 /// ([`super::configs_name_artifacts`]). An unset `TMPDIR` is the platform's temporary folder
 /// (std's `temp_dir`: on macOS the per-user one `confstr` names), outside HOME. A `-C` this
 /// reader cannot resolve leaves it unclear.
-fn miri_setup_clear(
+fn miri_setup_path_refusal(
     home: &Path,
     args: &[String],
     tool: super::Tool,
     machine: &super::Machine<'_>,
-) -> bool {
+) -> Option<String> {
     let Ok(Some(cwd)) = targo_cwd(args, machine) else {
-        return false;
+        return Some(
+            "miri's sysroot setup cannot resolve Targo's effective working directory".into(),
+        );
     };
     let cwd = under_home(&cwd, home).unwrap_or(cwd);
     if super::cargo_var(super::ARTIFACT_DIR_ENV, tool, machine).is_some() {
-        return false;
+        return Some("miri's sysroot setup found an artifact directory environment variable (CARGO_BUILD_ARTIFACT_DIR or TARGO_BUILD_ARTIFACT_DIR)".into());
     }
     let at = super::Machine {
         cwd: Some(&cwd),
         ..*machine
     };
     let base = |name: &str| (machine.env)(name).map(|value| cwd.join(value));
-    let sysroot =
-        base("MIRI_SYSROOT").unwrap_or_else(|| home.join("Library/Caches/org.rust-lang.miri"));
+    let (sysroot, root_name, rustlib_name) = match base("MIRI_SYSROOT") {
+        Some(path) => (path, "MIRI_SYSROOT", "MIRI_SYSROOT/lib/rustlib"),
+        None => (
+            home.join("Library/Caches/org.rust-lang.miri"),
+            "the default Miri sysroot",
+            "the default Miri sysroot's lib/rustlib",
+        ),
+    };
     let shared = home.join("Library/Caches/aterm");
     let rustlib = sysroot.join("lib/rustlib");
-    for folder in base("TMPDIR").into_iter().chain([sysroot, rustlib]) {
+    let tmp = base("TMPDIR").map(|path| ("TMPDIR", path));
+    for (name, folder) in tmp
+        .into_iter()
+        .chain([(root_name, sysroot), (rustlib_name, rustlib)])
+    {
         // As the kernel resolves it, whatever its spelling: one under a folder of HOME atpkg
         // never looks into may still be, or hold, a link into one it manages.
         let Some(resolved) = physical(folder, Some(&cwd)).map(|folder| standing(&folder)) else {
-            return false;
+            return Some(format!("miri's sysroot setup cannot resolve {name}"));
         };
         let spelled = under_home(&resolved, home).unwrap_or(resolved);
         if spelled == home || scope(home, &spelled) || spelled.starts_with(&shared) {
-            return false;
+            return Some(format!(
+                "miri's sysroot setup was refused because {name} resolves to a location atpkg protects"
+            ));
         }
     }
-    !super::configs_name_artifacts(&cwd, tool, &at)
+    super::configs_name_artifacts(&cwd, tool, &at)
+        .then(|| "miri's sysroot setup cannot rule out an artifact directory configuration".into())
 }
 
-/// Whether the call `args`, the words typed, builds `cargo-miri`'s sysroot
+/// The reason the call `args`, the words typed, cannot build `cargo-miri`'s sysroot
 /// ([`super::miri_call`]'s `setup`: a `miri setup`, a verb it hands back with no `MIRI_SYSROOT`,
-/// or an alias the reader cannot tell where the call runs in the lane) somewhere
-/// [`miri_setup_clear`] does not clear.
-fn miri_setup_unclear(
+/// or an alias the reader cannot tell where the call runs in the lane).
+fn miri_setup_refusal(
     args: &[String],
     tool: super::Tool,
     home: &Path,
     machine: &super::Machine<'_>,
-) -> bool {
+) -> Option<String> {
     let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
     let alias = |verb: &str| user_alias(verb, args, tool, machine);
-    with_miri(&args[at..], tool, machine, |miri| {
+    if with_miri(&args[at..], tool, machine, |miri| {
         super::miri_call(&args[at..], tool, &alias, miri).setup
-    }) && !miri_setup_clear(home, &args[at..], tool, machine)
+    }) {
+        miri_setup_path_refusal(home, &args[at..], tool, machine)
+    } else {
+        None
+    }
 }
 
 /// One definition of an alias in a config file ([`user_alias`]): a string's words, an array's,
@@ -3319,7 +3337,7 @@ fn user_alias(
 /// [`READING_VERBS`], the [`RESOLVING_VERBS`] whose lockfile stays out of every target, help and
 /// clean, as the verb of the line Targo runs ([`super::targo_line`]: `h = "clean"` cleans),
 /// Targo's `miri clean`, which removes and builds nothing, and its `miri setup` where it builds
-/// nothing or builds where nothing atpkg records or protects lies ([`miri_setup_unclear`]; with
+/// nothing or builds where nothing atpkg records or protects lies ([`miri_setup_refusal`]; with
 /// no HOME, only where Targo refuses it for want of its lane). Clean must reach Cargo even for an
 /// unregistered target, without adopting it. A command name used as
 /// an option value, an external alias or lint argument proves none of this, nor does a line whose
@@ -3408,7 +3426,7 @@ fn non_producing_command(args: &[String], tool: super::Tool, machine: &super::Ma
                     // build writes nothing atpkg could record or must protect.
                     Some("setup") => machine.home.map_or_else(
                         || !super::in_lane(&args[at..], tool, machine.env),
-                        |home| !miri_setup_unclear(args, tool, home, machine),
+                        |home| miri_setup_refusal(args, tool, home, machine).is_none(),
                     ),
                     _ => false,
                 };
@@ -5106,10 +5124,8 @@ fn observe_for_producer_with_placement(
             selected,
         );
     }
-    if require_explicit && miri_setup_unclear(args, tool, home, machine) {
-        return Err(std::io::Error::other(
-            "miri's sysroot setup may build where atpkg manages builds, or where it cannot read; no build started",
-        ));
+    if require_explicit && let Some(why) = miri_setup_refusal(args, tool, home, machine) {
+        return Err(std::io::Error::other(why));
     }
     let query = in_every_home(&|machine| targo_query(args, tool, machine));
     if unsettled && !query {

@@ -14707,6 +14707,37 @@ fn a_defense_naming_unlanded_work_gets_the_hinted_check() {
     assert!(!open_work_strict(Some(&body)).is_empty(), "Land's reading");
 }
 
+/// LAND'S READINGS OF A REPLY ARE KEPT BY ITS WORDS, NOT ITS LENGTH: three replies of one length,
+/// two open on different clauses and one clean, read in turn on one thread, each get their own
+/// open work ([`land_open_of`]) and owed check's clause ([`land_hint_of`]), as Land reads them
+/// unremembered ([`land_open_words`], [`land_check::hint_clause`]). CONTROL: the three readings
+/// differ, so a reading kept for one reply and served for another shows.
+#[test]
+fn land_readings_are_kept_by_a_replys_words_not_its_length() {
+    let replies = [
+        "Merged the parser.\nNothing left: the lexer is parked on a branch for later.",
+        "Merged the parsers.\nNothing left: the WIP refactor stays on its own branch.",
+        "Merged the parser.\nNothing left: every change is merged and on remote main.",
+    ];
+    let unremembered =
+        replies.map(|reply| (land_open_words(Some(reply)), land_check::hint_clause(reply)));
+    assert!(
+        replies.iter().all(|reply| reply.len() == replies[0].len()),
+        "CONTROL: {replies:?}"
+    );
+    for (i, j) in [(0, 1), (1, 2), (0, 2)] {
+        assert_ne!(unremembered[i], unremembered[j], "CONTROL");
+    }
+    for i in [0, 1, 2, 0, 2, 1] {
+        assert_eq!(
+            (land_open_of(Some(replies[i])), land_hint_of(replies[i])),
+            unremembered[i],
+            "{}",
+            replies[i]
+        );
+    }
+}
+
 fn uncommitted_repo() -> crate::harness::repo_work::RepoWork {
     crate::harness::repo_work::RepoWork {
         repo: "/Users//a/Developer/parser".to_string(),
@@ -23388,6 +23419,235 @@ fn a_transcript_quoting_a_revoked_token_is_no_lost_login() {
     };
     let point = st.account_point(&walled, &cfg());
     assert!(lost(point), "{point:?}");
+}
+
+/// A LOGIN WALL THAT NAMES A BLOCKED PATH SHOWS NOTHING OF THE LOGIN (plan package UB-05):
+/// Claude Code puts its sign-in remedy before a 403 it is answered with, so `Please run /login ·
+/// API Error: 403 Forbidden` reads as a login wall, yet its words name no credential: the point
+/// says nothing of the tab's login (no `LoginSeen::Lost`, which the host records as a strike),
+/// and no lost login is told the host (`AccountPoint::LoginEnded`, which would mark the row
+/// signed out and run a sign-in against the same block).
+/// CONTROL: the remedy alone and `Login expired` under it are the login lost, and told.
+/// NEGATIVE CONTROLS (2026-11-18, each restored with cp from a backup plus touch, confirmed with
+/// cmp): with `login_seen` reading no strike cause, the 403 is `Some(Lost)`; before
+/// `point_moving` read one, the following tab's 403 was `Some(LoginEnded)`.
+#[test]
+fn a_login_wall_that_names_a_blocked_path_shows_nothing_of_the_login() {
+    let t = t0();
+    for (message, lost) in [
+        ("Please run /login · API Error: 403 Forbidden", false),
+        ("API Error: 403 Forbidden", false),
+        (
+            "Please run /login · API Error: 403 Attention Required! | Cloudflare",
+            false,
+        ),
+        ("Please run /login", true),
+        ("Login expired · Please run /login", true),
+    ] {
+        let r = TurnEndReading {
+            login_label: Some("work".to_owned()),
+            ..walled(WallKind::Auth, message, Some(Duration::from_secs(2)))
+        };
+        assert_eq!(r.login_wall_strikes(), lost, "{message}");
+        let mut st = TurnEndState::default();
+        st.observe(&r, t + MIN);
+        assert_eq!(
+            st.login_seen(&r),
+            lost.then_some(LoginSeen::Lost),
+            "{message}"
+        );
+        let point = st.account_point(&r, &cfg());
+        assert_eq!(
+            point == Some(AccountPoint::LoginEnded),
+            lost,
+            "{message}: {point:?}"
+        );
+    }
+}
+
+/// Claude Code's 403 named by its status alone under its sign-in remedy (aterm-phase's UB-05
+/// fixture, HAND-BUILT on the measured 2.1.310 rows).
+const STATUS_ALONE_403: &str =
+    include_str!("../../../../aterm-phase/src/fixtures/claude-2.1.310-wall-403-status-alone.txt");
+
+/// A MOVE ANSWERED BY A BLOCKED PATH STRIKES NOTHING OF THE MOVED-TO LOGIN (plan package UB-05):
+/// the moved-to process's turn that ends on `Please run /login · API Error: 403 Forbidden` met the
+/// machine's blocked path, which every account would meet: no `AccountBad::SignedOut` is
+/// answered (the host would strike the row, roll the pool back and sign it in against the same
+/// block), and the move stays awaited. The screen itself reads that wall as the API's outage
+/// (`answered_wall`), which answers nothing either.
+/// CONTROL: `Login expired` under the remedy, and the remedy alone, answer the move signed out.
+/// NEGATIVE CONTROL (2026-11-18, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `account_answer_as` reading no strike cause, the 403 answers `Bad(SignedOut)`.
+#[test]
+fn a_move_answered_by_a_blocked_path_strikes_nothing_of_the_moved_to_login() {
+    let t = t0();
+    for (message, struck) in [
+        ("Please run /login · API Error: 403 Forbidden", false),
+        ("Login expired · Please run /login", true),
+        ("Please run /login", true),
+    ] {
+        let mut st = TurnEndState::default();
+        st.restarted(
+            &to_account("pool-a", AccountAt::Wall),
+            true,
+            &session_wall(t),
+            t,
+        );
+        let first = advised(
+            &walled(WallKind::Auth, message, Some(Duration::from_secs(2))),
+            "pool-b",
+        );
+        assert_eq!(
+            st.account_answer(&first),
+            None,
+            "{message}: the old process's"
+        );
+        st.observe(&first, t + MIN);
+        let a = decide_turn_end(&st, &first, &cfg(), t + MIN);
+        st.acted(&a, &first, t + MIN);
+        let after = walled(WallKind::Auth, message, Some(Duration::from_secs(1)));
+        assert_eq!(
+            st.account_answer(&after),
+            struck.then_some(AccountAnswer::Bad(AccountBad::SignedOut)),
+            "{message}"
+        );
+        if !struck {
+            let shown = TurnEndReading {
+                worked: Some(Duration::from_secs(1)),
+                ..real_point(STATUS_ALONE_403)
+            };
+            assert_eq!(
+                shown.wall,
+                Some(answered_wall(WallKind::Auth, message)),
+                "the screen's 403 is the outage's"
+            );
+            assert_eq!(st.account_answer(&shown), None, "{message}: on the screen");
+        }
+    }
+}
+
+/// A `/login` TYPED AND LEFT AT A BLOCKED PATH ENDS NO ROSTER ROW'S LOGIN (plan package UB-05): a
+/// `/login` aterm typed at a login wall read `Please run /login · API Error: 403 Forbidden` before
+/// the roster named the row, its dialog backed out of once the row was named, leaves `Login
+/// interrupted` below the wall, whose words, as the track keeps them, name a blocked path: no
+/// `AccountPoint::LoginEnded` is told (the host would mark the row signed out and sign it in
+/// against the same block). The screen reads such a wall as the API's outage (`answered_wall`),
+/// at which no `/login` is typed; the gate holds for a login wall's track that kept those words
+/// all the same.
+/// CONTROL: the same `/login` typed and left at `Not logged in` tells the login's end.
+/// NEGATIVE CONTROL (2026-11-18, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `login_end_told`'s typed-and-left arm reading no strike cause, the 403 tells
+/// `LoginEnded`.
+#[test]
+fn a_login_typed_and_left_at_a_blocked_path_ends_no_rows_login() {
+    let t = t0();
+    let mut by_hand = cfg();
+    by_hand.relaunch = false;
+    for (message, ends) in [
+        ("Please run /login · API Error: 403 Forbidden", false),
+        ("Not logged in · Please run /login", true),
+    ] {
+        let gone = walled(WallKind::Auth, message, Some(Duration::from_secs(2)));
+        let mut st = TurnEndState::default();
+        let a = at_under(&mut st, &gone, t + MIN, &by_hand);
+        assert_eq!(
+            a.rule_id(),
+            Some(RULE_LOGIN),
+            "{message}: no roster row, so `/login`"
+        );
+        st.acted(&a, &gone, t + MIN);
+        // The hand-off drawn under the wall the `/login` was typed at, its words the wall's.
+        let handoff = TurnEndReading {
+            login_label: Some("m7-a".to_string()),
+            wall_message: message.to_string(),
+            ..real_point(aterm_phase::prompt::fixtures::LOGIN_HANDOFF)
+        };
+        assert_eq!(handoff.wall, Some(WallKind::Auth), "PRECONDITION");
+        let shown = t + MIN + Duration::from_secs(5);
+        let a = at_under(&mut st, &handoff, shown, &by_hand);
+        assert_eq!(
+            a,
+            TurnEndAction::Cancel {
+                rule_id: super::super::login::RULE_LOGIN_BACK_OUT
+            },
+            "{message}: aterm backs out of its own /login"
+        );
+        st.acted(&a, &handoff, shown);
+        let left = TurnEndReading {
+            login_label: Some("m7-a".to_string()),
+            ..real_point(aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED)
+        };
+        st.observe(&left, t + 2 * MIN);
+        assert!(st.login_typed_left(), "{message}: typed and left");
+        assert_eq!(
+            st.account_point(&left, &by_hand) == Some(AccountPoint::LoginEnded),
+            ends,
+            "{message}: {:?}",
+            st.account_point(&left, &by_hand)
+        );
+    }
+}
+
+/// A ROSTER ROW'S TAB AT A BLOCKED PATH IS RETRIED ON THE OUTAGE'S LADDER, NEVER LEFT WAITING ON A
+/// SIGN-IN (plan package UB-05): the screen's `Please run /login · API Error: 403 Forbidden` is
+/// the API's outage, as Cloudflare's page is (`answered_wall`), so a tab whose login is the
+/// roster row `work` waits out the outage's first rung and then types the outage's resume, and
+/// nothing says aterm signs `work` in again (no strike was told, so no sign-in would ever end that
+/// wait); no lost login is seen or told, and no person is told to sign in.
+/// CONTROL: the same tab at `Login expired` waits on the row's own sign-in.
+/// NEGATIVE CONTROL (2026-11-18, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `TurnEndReading::of` keeping the screen's `Auth`, the 403's tab waits `the login is gone:
+/// aterm signs work in again by itself`.
+#[test]
+fn a_rows_tab_at_a_blocked_path_is_retried_never_left_waiting_on_a_sign_in() {
+    use super::super::exception::exception_for;
+    use super::super::outlook::ExceptionKind;
+    let t = t0();
+    let r = renewable(&real_point(STATUS_ALONE_403), "work");
+    assert_eq!(
+        r.wall,
+        Some(WallKind::ApiError {
+            code: Some(403),
+            retryable: true,
+            cause: ApiCause::Server,
+        }),
+        "{}",
+        r.wall_message
+    );
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &r, t + MIN);
+    assert!(
+        matches!(
+            &a,
+            TurnEndAction::WaitUntil {
+                wait: WaitKind::Outage { .. },
+                why,
+                ..
+            } if !why.contains("signs")
+        ),
+        "the outage's first rung: {a:?}"
+    );
+    assert_eq!(st.login_seen(&r), None, "no lost login seen");
+    assert_eq!(st.account_point(&r, &cfg()), None, "no lost login told");
+    assert!(
+        exception_for(&st, &r, &cfg(), t + MIN).is_none_or(|e| e.kind != ExceptionKind::Login),
+        "no one is told to sign in"
+    );
+    let rung = t + MIN + st.timing.outage_first;
+    let a = at(&mut st, &r, rung);
+    assert_eq!(a.rule_id(), Some(RULE_OUTAGE_RESUME), "tried again: {a:?}");
+
+    let expired = renewable(
+        &real_point(aterm_phase::prompt::fixtures::LOGIN_EXPIRED_2_1_310),
+        "work",
+    );
+    assert_eq!(expired.wall, Some(WallKind::Auth), "CONTROL");
+    let a = at(&mut TurnEndState::default(), &expired, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("aterm signs work in again")),
+        "CONTROL: the row's own sign-in: {a:?}"
+    );
 }
 
 /// WHAT A TAB SHOWS OF ITS OWN LOGIN IS SAID FOR EVERY PROGRAM, WHATEVER THE ACCOUNTS' SWITCHES

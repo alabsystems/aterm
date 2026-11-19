@@ -9,6 +9,7 @@ pub mod brief;
 pub mod bus;
 pub mod field;
 pub mod fold;
+pub mod harness_stamp;
 pub mod journal;
 pub mod limit;
 pub mod line;
@@ -42,6 +43,7 @@ pub use fold::{
     TITLE_AS_FOLDER, TITLE_AS_PROGRAM, TITLE_AS_PROMPT, TITLE_AS_TASK, TitleSrc, is_birth,
     matters_src, title_src,
 };
+pub use harness_stamp::HarnessStamp;
 pub use limit::{
     Bucket, MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS, MARK_REFILL_MS, MarkLimiter, Owed,
 };
@@ -70,9 +72,9 @@ pub use turn::ClaimView;
 pub use turn::{
     ATTRIBUTION_MS, ActWord, Admission, AttributionView, Binding, BoundInput, Chose, ClaimEdge,
     ClaimedBox, ClaimedReport, EdgeOutcome, LastClose, SETTLE_MS, STEP_ACT_MS, STEP_INPUT_LEAD_MS,
-    ScreenStep, SettleCause, TX_TOOLS_MAX, TrackerView, TurnTracker, TxEvent, TxMark, TxPos,
-    TxState, TxView, Verdict, WallJudge, attributes, dismisses, rebase, settle_due, settle_out,
-    tx_close_at, within_lead,
+    ScreenStep, SettleCause, StreamSteps, StreamTurn, TX_TOOLS_MAX, TrackerView, TurnTracker,
+    TxEvent, TxMark, TxPos, TxState, TxView, Verdict, WallJudge, attributes, dismisses, rebase,
+    settle_due, settle_out, tx_close_at, within_lead,
 };
 pub use vocab::{
     Actor, Conf, FLEET_ACTOR_PREFIX, FLEET_NODE_HEAD, Kind, Lvl, Node, Op, RESERVED_ACTOR_WORDS,

@@ -770,6 +770,51 @@ fn retention_keeps_foreign_and_uncoordinated_files_and_removes_old_managed_logs(
     );
 }
 
+/// A pruned log takes its run record's archive and that archive's kin companion with it
+/// (`runs::archive_path`, `runs::kin_archive_path`), which no other pass removes; a kept log
+/// keeps both, and a companion that is no regular file is left as it is. NEGATIVE CONTROL:
+/// remove neither in `Candidate::remove`, and each pruned log's `.run` and `.kin` outlive it.
+#[cfg(unix)]
+#[test]
+fn a_pruned_log_takes_its_record_archive_and_kin_companion() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let outside = aterm_tempfile::tempdir().unwrap();
+    let target = outside.path().join("kept");
+    std::fs::write(&target, b"not the log's").unwrap();
+    let logs: Vec<_> = (0..LOGS_KEPT + 4)
+        .map(|i| {
+            let path = write_at(
+                dir.path(),
+                &format!("1700000000-{}.log", i + 2),
+                100 + i as u64,
+            );
+            let archive = crate::runs::archive_path(&path);
+            std::fs::write(&archive, b"run v=1\n").unwrap();
+            let kin = crate::runs::kin_archive_path(&archive);
+            if i == 0 {
+                std::os::unix::fs::symlink(&target, &kin).unwrap();
+            } else {
+                std::fs::write(&kin, b"kin v=1\n").unwrap();
+            }
+            path
+        })
+        .collect();
+    let _current = open_at(&dir.path().join("1700000001-123.log"), true).unwrap();
+    for (i, path) in logs.iter().enumerate() {
+        let archive = crate::runs::archive_path(path);
+        let kin = crate::runs::kin_archive_path(&archive);
+        assert_eq!(path.exists(), i >= 5, "{}", path.display());
+        assert_eq!(archive.exists(), i >= 5, "{}", archive.display());
+        assert_eq!(
+            std::fs::symlink_metadata(&kin).is_ok(),
+            i == 0 || i >= 5,
+            "{}",
+            kin.display()
+        );
+    }
+    assert_eq!(std::fs::read(&target).unwrap(), b"not the log's");
+}
+
 #[test]
 fn a_second_writer_and_a_generated_name_collision_never_truncate_a_log() {
     let dir = aterm_tempfile::tempdir().unwrap();

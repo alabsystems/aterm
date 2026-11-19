@@ -156,6 +156,10 @@ pub(super) fn status(paths: &Paths, here: &StatusHost<'_>) -> crate::Result<Exit
             Ok(None) => {}
             Err(error) => println!("log: unreadable ({error})"),
         }
+        // What this Mac's last format-2 log pass did; no line where none kept a record.
+        if let Some(line) = client::log_pass_line(paths, ago) {
+            println!("{line}");
+        }
     }
     match client::swarm_lease_holder(paths) {
         Ok(Some(holder)) => println!("vault steward: {holder}"),

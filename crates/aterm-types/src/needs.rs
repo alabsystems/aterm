@@ -38,6 +38,9 @@ pub enum NeedWord {
     Memory,
     /// Any other wall nobody answers.
     Wall,
+    /// aterm's harness watchdog ended the tab's harness (dead, or deaf to `restart`) and nothing
+    /// supervises the tab until it is relaunched.
+    Unsupervised,
     /// A keyed attention entry of kind ask: someone asked for the owner.
     Ask,
     /// An approval box no harness presses.
@@ -48,13 +51,14 @@ pub enum NeedWord {
 
 impl NeedWord {
     /// Every word, in precedence order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Frozen,
         Self::Stopped,
         Self::Stalled,
         Self::Login,
         Self::Memory,
         Self::Wall,
+        Self::Unsupervised,
         Self::Ask,
         Self::Approval,
         Self::Question,
@@ -70,6 +74,7 @@ impl NeedWord {
             Self::Login => "login",
             Self::Memory => "memory",
             Self::Wall => "wall",
+            Self::Unsupervised => "unsupervised",
             Self::Ask => "ask",
             Self::Approval => "approval",
             Self::Question => "question",
@@ -91,7 +96,8 @@ impl NeedWord {
             | Self::Stalled
             | Self::Login
             | Self::Memory
-            | Self::Wall => Severity::Stuck,
+            | Self::Wall
+            | Self::Unsupervised => Severity::Stuck,
             Self::Ask | Self::Approval | Self::Question => Severity::Decide,
         }
     }

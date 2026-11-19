@@ -4,7 +4,8 @@
 //! The vault checkpoint as a pure function of the log (`docs/DESIGN-vault-log-2026-11-14.md`
 //! step 4, tracker FL-148b): its cut, the records a prune at the cut keeps and drops, the digests
 //! its body names, when it is final, and when a seat may share it. Nothing here signs, prunes or
-//! writes: FL-148c applies a final checkpoint and FL-148f signs one.
+//! writes: [`super::rooted`] applies a final checkpoint, and [`super::pass`] chooses the one a
+//! seat shares and the one a node prunes at.
 //!
 //! Every function reads record frames alone: headers, parents, the clear fields of a version-2
 //! `Put` or `Delete` (audience, epoch, its [`Statement`]), and the weighed records. No audience
@@ -113,12 +114,14 @@
 //! A false statement then reaches only entries its author could overwrite or delete itself. The
 //! prune of a log a final checkpoint already pruned matches the
 //! prune of the whole one only where every op a kept op superseded is named by a kept op:
-//! FL-148f's writer names them, and FL-148c's union and evaluation tests judge it.
+//! the version-2 writer names them ([`super::writer`]), and FL-148c's union and evaluation tests
+//! judge it.
 //!
 //! A `Statement`'s `carries` must name the value's semantic representative, the earliest op of
 //! its carry chain (`register.reps` in `entries.rs`), and not merely the op the writer read the
 //! value from: the keep set follows `carries` one step per kept op, and a version-1 reseal states
-//! nothing, so a chain through one ends there. FL-148f's writer names the representative itself.
+//! nothing, so a chain through one ends there. The version-2 writer names the representative
+//! itself ([`super::writer`]).
 //! Every log, whole or rooted, reads a version-2 op by its statement alone ([`super::rooted`]): a
 //! `Put`'s `carries`, and a `Delete`'s `supersedes`, which must name every op it read as live (a
 //! `Delete` over `Delete`s alone is a carry of their winner, and carries nothing a statement can

@@ -607,10 +607,10 @@ pub mod tether;
 /// What a run read and compared while a thread's scope was armed (file stamps, listings, owners' standings, watched generations, wall and monotonic bounds), whether running it again could answer otherwise ([`trace::Trace::stands`]), and when it may stop standing on its own ([`trace::Trace::horizon`]).
 pub mod trace;
 
-/// A scratch world's words (`aterm_types::world`), mounted from that crate's own `std`-only file,
-/// so the LAN client's ask of the root broker (`lan::install`) reads the same mark
+/// A scratch world's layout (`aterm_types::world`), mounted from that crate's own `std`-only
+/// file, so the LAN client's ask of the root broker (`lan::install`) reads the same mark
 /// ([`world::MARKER`]) and sends nothing from a world.
-#[path = "../../aterm-types/src/world_words.rs"]
+#[path = "../../aterm-types/src/world_layout.rs"]
 pub mod world;
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]

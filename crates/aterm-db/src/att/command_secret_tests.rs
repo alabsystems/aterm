@@ -71,6 +71,8 @@ fn secret_get_scan_export_history_and_unknown_reader() {
         awaiting: crate::typed::Awaiting::NONE,
         refused: vec![],
         refusals: vec![],
+        state: Default::default(),
+        claims_floor: None,
         cells_from: None,
     };
     const OLD: Collection = Collection {

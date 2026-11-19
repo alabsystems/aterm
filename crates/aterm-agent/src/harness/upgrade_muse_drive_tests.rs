@@ -13,7 +13,7 @@ use crate::harness::relaunch::{AgentRun, ExitCause, ExitRecord, MuseRun, Snapsho
 use crate::harness::upgrade_drive::load;
 use crate::supervise::ScratchDir;
 
-const TAB: &str = "s-0123456789abcdef4d55";
+const TAB: &str = "t0123454d55";
 const TOKEN: &str = "0badf00d0badf00d";
 /// The session the crashed Muse held; another a `/new` moved it to.
 const S1: &str = "01a148f8-9301-7752-96db-fef456f88074";

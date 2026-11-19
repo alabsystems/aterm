@@ -87,6 +87,7 @@ impl Peer {
             parents,
             authored_ms: 7,
             body,
+            statement: None,
         }
         .sign(&self.seed, self.incarnation)
         .unwrap();

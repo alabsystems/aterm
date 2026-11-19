@@ -781,6 +781,9 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
             Kind::Refused => f
                 .u(Key::In, 3)
                 .and_then(|f| f.text(Key::Text, "no relaunch grant")),
+            Kind::Msg | Kind::Diff => f
+                .u(Key::Hseq, 9)
+                .and_then(|f| f.id(Key::Fp, "0123456789abcdef0123456789abcdef01234567")),
             _ => Ok(f),
         }
         .expect("fields")
@@ -818,6 +821,8 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
         Kind::Tab,
         Kind::Desc,
         Kind::Refused,
+        Kind::Msg,
+        Kind::Diff,
     ];
     for i in 0..12u64 {
         for k in kinds {

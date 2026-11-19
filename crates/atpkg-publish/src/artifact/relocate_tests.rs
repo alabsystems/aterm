@@ -230,8 +230,16 @@ impl Backend for ScriptedBackend {
     fn repoint_dep(&self, _path: &Path, _from: &str, _basename: &str) -> Result<(), String> {
         Ok(())
     }
-    fn fix_rpaths(&self, _: &Path, _: &str, _: &[String], _: &[String]) -> Result<(), String> {
-        Ok(())
+    fn fix_rpaths(
+        &self,
+        path: &Path,
+        origin: &str,
+        _: &[String],
+        _: &[String],
+    ) -> Result<(), String> {
+        let mut image = std::fs::read(path).map_err(|e| e.to_string())?;
+        image.extend_from_slice(format!("|rpath={origin}").as_bytes());
+        std::fs::write(path, image).map_err(|e| e.to_string())
     }
     fn resign(&self, path: &Path, _sign_id: Option<&str>) -> Result<(), String> {
         let mut bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -449,6 +457,122 @@ fn explicit_donor_libraries_resolve_portable_and_transitive_rpaths() {
         assert!(copy.starts_with(&original_bytes));
         assert!(copy.ends_with(b"|sig"));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn only_imports_resolved_from_the_vendor_directory_gain_its_rpath() {
+    let (_dir, d) = scratch("mixed-runtime");
+    let stage = d.join("stage");
+    let seal = d.join("seal");
+    let vendor = stage.join(VENDOR_REL);
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::create_dir_all(seal.join("lib")).unwrap();
+    std::fs::write(stage.join("lib/libdriver.dylib"), b"OBJ driver").unwrap();
+    std::fs::write(vendor.join("libused.so"), b"OBJ runtime").unwrap();
+    std::fs::write(seal.join("lib/libSystem.B.dylib"), b"OBJ donor").unwrap();
+
+    let mut refs = BTreeMap::new();
+    let vendor_rpath = "@loader_path/../lib/atpkg-vendored";
+    for (name, dep, rpath) in [
+        ("system", "/usr/lib/libSystem.B.dylib", ""),
+        ("direct", "@loader_path/../lib/libdriver.dylib", ""),
+        ("compiler", "@rpath/libdriver.dylib", "@loader_path/../lib"),
+        ("already", "@rpath/libused.so", vendor_rpath),
+        ("needs-rpath", "@rpath/libused.so", ""),
+        ("bare-name", "libused.so", ""),
+    ] {
+        let path = stage.join("bin").join(name);
+        std::fs::write(&path, b"OBJ caller").unwrap();
+        refs.insert(
+            path,
+            ObjectRefs {
+                needed: vec![dep.into()],
+                rpaths: (!rpath.is_empty())
+                    .then(|| rpath.to_owned())
+                    .into_iter()
+                    .collect(),
+                ..ObjectRefs::default()
+            },
+        );
+    }
+    let report = relocate_with(&stage, &ScriptedBackend { refs }, None, &[seal]).unwrap();
+    report.require_self_contained().unwrap();
+    assert!(!vendor.join("libSystem.B.dylib").exists());
+    for name in ["system", "direct", "compiler", "already"] {
+        assert_eq!(
+            std::fs::read(stage.join("bin").join(name)).unwrap(),
+            b"OBJ caller",
+            "{name}"
+        );
+    }
+    for name in ["needs-rpath", "bare-name"] {
+        assert_eq!(
+            std::fs::read_to_string(stage.join("bin").join(name)).unwrap(),
+            format!("OBJ caller|rpath={vendor_rpath}|sig"),
+            "{name}"
+        );
+    }
+    assert_eq!(report.rewritten, 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_relocator_preserves_a_system_only_macho_in_a_mixed_payload() {
+    let (_dir, d) = scratch("native-portable");
+    let stage = d.join("stage");
+    let tool = stage.join("bin/portable");
+    std::fs::copy("/usr/bin/true", &tool).unwrap();
+    let original = std::fs::read(&tool).unwrap();
+    let donor = d.join("donor");
+    let lib = donor.join("lib/libanswer.dylib");
+    std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+    let source = d.join("fixture.c");
+    let consumer = stage.join("bin/uses-vendor");
+    std::fs::write(&source, "int answer(void) { return 4; }").unwrap();
+    let output = aterm_uds::spawnfd::command("/usr/bin/cc")
+        .args(["-dynamiclib", "-Wl,-install_name,@rpath/libanswer.dylib"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&lib)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::write(
+        &source,
+        "int answer(void); int main(void) { return answer() != 4; }",
+    )
+    .unwrap();
+    let output = aterm_uds::spawnfd::command("/usr/bin/cc")
+        .arg("-Wl,-headerpad_max_install_names")
+        .arg(&source)
+        .arg(&lib)
+        .arg("-o")
+        .arg(&consumer)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report = relocate_stage(&stage, None, &[donor]).unwrap();
+    report.require_self_contained().unwrap();
+    assert_eq!(report.rewritten, 1);
+    assert_eq!(report.vendored, ["libanswer.dylib"]);
+    assert!(
+        macho::MachoBackend
+            .read_refs(&consumer)
+            .unwrap()
+            .rpaths
+            .contains(&"@loader_path/../lib/atpkg-vendored".to_owned())
+    );
+    assert_eq!(std::fs::read(tool).unwrap(), original);
 }
 
 #[cfg(unix)]

@@ -534,6 +534,7 @@ impl Fixture {
             parents,
             authored_ms: 100 + sequence,
             body: Body::Name { name: name.into() },
+            statement: None,
         }
         .sign(&WRITER, INCARNATION)
         .unwrap()

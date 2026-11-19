@@ -11,7 +11,7 @@ use crate::harness::{FakeInstanceLog, UNANSWERED, fake_instance};
 use crate::supervise::ScratchDir;
 use aterm_spec::wait::MUST_HAPPEN;
 
-const TAB: &str = "s-0ddba11c0ffee0ddba11";
+const TAB: &str = "t0ddba11c0f";
 const SESSION: &str = "0ddba11c-1111-2222-3333-444455556666";
 const TOKEN: &str = "hang-tok";
 /// The bound a test gives an exchange it leaves unanswered, waited out in full.

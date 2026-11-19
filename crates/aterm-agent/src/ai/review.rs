@@ -47,6 +47,11 @@ pub enum Verdict {
     Failed,
     /// It was not run.
     Skipped,
+    /// Its path to the vendor was blocked or did not answer, and nothing about its login was
+    /// answered (plan package UB-05): a page in the API's place ([`aterm_phase::wall::edge_block`]),
+    /// a login wall whose cause is a blocked path ([`aterm_phase::wall::StrikeCause::Blocked`]:
+    /// a 403 named by its status alone under Claude Code's remedy), or an unreachable route.
+    Unreached,
 }
 
 impl Verdict {
@@ -60,13 +65,17 @@ impl Verdict {
             Verdict::Timeout => "timeout",
             Verdict::Failed => "failed",
             Verdict::Skipped => "skipped",
+            Verdict::Unreached => "unreached",
         }
     }
 
     /// Whether the next reviewer in order is tried in its place.
     #[must_use]
     pub const fn falls_through(self) -> bool {
-        matches!(self, Verdict::Auth | Verdict::Limit | Verdict::Failed)
+        matches!(
+            self,
+            Verdict::Auth | Verdict::Limit | Verdict::Failed | Verdict::Unreached
+        )
     }
 }
 
@@ -409,18 +418,47 @@ pub fn verdict_of(
             // Cloudflare`): a network block the login did not cause and no sign-in moves.
             if aterm_phase::wall::edge_block(&said) {
                 (
-                    Verdict::Failed,
+                    Verdict::Unreached,
                     Some("Cloudflare's block page answered in the API's place".to_string()),
                 )
             } else if c.auth_words.iter().any(|w| said.contains(w)) {
-                (
-                    Verdict::Auth,
-                    Some("its login could not authenticate".to_string()),
-                )
+                // A login wall is the login's end only where its words name a refused credential
+                // or no cause: a 403 whose body names no credential under the remedy (`Please run
+                // /login · API Error: 403 Forbidden`), or a page in the API's place after a 403
+                // or a 503 (Codex's response error included, whose `cf-ray` diagnostic is no
+                // page), is a blocked path.
+                if aterm_phase::wall::strike_cause(&said).strikes() {
+                    (
+                        Verdict::Auth,
+                        Some("its login could not authenticate".to_string()),
+                    )
+                } else {
+                    (
+                        Verdict::Unreached,
+                        Some(
+                            "its path to the vendor was blocked, not its login: a page in the \
+                             API's place, or a 403 that names no credential"
+                                .to_string(),
+                        ),
+                    )
+                }
             } else if c.limit_words.iter().any(|w| said.contains(w)) {
                 (
                     Verdict::Limit,
                     Some("its usage limit is reached".to_string()),
+                )
+            } else if said.lines().any(|line| {
+                matches!(
+                    aterm_phase::classify_wall(line),
+                    Some(alab_policy::vocab::WallKind::ApiError {
+                        cause: alab_policy::vocab::ApiCause::Unreachable,
+                        ..
+                    })
+                )
+            }) {
+                (
+                    Verdict::Unreached,
+                    Some("the vendor did not answer: its route was unreachable".to_string()),
                 )
             } else {
                 (
@@ -673,7 +711,7 @@ fn run_one(h: &Host<'_>, prepared: &PreparedReview, ask: &Ask<'_>) -> (Answer, O
         let clean = sanitize_block(raw, raw.len());
         let (text, _) = redact(&strip_markers(&clean));
         answer.text = Some(sanitize_block(&text, ANSWER_MAX));
-    } else if verdict == Verdict::Failed
+    } else if matches!(verdict, Verdict::Failed | Verdict::Unreached)
         && let Ok(r) = &ran
         && let Some(last) = r
             .stderr
@@ -694,6 +732,7 @@ fn run_one(h: &Host<'_>, prepared: &PreparedReview, ask: &Ask<'_>) -> (Answer, O
     let outcome = match verdict {
         Verdict::Served => Some(Outcome::Worked),
         Verdict::Auth => Some(Outcome::Ended(Ended::ReviewAuth)),
+        Verdict::Unreached => Some(Outcome::Ended(Ended::Unreached)),
         Verdict::Limit => Some(Outcome::Limited(Some(
             (h.now)().saturating_add(LIMIT_WAIT_S),
         ))),
@@ -1413,6 +1452,7 @@ pub fn answers_of(json: &str) -> Option<(String, PathBuf, Vec<Answer>)> {
             "limit" => Verdict::Limit,
             "timeout" => Verdict::Timeout,
             "skipped" => Verdict::Skipped,
+            "unreached" => Verdict::Unreached,
             _ => Verdict::Failed,
         };
         answers.push(Answer {

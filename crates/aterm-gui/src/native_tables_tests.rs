@@ -4236,8 +4236,8 @@ fn the_tables_page_lists_every_registry_collection() {
     let listed = crate::tables_store::listed(handle.compiled().table);
     assert_eq!(
         listed.len(),
-        17,
-        "eighteen collections, archived not listed"
+        18,
+        "twenty collections, archived and history not listed"
     );
     let read: Vec<&str> = app
         .native_runtime

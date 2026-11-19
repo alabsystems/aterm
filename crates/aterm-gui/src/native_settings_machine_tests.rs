@@ -977,6 +977,34 @@ mod read {
         assert_eq!(value(&route), "Heron", "a second Escape changes no field");
     }
 
+    #[test]
+    fn a_spelling_that_displays_the_saved_name_leaves_only_a_numeric_edit_to_save() {
+        let names = Names::authorized(Ok(true));
+        let scratch = named(Class::Chosen, 7, "Dog");
+        publish_all(&scratch, &names);
+        let mut route = machine_route(page(1, found(&scratch, &[], &names), false));
+        assert!(act(&mut route, NAME_FIELD_NICK, Some("dog")).is_empty());
+        assert!(!primary(&route).1);
+        assert!(act(&mut route, NAME_FIELD_NUMBER, Some("8")).is_empty());
+        assert_eq!(
+            act(&mut route, NAME_SAVE, None),
+            [MachineRequest::Save {
+                rev: 1,
+                number: Some("8".to_owned()),
+                nick: None,
+            }]
+        );
+        rename(&scratch, Class::Chosen, 8, "Puffin");
+        publish(&mut route, page(2, found(&scratch, &[], &names), false), 2);
+        assert_eq!(
+            whole(&route)
+                .semantic(&UiKey::new(NAME_FIELD_NICK))
+                .unwrap()
+                .value,
+            SemanticValue::Text("Puffin".into())
+        );
+    }
+
     /// A field the person did not type into follows each read; a typed one keeps its words.
     #[test]
     fn an_untouched_field_follows_a_new_read_and_a_typed_one_does_not() {

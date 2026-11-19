@@ -906,6 +906,8 @@ struct ChromeFonts {
     measures: MeasureMemo,
     /// The glyphs rasters drew, kept for the next ([`GlyphMemo`]).
     glyphs: GlyphMemo,
+    /// The pixels rasters' glyph texels blended, kept for the next ([`GlyphBlends`]).
+    glyph_blends: GlyphBlends,
     /// Chars chrome text measured or drew with no face of this stack ([`chrome_text_holes`]).
     text_holes: u64,
 }
@@ -1201,6 +1203,7 @@ fn default_chrome_fonts() -> ChromeFonts {
         semantic_prewarm_ms: None,
         measures: MeasureMemo::default(),
         glyphs: GlyphMemo::default(),
+        glyph_blends: GlyphBlends::default(),
         text_holes: 0,
     }
 }
@@ -1332,6 +1335,38 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn linear_composites() -> u64 {
     LINEAR_COMPOSITES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static GLYPH_TEXELS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLYPH_BLENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// While set, [`Canvas::blend_glyph_texel`] blends as it did before it kept its pixels
+    /// ([`Canvas::blend_glyph_texel_as_before`], the tests' oracle).
+    static TEXELS_AS_BEFORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The glyph texels this thread has blended onto a canvas, inside its clip, so far (test-only).
+#[cfg(test)]
+pub(crate) fn glyph_texels() -> u64 {
+    GLYPH_TEXELS.with(std::cell::Cell::get)
+}
+
+/// The glyph texels' pixels this thread has worked out, not found kept ([`GlyphBlends`]), so far
+/// (test-only).
+#[cfg(test)]
+pub(crate) fn glyph_blends() -> u64 {
+    GLYPH_BLENDS.with(std::cell::Cell::get)
+}
+
+/// `draw` with every glyph texel blended as before [`GlyphBlends`] (test-only): the oracle
+/// [`Canvas::blend_glyph_texel_as_before`] in place of the kept pixels.
+#[cfg(test)]
+pub(crate) fn with_texels_as_before<R>(draw: impl FnOnce() -> R) -> R {
+    TEXELS_AS_BEFORE.with(|on| on.set(true));
+    let drawn = draw();
+    TEXELS_AS_BEFORE.with(|on| on.set(false));
+    drawn
 }
 
 #[cfg(test)]
@@ -1554,12 +1589,17 @@ fn install_chrome_faces_locked(
     fonts.glyphs = GlyphMemo::default();
 }
 
-/// Drop the glyphs rasters keep for the next ([`GlyphMemo`]), as a window's scale change and a
-/// theme change do. Neither could make a kept glyph draw stale, as its key names its size in device
-/// px and its bitmap is coverage alone: the drop frees what the old scale drew, and starts the
-/// memo again with the chrome a new theme redraws.
+/// Drop the glyphs rasters keep for the next ([`GlyphMemo`]) and the pixels their texels blended
+/// ([`GlyphBlends`]), as a window's scale change and a theme change do. Neither could make a kept
+/// glyph or blend draw stale, as a glyph's key names its size in device px and its bitmap is
+/// coverage alone, and a blend's key names its ink, its ground and its coverage: the drop frees
+/// what the old scale drew, and starts the memos again with the chrome a new theme redraws, in
+/// its own inks on its own grounds.
 pub(crate) fn forget_kept_glyphs() {
-    with_fonts(|fonts| fonts.glyphs = GlyphMemo::default());
+    with_fonts(|fonts| {
+        fonts.glyphs = GlyphMemo::default();
+        fonts.glyph_blends = GlyphBlends::default();
+    });
 }
 
 /// How many glyphs rasters keep for the next on this test thread ([`GlyphMemo`]).
@@ -3579,6 +3619,88 @@ impl RimMemo {
     }
 }
 
+/// The pixels glyph texels blended ([`Canvas::blend_glyph_texel`]), kept per ink and ground.
+/// A texel's blend is a function of its ink, the pixel under it and its coverage alone: the
+/// contrast correction reads the ink's and the ground's luminance and the coverage, and the
+/// linear composite the two pixels and the corrected alpha. Text over one ground so works out
+/// each coverage's pixel once (the correction's three sRGB transfers, two of them `powf`, and
+/// the composite's three encodes) and copies it after. Kept from one raster to the next in
+/// [`ChromeFonts::glyph_blends`] ([`rasterize_tray_on_canvas`]), as the glyphs are: a reading of
+/// the Deck draws the inks on the grounds the reading before it drew.
+#[derive(Default)]
+struct GlyphBlends {
+    grounds: Vec<GlyphGround>,
+    /// The place the last texel's ink and ground took, tried first.
+    last: usize,
+}
+
+/// The pixels one ink's texels blended over one ground, by coverage.
+struct GlyphGround {
+    /// The ink and the pixel under the texel, each as `u32::from_ne_bytes` reads it.
+    key: (u32, u32),
+    /// The texels that took this place, halved at each raster's start ([`GlyphBlends::begin`]).
+    uses: u32,
+    /// The coverages whose pixel `became` holds, a bit each.
+    held: [u64; 4],
+    became: [[u8; 4]; 256],
+}
+
+/// The inks and grounds [`GlyphBlends`] keeps (about 1 KiB each). Text lands on a few grounds
+/// for most of its texels (a panel's fill, under each ink) and on many for a few (a pixel a
+/// neighbouring glyph or a stroke already blended): the laws' cards of the Deck's words meet 245
+/// to 253 inks and grounds at 1x and 68 or 69 at 2x set as the Deck sets them, and 30 set apart.
+/// Past them a new one takes the place fewest texels took lately, so the few that most texels
+/// land on stay kept.
+const GLYPH_BLEND_GROUNDS: usize = 32;
+
+impl GlyphBlends {
+    /// Start a raster: the uses kept so far count half, so an ink or a ground no raster draws
+    /// any longer gives up its place.
+    fn begin(&mut self) {
+        for ground in &mut self.grounds {
+            ground.uses /= 2;
+        }
+    }
+
+    /// The place `key`'s pixels are kept in, which a texel now takes: the one that holds it,
+    /// else a new one, else the one fewest texels took lately, its pixels dropped.
+    fn place(&mut self, key: (u32, u32)) -> usize {
+        let at = if self
+            .grounds
+            .get(self.last)
+            .is_some_and(|ground| ground.key == key)
+        {
+            self.last
+        } else if let Some(at) = self.grounds.iter().position(|ground| ground.key == key) {
+            at
+        } else if self.grounds.len() < GLYPH_BLEND_GROUNDS {
+            self.grounds.push(GlyphGround {
+                key,
+                uses: 0,
+                held: [0; 4],
+                became: [[0; 4]; 256],
+            });
+            self.grounds.len() - 1
+        } else {
+            let mut at = 0;
+            for (place, ground) in self.grounds.iter().enumerate() {
+                if ground.uses < self.grounds[at].uses {
+                    at = place;
+                }
+            }
+            let ground = &mut self.grounds[at];
+            ground.key = key;
+            ground.uses = 0;
+            ground.held = [0; 4];
+            at
+        };
+        let ground = &mut self.grounds[at];
+        ground.uses = ground.uses.saturating_add(1);
+        self.last = at;
+        at
+    }
+}
+
 struct Canvas {
     origin_x: i32,
     origin_y: i32,
@@ -3587,7 +3709,7 @@ struct Canvas {
     px: Vec<u8>,
     glyphs: GlyphMemo,
     clip: Vec<(i32, i32, i32, i32)>,
-    glyph_remap: (u32, u32, [f32; 256]),
+    glyph_blends: GlyphBlends,
     fade: Vec<FadeLayer>,
     /// How many [`DrawPrim::SubpixelPush`]es are open: while any is, panels and rims keep
     /// their sub-pixel places instead of the device grid.
@@ -3650,7 +3772,7 @@ impl Canvas {
             px,
             glyphs: GlyphMemo::default(),
             clip: Vec::new(),
-            glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
+            glyph_blends: GlyphBlends::default(),
             fade: Vec::new(),
             subpixel: 0,
         }
@@ -4001,7 +4123,15 @@ impl Canvas {
         last.0 >= x0 && last.1 >= y0 && first.0 < x1 && first.1 < y1
     }
 
+    /// Blend a glyph texel of ink `c` at `coverage` over pixel `(x, y)`, if it lies on the
+    /// canvas and inside the clip: its pixel is the one [`Self::composite_glyph_texel`] works
+    /// out, kept per ink, ground and coverage ([`GlyphBlends`]).
     fn blend_glyph_texel(&mut self, x: i32, y: i32, c: [u8; 4], coverage: u8) {
+        #[cfg(test)]
+        if TEXELS_AS_BEFORE.with(std::cell::Cell::get) {
+            self.blend_glyph_texel_as_before(x, y, c, coverage);
+            return;
+        }
         if coverage == 0 {
             return;
         }
@@ -4010,27 +4140,48 @@ impl Canvas {
         if local_x < 0 || local_y < 0 || local_x as u32 >= self.w || local_y as u32 >= self.h {
             return;
         }
-        let plain = f32::from(coverage) / 255.0;
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clip.last()
+            && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
+        {
+            return;
+        }
         let i = ((local_y as u32 * self.w + local_x as u32) * 4) as usize;
+        #[cfg(test)]
+        GLYPH_TEXELS.with(|n| n.set(n.get() + 1));
+        let place = self
+            .glyph_blends
+            .place((u32::from_ne_bytes(c), self.pixel_word(i)));
+        let (word, bit) = (usize::from(coverage / 64), 1_u64 << (coverage % 64));
+        let ground = &self.glyph_blends.grounds[place];
+        if ground.held[word] & bit != 0 {
+            self.px[i..i + 4].copy_from_slice(&ground.became[usize::from(coverage)]);
+            return;
+        }
+        self.composite_glyph_texel(x, y, i, c, coverage);
+        let ground = &mut self.glyph_blends.grounds[place];
+        ground.held[word] |= bit;
+        ground.became[usize::from(coverage)].copy_from_slice(&self.px[i..i + 4]);
+    }
+
+    /// Blend a glyph texel of ink `c` at `coverage` (not 0) over pixel `(x, y)`, which is the
+    /// canvas's pixel `i` and inside the clip. A partial texel over a pixel with any alpha is
+    /// corrected for contrast as terminal text is ([`aterm_render::correct_alpha`], from the
+    /// ink's and the pixel's luminance), so dark text on a light ground is as heavy as light text
+    /// on a dark one; a full texel, or one over a clear pixel, blends at its plain coverage.
+    fn composite_glyph_texel(&mut self, x: i32, y: i32, i: usize, c: [u8; 4], coverage: u8) {
+        #[cfg(test)]
+        GLYPH_BLENDS.with(|n| n.set(n.get() + 1));
+        let plain = f32::from(coverage) / 255.0;
         if coverage == u8::MAX || self.px[i + 3] == 0 {
             self.blend(x, y, c, plain);
             return;
         }
         let pack = |p: &[u8]| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]);
-        let ink = pack(&c[..3]);
-        let ground = pack(&self.px[i..i + 3]);
-        if (self.glyph_remap.0, self.glyph_remap.1) != (ink, ground) {
-            self.glyph_remap = (ink, ground, [f32::NAN; 256]);
-        }
-        let slot = &mut self.glyph_remap.2[usize::from(coverage)];
-        if slot.is_nan() {
-            *slot = aterm_render::correct_alpha(
-                aterm_render::linear_luminance(ink),
-                aterm_render::linear_luminance(ground),
-                plain,
-            );
-        }
-        let corrected = *slot;
+        let corrected = aterm_render::correct_alpha(
+            aterm_render::linear_luminance(pack(&c[..3])),
+            aterm_render::linear_luminance(pack(&self.px[i..i + 3])),
+            plain,
+        );
         self.blend(x, y, c, corrected);
     }
 }
@@ -5482,7 +5633,7 @@ pub(crate) fn composite_rgba_surface(
         px: std::mem::take(destination),
         glyphs: GlyphMemo::default(),
         clip: Vec::new(),
-        glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
+        glyph_blends: GlyphBlends::default(),
         fade: Vec::new(),
         subpixel: 0,
     };
@@ -5548,6 +5699,8 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
     with_fonts(|fonts| {
         cv.glyphs = std::mem::take(&mut fonts.glyphs);
         cv.glyphs.begin();
+        cv.glyph_blends = std::mem::take(&mut fonts.glyph_blends);
+        cv.glyph_blends.begin();
         let mut frames: Vec<(usize, Rc<aterm_render::Frame>)> = Vec::new();
         match occluding_specimen(prims, scale, &cv, &mut frames) {
             Some((cover, covered)) => {
@@ -5613,6 +5766,7 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
         }
         fonts.glyphs = std::mem::take(&mut cv.glyphs);
         fonts.glyphs.trim();
+        fonts.glyph_blends = std::mem::take(&mut cv.glyph_blends);
         cv.px
     })
 }

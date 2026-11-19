@@ -199,15 +199,23 @@ impl MachineRow {
     }
 }
 
-/// The three cells of a measure: used, capacity, and when the newer of the two was read.
+/// The older of two read times, either where the other is unread: a figure made of both is
+/// never dated newer than the older read it holds.
+fn older(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The three cells of a measure: used, capacity, and when the older of the two was read.
 fn pair(cells: &mut Vec<Cell>, pair: &Pair<u64>) {
     cells.push(Cell::read(pair.used.map(|at| at.v)));
     cells.push(Cell::read(pair.capacity.map(|at| at.v)));
-    cells.push(Cell::read(
-        pair.used
-            .map(|at| at.at_ms)
-            .max(pair.capacity.map(|at| at.at_ms)),
-    ));
+    cells.push(Cell::read(older(
+        pair.used.map(|at| at.at_ms),
+        pair.capacity.map(|at| at.at_ms),
+    )));
 }
 
 /// The machines relation.
@@ -291,7 +299,7 @@ pub static MACHINES: Schema = Schema {
         opt(
             "facts_at",
             Ty::Time,
-            "when build, disk_free_mb and the updater's standing were read",
+            "when the oldest of build, disk_free_mb and the updater's standing was read",
         ),
         opt(
             "disk_free_mb",
@@ -300,19 +308,39 @@ pub static MACHINES: Schema = Schema {
         ),
         opt("cpu_used_x100", Ty::Uint, "cores busy, hundredths"),
         opt("cpu_cores", Ty::Uint, "cores"),
-        opt("cpu_at", Ty::Time, "when the cpu pair was read"),
+        opt(
+            "cpu_at",
+            Ty::Time,
+            "when the older side of the cpu pair was read",
+        ),
         opt("mem_used_mb", Ty::Uint, "memory in use, MiB"),
         opt("mem_total_mb", Ty::Uint, "memory installed, MiB"),
-        opt("mem_at", Ty::Time, "when the memory pair was read"),
+        opt(
+            "mem_at",
+            Ty::Time,
+            "when the older side of the memory pair was read",
+        ),
         opt("gpu_used_x100", Ty::Uint, "GPU cores busy, hundredths"),
         opt("gpu_cores", Ty::Uint, "GPU cores"),
-        opt("gpu_at", Ty::Time, "when the GPU pair was read"),
+        opt(
+            "gpu_at",
+            Ty::Time,
+            "when the older side of the GPU pair was read",
+        ),
         opt("disk_used_mb", Ty::Uint, "home volume used, MiB"),
         opt("disk_total_mb", Ty::Uint, "home volume size, MiB"),
-        opt("disk_at", Ty::Time, "when the disk pair was read"),
+        opt(
+            "disk_at",
+            Ty::Time,
+            "when the older side of the disk pair was read",
+        ),
         opt("net_used_kbps", Ty::Uint, "network traffic, kbit/s"),
         opt("net_link_kbps", Ty::Uint, "link rate, kbit/s"),
-        opt("net_at", Ty::Time, "when the network pair was read"),
+        opt(
+            "net_at",
+            Ty::Time,
+            "when the older side of the network pair was read",
+        ),
         opt("cpu_limit", Ty::Bool, "its own verdict: CPU at its limit"),
         opt(
             "mem_limit",
@@ -327,7 +355,11 @@ pub static MACHINES: Schema = Schema {
             Ty::Uint,
             "how far past capacity its load dial reads, 0 to 100",
         ),
-        opt("look_at", Ty::Time, "when its verdicts and load were read"),
+        opt(
+            "look_at",
+            Ty::Time,
+            "when the older of its verdicts and load was read",
+        ),
         opt("update", Ty::Text(24), "where its updater stands"),
         opt("update_to", Ty::Text(64), "the build its standing names"),
         opt(
@@ -354,19 +386,17 @@ impl Row for MachineRow {
     fn cells(&self) -> Vec<Cell> {
         let tally = self.tally.as_ref().map(|at| at.v);
         let count = |pick: fn(&Tally) -> u32| Cell::read(tally.as_ref().map(pick));
-        let facts_at = self
-            .build
-            .as_ref()
-            .map(|at| at.at_ms)
-            .max(self.disk_free_mb.map(|at| at.at_ms))
-            .max(self.update.as_ref().map(|at| at.at_ms));
+        let facts_at = older(
+            older(
+                self.build.as_ref().map(|at| at.at_ms),
+                self.disk_free_mb.map(|at| at.at_ms),
+            ),
+            self.update.as_ref().map(|at| at.at_ms),
+        );
         let limits = self.limits.map(|at| at.v);
         let verdict =
             |pick: fn(&Limits) -> Option<bool>| Cell::read(limits.as_ref().and_then(pick));
-        let look_at = self
-            .limits
-            .map(|at| at.at_ms)
-            .max(self.load.map(|at| at.at_ms));
+        let look_at = older(self.limits.map(|at| at.at_ms), self.load.map(|at| at.at_ms));
         let agents_at = self
             .tally
             .map(|at| at.at_ms)
@@ -425,7 +455,16 @@ impl Row for MachineRow {
 }
 
 /// The status words of an account row: the registry's, and `retired`.
-pub const ACCOUNT_STATUS: &[&str] = &["pending", "active", "paused", "broken", "banned", "retired"];
+pub const ACCOUNT_STATUS: &[&str] = &[
+    "pending",
+    "active",
+    "paused",
+    "broken",
+    "banned",
+    "suspended",
+    "cancelled",
+    "retired",
+];
 
 /// What a limit window's figure stands on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -680,8 +719,8 @@ pub struct AccountRow {
     pub expected: Vec<MachineRef>,
     /// The machines evidence says it runs on now; `None` where no evidence source was read.
     pub active: Option<Vec<Evidence>>,
-    /// Sighted agent sessions on it, of proven answers; `None` where no machine's answer still
-    /// speaks for its agents (`fold::AGENTS_KEEP_MS`).
+    /// Sighted agent sessions on it, of proven answers; `None` where no machine that answers now
+    /// (`fold::REACH_KEEP_MS`) speaks for its agents.
     pub agents: Option<u32>,
     pub last_use_ms: Option<u64>,
     pub last_use_on: Option<String>,
@@ -1104,7 +1143,7 @@ pub struct AgentRow {
 /// The agents relation: sightings, not conversations.
 pub static AGENTS: Schema = Schema {
     name: "agents",
-    doc: "every agent session a machine that answered listed: a sighting, kept two hours",
+    doc: "every agent session a machine that answers now listed: a sighting, given only while that machine answers",
     key: &["machine", "sid"],
     order: "by machine, as the machines relation orders them, then sid",
     columns: &[

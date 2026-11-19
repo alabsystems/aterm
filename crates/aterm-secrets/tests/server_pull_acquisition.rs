@@ -726,6 +726,7 @@ fn unreadable_memo(bad_signature: bool) {
         body: Body::Name {
             name: "unreadable-child".into(),
         },
+        statement: None,
     }
     .sign(&WRITER, INCARNATION)
     .unwrap();
@@ -738,6 +739,7 @@ fn unreadable_memo(bad_signature: bool) {
         body: Body::Name {
             name: "unreadable-leaf".into(),
         },
+        statement: None,
     }
     .sign(&WRITER, INCARNATION)
     .unwrap();

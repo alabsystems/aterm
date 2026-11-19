@@ -801,6 +801,7 @@ fn fill_names(log: &mut Log, to: usize) {
             parents: vec![*last.id()],
             authored_ms: T0,
             body: name(),
+            statement: None,
         }
         .sign(&ME.seed(), ME.incarnation())
         .unwrap();
@@ -1033,6 +1034,7 @@ fn an_admission_whose_batch_could_pass_the_record_bytes_is_refused_before_signin
                 salt: [7; 32],
                 ciphertext: Payload::from(vec![1; ciphertext]),
             },
+            statement: None,
         }
         .sign(&ME.seed(), ME.incarnation())
         .unwrap()

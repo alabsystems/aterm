@@ -1711,12 +1711,15 @@ fn a_pass_holds_one_background_claim_and_a_stopped_pass_is_cancelled() {
 }
 
 /// A GIT STEP THAT MOVES OBJECTS IS BOUNDED BY PROGRESS, NOT BY A WALL CLOCK, AND A SEED THAT
-/// WAS STOPPED HALF WAY IS MADE AGAIN. A step that works for three times its stall window ends
-/// well, since it never stopped working; the seed clone took 38.8 to 67.8 s under a 60 s wall
-/// bound. What a stopped seed left beside the workspace is cleared, and the workspace appears
-/// whole, with its owner's mark, or not at all. NEGATIVE CONTROLS: a step that only sleeps for
-/// as long is ended as a hang; a folder at the workspace's own path that this tool did not
-/// make is still refused and kept.
+/// WAS STOPPED HALF WAY IS MADE AGAIN. A step that spins on its CPU, starting no process, until
+/// the test tells it to stop three stall windows in ends well, since its tree's CPU time
+/// advanced the whole time; the seed clone took 38.8 to 67.8 s under a 60 s wall bound. What a
+/// stopped seed left beside the workspace is cleared, and the workspace appears whole, with its
+/// owner's mark, or not at all. NEGATIVE CONTROLS: a step parked in `sleep` for
+/// [`aterm_spec::wait::PARKED_SECS`] is ended by the stall window, whose error names that
+/// window, so a wall bound that ends it instead fails; the window must be judged before the
+/// park ends; a folder at the workspace's own path that this tool did not make is still
+/// refused and kept.
 #[test]
 fn a_seed_waits_by_progress_and_a_half_made_seed_is_made_again() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -1728,13 +1731,25 @@ fn a_seed_waits_by_progress_and_a_half_made_seed_is_made_again() {
     )
     .unwrap();
     let window = Duration::from_secs(1);
-    let busy = "alias.work=!end=$(( $(date +%s) + 3 )); while [ $(date +%s) -lt $end ]; do :; done; echo worked";
-    assert_eq!(
-        git_working_within(&source, &["-c", busy, "work"], window).as_deref(),
-        Ok("worked")
+    let told = dir.path().join("told");
+    let busy = format!(
+        "alias.work=!while [ ! -e '{}' ]; do :; done; echo worked",
+        told.display()
     );
-    let idle = git_working_within(&source, &["-c", "alias.work=!sleep 3", "work"], window);
-    assert!(idle.is_err(), "{idle:?}");
+    let worked = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(window * 3);
+            fs::write(&told, "").unwrap();
+        });
+        git_working_within(&source, &["-c", &busy, "work"], window)
+    });
+    assert_eq!(worked.as_deref(), Ok("worked"));
+    let parked = format!("alias.work=!exec sleep {}", aterm_spec::wait::PARKED_SECS);
+    let idle = git_working_within(&source, &["-c", &parked, "work"], window).unwrap_err();
+    assert!(
+        idle.contains(&format!("progress for {window:?} while")),
+        "{idle}"
+    );
     let failed = git_working(&source, &["rev-parse", "--verify", "absent"]).unwrap_err();
     assert!(
         failed.starts_with("git rev-parse --verify absent: "),

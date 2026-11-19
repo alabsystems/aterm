@@ -334,6 +334,9 @@ pub(crate) struct AgentMove<'a> {
     pub(crate) reader: Option<aterm_phase::Program>,
     /// The foreground group it was read under.
     pub(crate) pgid: i32,
+    /// aterm's harness watchdog decided it (its claimant's beats missed, its stream closed
+    /// inside the re-exec grace, or the kernel reports it stopped): written `src=aterm`.
+    pub(crate) aterm: bool,
     /// The `state` record that decided it, `None` for a reader's move.
     pub(crate) stream: Option<StreamMove<'a>>,
 }
@@ -776,6 +779,19 @@ pub(crate) struct SessionLog {
     /// one the same way as it adopts the log (its `reconcile`, reading the opener's `holder=`
     /// from the step's open record).
     stream_compact: Option<(Node, String)>,
+    /// The `tool` and `subagent` steps the stream's records opened and no record has closed, by
+    /// kind and the record's `id`, at most [`conversation::STREAM_STEPS_MAX`]
+    /// ([`Self::stream_step`]). Never carried: a successor's stream feeds nothing yet.
+    stream_steps: Vec<(Kind, String, Node)>,
+    /// The `ask` steps the stream's records opened and no `asked` has closed, oldest first, at
+    /// most [`conversation::STREAM_STEPS_MAX`] ([`Self::stream_ask`]). Never carried.
+    stream_asks: Vec<asks::AskStep>,
+    /// The wall step the stream's latest `wall` record opened, while it stands
+    /// ([`Self::stream_wall`]). Never carried.
+    stream_wall: Option<asks::WallStep>,
+    /// The `ask` records the stream applied, oldest first, as their `asked` is judged
+    /// ([`Self::stream_asked`]). Never carried.
+    stream_known: std::collections::VecDeque<asks::KnownAsk>,
 }
 
 /// WHICH BUILT-IN WRITERS STAND DOWN for the claim's record stream, per kind: while the stream
@@ -792,6 +808,39 @@ pub(crate) struct StreamDown {
     pub(crate) goal: bool,
     /// `compact`: the transcript's compact step.
     pub(crate) compact: bool,
+    /// `turn`: the turn tracker's screen verdicts and the program's claimed edges (OSC 7501),
+    /// and the transcript's opens, closes and supersedes of a turn
+    /// ([`aterm_slog::TurnTracker::set_stream_turns`]).
+    pub(crate) turn: bool,
+    /// `tool`: the transcript feeders' tool steps (the footer's step tap and the rollout tap).
+    pub(crate) tool: bool,
+    /// `subagent`: the transcript feeders' subagent steps.
+    pub(crate) subagent: bool,
+    /// `ask` under `approvals`: the prompt parser's approval steps and a program's claimed
+    /// approval box ([`aterm_slog::TurnTracker::set_stream_steps`]).
+    pub(crate) approvals: bool,
+    /// `ask` under `questions`: the question parser's dialog steps and a claimed question box.
+    pub(crate) questions: bool,
+    /// `wall` under `walls`: the wall readers' steps (the screen's verdict, which the
+    /// transcript's wall judge then confirms or refutes).
+    pub(crate) walls: bool,
+}
+
+impl StreamDown {
+    /// Whether the stream feeds the kind of a transcript call: `subagent` for a subagent call,
+    /// else `tool`.
+    pub(crate) const fn step(self, subagent: bool) -> bool {
+        if subagent { self.subagent } else { self.tool }
+    }
+
+    /// The screen steps the turn tracker leaves to the stream ([`aterm_slog::StreamSteps`]).
+    pub(crate) const fn screen_steps(self) -> aterm_slog::StreamSteps {
+        aterm_slog::StreamSteps {
+            approvals: self.approvals,
+            questions: self.questions,
+            walls: self.walls,
+        }
+    }
 }
 
 /// A person's gesture as [`SessionLog::person_input`] takes it from the seam (`crate::app_input::note_person_reaching`): the number of the gesture when it opened a burst (`HumanInputStamp::note_reaching`), and whether it reached the program ([`crate::human_input::reaches_program`]).
@@ -891,6 +940,10 @@ impl SessionLog {
             desc_creator: None,
             stream_down: StreamDown::default(),
             stream_compact: None,
+            stream_steps: Vec::new(),
+            stream_asks: Vec::new(),
+            stream_wall: None,
+            stream_known: std::collections::VecDeque::new(),
         }
     }
 }
@@ -2304,6 +2357,8 @@ impl SessionLog {
         });
         if let Some(who) = agent {
             let mut tracker = TurnTracker::new(node);
+            tracker.set_stream_turns(self.stream_down.turn, at);
+            tracker.set_stream_steps(&mut self.log, self.stream_down.screen_steps(), at);
             let _ = tracker.observe(
                 &mut self.log,
                 Verdict::from_agent_word(word, detail),
@@ -2394,7 +2449,9 @@ impl SessionLog {
 
     /// The published agent verdict moved: `mark agent word= rev= gen= fp=` for a reader's move,
     /// `mark agent word= rev= hseq= holder=` through [`Self::stream_mark`] for one a `state`
-    /// record decided, then the turn tracker's transitions.
+    /// record decided, `mark agent word= rev= src=aterm conf=strong` for one aterm's harness
+    /// watchdog decided (no screen and no record stands behind it), then the turn tracker's
+    /// transitions.
     ///
     /// A move with no agent run open opens one ([`Self::open_named_run`]): for the reader that
     /// read it, or, for a stream's move, for the agent the claim's registry row names.
@@ -2419,6 +2476,13 @@ impl SessionLog {
             // A stream's row carries the record's number where a screen's carries the screen.
             let f = with(f, Key::Hseq, Some(Val::U(s.hseq)));
             let _ = self.stream_mark(Kind::Agent, node, f, s.holder, s.by, at);
+        } else if m.aterm {
+            // aterm's own reading of the claimant: no screen was read for it.
+            let mut mark = Mark::new(Kind::Agent, Src::Aterm, Conf::Strong).fields(f);
+            if let Some(node) = node {
+                mark = mark.at(node);
+            }
+            let _ = self.log.mark(mark, at);
         } else {
             let f = with(
                 f,
@@ -2497,12 +2561,15 @@ impl SessionLog {
         let Ok(node) = self.log.open(open, at) else {
             return false;
         };
+        let mut tracker = TurnTracker::new(node);
+        tracker.set_stream_turns(self.stream_down.turn, at);
+        tracker.set_stream_steps(&mut self.log, self.stream_down.screen_steps(), at);
         self.agent = Some(AgentRun {
             pgid,
             node,
             who,
             by_screen: true,
-            tracker: TurnTracker::new(node),
+            tracker,
             pairs: transcript::HarnessPairs::default(),
             first_prompt: None,
             kept_prompt: false,
@@ -2999,6 +3066,24 @@ impl crate::App {
         self.session_status
             .note_pair_wait(id, wait.map(|(wait, ms)| (wait, log_instant(ms))));
         self.follow_clause(id);
+    }
+
+    /// Note session `id`'s settle wake as its log holds it now: a claim's move (a release, a
+    /// lapse, a take) can end the record stream's stand-down for `turn`, and the turn tracker
+    /// then arms the settle the screen's rest owes the turn the stream left open
+    /// ([`aterm_slog::TurnTracker::set_stream_turns`]) under the session's lock, on whichever
+    /// thread moved the claim; the loop learns of it here.
+    pub(crate) fn note_slog_wake(&mut self, id: u64) {
+        let Some(s) = self.pool.get(id) else {
+            return;
+        };
+        let wake = s
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slog_wake();
+        self.session_status.slog_wakes.note(id, wake);
     }
 
     /// THE SESSION LOG's settle ticks: each session whose log's wake is due is ticked under its timeline's leaf lock (the lock the sweep takes on this thread), its next wake replaces the entry, and its harness pairing's read wait as the tick left it goes to the rollout tap's ask ([`crate::session_status::StatusObserver::note_pair_wait`]).
@@ -3650,6 +3735,13 @@ pub(crate) mod observed;
 #[path = "session_log_turns.rs"]
 mod turns;
 pub(crate) use turns::{Front, Leaving, ProgramRead};
+
+#[path = "session_log_conversation.rs"]
+pub(crate) mod conversation;
+
+/// The `ask`, `asked` and `wall` records' rows (HX-15i1).
+#[path = "session_log_asks.rs"]
+pub(crate) mod asks;
 
 #[cfg(test)]
 #[path = "session_log_tests.rs"]

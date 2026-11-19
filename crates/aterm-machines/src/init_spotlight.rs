@@ -10,12 +10,14 @@ use crate::items::{Ctx, Item};
 use crate::model::{PValue, Probe, User};
 use crate::port::{Cmd, System};
 use aterm_toolchain::layout;
-use aterm_types::macos_setup::spotlight_scope::{self, State as Standing};
+use aterm_types::macos_setup::spotlight_scope::{self, Leave, State as Standing};
+use aterm_uds::lan::{ScopeAnswer, ScopePlan};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 /// The group's id, as `aterm init --only` and every remedy that names it spell it.
 pub const ID: &str = "init.spotlight";
@@ -49,6 +51,63 @@ pub const SCOPE_RECEIPT: &str = spotlight_scope::RECEIPT;
 /// The folders a failed apply could not exclude ([`spotlight_scope::REFUSED`]).
 pub const SCOPE_REFUSED: &str = spotlight_scope::REFUSED;
 
+/// Root's one lock on Spotlight's configuration and the files beside it
+/// ([`spotlight_scope::LOCK`], [`hold_scope`]).
+pub const SCOPE_LOCK: &str = spotlight_scope::LOCK;
+
+/// The LAN broker's record of its own lines of the receipt ([`spotlight_scope::BROKERED`]).
+pub const SCOPE_BROKERED: &str = spotlight_scope::BROKERED;
+
+/// How many times in all an edit of Spotlight's configuration is made, each from a fresh copy,
+/// where `mds` rewrote the configuration between the copy and its rename ([`Scope::exclude`]):
+/// `mds` is no party to root's lock, and each copy reads its last write.
+const EDIT_TRIES: usize = 3;
+
+/// How long the password route's step and the page's Keep a folder out… wait for another holder
+/// of [`SCOPE_LOCK`]: a hang detector over a broker apply, which holds it for at most a batch's
+/// inserts, or another root step's couple of hundred.
+pub const LOCK_WAIT: Duration = Duration::from_secs(120);
+
+/// Hold [`SCOPE_LOCK`] through `sys` ([`System::hold_root_lock`]), waiting at most `wait` for
+/// another holder; its folder, the receipt's, is made first. Every root writer of Spotlight's
+/// configuration or of the receipt, [`SCOPE_BROKERED`], [`SCOPE_REFUSED`] or
+/// [`spotlight_scope::YOURS`] holds it from its reading of them to its last write: [`Scope`]'s
+/// apply, the LAN broker's ([`broker_duty`]) and [`KeepOut`]'s.
+///
+/// # Errors
+/// `WouldBlock` where another holder kept it past `wait`; the folder's, the open's or the lock's
+/// own error, a file there that is not root's included.
+fn hold_scope(sys: &dyn System, wait: Duration) -> io::Result<Box<dyn std::any::Any>> {
+    let lock = Path::new(SCOPE_LOCK);
+    if let Some(dir) = lock.parent() {
+        sys.create_dir_all(dir, 0o755)?;
+    }
+    sys.hold_root_lock(
+        lock,
+        wait,
+        "another of root's Spotlight edits holds its lock",
+    )
+}
+
+/// Why [`Scope::exclude`] left the configuration as it was.
+#[derive(Debug)]
+enum Unexcluded {
+    /// The configuration changed between the copy and its rename on each of [`EDIT_TRIES`]
+    /// tries (`mds` rewrote it): nothing was written, and the folders were refused nothing, so
+    /// no record says they were.
+    Changed(String),
+    /// Any other cause: the folders could not be excluded.
+    Failed(String),
+}
+
+impl From<Unexcluded> for String {
+    fn from(unexcluded: Unexcluded) -> Self {
+        match unexcluded {
+            Unexcluded::Changed(why) | Unexcluded::Failed(why) => why,
+        }
+    }
+}
+
 /// `sys` as the shared reading's port ([`spotlight_scope::Reads`]): the reading itself is
 /// `aterm-types`' so the window, which does not link this crate outside its tests, makes the
 /// same one from its own file reads.
@@ -57,6 +116,10 @@ pub(crate) struct Port<'a>(pub(crate) &'a dyn System);
 impl spotlight_scope::Reads for Port<'_> {
     fn macos(&self) -> bool {
         self.0.macos()
+    }
+
+    fn now(&self) -> Option<u64> {
+        Some(self.0.now())
     }
 
     fn euid(&self) -> u32 {
@@ -74,6 +137,7 @@ impl spotlight_scope::Reads for Port<'_> {
             dir: stat.dir,
             symlink: stat.symlink,
             id: self.0.file_id(path).ok().map(|id| (id.dev, id.ino)),
+            mode: stat.mode & 0o7777,
         })
     }
 
@@ -83,6 +147,23 @@ impl spotlight_scope::Reads for Port<'_> {
 
     fn names(&self, dir: &Path) -> io::Result<Vec<String>> {
         self.0.list_dir(dir)
+    }
+
+    fn names_within(&self, dir: &Path, max: usize) -> io::Result<Option<Vec<String>>> {
+        self.0.list_dir_within(dir, max)
+    }
+
+    fn home_of(&self, uid: u32) -> Option<PathBuf> {
+        self.0.home_of(uid)
+    }
+
+    fn mount_points(&self) -> Option<BTreeSet<PathBuf>> {
+        self.0.mount_points()
+    }
+
+    fn broker_left(&self) -> Option<Vec<u8>> {
+        let bytes = self.0.read_file(&broker_left_record(self.0)?).ok()?;
+        (bytes.len() <= spotlight_scope::BROKER_LEFT_MAX).then_some(bytes)
     }
 
     fn root_file(&self, path: &Path, max: usize) -> io::Result<Vec<u8>> {
@@ -119,12 +200,23 @@ pub(crate) fn listed(sys: &dyn System, file: &str) -> Result<BTreeSet<PathBuf>, 
     spotlight_scope::listed(&Port(sys), file)
 }
 
-/// Write `paths`, one a line, as root's file at `file`, readable by every account.
+/// Write `paths`, one a line, as root's file at `file`, readable by every account: never past
+/// [`spotlight_scope::RECEIPT_MAX`], which no reader reads.
+///
+/// # Errors
+/// The lines would pass that bound, or the folder or the file could not be written.
 pub(crate) fn list(sys: &dyn System, file: &str, paths: &BTreeSet<PathBuf>) -> Result<(), String> {
     let text: String = paths
         .iter()
         .map(|path| format!("{}\n", path.display()))
         .collect();
+    if text.len() > spotlight_scope::RECEIPT_MAX {
+        return Err(format!(
+            "{file}: {} bytes would pass its bound of {}",
+            text.len(),
+            spotlight_scope::RECEIPT_MAX
+        ));
+    }
     let file = Path::new(file);
     if let Some(dir) = file.parent() {
         sys.create_dir_all(dir, 0o755)
@@ -200,12 +292,14 @@ pub fn scope_owed(sys: &dyn System) -> bool {
 }
 
 /// Whether setup's automatic ask owes this account's home its Spotlight scope
-/// ([`spotlight_scope::automatic_owed`]: only while setup's password never scoped the home),
-/// the one reading every run of `aterm init` and the window
-/// ([`spotlight_scope::automatic_owed_here`]) share.
+/// ([`spotlight_scope::automatic_owed_beside`]: only while setup's password never scoped the
+/// home or the rest of the data volume for it, unless a root LAN broker of this build serves,
+/// [`broker_serves`], and would take every folder owed, which it then excludes with no
+/// password; it takes only the home's own top-level folders): the one rule every run of
+/// `aterm init` and the window ([`spotlight_scope::automatic_owed_here`]) read.
 #[must_use]
 pub fn automatic_scope_owed(sys: &dyn System) -> bool {
-    spotlight_scope::automatic_owed(&Port(sys))
+    spotlight_scope::automatic_owed_beside(&Port(sys), || broker_serves(sys))
 }
 
 /// `folders`, summed by where they are: the home's own folders by name, those anywhere in
@@ -284,22 +378,53 @@ impl Scope {
     /// Put `add` on the configuration's excluded folders, keeping every entry already there,
     /// and restart `mds`. The configuration is never edited where it stands: a copy beside it
     /// takes every insert, is checked, and replaces it in one rename, so a run cut short
-    /// leaves the list as it was. A configuration `mds` rewrote meanwhile is left alone, and
-    /// the step fails. With nothing to add, nothing is written and `mds` is left running.
-    fn exclude(sys: &dyn System, add: &BTreeSet<PathBuf>) -> Result<(), String> {
+    /// leaves the list as it was. A configuration rewritten between the copy and the rename is
+    /// left as it was rewritten: the caller holds [`SCOPE_LOCK`], so no root writer of ours did
+    /// it, `mds` did, and the edit is made again at once from a fresh copy, which reads that
+    /// write, up to [`EDIT_TRIES`] times in all. One rewritten under each is
+    /// [`Unexcluded::Changed`]: the password route's step and the page's Keep a folder out fail
+    /// on it, and the broker answers busy. With nothing to add, nothing is written and `mds` is
+    /// left running.
+    fn exclude(sys: &dyn System, add: &BTreeSet<PathBuf>) -> Result<(), Unexcluded> {
         let config = Path::new(VOLUME_CONFIG);
-        if add.is_empty() || excluded(sys, config).is_ok_and(|now| add.is_subset(&now)) {
-            return Ok(());
+        let mut tries = 0;
+        loop {
+            if add.is_empty() || excluded(sys, config).is_ok_and(|now| add.is_subset(&now)) {
+                return Ok(());
+            }
+            tries += 1;
+            match Self::exclude_staged(sys, config, add) {
+                Err(Unexcluded::Changed(_)) if tries < EDIT_TRIES => {}
+                Err(Unexcluded::Changed(_)) => {
+                    return Err(Unexcluded::Changed(format!(
+                        "{VOLUME_CONFIG} changed while it was being edited, each of {EDIT_TRIES} \
+                         times: Spotlight kept rewriting it, so the folders were left as \
+                         Spotlight wrote it"
+                    )));
+                }
+                done => return done,
+            }
         }
-        let dir = config.parent().ok_or("the configuration has no folder")?;
+    }
+
+    /// [`Self::exclude`]'s edit of a copy of `config` and its rename over it.
+    fn exclude_staged(
+        sys: &dyn System,
+        config: &Path,
+        add: &BTreeSet<PathBuf>,
+    ) -> Result<(), Unexcluded> {
+        use Unexcluded::Failed;
+        let dir = config
+            .parent()
+            .ok_or_else(|| Failed("the configuration has no folder".to_owned()))?;
         let scratch = crate::port::Scratch::new_in(sys, dir, "spotlight")
-            .map_err(|error| format!("{}: {error}", dir.display()))?;
+            .map_err(|error| Failed(format!("{}: {error}", dir.display())))?;
         let staged = scratch.path().join("VolumeConfiguration.plist");
         sys.copy_file(config, &staged, 0o600)
-            .map_err(|error| format!("{VOLUME_CONFIG}: {error}"))?;
+            .map_err(|error| Failed(format!("{VOLUME_CONFIG}: {error}")))?;
         let copied = sys
             .sha256(&staged)
-            .map_err(|error| format!("{}: {error}", staged.display()))?;
+            .map_err(|error| Failed(format!("{}: {error}", staged.display())))?;
         // A configuration with no list yet gets an empty one; where that fails too (the key
         // holds something else), the first reading's refusal is the reason.
         let before = match excluded(sys, &staged) {
@@ -309,8 +434,8 @@ impl Scope {
                     sys,
                     &config_cmd(&["-insert", EXCLUSIONS, "-array"], &staged),
                 )
-                .map_err(|_| why)?;
-                excluded(sys, &staged)?
+                .map_err(|_| Failed(why))?;
+                excluded(sys, &staged).map_err(Failed)?
             }
         };
         for path in add.difference(&before) {
@@ -325,37 +450,40 @@ impl Scope {
                     ],
                     &staged,
                 ),
-            )?;
+            )
+            .map_err(Failed)?;
         }
-        ran_ok(sys, &config_cmd(&["-lint"], &staged))?;
-        let after = excluded(sys, &staged)?;
+        ran_ok(sys, &config_cmd(&["-lint"], &staged)).map_err(Failed)?;
+        let after = excluded(sys, &staged).map_err(Failed)?;
         if let Some(lost) = add
             .difference(&after)
             .chain(before.difference(&after))
             .next()
         {
-            return Err(format!(
+            return Err(Failed(format!(
                 "{VOLUME_CONFIG} would not list {} after the edit",
                 lost.display()
-            ));
+            )));
         }
         let was = sys
             .stat(config)
-            .map_err(|error| format!("{VOLUME_CONFIG}: {error}"))?;
+            .map_err(|error| Failed(format!("{VOLUME_CONFIG}: {error}")))?;
         sys.set_owner_and_mode(&staged, was.uid, was.gid, was.mode)
-            .map_err(|error| format!("{}: {error}", staged.display()))?;
+            .map_err(|error| Failed(format!("{}: {error}", staged.display())))?;
         if sys.sha256(config).ok().as_ref() != Some(&copied) {
-            return Err(format!("{VOLUME_CONFIG} changed while it was being edited"));
+            return Err(Unexcluded::Changed(format!(
+                "{VOLUME_CONFIG} changed while it was being edited: Spotlight rewrote it"
+            )));
         }
         sys.rename(&staged, config)
-            .map_err(|error| format!("{VOLUME_CONFIG}: {error}"))?;
+            .map_err(|error| Failed(format!("{VOLUME_CONFIG}: {error}")))?;
         let kill = Cmd::new(KILLALL).args(["-9", "mds"]);
         let ran = sys
             .run(&kill)
-            .map_err(|error| format!("{}: {error}", kill.display()))?;
+            .map_err(|error| Failed(format!("{}: {error}", kill.display())))?;
         // With no mds running there is none to end: launchd's next one reads the list.
         if !ran.success() && !ran.err().contains("No matching processes") {
-            return Err(format!("{}: {}", kill.display(), ran.describe()));
+            return Err(Failed(format!("{}: {}", kill.display(), ran.describe())));
         }
         Ok(())
     }
@@ -401,7 +529,12 @@ impl Item for Scope {
     /// person took it out. The receipt comes last, so a run that stopped before it leaves a
     /// home never scoped still asked for ([`automatic_scope_owed`]) and any home's folders
     /// still to exclude ([`scope_owed`]); the next one finds the folders excluded already and
-    /// only writes the receipt. A failure leaves [`SCOPE_REFUSED`] naming the folders it could not exclude.
+    /// only writes the receipt. A failure other than a configuration `mds` rewrote under each
+    /// of its edits leaves [`SCOPE_REFUSED`] naming the folders it could not exclude. The home is
+    /// read before the lock, so a reading that hangs holds no other root writer; it holds
+    /// [`SCOPE_LOCK`] from its reading of the receipt to its last write, waiting [`LOCK_WAIT`]
+    /// for a LAN broker's apply or the page's step under way, and fails, naming nothing refused,
+    /// where that holder keeps it longer.
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         if !sys.macos() {
             return Err("Spotlight is macOS's".into());
@@ -410,21 +543,12 @@ impl Item for Scope {
             return Err("Spotlight's excluded folders belong to setup's administrator step".into());
         }
         let home = Self::home(ctx).ok_or("no one is logged in at this Mac's console")?;
+        // The home's reading takes no lock: a reading that hangs holds no other root writer.
         let wanted = wanted(sys, &home)?;
-        let mut noted = listed(sys, SCOPE_RECEIPT).unwrap_or_default();
+        let _held = hold_scope(sys, LOCK_WAIT).map_err(|error| format!("{SCOPE_LOCK}: {error}"))?;
+        let noted = spotlight_scope::listed_as_root(&Port(sys), SCOPE_RECEIPT)?;
         let add: BTreeSet<PathBuf> = wanted.difference(&noted).cloned().collect();
-        noted.extend(wanted);
-        let done = Self::exclude(sys, &add).and_then(|()| list(sys, SCOPE_RECEIPT, &noted));
-        match &done {
-            Ok(()) => {
-                if sys.stat(Path::new(SCOPE_REFUSED)).is_ok() {
-                    let _ = sys.remove(Path::new(SCOPE_REFUSED));
-                }
-            }
-            // Best effort: without it a home never scoped is only asked for again.
-            Err(_) => drop(list(sys, SCOPE_REFUSED, &add)),
-        }
-        done
+        note_and_exclude(sys, &noted, &add, Route::Password).map_err(String::from)
     }
     fn revert(&self) -> Option<String> {
         Some(format!(
@@ -432,6 +556,525 @@ impl Item for Scope {
              {KILLALL} -9 mds; setup does not add it again"
         ))
     }
+}
+
+/// The root route an exclusion is made by ([`note_and_exclude`]), which says which record beside
+/// the receipt it keeps.
+#[derive(Debug, Clone, Copy)]
+enum Route<'a> {
+    /// The password route's own apply ([`Scope`]): it keeps [`SCOPE_REFUSED`], which that route
+    /// alone reads ([`spotlight_scope::owed`]). A failure writes the folders it could not
+    /// exclude there, best effort (without it a home never scoped is only asked for again), and
+    /// a success removes the record. It never writes [`SCOPE_BROKERED`].
+    Password,
+    /// The LAN broker's ([`broker_duty`]), its record of its own lines of the receipt as read
+    /// under the lock in hand: it writes [`SCOPE_BROKERED`] as those lines the receipt still
+    /// names and the folders it adds, after the exclusion and before the receipt, and neither
+    /// reads nor writes [`SCOPE_REFUSED`].
+    Broker(&'a BTreeSet<PathBuf>),
+}
+
+/// Exclude `add` from Spotlight ([`Scope::exclude`]), then write root's receipt as what it
+/// named (`noted`) and `add`: the one apply the password route's root step and the root LAN
+/// broker share, which differ only in the record their `route` keeps. The receipt comes last,
+/// so a run that stopped before it leaves the folders owed, and the next finds them excluded
+/// already and only writes the receipt; the broker's record comes before it, so a line the
+/// receipt lacks is one no reader counts.
+///
+/// A receipt `noted` and `add` would take past [`spotlight_scope::RECEIPT_MAX`] fails before
+/// Spotlight is edited: no route writes a receipt no reader reads, and none excludes a folder
+/// its receipt then cannot name. The caller holds [`SCOPE_LOCK`] and read `noted` under it.
+/// A configuration `mds` rewrote under each of the edit's tries ([`Unexcluded::Changed`]) is no
+/// refusal of the folders: [`SCOPE_REFUSED`] is left as it is, so the password route's next run
+/// asks for them again, and the broker answers busy.
+///
+/// # Errors
+/// [`Unexcluded::Changed`] for a configuration rewritten under each try; [`Unexcluded::Failed`]
+/// for a receipt that would pass its bound, any other failure of the exclusion, or a record or
+/// receipt that could not be written.
+fn note_and_exclude(
+    sys: &dyn System,
+    noted: &BTreeSet<PathBuf>,
+    add: &BTreeSet<PathBuf>,
+    route: Route<'_>,
+) -> Result<(), Unexcluded> {
+    let mut receipt = noted.clone();
+    receipt.extend(add.iter().cloned());
+    let bytes: usize = receipt.iter().map(|path| path.as_os_str().len() + 1).sum();
+    let done = if bytes > spotlight_scope::RECEIPT_MAX {
+        Err(Unexcluded::Failed(format!(
+            "{SCOPE_RECEIPT} would pass its bound of {} bytes with these folders: Spotlight is \
+             left as it is",
+            spotlight_scope::RECEIPT_MAX
+        )))
+    } else {
+        Scope::exclude(sys, add)
+            .and_then(|()| match route {
+                Route::Password => Ok(()),
+                Route::Broker(brokered) => {
+                    let mut own: BTreeSet<PathBuf> =
+                        brokered.intersection(noted).cloned().collect();
+                    own.extend(add.iter().cloned());
+                    list(sys, SCOPE_BROKERED, &own).map_err(Unexcluded::Failed)
+                }
+            })
+            .and_then(|()| list(sys, SCOPE_RECEIPT, &receipt).map_err(Unexcluded::Failed))
+    };
+    if matches!(route, Route::Password) {
+        match &done {
+            Ok(()) => {
+                if sys.stat(Path::new(SCOPE_REFUSED)).is_ok() {
+                    let _ = sys.remove(Path::new(SCOPE_REFUSED));
+                }
+            }
+            Err(Unexcluded::Failed(_)) => drop(list(sys, SCOPE_REFUSED, add)),
+            Err(Unexcluded::Changed(_)) => {}
+        }
+    }
+    done
+}
+
+/// The longest the LAN broker's reading of one home takes ([`broker_duty`]) before its request
+/// leaves Spotlight as it is: a hang detector over reads of a few thousand names' metadata, which
+/// a filesystem an account mounts in its home and keeps from answering would hold without end.
+/// Two plans, the pace and an apply stay within the client's own bound for the request.
+pub const READ_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The LAN broker's Spotlight duty over `sys` (`aterm lan serve` hands it `port::Live`, as root):
+/// the exclusion of the console account's own new top-level home folders, worked out from what
+/// root reads, never from the request, which names nothing (`docs/DESIGN-lan-broker-2026-11-05.md`
+/// §2). Root must never edit or exclude a path an ordinary account can steer outside that
+/// account's own top-level home folders, so a plan holds to the shared reading's rules
+/// ([`spotlight_scope::broker_home_reading`], [`spotlight_scope::broker_plan_over`]), read for
+/// each request, which the account reads too, with no root, before it asks:
+///
+/// - The peer the kernel names is not root, owns `/dev/console`, and its home is a plain path on
+///   the data volume no filesystem is mounted on, under folders root's alone, of its own with no
+///   sticky bit.
+/// - The folders are the home's own top-level ones the scope leaves out ([`Scope`]'s rule there),
+///   never one in ~/Library, at the data volume's top level or in /Users//Shared, and none while
+///   the volume is not indexed (the person's pause among the causes).
+/// - Root's receipt is read strictly, a folder it names is never added again, and neither the
+///   password route's [`SCOPE_REFUSED`] nor the person's kept-out folders
+///   ([`spotlight_scope::YOURS`]) is read or written.
+/// - An apply holds root's one lock on Spotlight's configuration and the receipt
+///   ([`SCOPE_LOCK`]), tried and never waited for: while the password route's step or the
+///   page's holds it the request is answered busy, as it is where the lock was not taken for
+///   another cause that passes (a full disk, no descriptor left). The receipt and the broker's
+///   record of its own lines ([`SCOPE_BROKERED`]) are read again under it, which drops from the
+///   plan every folder another route excluded since, and holds what is left to the plan's bounds
+///   again ([`spotlight_scope::broker_fit`]).
+/// - The home's listing is read to at most [`spotlight_scope::LISTING_MAX`] names, a name another
+///   filesystem is mounted on is never read, and the reading runs on a thread of its own that a
+///   request waits [`READ_DEADLINE`] for; while one that outlived it still runs, no other starts,
+///   so a filesystem that never answers holds one thread and no lock.
+/// - At most [`spotlight_scope::SCOPE_BATCH`] folders a request; a home keeps at most
+///   [`spotlight_scope::HOME_LINES`] lines and [`spotlight_scope::HOME_BYTES`] bytes of the
+///   receipt, the broker's own lines at most [`spotlight_scope::BROKER_MAX`], and the receipt
+///   stays within its bound.
+/// - A configuration `mds` rewrote under the edit is edited again from a fresh copy, a bounded
+///   number of times ([`Scope::exclude`]); one it rewrote under each is answered busy.
+/// - The same account's same folders whose apply failed are not tried again for
+///   [`spotlight_scope::LEFT_KEPT`], or until the broker restarts.
+///
+/// What the account steers is only which of its own top-level folders' names reach `plutil` as
+/// separate arguments and `mds` as path strings: an account can already keep any of those
+/// folders out of Spotlight by renaming it `*.noindex`.
+#[must_use]
+pub fn broker_duty(sys: Arc<dyn System + Send + Sync>) -> Arc<dyn aterm_uds::lan::ScopeDuty> {
+    broker_duty_within(sys, READ_DEADLINE)
+}
+
+/// [`broker_duty`] whose reading of a home waits at most `deadline`.
+#[must_use]
+pub fn broker_duty_within(
+    sys: Arc<dyn System + Send + Sync>,
+    deadline: Duration,
+) -> Arc<dyn aterm_uds::lan::ScopeDuty> {
+    Arc::new(BrokerDuty {
+        sys,
+        failed: Mutex::new(None),
+        deadline,
+        reading: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// [`broker_duty`]'s state: the system, the last plan whose apply failed and when, by the
+/// duty's clock, and the reading of a home under way past its deadline.
+struct BrokerDuty {
+    sys: Arc<dyn System + Send + Sync>,
+    failed: Mutex<Option<(ScopePlan, u64)>>,
+    deadline: Duration,
+    /// Set while a reading of a home runs; one past its deadline keeps it set until it ends.
+    reading: Arc<AtomicBool>,
+}
+
+impl BrokerDuty {
+    /// `uid`'s home as [`spotlight_scope::broker_home_reading`] reads it, on a thread of its own,
+    /// waited for at most [`Self::deadline`].
+    fn read_home(&self, uid: u32) -> Result<spotlight_scope::HomeReading, Leave> {
+        if self.reading.swap(true, Ordering::AcqRel) {
+            return Err(Leave::Unread(
+                "an earlier reading of a home has not ended".to_owned(),
+            ));
+        }
+        let (sent, heard) = std::sync::mpsc::sync_channel(1);
+        let sys = Arc::clone(&self.sys);
+        let reading = Arc::clone(&self.reading);
+        let spawned = std::thread::Builder::new()
+            .name("lan-scope-read".into())
+            .spawn(move || {
+                read_then_end(
+                    reading,
+                    || spotlight_scope::broker_home_reading(&Port(sys.as_ref()), uid),
+                    |read| drop(sent.send(read)),
+                );
+            });
+        if spawned.is_err() {
+            self.reading.store(false, Ordering::Release);
+            return Err(Leave::Unread(
+                "the LAN broker could not start its reading of this home".to_owned(),
+            ));
+        }
+        heard.recv_timeout(self.deadline).unwrap_or_else(|_| {
+            Err(Leave::Unread(format!(
+                "this account's home did not answer within {} s",
+                self.deadline.as_secs()
+            )))
+        })
+    }
+}
+
+/// The end of a reading of a home ([`BrokerDuty::read_home`]), however its thread ends, a panic
+/// included: the next request may start another.
+struct ReadingEnds(Arc<AtomicBool>);
+
+/// A reading of a home as its thread runs it ([`BrokerDuty::read_home`]): `read`, then the
+/// reading's end ([`ReadingEnds`]), and only then `send`, which hands the result to the request,
+/// so a request that hears it never finds this reading still held and answers the next busy.
+fn read_then_end<R>(reading: Arc<AtomicBool>, read: impl FnOnce() -> R, send: impl FnOnce(R)) {
+    let read = {
+        let _ends = ReadingEnds(reading);
+        read()
+    };
+    send(read);
+}
+
+impl Drop for ReadingEnds {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// A leave's answer to a client: a refusal refused, a cause that stands Spotlight left as it
+/// is, and a read that did not answer busy, which the client asks again on the clock.
+fn answer_of(leave: Leave) -> ScopeAnswer {
+    match leave {
+        Leave::Refused(why) => ScopeAnswer::Refused(why),
+        Leave::Stands(why) => ScopeAnswer::Unchanged(why),
+        Leave::Unread(why) => busy(&why),
+    }
+}
+
+/// The busy answer, journaled with `why`: the client asks again, the broker does not.
+fn busy(why: &str) -> ScopeAnswer {
+    aterm_log::info!("Spotlight: the LAN broker answered busy, and the client asks again: {why}");
+    ScopeAnswer::Busy
+}
+
+/// Whether root's lock not taken for `error` ([`hold_scope`]) is a cause that passes, which the
+/// broker answers busy and the client asks again on the clock: another holder, a full disk or
+/// quota making its folder, an interrupted call, or no memory or descriptor left. Any other (a
+/// link at the lock's path, a file there that is not root's) stands until something else
+/// changes it, and is a definite leave.
+fn passing(error: &io::Error) -> bool {
+    use io::ErrorKind::{Interrupted, OutOfMemory, QuotaExceeded, StorageFull, WouldBlock};
+    matches!(
+        error.kind(),
+        WouldBlock | StorageFull | QuotaExceeded | Interrupted | OutOfMemory
+    ) || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+impl aterm_uds::lan::ScopeDuty for BrokerDuty {
+    fn plan(&self, uid: u32) -> Result<ScopePlan, ScopeAnswer> {
+        let sys = self.sys.as_ref();
+        let folders = spotlight_scope::broker_plan_over(&Port(sys), || self.read_home(uid))
+            .map_err(answer_of)?;
+        let plan = ScopePlan { uid, folders };
+        let now = sys.now();
+        let failed_lately = self
+            .failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|(failed, at)| {
+                *failed == plan && *at <= now && now - at < spotlight_scope::LEFT_KEPT.as_secs()
+            });
+        if !plan.folders.is_empty() && failed_lately {
+            return Err(ScopeAnswer::Unchanged(
+                "the LAN broker's last exclusion of these same folders failed, and it does not try \
+                 them again for a day, or until it restarts"
+                    .to_owned(),
+            ));
+        }
+        Ok(plan)
+    }
+
+    /// Exclude `plan`'s folders under [`SCOPE_LOCK`], tried and never waited for: busy where the
+    /// password route or the page's step holds it, or where it was not taken for another cause
+    /// that passes ([`passing`]). The receipt and the broker's record of its own lines are read
+    /// under it: a folder the receipt names since the plan was made (the password route's run in
+    /// between) is not added again, since where the configuration lacks it the person took it
+    /// out, and what is left is held to the plan's bounds again over what was read
+    /// ([`spotlight_scope::broker_fit`]), so that run moves no bound. A configuration `mds`
+    /// rewrote under each of the edit's tries is busy too, and the plan is not remembered as
+    /// failed: nothing of ours failed, and the client's next ask tries it again.
+    fn apply(&self, plan: &ScopePlan) -> ScopeAnswer {
+        let sys = self.sys.as_ref();
+        let _held = match hold_scope(sys, Duration::ZERO) {
+            Ok(held) => held,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return ScopeAnswer::Busy,
+            Err(error) if passing(&error) => {
+                return busy(&format!(
+                    "root's lock on Spotlight's excluded folders was not taken: {error}"
+                ));
+            }
+            Err(_) => {
+                return ScopeAnswer::Unchanged(
+                    "the LAN broker left Spotlight as it is: root's lock on its excluded folders \
+                     could not be taken"
+                        .to_owned(),
+                );
+            }
+        };
+        let (noted, brokered) = match spotlight_scope::broker_lines(&Port(sys)) {
+            Ok(lines) => lines,
+            Err(leave) => return answer_of(leave),
+        };
+        let Some(home) = plan.folders.first().and_then(|folder| folder.parent()) else {
+            return ScopeAnswer::Excluded(0);
+        };
+        let add = match spotlight_scope::broker_fit(
+            &noted,
+            &brokered,
+            home,
+            plan.folders.iter().cloned(),
+        ) {
+            Ok(add) => add,
+            Err(leave) => return answer_of(leave),
+        };
+        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        match note_and_exclude(sys, &noted, &add, Route::Broker(&brokered)) {
+            Ok(()) => {
+                *failed = None;
+                ScopeAnswer::Excluded(u32::try_from(add.len()).unwrap_or(u32::MAX))
+            }
+            Err(Unexcluded::Changed(why)) => busy(&why),
+            Err(Unexcluded::Failed(_)) => {
+                *failed = Some((plan.clone(), sys.now()));
+                ScopeAnswer::Failed(
+                    "the LAN broker could not exclude these folders: its edit of Spotlight's \
+                     configuration, or its receipt, failed"
+                        .to_owned(),
+                )
+            }
+        }
+    }
+
+    fn now(&self) -> u64 {
+        self.sys.now()
+    }
+
+    fn sleep(&self, period: std::time::Duration) {
+        self.sys.sleep(period);
+    }
+}
+
+/// Why `sync.spotlight` asks nothing where no root LAN broker of this build serves
+/// ([`broker_reading`]).
+pub const NOT_SERVED: &str = "no LAN broker of this build serves this Mac: a home setup's \
+                              password never scoped is the password's, and a person's own \
+                              `aterm init` asks the broker first, else the Mac password";
+
+/// What the root LAN broker would exclude for this account's home, as the account reads its
+/// rules ([`spotlight_scope::broker_would_ask`]: folders the broker left as they are within the
+/// last day are not asked for), read through `sys`: what `sync.spotlight` reads before it asks.
+/// Where no broker of this build serves ([`broker_serves`]) it leaves the folders as they are
+/// ([`NOT_SERVED`]). `None` where this account has no home at the console.
+#[must_use]
+pub fn broker_reading(sys: &dyn System) -> Option<Result<BTreeSet<PathBuf>, Leave>> {
+    spotlight_scope::console_home(&Port(sys))?;
+    if !broker_serves(sys) {
+        return Some(Err(Leave::Stands(NOT_SERVED.to_owned())));
+    }
+    spotlight_scope::broker_would_ask(&Port(sys))
+}
+
+/// Where this account keeps [`spotlight_scope::BROKER_LEFT`]: its state folder, none for root.
+fn broker_left_record(sys: &dyn System) -> Option<PathBuf> {
+    if sys.euid() == 0 {
+        return None;
+    }
+    Some(sys.account_state_dir()?.join(spotlight_scope::BROKER_LEFT))
+}
+
+/// The folders a pass makes while it makes them, and the one asker of the root LAN broker
+/// beside the lanes that make them ([`Self::ask_while_made`]): what every clone aterm publishes
+/// asks, so the clone leaves Spotlight's index now, not at the next pass's `sync.spotlight`. A
+/// lane only notes its folder ([`Self::made`]) and goes on; the asker asks once for every folder
+/// noted since its last ask began (the request names nothing, and the broker works out the
+/// folders itself), so a broker's pace of up to a minute holds no lane, and a pass of many
+/// clones asks a few times, not once a clone. Its answers are journaled; nothing fails for them.
+pub(crate) struct MadeFolders {
+    state: Mutex<Made>,
+    wake: std::sync::Condvar,
+}
+
+/// [`MadeFolders`]' state: a folder noted since the last ask began, and the makers still at
+/// work.
+#[derive(Default)]
+struct Made {
+    noted: bool,
+    makers: usize,
+}
+
+/// A maker of folders at work ([`MadeFolders::maker`]): the asker ends once every one has
+/// ended, a lane that panicked included, and nothing it noted is left unasked.
+pub(crate) struct Maker<'a>(&'a MadeFolders);
+
+impl Drop for Maker<'_> {
+    fn drop(&mut self) {
+        let mut made = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        made.makers -= 1;
+        drop(made);
+        self.0.wake.notify_all();
+    }
+}
+
+impl MadeFolders {
+    /// None noted, and no maker at work.
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(Made::default()),
+            wake: std::sync::Condvar::new(),
+        }
+    }
+
+    /// A maker at work until the returned guard drops: take one before the asker starts and
+    /// one for each lane, each before the lane is spawned.
+    pub(crate) fn maker(&self) -> Maker<'_> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .makers += 1;
+        Maker(self)
+    }
+
+    /// Note a folder just made at `made`, where it is a top-level folder of this account's own
+    /// home while the account is the one at the console ([`spotlight_scope::console_home`]):
+    /// the asker asks for it. Nothing waits.
+    pub(crate) fn made(&self, sys: &dyn System, made: &Path) {
+        let home = spotlight_scope::console_home(&Port(sys));
+        if home.is_none() || made.parent() != home.as_deref() {
+            return;
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .noted = true;
+        self.wake.notify_all();
+    }
+
+    /// The asker, on a thread of its own beside the makers: ask the root LAN broker through
+    /// `sys` ([`System::scope_home`]) once for the folders noted since the last ask began,
+    /// until every maker has ended and nothing noted is left ([`next`]).
+    pub(crate) fn ask_while_made(&self, sys: &dyn System) {
+        let mut made = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            match next(&mut made) {
+                Next::Ask => {
+                    drop(made);
+                    let answer = sys.scope_home();
+                    aterm_log::info!(
+                        "Spotlight: the LAN broker answered {} for folders made in this account's \
+                         home",
+                        answer.class()
+                    );
+                    made = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                }
+                Next::Wait => {
+                    made = self.wake.wait(made).unwrap_or_else(PoisonError::into_inner);
+                }
+                Next::End => return,
+            }
+        }
+    }
+}
+
+/// What the asker does next ([`MadeFolders::ask_while_made`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// Ask for the folders noted since the last ask began.
+    Ask,
+    /// Wait for a folder noted or a maker's end.
+    Wait,
+    /// Every maker has ended, and nothing noted is left unasked.
+    End,
+}
+
+/// The asker's next step by `made`: ask where a folder was noted (taking the note, so a folder
+/// noted during the ask is the next ask's), end only once no maker is at work, else wait.
+fn next(made: &mut Made) -> Next {
+    if std::mem::take(&mut made.noted) {
+        Next::Ask
+    } else if made.makers == 0 {
+        Next::End
+    } else {
+        Next::Wait
+    }
+}
+
+/// Ask the root LAN broker through `sys` ([`System::scope_home`]) to exclude what
+/// [`broker_reading`] reads it would take, and read the home again after its answer
+/// ([`spotlight_scope::exclude_owed`]): what `sync.spotlight` applies. Folders the broker left
+/// as they are, or failed to exclude, are kept in this account's
+/// [`spotlight_scope::BROKER_LEFT`] with the time, so neither is asked for again until another
+/// folder is made or [`spotlight_scope::LEFT_KEPT`] has passed, and the password owes a home
+/// they leave never scoped while the record stands; an ask that excluded every folder owed
+/// removes the record. Keeping it is best effort: without it, the next pass asks again.
+#[must_use]
+pub fn exclude_by_broker(sys: &dyn System) -> spotlight_scope::Pass {
+    use spotlight_scope::Pass;
+    let (pass, folders) = spotlight_scope::exclude_owed(&Port(sys), &|| sys.scope_home());
+    if let Some(record) = broker_left_record(sys) {
+        match &pass {
+            Pass::Left(_) | Pass::Failed(_) => {
+                let text = spotlight_scope::broker_left_text(&folders, sys.now());
+                if let Err(error) = sys.write_file(&record, text.as_bytes(), 0o600) {
+                    aterm_log::info!(
+                        "Spotlight: the record of folders the LAN broker left was not kept: {error}"
+                    );
+                }
+            }
+            Pass::Done(_) if sys.stat(&record).is_ok() => {
+                let _ = sys.remove(&record);
+            }
+            _ => {}
+        }
+    }
+    pass
+}
+
+/// Whether the root LAN broker of this build serves this account's requests with no password,
+/// as the account reads it ([`aterm_uds::lan::install::Reading::serves_with`]): this build's own
+/// install as [`crate::items::lan::reading`] reads it, and launchd running its job, the rule the
+/// window reads too ([`aterm_uds::lan::install::serves_this_build_here`]). Where it does and the
+/// broker would take every folder owed, the broker excludes them, and no automatic ask owes the
+/// password that step ([`automatic_scope_owed`]).
+pub(crate) fn broker_serves(sys: &dyn System) -> bool {
+    crate::items::lan::reading(sys).is_some_and(|reading| {
+        reading.is_ok_and(|reading| reading.serves_with(|| crate::items::lan::job_state(sys)))
+    })
 }
 
 // The person's own Spotlight steps (SD-96), each run alone from System Resources' Spotlight
@@ -629,7 +1272,8 @@ impl Item for KeepOut {
         }
     }
     /// Exclude the folder, then record it as the person's: a run cut short before the record
-    /// leaves the exclusion, and the next one only writes the record.
+    /// leaves the exclusion, and the next one only writes the record. It holds [`SCOPE_LOCK`]
+    /// from its reading of the record to its write, waiting [`LOCK_WAIT`] for another holder.
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         if !sys.macos() {
             return Err("Spotlight is macOS's".into());
@@ -637,9 +1281,10 @@ impl Item for KeepOut {
         if sys.euid() != 0 {
             return Err("Spotlight's excluded folders are root's to change".into());
         }
+        let _held = hold_scope(sys, LOCK_WAIT).map_err(|error| format!("{SCOPE_LOCK}: {error}"))?;
         let mut yours = listed(sys, spotlight_scope::YOURS)?;
         let folder = self.judged(ctx, &yours)?;
-        Scope::exclude(sys, &BTreeSet::from([folder.clone()]))?;
+        Scope::exclude(sys, &BTreeSet::from([folder.clone()])).map_err(String::from)?;
         yours.insert(folder);
         list(sys, spotlight_scope::YOURS, &yours)
     }

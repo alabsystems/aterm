@@ -641,32 +641,45 @@ fn system_reads_reject_newer_canonical_names_and_naming_policy() {
             );
         }
     }
+}
 
-    // Even a spelling change whose generated targets coincide retires old work.
-    let scratch = fresh();
-    chosen(&scratch.state, 59);
-    let policy = Policy::read(&scratch.config, num(59)).unwrap();
-    let changed = Cell::new(false);
-    let on_read = || {
-        if !changed.replace(true) {
-            crate::machine_name::set_nick(
-                &scratch.state,
-                &crate::machine_name::NickTo::Word(Nickname::parse("heron").unwrap()),
-                ByKind::Person,
-                || Ok(None),
-                NOW + 1,
-                false,
-            )
-            .unwrap();
+#[test]
+fn publication_continues_only_while_the_nicknames_displayed_words_stay_the_same() {
+    for (word, changes) in [("heron", false), ("He Ron", true)] {
+        let scratch = fresh();
+        chosen(&scratch.state, 59);
+        let policy = Policy::read(&scratch.config, num(59)).unwrap();
+        let edited = Cell::new(false);
+        let on_read = || {
+            if !edited.replace(true) {
+                let set = crate::machine_name::set_nick(
+                    &scratch.state,
+                    &crate::machine_name::NickTo::Word(Nickname::parse(word).unwrap()),
+                    ByKind::Person,
+                    || Ok(None),
+                    NOW + 1,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(set.changed, changes);
+            }
+        };
+        let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
+        fake.after = Some(names([
+            Some("m59 Heron"),
+            Some("m59-heron"),
+            Some("m59-heron"),
+        ]));
+        fake.on_read = &on_read;
+        let result = publish(&scratch.state, &scratch.config, &policy, Some(&fake));
+        if changes {
+            assert!(matches!(result, Err(Pending::Superseded(_))));
+            assert!(fake.applied().is_empty());
+        } else {
+            assert_eq!(result, Ok(()));
+            assert_eq!(fake.applied(), ["apply m59"]);
         }
-    };
-    let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
-    fake.on_read = &on_read;
-    assert!(matches!(
-        publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
-        Err(Pending::Superseded(_)),
-    ));
-    assert!(fake.applied().is_empty());
+    }
 }
 
 #[test]

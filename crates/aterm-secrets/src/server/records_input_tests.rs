@@ -632,7 +632,7 @@ fn vault_checkpoint_a_staged_frame_is_named_by_its_records_id() {
             || verified += 1,
         )
         .unwrap_or_else(|_| panic!("a format-2 server stages a version-2 record"));
-        (staged.into_records().remove(0), asked, verified)
+        (staged.into_parts().0.remove(0), asked, verified)
     };
 
     // The server holds the record whole: it stands for the frame, unverified.

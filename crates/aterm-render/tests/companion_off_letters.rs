@@ -16,25 +16,8 @@ use aterm_effects::kitty_pet::{OldPath, art_cols, head_law};
 use aterm_render::{FaceRef, FaceTarget, Renderer, Theme};
 use std::ops::RangeInclusive;
 
-/// The companion styles.
-pub const COMPANIONS: [&str; 4] = [
-    "rainbow + cat",
-    "underline rainbow + cat",
-    "rainbow + dog",
-    "flat rainbow + cat",
-];
-
-/// The companions a shipped setting draws: `cursor_pet`'s cat and dog beside the rainbow. The
-/// other two of [`COMPANIONS`] lay the ribbon in a body only a seam selects
-/// (`EffectsPipeline::set_ribbon_shape`: underline, flat).
-pub const SHIPPED: [&str; 2] = ["rainbow + cat", "rainbow + dog"];
-
-/// Whether a sweep over the pages judges `style` on `look`: a shipped companion on every page, a
-/// body no setting selects on dark alone. Ten runs a sweep where every pair was sixteen; the six
-/// left out are the underline and the flat body on the three other pages.
-pub fn swept(style: &str, look: Look) -> bool {
-    SHIPPED.contains(&style) || look.name == DARK.name
-}
+/// The companion styles: `cursor_pet`'s cat and dog beside the rainbow.
+pub const COMPANIONS: [&str; 2] = ["rainbow + cat", "rainbow + dog"];
 
 /// How a replay's keys reach the terminal and when its frames render.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +90,10 @@ pub fn coats_driven_on(
                 ),
             ));
         }
+    }
+    // A dumped frame is drawn as the window draws it, the letter guard on.
+    if r.dump.is_empty() {
+        r.read_only_the_coat();
     }
     let (ev, tail) = scene.events();
     r.run(&ev, tail)
@@ -546,9 +533,11 @@ fn typed_under_a_lettered_row(
         );
     }
     let mut r = Replay::new(style, look, TrailColor::Automatic);
-    r.coat = true;
-    r.letters = letters;
-    r.own = letters;
+    if letters {
+        (r.coat, r.letters, r.own) = (true, true, true);
+    } else {
+        r.read_only_the_coat();
+    }
     r.fx.set_sparkle_enabled(true);
     for &law in old {
         r.fx.set_pet_old_path(law, true);
@@ -752,11 +741,7 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
         (listing.as_str(), ""),
         (wide.as_str(), ""),
     ] {
-        for (style, look) in [
-            ("rainbow + cat", DARK),
-            ("underline rainbow + cat", DARK),
-            ("rainbow + dog", SOLARIZED_DARK),
-        ] {
+        for (style, look) in [("rainbow + cat", DARK), ("rainbow + dog", SOLARIZED_DARK)] {
             let (judged, ch) = typed_under_a_lettered_row(style, look, 4, rows, &[], false);
             let s = sum(&past_the_first_keys(&judged, TYPING_FROM, 4), from);
             let boxed = boxes_on_glyphs(&judged, from, 3..=3);
@@ -938,7 +923,7 @@ fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
     ];
     let run = |style: &str, look: Look, old: &[OldPath], output: &[u8]| {
         let mut r = Replay::new(style, look, TrailColor::Automatic);
-        r.coat = true;
+        r.read_only_the_coat();
         r.fx.set_sparkle_enabled(true);
         for &law in old {
             r.fx.set_pet_old_path(law, true);
@@ -954,9 +939,6 @@ fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
     };
     for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
         for style in COMPANIONS {
-            if !swept(style, look) {
-                continue;
-            }
             for output in outputs {
                 let boxed = boxes_on_glyphs(&run(style, look, &[], output), enter, 0..=12);
                 assert_eq!(
@@ -971,7 +953,7 @@ fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
         }
     }
     let old = run(
-        "flat rainbow + cat",
+        "rainbow + cat",
         DARK,
         &[OldPath::HeadClearInFlight],
         outputs[1],
@@ -991,7 +973,7 @@ fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
         "negative control: judged at take-off alone, the bound's box never met the output \
          landed two rows above"
     );
-    let old = run("flat rainbow + cat", DARK, &[OldPath::RowFit], outputs[2]);
+    let old = run("rainbow + cat", DARK, &[OldPath::RowFit], outputs[2]);
     assert!(
         boxes_on_glyphs(&old, enter, 12..=12) > 0,
         "negative control: the box never met the long line above the last row"
@@ -1016,9 +998,6 @@ fn steam_runs() -> Vec<((&'static str, &'static str), Look, &'static str, Drive)
     for rows in STEAM_ROWS {
         for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
             for style in COMPANIONS {
-                if !swept(style, look) {
-                    continue;
-                }
                 for drive in [Drive::Ctl, Drive::Console] {
                     runs.push((rows, look, style, drive));
                 }
@@ -1057,13 +1036,19 @@ fn steamed_then(
     then: Then<'_>,
 ) -> (Vec<Judged>, i32) {
     let mut r = Replay::new(style, look, TrailColor::Automatic);
-    r.coat = true;
+    r.read_only_the_coat();
     r.keys_unnoted = drive != Drive::Console;
     r.fx.set_sparkle_enabled(true);
     for &law in old {
         r.fx.set_pet_old_path(law, true);
     }
     let ch = r.cell.1 as i32;
+    (r.run(&steam_events(page, then), 1_600), ch)
+}
+
+/// The steam scene's events on `page` ([`steamed_then`]): the page, the typing scene's line typed
+/// at 60 ms a key from 1 s, then 300 ms on, twelve Backspaces 50 ms apart, and each of `then`.
+fn steam_events(page: &str, then: Then<'_>) -> Vec<(u64, Ev)> {
     let mut ev = vec![(0, Ev::Out(page.as_bytes().to_vec()))];
     ev.extend(typed(TYPING_TEXT, TYPING_FROM, 60));
     let erase_from = TYPING_FROM + 60 * TYPING_TEXT.len() as u64 + 300;
@@ -1076,7 +1061,68 @@ fn steamed_then(
     for &(after, bytes) in then {
         ev.push((erase_from + 50 * 11 + after, Ev::Out(bytes.to_vec())));
     }
-    (r.run(&ev, 1_600), ch)
+    ev
+}
+
+/// A COAT ON PAPER READS NOTHING OF THE LETTER GUARD: a replay that reads only the coat draws its
+/// lights without the letter guard ([`Replay::read_only_the_coat`]). aterm-effects'
+/// `the_pet_reads_nothing_of_the_letter_guard` holds the companion to reading nothing of it on a
+/// dark page, with no glyph ink observed; the guard's paths on paper are not the dark page's.
+/// Here, on GitHub Light's paper, the `steam` scene between descenders and a sentence (the typing
+/// scene's line typed, then twelve Backspaces), the cat, keys through the console, each frame's
+/// glyph ink observed as every replay observes it: every frame's coat (the companion's box, alpha
+/// and fit, its knock layer's pixels on the letters' ink and on the caret, the word icons, the
+/// lettered page) and trail drawn with the guard, which judges the letters under its lights there,
+/// is the frame drawn without it. Negative control (2026-11-18): the companion told of a flow on
+/// every frame once the guard has judged a cell, on a light page alone, in
+/// `EffectsPipeline::apply`: the frames part here (first at 3,296 ms, the box), and the effects'
+/// dark law passes.
+#[test]
+fn a_coat_on_paper_reads_nothing_of_the_letter_guard() {
+    let ev = steam_events(&steam_page(STEAM_ROWS[1], Steam::Gallery), &[]);
+    let seen = aterm_spec::check::each(&[true, false], |&guarded| {
+        let mut r = Replay::new("rainbow + cat", GITHUB_LIGHT, TrailColor::Automatic);
+        if guarded {
+            r.coat = true;
+        } else {
+            r.read_only_the_coat();
+        }
+        r.fx.set_sparkle_enabled(true);
+        let frames: Vec<(u64, Coat, usize)> = r
+            .run(&ev, 1_600)
+            .into_iter()
+            .map(|j| (j.ms, j.coat, j.trail))
+            .collect();
+        (frames, r.fx.letter_guard_work().0)
+    });
+    let [(guarded, judged), (bare, unjudged)] = &seen[..] else {
+        unreachable!("two runs")
+    };
+    assert!(
+        guarded.len() >= 300 && guarded.iter().filter(|f| f.1.pet.is_some()).count() >= 200,
+        "fixture: the cat is drawn on the steam page ({} frames, {} of them with its body)",
+        guarded.len(),
+        guarded.iter().filter(|f| f.1.pet.is_some()).count()
+    );
+    assert!(
+        *judged > 0 && *unjudged == 0,
+        "fixture: the guard judged {judged} cells with it on and {unjudged} with it off"
+    );
+    // A frame in brief: its time, the companion's box, alpha and fit, its pixels on ink and on
+    // the caret, the word icons on glass and the trail's cells.
+    let brief = |(ms, c, trail): &(u64, Coat, usize)| {
+        let (ink, caret, icons) = (c.ink_px, c.caret_px, c.icons.len());
+        (*ms, c.pet, c.alpha, c.sink_fit, ink, caret, icons, *trail)
+    };
+    let parted = guarded.iter().zip(bare).find(|(g, b)| g != b);
+    assert!(
+        parted.is_none() && guarded.len() == bare.len(),
+        "with the letter guard and without it the coats part on paper ({} and {} frames), first \
+         with and without it: {:?}",
+        guarded.len(),
+        bare.len(),
+        parted.map(|(g, b)| (brief(g), brief(b)))
+    );
 }
 
 /// The rows under the prompt the companion's seats are sought on (the effects' `HEAD_SEAT_ROWS`).
@@ -1293,7 +1339,7 @@ fn a_body_fitted_to_its_row_stays_fitted_along_it() {
     let below = "Below: pqgyj";
     let whole_after_fit = |style: &str, look: Look, old: &[OldPath]| -> (usize, usize, usize) {
         let mut r = Replay::new(style, look, TrailColor::Automatic);
-        r.coat = true;
+        r.read_only_the_coat();
         r.fx.set_sparkle_enabled(true);
         for &law in old {
             r.fx.set_pet_old_path(law, true);
@@ -1540,7 +1586,7 @@ fn far_from_the_caret(
 ) -> (Vec<Judged>, i32) {
     let (_, (rows, cols), typed_first, from, to, _) = leap;
     let mut r = Replay::gridded(style, look, TrailColor::Automatic, rows, cols);
-    r.coat = true;
+    r.read_only_the_coat();
     r.keys_unnoted = drive != Drive::Console;
     r.fx.set_sparkle_enabled(true);
     for &law in old {
@@ -1802,7 +1848,7 @@ fn a_full_screen_program_s_rows_under_its_line_are_its_own() {
 /// reverted, keys through the console, every frame's coat read; and the replay's cell height.
 fn context_coats(style: &str, look: Look, old: &[OldPath]) -> (Vec<Judged>, i32) {
     let mut r = Replay::new(style, look, TrailColor::Automatic);
-    r.coat = true;
+    r.read_only_the_coat();
     r.fx.set_sparkle_enabled(true);
     for &law in old {
         r.fx.set_pet_old_path(law, true);
@@ -1851,9 +1897,6 @@ fn last_heights(judged: &[Judged], ms: u64, ch: i32) -> Vec<f64> {
 fn the_companion_is_drawn_whole_past_the_row_above_s_last_letter() {
     for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
         for style in COMPANIONS {
-            if !swept(style, look) {
-                continue;
-            }
             let (judged, ch) = context_coats(style, look, &[]);
             // From its landing on the prompt's row: the replay's cat starts in the window's
             // corner and flies down across the page to the prompt, a flight between rows.
@@ -1912,7 +1955,7 @@ fn the_companion_is_drawn_whole_past_the_row_above_s_last_letter() {
 /// frame's coat read.
 fn context_unworded(style: &str, look: Look, bar: bool, old: &[OldPath]) -> Vec<Judged> {
     let mut r = Replay::new(style, look, TrailColor::Automatic);
-    r.coat = true;
+    r.read_only_the_coat();
     for &law in old {
         r.fx.set_pet_old_path(law, true);
     }
@@ -1940,9 +1983,6 @@ fn a_seat_under_the_line_reads_its_own_row() {
     let under = 5..=usize::from(crate::trail_letters_read::ROWS);
     for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
         for style in COMPANIONS {
-            if !swept(style, look) {
-                continue;
-            }
             for bar in [false, true] {
                 let judged = context_unworded(style, look, bar, &[]);
                 assert!(
@@ -1979,7 +2019,7 @@ fn a_seat_under_the_line_reads_its_own_row() {
 fn fitted_then_past_the_line(old: &[OldPath], back: u64) -> (Vec<Judged>, i32) {
     let below = "Below: every glyph here must stay legible! pqgyj {braces} [ok] and more";
     let mut r = Replay::new("rainbow + cat", DARK, TrailColor::Automatic);
-    r.coat = true;
+    r.read_only_the_coat();
     r.fx.set_sparkle_enabled(true);
     for &law in old {
         r.fx.set_pet_old_path(law, true);
@@ -2057,7 +2097,7 @@ fn enter_bottom_coats(
 ) -> (Vec<Judged>, i32, u64) {
     let enter = 1_000 + 60 * TYPING_TEXT.len() as u64 + 200;
     let mut r = Replay::new(style, look, TrailColor::Automatic);
-    r.coat = true;
+    r.read_only_the_coat();
     r.fx.set_sparkle_enabled(true);
     for &law in old {
         r.fx.set_pet_old_path(law, true);
@@ -2091,7 +2131,7 @@ const ENTER_OUTPUT: &[u8] = b"the quick brown fox\r\n$ ";
 /// Dark and both light themes, with the scene's output and with that output ending on a full
 /// stop (ink the head law reads that is no letter, which the seat read as blank: the seat past
 /// the `x` lay under the `.` and the body was drawn down or fitted there). Negative control
-/// (the law reverted alone, the flat rainbow's cat on dark): frames on the last row are fitted.
+/// (the law reverted alone, the cat on dark): frames on the last row are fitted.
 #[test]
 fn a_seat_past_a_line_s_end_keeps_the_body_whole() {
     let last = i32::from(crate::trail_letters_read::ROWS) - 1;
@@ -2106,9 +2146,6 @@ fn a_seat_past_a_line_s_end_keeps_the_body_whole() {
     };
     for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
         for style in COMPANIONS {
-            if !swept(style, look) {
-                continue;
-            }
             for output in [ENTER_OUTPUT, b"the quick brown fox.\r\n$ "] {
                 let (judged, ch, enter) = enter_bottom_coats(style, look, &[], output);
                 let (h, boxed) = heights(&judged, enter, ch);
@@ -2132,7 +2169,7 @@ fn a_seat_past_a_line_s_end_keeps_the_body_whole() {
         }
     }
     let (old, ch, enter) = enter_bottom_coats(
-        "flat rainbow + cat",
+        "rainbow + cat",
         DARK,
         &[OldPath::SeatClearsTheStretch],
         ENTER_OUTPUT,
@@ -2208,11 +2245,12 @@ fn wrapped_coat(style: &str, look: Look, old: &[OldPath]) -> (i32, i32, usize, u
 /// ([`OldPath::HeadUnderLetters`]) its head lies on the first row's letters beside the caret.
 #[test]
 fn a_companion_crossing_a_wrap_keeps_off_the_line() {
-    for (style, look) in
-        COMPANIONS
-            .into_iter()
-            .zip([DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT])
-    {
+    for (style, look) in [
+        ("rainbow + cat", DARK),
+        ("rainbow + cat", SOLARIZED_DARK),
+        ("rainbow + dog", GITHUB_LIGHT),
+        ("rainbow + cat", DEFAULT_LIGHT),
+    ] {
         let (.., crossing) = wrapped_coat(style, look, &[]);
         assert_eq!(
             crossing, 0,
@@ -2325,9 +2363,6 @@ fn on_a_full_screen_s_last_row_the_companion_stands_beside_the_caret() {
     );
     for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
         for style in COMPANIONS {
-            if !swept(style, look) {
-                continue;
-            }
             let frames = held(style, look, &[]);
             let met: Vec<_> = frames.iter().filter(|f| !f.1.is_empty()).collect();
             assert!(
@@ -2764,8 +2799,8 @@ fn judge_the_wall(part: WallPart) {
     for (f, face) in faces.iter().enumerate() {
         let window = face.face.is_none();
         let seated = seated_at(face.cell);
-        // The window's face draws the shipped companions on every page and the bodies no
-        // setting selects on dark ([`swept`]), another face the cat and the dog on dark; each replays what follows a line that seats the companion where it was
+        // The window's face draws the companions on every page, another face the cat and the
+        // dog on dark; each replays what follows a line that seats the companion where it was
         // measured (the window's face on the bundled 13 x 29 alone).
         let (styles, looks): (&[&str], &[Look]) = if window {
             (&COMPANIONS, &PAGES)
@@ -2790,9 +2825,6 @@ fn judge_the_wall(part: WallPart) {
                 for drive in [Drive::Ctl, Drive::Console] {
                     for &look in looks {
                         for &style in styles {
-                            if !swept(style, look) {
-                                continue;
-                            }
                             runs.push((f, style, look, (room, then), drive, None));
                         }
                     }
@@ -3081,9 +3113,6 @@ fn the_margin_keeps_the_companion_off_the_line() {
     for scene in [Scene::FoldRest, Scene::FocusWrap, Scene::StatusWrap] {
         for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
             for style in COMPANIONS {
-                if !swept(style, look) {
-                    continue;
-                }
                 let met = hits(style, look, scene, &[]);
                 assert!(
                     met.is_empty(),
@@ -3253,7 +3282,7 @@ pub fn walled(
 ) -> Vec<Judged> {
     let rows = crate::trail_letters_read::ROWS;
     let mut r = Replay::gridded(style, look, TrailColor::Automatic, rows, cols);
-    r.coat = true;
+    r.read_only_the_coat();
     r.keys_unnoted = drive != Drive::Console;
     r.fx.set_sparkle_enabled(true);
     r.old_paths = old.to_vec();
@@ -3352,9 +3381,6 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
         for cols in [72, 71, 70] {
             for look in WALL_PAGES {
                 for style in COMPANIONS {
-                    if !swept(style, look) {
-                        continue;
-                    }
                     runs.push((drive, cols, style, look, &[]));
                     runs.push((drive, cols, style, look, &[HIDE]));
                 }
@@ -3456,9 +3482,6 @@ fn a_watched_page_s_caret_takes_its_cell_back() {
             };
             for &look in looks {
                 for style in COMPANIONS {
-                    if !swept(style, look) {
-                        continue;
-                    }
                     runs.push((drive, cols, style, look, &[]));
                 }
             }
@@ -3647,9 +3670,6 @@ fn a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page() {
         for cols in [72, 71, 70] {
             for look in WALL_PAGES {
                 for style in COMPANIONS {
-                    if !swept(style, look) {
-                        continue;
-                    }
                     runs.push((drive, cols, style, look, &[]));
                 }
             }

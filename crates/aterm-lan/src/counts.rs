@@ -105,11 +105,14 @@ pub(crate) enum Count {
     Answered,
     /// Ended: the request failed and its error was sent.
     Failed,
+    /// A Spotlight exclusion request (`Request::ScopeHome`), answered whichever way with its own
+    /// frame ([`crate::scope`]).
+    ScopeHome,
 }
 
 impl Count {
     /// Every count, in the order a snapshot prints them.
-    pub(crate) const ALL: [Self; 29] = [
+    pub(crate) const ALL: [Self; 30] = [
         Self::Accepted,
         Self::Busy,
         Self::NoThread,
@@ -139,6 +142,7 @@ impl Count {
         Self::Considered,
         Self::Answered,
         Self::Failed,
+        Self::ScopeHome,
     ];
 
     /// The count's name in a snapshot.
@@ -173,6 +177,7 @@ impl Count {
             Self::Considered => "considered",
             Self::Answered => "answered",
             Self::Failed => "failed",
+            Self::ScopeHome => "scope_home",
         }
     }
 }

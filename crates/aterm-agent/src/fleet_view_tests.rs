@@ -808,6 +808,54 @@ fn the_floor_is_read_off_this_macs_own_format_mark() {
     assert_eq!(needs(Some(&paths)), none, "no mark, a node key held");
 }
 
+/// A MAC ITS VAULT'S SOURCE REFUSED FOR A LATER FORMAT NAMES ITS OWN ROW ([`format_floor`]):
+/// with no format mark, the note a records pass keeps where the source refused it for a later
+/// format than its build reads (`aterm_secrets::client::told_later_format`) reads as
+/// [`FormatFloor::Unread`], so this Mac's own row needs an update and no other row is named;
+/// with the note gone the floor is `Every` again. A mark, where one is stored, says the floor
+/// as it did, the note beside it read for nothing.
+///
+/// NEGATIVE CONTROL: `format_floor` reading no note (as before), run against this test and seen
+/// to fail with ``assertion `left == right` failed: a source's refusal names this Mac's own
+/// row``, `left: Every`, `right: Unread`.
+#[cfg(unix)]
+#[test]
+fn a_mac_its_source_refused_for_a_later_format_names_its_own_row() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let home = aterm_tempfile::tempdir().expect("a home");
+    let paths = aterm_secrets::client::Paths::locate_for_home(home.path());
+    let note = paths.records_file().with_file_name("records.later-format");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(note.parent().expect("the vault's folder"))
+        .expect("the vault's folder");
+    assert_eq!(format_floor(Some(&paths)), FormatFloor::Every, "no note");
+    std::fs::write(&note, b"aterm-secrets records refused for a later format\n").expect("the note");
+    assert_eq!(
+        format_floor(Some(&paths)),
+        FormatFloor::Unread,
+        "a source's refusal names this Mac's own row"
+    );
+    let mark = paths.records_file().with_file_name("records.format");
+    std::fs::write(&mark, b"aterm-secrets records format 2\n").expect("the mark");
+    let reads = aterm_secrets::commons::hearing::READS_FORMAT
+        .map(|release| (u64::from(release.0), u64::from(release.1)));
+    assert_eq!(
+        format_floor(Some(&paths)),
+        FormatFloor::of(Some(2), reads),
+        "a mark says the floor"
+    );
+    std::fs::remove_file(&mark).expect("the mark removed");
+    std::fs::remove_file(&note).expect("the note removed");
+    assert_eq!(
+        format_floor(Some(&paths)),
+        FormatFloor::Every,
+        "the note gone"
+    );
+}
+
 /// With no node serving presence, nothing is read as up or silent and nothing as in step; the
 /// view says why, and a build comes from the book alone.
 #[test]

@@ -30,6 +30,8 @@ pub mod cli;
 pub mod file;
 pub mod frontier;
 pub mod layout;
+#[cfg(any(unix, windows))]
+mod local;
 pub mod name;
 pub mod outbox;
 pub mod rendered;
@@ -63,6 +65,12 @@ pub use status::{Face, Kept, State, Status, Why, Word};
 /// Only where the key alone does not fit, or the rows pass [`MAX_FACE_RECORDS`], is no face
 /// written: a pass removes the face it wrote.
 pub const MAX_FACE_BYTES: u64 = 4 * 1024 * 1024;
+/// An editable TSV body uses the same file bound as the snapshot it represents.
+pub const MAX_EXPORT_BODY_BYTES: u64 = snapshot::MAX_BYTES;
+/// The edit planner bounds parsed cells, including the header and empty positions.
+pub const MAX_EXPORT_CELLS: usize = 4_194_304;
+/// An editable TSV extends its revision header by a dot, two hex digests and a plus sign.
+pub const MAX_EXPORT_BYTES: u64 = MAX_EXPORT_BODY_BYTES + 1 + 64 + 1 + 64;
 
 /// The most records of a face, its header included: the grid's limit
 /// (`amacs::table::MAX_TABLE_RECORDS`). A table with more rows has no face.

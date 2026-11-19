@@ -5254,6 +5254,8 @@ impl MarkdownApp {
                     labelled: true,
                     dense: false,
                 },
+                0,
+                geometry.preview_content_width,
                 ty,
             )
             .map_or(22.0, |frame| frame.line_h);
@@ -5285,6 +5287,8 @@ impl MarkdownApp {
                     labelled: true,
                     dense: false,
                 },
+                0,
+                geometry.preview_content_width,
                 ty,
             )
             .map_or(22.0, |frame| frame.line_h);
@@ -5701,7 +5705,7 @@ impl NativeAppModel for MarkdownApp {
                     }
                     LinkPolicy::ExplicitExternal if link.destination.len() <= 2_048 => {
                         cx.open_external(ExternalOpenRequest {
-                            uri: link.destination.clone(),
+                            uri: link.destination.to_string(),
                         });
                         view.notice = Some("Opening link…".to_string());
                         view.common.presentation_revision =
@@ -5711,7 +5715,7 @@ impl NativeAppModel for MarkdownApp {
                         if resolve_markdown_link(&self.canonical_uri, &link.destination)
                             .is_ok() =>
                     {
-                        cx.open_markdown_document(self.document, link.destination.clone());
+                        cx.open_markdown_document(self.document, link.destination.to_string());
                     }
                     LinkPolicy::LocalDocument
                     | LinkPolicy::DeniedScheme
@@ -6368,9 +6372,11 @@ impl NativeAppModel for MarkdownApp {
             // The preview shows whole rows: a block the bottom edge would cut ends at its
             // last row that fits, and the rows after it are a scroll away.
             let room = preview_viewport_height - visible_block.y;
-            if paint_height > room + 0.01 {
-                let whole = crate::native_markdown::block_frame(
-                    crate::native_markdown::BlockShape::of(block),
+            let cropped = paint_height > room + 0.01;
+            if cropped {
+                let whole = crate::native_markdown::preview_frame(
+                    block,
+                    preview_content_width,
                     reader_type,
                 )
                 .map_or(0.0, |frame| {
@@ -6385,28 +6391,43 @@ impl NativeAppModel for MarkdownApp {
                 }
                 paint_height = whole;
             }
-            let kind = match block {
+            let gap_after = if cropped || index + 1 == self.parsed.blocks.len() {
+                0.0
+            } else {
+                (room - paint_height).clamp(0.0, crate::native_markdown::VISUAL_BLOCK_GAP)
+            };
+            let content = block.content();
+            let kind = match content {
                 MarkdownBlock::Heading { level, .. } => MarkdownBlockKind::Heading(*level),
                 MarkdownBlock::Paragraph { .. } => MarkdownBlockKind::Paragraph,
                 MarkdownBlock::ListItem { depth, ordinal, .. } => MarkdownBlockKind::ListItem {
                     depth: *depth,
                     ordinal: *ordinal,
                 },
-                MarkdownBlock::Quote { .. } => MarkdownBlockKind::Quote,
+                MarkdownBlock::Quote { .. } => unreachable!("quote content is a leaf"),
                 MarkdownBlock::CodeBlock { language, .. } => MarkdownBlockKind::Code {
                     language: language.clone(),
                 },
                 MarkdownBlock::Table { .. } => MarkdownBlockKind::Table,
                 MarkdownBlock::ThematicBreak { .. } => MarkdownBlockKind::Rule,
             };
-            let (text, inline) = bounded_markdown_block_paint(&self.parsed, index, block);
+            let (text, mut inline) =
+                bounded_markdown_block_paint(&self.parsed, index, block, preview_content_width);
+            for (_, style) in &mut inline {
+                style.link_index = style.link_index.filter(|&index| self.link_enabled(index));
+            }
             let node = UiContent::MarkdownBlock(MarkdownBlockSpec {
+                focused_link: None,
                 text,
                 inline,
                 kind,
+                quote_depth: block.quote_depth(),
+                quote_above: self.parsed.quote_continuation(index),
+                quote_below: self.parsed.quote_continuation(index + 1),
+                gap_after,
                 dense: false,
-                selectable: !matches!(block, MarkdownBlock::ThematicBreak { .. }),
-                action: (!matches!(block, MarkdownBlock::ThematicBreak { .. }))
+                selectable: !matches!(content, MarkdownBlock::ThematicBreak { .. }),
+                action: (!matches!(content, MarkdownBlock::ThematicBreak { .. }))
                     .then(|| ActionId::new(format!("markdown/select-block/{index}"))),
                 selected: selected.as_ref().is_some_and(|selection| {
                     selection.start < block.source().end && selection.end > block.source().start
@@ -6419,7 +6440,7 @@ impl NativeAppModel for MarkdownApp {
             preview_blocks.push(
                 UiNode::new(key, node).layout(
                     Layout::default()
-                        .height(Length::Fixed(paint_height.min(1_000_000.0)))
+                        .height(Length::Fixed(paint_height.min(1_000_000.0) + gap_after))
                         .width(Length::Fill),
                 ),
             );
@@ -6437,7 +6458,6 @@ impl NativeAppModel for MarkdownApp {
                     preview_horizontal_inset,
                     preview_vertical_inset,
                 ))
-                .gap(crate::native_markdown::VISUAL_BLOCK_GAP)
                 .clipped(),
         )
         .children(preview_blocks);
@@ -6465,10 +6485,15 @@ impl NativeAppModel for MarkdownApp {
         let source = UiNode::new(
             "markdown/source",
             UiContent::MarkdownBlock(MarkdownBlockSpec {
+                focused_link: None,
                 text: source_window.text,
                 kind: MarkdownBlockKind::Code {
                     language: Some("markdown".to_string()),
                 },
+                quote_depth: 0,
+                quote_above: 0,
+                quote_below: 0,
+                gap_after: 0.0,
                 dense: view.mode == MarkdownViewMode::Split,
                 selectable: source_action.is_some(),
                 action: source_action,
@@ -7019,22 +7044,29 @@ fn markdown_images_in_range(
         .collect()
 }
 
-/// Block `index`'s bounded display text and its styled spans (prose kinds only; code and tables paint verbatim).
+/// Block `index`'s bounded display text and styled spans at the preview width.
 pub(crate) fn bounded_markdown_block_paint(
     parsed: &crate::native_markdown::MarkdownDocument,
     index: usize,
     block: &crate::native_markdown::MarkdownBlock,
+    width: f32,
 ) -> (
     String,
     Vec<(std::ops::Range<usize>, crate::native_markdown::InlineStyle)>,
 ) {
     use crate::native_markdown::MarkdownBlock;
+    let content = block.content();
+    if let MarkdownBlock::Table { table, .. } = content {
+        let frame =
+            crate::native_markdown::preview_frame(block, width, crate::native_ui::reader_type())
+                .expect("table frame");
+        return table.project(frame.columns(width));
+    }
     let text = crate::native_markdown::block_paint_text(block).into_owned();
-    let own = match block {
+    let own = match content {
         MarkdownBlock::Heading { text, .. }
         | MarkdownBlock::Paragraph { text, .. }
-        | MarkdownBlock::ListItem { text, .. }
-        | MarkdownBlock::Quote { text, .. } => text.len(),
+        | MarkdownBlock::ListItem { text, .. } => text.len(),
         _ => 0,
     };
     let kept = if text.len() < own {

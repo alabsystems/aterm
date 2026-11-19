@@ -17,6 +17,36 @@ struct Frontend {
     scope: crate::harness::account_work::Scope,
 }
 impl ServiceFrontend {
+    pub(in crate::harness::codex_source_registry) fn in_namespace(
+        &self,
+        state: &Weak<Mutex<State>>,
+    ) -> bool {
+        Weak::ptr_eq(&self.0.state, state)
+    }
+    pub(in crate::harness::codex_source_registry) fn check_foreground(
+        &self,
+        foreground: &FrontendMember<'_>,
+    ) -> Result<(), Error> {
+        self.current()?;
+        self.0.controller.check_foreground(foreground)
+    }
+    /// Actual controller process DATA; callers still need current/foreground checks.
+    pub fn process(&self) -> &Process {
+        self.0.controller.process()
+    }
+    /// Reborrow the actual session PTY for this original control allocation.
+    /// No descriptor or foreground grant survives the callback.
+    ///
+    /// # Errors
+    /// The original scope/controller/process ended, or it is no longer foreground.
+    pub fn with_foreground<T>(
+        &self,
+        master: std::os::fd::BorrowedFd<'_>,
+        action: impl FnOnce(&FrontendMember<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.current()?;
+        self.0.controller.with_foreground(master, action)
+    }
     /// Comparison-only identity of this issued controller. It retains no App
     /// request scope and supplies no currentness, foreground or SDK permission.
     pub fn identity(&self) -> ServiceIdentity {
@@ -47,6 +77,9 @@ impl ServiceFrontend {
 #[derive(Clone)]
 pub struct ServiceIdentity(Arc<frontend_control::FrontendIdentity>);
 impl ServiceIdentity {
+    pub(crate) fn journal_data(&self) -> Vec<u8> {
+        self.0.journal_data()
+    }
     /// Compare original namespace, process incarnation, connection and allocation.
     pub fn same(&self, other: &Self) -> bool {
         self.0.same_requester(&other.0)
@@ -119,6 +152,76 @@ struct Active {
     identity: Arc<()>,
     frontend: ServiceFrontend,
     fence: aterm_uds::CtlStream,
+    nonce: String,
+}
+
+/// Closed frame kinds on the original Native-owned backend control socket.
+/// Strings select the original operation/attachment; none grants Source use.
+#[derive(Clone, Copy)]
+pub enum ServicePacketKind<'a> {
+    Hold,
+    Runtime {
+        go: Option<&'a str>,
+        attachment: &'a str,
+    },
+    SourceInhibit {
+        parent: &'a str,
+        attachment: &'a str,
+    },
+    SourceSelection {
+        parent: &'a str,
+        attachment: &'a str,
+    },
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PacketPhase {
+    Prepared,
+    Offered,
+    Acknowledged,
+    Uncertain,
+}
+/// One original service/control-owned packet. Only the SAME constructor's
+/// authenticated backend controller can acknowledge its private nonce.
+pub struct PreparedServicePacket {
+    owner: Weak<()>,
+    control: Arc<control::Control>,
+    operation: String,
+    nonce: String,
+    bytes: Vec<u8>,
+    phase: PacketPhase,
+}
+impl PreparedServicePacket {
+    /// Private challenge DATA for correlation with the original backend ACK.
+    /// This value never acknowledges the packet or grants frontend authority.
+    pub fn nonce_data(&self) -> &str {
+        &self.nonce
+    }
+    /// Selector comparison only; completion still requires the original backend.
+    pub fn matches_data(&self, operation: &str, nonce: &str) -> bool {
+        self.operation == operation && aterm_digest::ct_eq(self.nonce.as_bytes(), nonce.as_bytes())
+    }
+    /// Historical physical ACK state, never a current frontend/Source grant.
+    pub fn acknowledged(&self) -> bool {
+        self.phase == PacketPhase::Acknowledged
+    }
+    /// Write this already-owned packet outside Native service/phase locks.
+    /// The original socket/binding and live service identity are retained;
+    /// the Native operation separately checks its current admission around IO.
+    ///
+    /// # Errors
+    /// Service/control ended, or an earlier/this write has an uncertain outcome.
+    pub fn offer(&mut self) -> Result<(), Error> {
+        let _owner = self.owner.upgrade().ok_or(Error::Stale)?;
+        match self.phase {
+            PacketPhase::Offered | PacketPhase::Acknowledged => return Ok(()),
+            PacketPhase::Uncertain => return Err(Error::Unavailable),
+            PacketPhase::Prepared => {}
+        }
+        self.phase = PacketPhase::Uncertain;
+        self.control.send_packet(&self.bytes)?;
+        self.phase = PacketPhase::Offered;
+        Ok(())
+    }
 }
 
 /// Keep this owner outside frontend processes and off the GUI thread. Dropping
@@ -133,6 +236,112 @@ pub struct OwnedService {
     active: Option<Active>,
 }
 impl OwnedService {
+    /// Check the actual original backend constructor, bound control allocation
+    /// and SDK construction, independently of any foreground UI controller.
+    ///
+    /// # Errors
+    /// Original child/control/SDK or the exact backend allocation is foreign/stale.
+    pub fn backend_current(&mut self, backend: &ServiceFrontend) -> Result<(), Error> {
+        backend.current()?;
+        if !backend.in_namespace(&self.state) || backend.process() != &self.worker.process()? {
+            return Err(Error::Denied);
+        }
+        self.worker.check_control_binding()?;
+        self.worker.check_sdk_construction()?;
+        let (connection, member) = self.control.bound()?;
+        if !backend.0.controller.on_control(&connection, &member) {
+            return Err(Error::Denied);
+        }
+        backend.current()
+    }
+    /// Prepare the exact original control packet before sending any bytes.
+    /// The owning Native state must retain it before invoking its `offer`.
+    ///
+    /// # Errors
+    /// Invalid selectors, incomplete SDK construction, or unavailable entropy.
+    pub fn prepare_packet(
+        &mut self,
+        operation: &str,
+        kind: ServicePacketKind<'_>,
+    ) -> Result<PreparedServicePacket, Error> {
+        if !hex(operation, 32) {
+            return Err(Error::Denied);
+        }
+        self.worker.check_control_binding()?;
+        self.worker.check_sdk_construction()?;
+        let nonce = aterm_uds::rand::hex_token::<16>().map_err(|_| Error::Unavailable)?;
+        let mut bytes = Vec::new();
+        match kind {
+            ServicePacketKind::Hold => bytes.extend_from_slice(b"H1"),
+            ServicePacketKind::Runtime { go, attachment } => {
+                if !hex(attachment, 32) || go.is_some_and(|go| !hex(go, 32)) {
+                    return Err(Error::Denied);
+                }
+                bytes.extend_from_slice(if go.is_some() { b"R1" } else { b"R0" });
+                if let Some(go) = go {
+                    bytes.extend_from_slice(go.as_bytes());
+                }
+            }
+            ServicePacketKind::SourceInhibit { parent, attachment }
+            | ServicePacketKind::SourceSelection { parent, attachment } => {
+                if !hex(parent, 32) || !hex(attachment, 32) {
+                    return Err(Error::Denied);
+                }
+                bytes.extend_from_slice(
+                    if matches!(kind, ServicePacketKind::SourceInhibit { .. }) {
+                        b"S1"
+                    } else {
+                        b"S2"
+                    },
+                );
+                bytes.extend_from_slice(parent.as_bytes());
+            }
+        }
+        bytes.extend_from_slice(operation.as_bytes());
+        bytes.extend_from_slice(nonce.as_bytes());
+        match kind {
+            ServicePacketKind::Hold => {}
+            ServicePacketKind::Runtime { attachment, .. }
+            | ServicePacketKind::SourceInhibit { attachment, .. }
+            | ServicePacketKind::SourceSelection { attachment, .. } => {
+                bytes.extend_from_slice(attachment.as_bytes())
+            }
+        }
+        Ok(PreparedServicePacket {
+            owner: Arc::downgrade(&self.identity),
+            control: self.control.clone(),
+            operation: operation.into(),
+            nonce,
+            bytes,
+            phase: PacketPhase::Prepared,
+        })
+    }
+    /// Acknowledge through the actual constructor-bound backend controller.
+    /// Receipt bytes/operation strings on another control connection refuse.
+    ///
+    /// # Errors
+    /// Wrong/ended constructor, packet owner, operation, nonce or send phase.
+    pub fn acknowledge_packet(
+        &mut self,
+        packet: &mut PreparedServicePacket,
+        backend: &ServiceFrontend,
+        operation: &str,
+        nonce: &str,
+    ) -> Result<(), Error> {
+        self.backend_current(backend)?;
+        if !Weak::ptr_eq(&packet.owner, &Arc::downgrade(&self.identity))
+            || !Arc::ptr_eq(&packet.control, &self.control)
+            || !packet.matches_data(operation, nonce)
+            || !matches!(
+                packet.phase,
+                PacketPhase::Offered | PacketPhase::Acknowledged
+            )
+        {
+            return Err(Error::Denied);
+        }
+        packet.phase = PacketPhase::Acknowledged;
+        Ok(())
+    }
     /// Observe the actual owned child before this service starts stopping it.
     /// Other actors may already have requested a stop; this supplies no cause.
     ///
@@ -259,8 +468,8 @@ impl OwnedService {
         }
         self.detach_frontend()?;
         let backend = attachment.backend_stream.as_ref().ok_or(Error::Stale)?;
-        match self.control.send_attachment(backend) {
-            Ok(()) => {}
+        let nonce = match self.control.send_attachment(backend) {
+            Ok(nonce) => nonce,
             // Control returns Busy only before sending any bytes or rights.
             // Retain this exact prepared endpoint for the same delivery owner.
             Err(Error::Busy) => return Err(Error::Busy),
@@ -270,7 +479,7 @@ impl OwnedService {
                 eprintln!("Retained native delivery: backend-receipt={error:?}");
                 return Err(error);
             }
-        }
+        };
         drop(attachment.backend_stream.take());
         // Record physical custody before any fallible metadata recheck. Busy
         // after this point retries admission, never the already received right.
@@ -278,6 +487,7 @@ impl OwnedService {
             identity: attachment.identity.clone(),
             frontend: attachment.frontend.clone(),
             fence: attachment.fence.take().ok_or(Error::Stale)?,
+            nonce,
         });
         attachment.phase = DeliveryPhase::Sent;
         match self.ready(&attachment.frontend, foreground) {
@@ -300,6 +510,43 @@ impl OwnedService {
             return Err(Error::Stale);
         }
         Ok(())
+    }
+
+    /// Original physical A nonce DATA for this exact committed attachment.
+    /// Its possession is never evidence that a frontend received F1.
+    ///
+    /// # Errors
+    /// Foreign/stale attachment, incomplete construction or ended foreground.
+    pub fn attachment_data(
+        &mut self,
+        attachment: &PreparedServiceAttachment,
+        foreground: &FrontendMember<'_>,
+    ) -> Result<String, Error> {
+        self.owns(attachment)?;
+        self.current_attachment(attachment)?;
+        self.ready(&attachment.frontend, foreground)?;
+        Ok(self.active.as_ref().ok_or(Error::Stale)?.nonce.clone())
+    }
+
+    /// Current A/constructor observation for the original backend, with a NEW
+    /// borrow of the real session PTY and the actual current frontend process.
+    /// Native's F1 owner must independently require its completed callback.
+    ///
+    /// # Errors
+    /// Backend/attachment/SDK/frontend or the actual foreground is foreign/stale.
+    pub fn current_origin(
+        &mut self,
+        backend: &ServiceFrontend,
+        attachment: &str,
+        master: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<(), Error> {
+        self.backend_current(backend)?;
+        let active = self.active.as_ref().ok_or(Error::Stale)?;
+        if active.nonce != attachment {
+            return Err(Error::Denied);
+        }
+        let frontend = active.frontend.clone();
+        frontend.with_foreground(master, |foreground| self.ready(&frontend, foreground))
     }
 
     /// Take the actual frontend endpoint once, after successful commit and a

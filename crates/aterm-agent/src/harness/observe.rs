@@ -411,16 +411,16 @@ pub fn muse(process: &Process<'_>, user_home: &Path) -> Observation {
 
 /// The account a login file names, by its identity fields alone.
 #[derive(Debug, PartialEq, Eq)]
-struct Identity {
+pub(super) struct Identity {
     /// The provider's id of the user.
-    user: String,
+    pub(super) user: String,
     /// The login address, where the file carries a well-formed one.
-    email: Option<String>,
+    pub(super) email: Option<String>,
 }
 
 /// What a login file says of its account ([`identity_in`]).
 #[derive(Debug, PartialEq, Eq)]
-enum Named {
+pub(super) enum Named {
     /// It names this account.
     One(Identity),
     /// It holds no login.
@@ -489,7 +489,7 @@ fn named_in(cli: Cli, region: Option<Region>, named: Option<Named>, path: PathBu
 /// `email` beside its tokens (grok 1.0.77's strings; no signed-in file was at hand to measure).
 /// A record at the top level is read the same way. Records of two users leave the account
 /// unsaid, since nothing in the file says which one a launch runs on.
-fn grok_named(file: &Value) -> Named {
+pub(super) fn grok_named(file: &Value) -> Named {
     let Some(records) = file.as_object() else {
         return Named::Nobody;
     };
@@ -716,7 +716,7 @@ fn kimi_slot(home: &Path, model: Option<&str>) -> Option<(Region, PathBuf)> {
 /// token's subject (kimi 2.5.2's `stableJwtSubject`), and whose `email` is the address where it
 /// carries one. A token that is no set of claims, or whose claims name no user, leaves the
 /// account unsaid.
-fn kimi_named(file: &Value) -> Named {
+pub(super) fn kimi_named(file: &Value) -> Named {
     let Some(token) = file["access_token"].as_str().filter(|t| !t.is_empty()) else {
         return Named::Nobody;
     };

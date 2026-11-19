@@ -45,6 +45,9 @@
 //! group killed, [`end_with_group`]) and the lane with [`Stopped`]; a second, which ends the lab
 //! at once, kills that group first ([`end_running_group`]).
 
+#[path = "codex_alab_withheld_source.rs"]
+pub(super) mod withheld_source;
+
 use std::io::{BufRead as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};

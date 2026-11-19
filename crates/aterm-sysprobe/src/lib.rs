@@ -83,7 +83,7 @@ pub mod windows;
 
 pub use procs::{
     CoreSplit, ProcessReading, Sweep, SweepOpts, pid_version, processes, processes_keeping,
-    processes_with,
+    processes_keeping_table, processes_with,
 };
 
 pub use caps::{Cap, CapSource, Caps, Why};

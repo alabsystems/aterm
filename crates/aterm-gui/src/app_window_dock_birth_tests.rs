@@ -898,6 +898,65 @@ fn a_default_dock_the_os_refuses_the_wider_frame_for_goes_inside() {
 }
 
 #[test]
+fn an_automatic_roster_retry_keeps_eighty_terminal_columns() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut app = docking_app();
+    let now = std::time::Instant::now();
+    let narrow = app.window_frame_px_for(WID, 24, 109);
+    let wide = app.window_frame_px_for(WID, 24, 110);
+    assert!(app.seat_local_panel_at_birth(WID));
+    assert!(app.fit_birth_dock_to(WID, 2000., Some(100.), false));
+    let resize = |app: &mut App, frame| {
+        app.windows.get_mut(&WID).unwrap().win_px = Some(frame);
+        app.on_resize(WID, frame);
+        app.settle_messages(now);
+        app.publish_navigators(now);
+    };
+    resize(&mut app, narrow);
+    // An unchanged configure and another roster publication must both keep the floor.
+    resize(&mut app, narrow);
+    assert_eq!(app.windows[&WID].dock.cells, 0);
+    assert_eq!(app.windows[&WID].cols, 109);
+    assert!(app.windows[&WID].dock.retry_roster_on_resize);
+
+    resize(&mut app, wide);
+    assert_eq!(app.windows[&WID].dock.cells, DOCK_CELLS);
+    assert_eq!(app.windows[&WID].cols, 80);
+    // Once shown, a window resize leaves its existing panel in place.
+    resize(&mut app, narrow);
+    assert_eq!(app.windows[&WID].cols, 79);
+    // A person's own width still fits at the explicit-Show floor, across publication.
+    app.set_dock_at(WID, 35, now).unwrap();
+    app.local_panel_roster.request_layout();
+    app.publish_navigators(now);
+    assert_eq!(app.windows[&WID].dock.cells, 35);
+    assert_eq!(app.windows[&WID].dock.pref, Some(35));
+    assert_eq!(app.windows[&WID].cols, 74);
+
+    let mut restored = docking_app();
+    restored.take_dock_record(
+        WID,
+        person(
+            Some(35),
+            DockBirth {
+                restored: true,
+                ..DockBirth::default()
+            },
+        ),
+    );
+    assert!(!restored.seat_local_panel_at_birth(WID));
+    restored
+        .windows
+        .get_mut(&WID)
+        .unwrap()
+        .dock
+        .restore_settled();
+    resize(&mut restored, narrow);
+    assert_eq!(restored.windows[&WID].dock.written(), Some(35));
+    assert_eq!(restored.windows[&WID].cols, 74);
+}
+
+#[test]
 fn local_panel_session_count_preserves_each_windows_visibility_and_preferred_width() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let mut app = docking_app();

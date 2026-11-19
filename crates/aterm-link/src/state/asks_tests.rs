@@ -76,6 +76,7 @@ fn every_record_round_trips_and_a_rewrite_holds_the_same_index() {
             deadlines: u64::MAX,
         }),
         noted: false,
+        landings: BTreeMap::new(),
     };
     assert_eq!(read.index, expected);
     let (rewritten, steps) = read.index.encode().expect("rewrite");
@@ -471,4 +472,199 @@ fn a_settles_verdict_rides_in_its_tail_and_a_bare_body_still_parses() {
         );
     }
     assert!(!gone(Some(Verdict::Unjudged { at: 9 })).carried());
+}
+
+/// [`Frame::of_record`] as every build before ATERM-KI-1116-7314's landings read it, word for
+/// word: its body, and a settle's verdict where its tail names one.
+fn of_record_before_landings(body: &[u8], tail: &[u8]) -> Option<Frame> {
+    let mut frame = Frame::parse(body)?;
+    if let Frame::DeadlineGone { how, .. } = &mut frame {
+        *how = Verdict::of_words(tail);
+    }
+    Some(frame)
+}
+
+/// A record as a build before the landings reads it ([`of_record_before_landings`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BeforeLanding(Frame);
+
+impl Record for BeforeLanding {
+    const JOURNAL: &'static str = "asks journal";
+
+    fn body(&self) -> String {
+        self.0.body()
+    }
+
+    fn tail(&self) -> String {
+        self.0.tail()
+    }
+
+    fn of_record(body: &[u8], tail: &[u8]) -> Option<Self> {
+        of_record_before_landings(body, tail).map(Self)
+    }
+}
+
+/// The records a build before the landings reads, in order.
+#[derive(Default)]
+struct BeforeLandings(Vec<Frame>);
+
+impl Replay for BeforeLandings {
+    type Record = BeforeLanding;
+
+    fn apply(&mut self, record: BeforeLanding) {
+        self.0.push(record.0);
+    }
+}
+
+/// **A ROW NAMES THE LANDING THAT NOTED IT IN ITS TAIL, AND A BUILD BEFORE IT READS THE ROW
+/// ALONE** (ATERM-KI-1116-7314, [`Index::landings`]): a recipient and a deadline noted at a
+/// landing carry its in-flight sequence (`seq=<n>`) in the record's tail; replayed, the index
+/// knows that landing at their offset while either row stands, a settle with the recipient
+/// standing included, and a rewrite writes it again; [`Index::landed_elsewhere`] finds it above
+/// a floor, never at the offset asked about. An untagged row that replaces one takes its landing
+/// out, a trim of both rows takes it, and a tail it cannot read names none. Read by a copy of the
+/// parse every build before it ran ([`of_record_before_landings`]), each such record is the row
+/// it always was, and the journal the old index. CONTROL: a row noted with none names none.
+#[test]
+fn a_row_names_the_landing_that_noted_it_and_a_build_before_reads_the_row_alone() {
+    let tagged = vec![
+        Frame::AskedAt {
+            asked: asked(7),
+            seq: 41,
+        },
+        Frame::DeadlineAt {
+            deadline: deadline(7, "s-a"),
+            seq: 41,
+        },
+        Frame::AskedAt {
+            asked: asked(9),
+            seq: 42,
+        },
+        Frame::DeadlineAt {
+            deadline: deadline(9, "s-b"),
+            seq: 42,
+        },
+        Frame::DeadlineGone {
+            off: 9,
+            sid: "s-b".to_string(),
+            how: Some(Verdict::Expired { at: 9 }),
+        },
+        Frame::DeadlineAt {
+            deadline: deadline(12, "s-c"),
+            seq: 43,
+        },
+        Frame::Deadline(Deadline {
+            at: 1,
+            ..deadline(12, "s-c")
+        }),
+        Frame::DeadlineAt {
+            deadline: deadline(14, "s-c"),
+            seq: 44,
+        },
+        Frame::DeadlineGone {
+            off: 14,
+            sid: "s-c".to_string(),
+            how: None,
+        },
+    ];
+    for frame in &tagged {
+        assert!(frame.carried(), "{frame:?}");
+    }
+    let read = read(&journal(&tagged));
+    assert_eq!(read.end, journal::End::Clean);
+    assert_eq!(
+        read.index.landings,
+        [(7, 41), (9, 42)].into(),
+        "a landing while a row of it stands: @9's settle keeps its recipient, @12's untagged \
+         row replaced it, @14's settle left no row"
+    );
+    assert_eq!(read.index.landed_elsewhere(41, 0, 20), [7]);
+    assert_eq!(read.index.landed_elsewhere(41, 0, 7), Vec::<u64>::new());
+    assert_eq!(read.index.landed_elsewhere(41, 8, 20), Vec::<u64>::new());
+    assert_eq!(read.index.landed_elsewhere(42, 0, 20), [9]);
+    assert_eq!(read.index.landed_elsewhere(43, 0, 20), Vec::<u64>::new());
+    let (rewritten, _) = read.index.encode().expect("rewrite");
+    assert_eq!(
+        super::read(&rewritten).index,
+        read.index,
+        "a rewrite keeps them"
+    );
+
+    let old = |bytes: &[u8]| -> Vec<Frame> {
+        let read = journal::read_as::<BeforeLandings>(bytes);
+        assert_eq!(
+            read.end,
+            journal::End::Clean,
+            "a build before reads every record"
+        );
+        read.index.0
+    };
+    let untagged: Vec<Frame> = tagged
+        .iter()
+        .map(|frame| match frame.clone() {
+            Frame::AskedAt { asked, .. } => Frame::Asked(asked),
+            Frame::DeadlineAt { deadline, .. } => Frame::Deadline(deadline),
+            frame => frame,
+        })
+        .collect();
+    assert_eq!(old(&journal(&tagged)), untagged, "the rows it always read");
+    let mut before = Index::default();
+    for frame in old(&rewritten) {
+        assert!(
+            !matches!(frame, Frame::AskedAt { .. } | Frame::DeadlineAt { .. }),
+            "{frame:?}"
+        );
+        before.apply(frame);
+    }
+    let mut was = read.index.clone();
+    was.landings.clear();
+    assert_eq!(before, was, "the index a build before holds");
+
+    assert_eq!(
+        Frame::of_record(b"asked 7 h-andrew", b"seq=41 more"),
+        Some(Frame::Asked(asked(7))),
+        "a tail it cannot read names no landing"
+    );
+    let bare = read_frames(&[Frame::Asked(asked(7)), Frame::Deadline(deadline(7, "s-a"))]);
+    assert!(
+        bare.landings.is_empty() && bare.landed_elsewhere(41, 0, 20).is_empty(),
+        "CONTROL: rows noted with none name none"
+    );
+}
+
+/// The index `frames` replay to.
+fn read_frames(frames: &[Frame]) -> Index {
+    read(&journal(frames)).index
+}
+
+/// **A TRIM TAKES A LANDING OUT WITH THE LAST ROW OF ITS OFFSET** ([`Index::landings`]): the
+/// recipients past [`ASKED_KEEP`] take their landings with them where no deadline holds the
+/// offset, and keep it where one does.
+#[test]
+fn a_trim_takes_a_landing_out_with_the_last_row_of_its_offset() {
+    let mut frames = vec![
+        Frame::DeadlineAt {
+            deadline: deadline(0, "s-a"),
+            seq: 1,
+        },
+        Frame::AskedAt {
+            asked: asked(0),
+            seq: 1,
+        },
+        Frame::AskedAt {
+            asked: asked(1),
+            seq: 2,
+        },
+    ];
+    frames.extend((2..=ASKED_KEEP as u64 + 1).map(|off| Frame::Asked(asked(off + 10))));
+    let index = read_frames(&frames);
+    assert!(
+        !index.asked.contains_key(&0) && !index.asked.contains_key(&1),
+        "trimmed"
+    );
+    assert_eq!(
+        index.landings,
+        [(0, 1)].into(),
+        "@0's deadline keeps its landing"
+    );
 }

@@ -50,13 +50,20 @@ impl How {
     }
 }
 
-/// Why a login reads ended.
+/// Why a run did not reach the login's work: its login ended, or (plan package UB-05) its path to
+/// the vendor did ([`Self::Unreached`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ended {
     /// A review's error output said the login has ended.
     ReviewAuth,
     /// The status read after a sign-in said nobody is signed in.
     StatusSignedOut,
+    /// A sign-in or a review met a blocked path, never an answer about its login: a bot check or
+    /// a block page in the API's place, a 403 named by its status alone
+    /// ([`aterm_phase::wall::StrikeCause::Blocked`]), or no answer at all (an unreachable route).
+    /// It is a path observation ([`Record::unreached_at`]), never the login's end
+    /// ([`Self::refuses_the_login`]): the same login serves again once the path does.
+    Unreached,
 }
 
 impl Ended {
@@ -66,13 +73,14 @@ impl Ended {
         match self {
             Ended::ReviewAuth => "review-auth",
             Ended::StatusSignedOut => "status-signed-out",
+            Ended::Unreached => "unreached",
         }
     }
 
     /// The word read back.
     #[must_use]
     pub fn parse(word: &str) -> Option<Ended> {
-        [Ended::ReviewAuth, Ended::StatusSignedOut]
+        [Ended::ReviewAuth, Ended::StatusSignedOut, Ended::Unreached]
             .into_iter()
             .find(|e| e.word() == word)
     }
@@ -83,7 +91,16 @@ impl Ended {
         match self {
             Ended::ReviewAuth => "a review could not authenticate",
             Ended::StatusSignedOut => "its status says nobody is signed in",
+            Ended::Unreached => "a run met a blocked path to the vendor, not its login",
         }
+    }
+
+    /// Whether it is evidence against the login: a refused authentication or a status that
+    /// names nobody signed in, never a blocked path ([`Self::Unreached`]), which is kept as an
+    /// observation of the path alone.
+    #[must_use]
+    pub const fn refuses_the_login(self) -> bool {
+        !matches!(self, Ended::Unreached)
     }
 }
 
@@ -92,7 +109,7 @@ impl Ended {
 pub enum Outcome {
     /// It worked.
     Worked,
-    /// The login has ended.
+    /// The login has ended, or the run's path to the vendor did ([`Ended::Unreached`]).
     Ended(Ended),
     /// The usage limit is reached, until this time when the text named it.
     Limited(Option<i64>),
@@ -113,8 +130,11 @@ pub struct Record {
     pub used_how: Option<How>,
     /// The newest end seen, unix seconds.
     pub ended_at: Option<i64>,
-    /// Why it ended.
+    /// Why it ended: a cause that refuses the login ([`Ended::refuses_the_login`]).
     pub ended_why: Option<Ended>,
+    /// The newest run that met a blocked path to the vendor ([`Ended::Unreached`]), unix
+    /// seconds: a path observation, which never reads the login ended ([`Self::ended`]).
+    pub unreached_at: Option<i64>,
     /// When the usage limit lifts, unix seconds.
     pub limited_until: Option<i64>,
 }
@@ -128,9 +148,12 @@ impl Record {
                 self.used_how = Some(how);
                 self.limited_until = self.limited_until.filter(|t| *t > now);
             }
-            Outcome::Ended(why) => {
+            Outcome::Ended(why) if why.refuses_the_login() => {
                 self.ended_at = Some(now);
                 self.ended_why = Some(why);
+            }
+            Outcome::Ended(_) => {
+                self.unreached_at = Some(self.unreached_at.map_or(now, |t| t.max(now)));
             }
             Outcome::Limited(until) => {
                 self.used_at = Some(self.used_at.map_or(now, |t| t.max(now)));
@@ -166,6 +189,9 @@ impl Record {
         if let Some(e) = self.ended_why {
             o.insert("ended_why".to_string(), Value::from(e.word()));
         }
+        if let Some(t) = self.unreached_at {
+            o.insert("unreached_at".to_string(), int(t));
+        }
         if let Some(t) = self.limited_until {
             o.insert("limited_until".to_string(), int(t));
         }
@@ -195,7 +221,10 @@ impl Record {
             used_at: int("used_at"),
             used_how: word("used_how").and_then(How::parse),
             ended_at: int("ended_at"),
-            ended_why: word("ended_why").and_then(Ended::parse),
+            ended_why: word("ended_why")
+                .and_then(Ended::parse)
+                .filter(|why| why.refuses_the_login()),
+            unreached_at: int("unreached_at"),
             limited_until: int("limited_until"),
         })
     }

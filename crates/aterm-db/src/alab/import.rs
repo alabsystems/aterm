@@ -90,9 +90,10 @@
 //!   run writes or withdraws the `+tag` link.
 
 use super::{
+    account_status,
     registry::{
-        ACCOUNT, ADDRESS, AddressHolder, AddressIndex, CLI, DIFFER_COLUMNS, MACHINE, MAILBOX,
-        MAX_DIFFERS, MODEL, PHONE, PLAN, PREFERENCE, PROVIDER, SOURCE,
+        ACCOUNT, ACCOUNT_EVENT, ADDRESS, AddressHolder, AddressIndex, CLI, DIFFER_COLUMNS, MACHINE,
+        MAILBOX, MAX_DIFFERS, MODEL, PHONE, PLAN, PREFERENCE, PROVIDER, SOURCE,
     },
     seeds,
 };
@@ -531,8 +532,13 @@ pub struct Terms {
 /// What one provider cell says beside its row's notes, as the harness reads the sheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
-    /// Empty, `0`, `no` or `false`.
+    /// Empty.
     Absent,
+    /// `0`: the provider banned this login's account there (the owner, 2026-11-16). Imported as
+    /// a `banned` account with its `account-event`.
+    Zero,
+    /// `no` or `false`: no account, and the word stays a note on the login.
+    No,
     /// A member.
     Member(Terms),
     /// A member whose notes disqualify this vendor: imported paused.
@@ -1114,6 +1120,96 @@ fn source_row<'p>(field: &Field, sources: &'p Projection) -> Option<(&'p str, &'
         .map(|(pk, row)| (pk.as_str(), row))
 }
 
+/// The `account-event` of each account a sheet's `0` bans whose `banned` this plan writes: born in
+/// the account's own entry, so its record holds the status and the event that says why. An event
+/// row the registry holds already is the same event (`keys::account_event_pk`), and a `banned`
+/// the plan keeps (the owner's word, another source's) moved nothing, so neither writes one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the finish pass's own state, threaded as its siblings take it"
+)]
+fn zero_events(
+    input: &Input<'_>,
+    table: &'static Table,
+    current: &BTreeMap<&'static str, Projection>,
+    zeros: &[Zeroed],
+    account_slots: &BTreeMap<String, usize>,
+    written_rows: &mut Vec<Vec<Change>>,
+    touched_rows: &mut BTreeSet<(usize, &'static str, String)>,
+    plan: &mut Plan,
+) -> Result<()> {
+    let form = table
+        .collection(ACCOUNT_EVENT.name)
+        .unwrap_or(&ACCOUNT_EVENT);
+    let (source, cause) = account_status::SHEET_ZERO;
+    let mut born = BTreeSet::new();
+    for zeroed in zeros {
+        let banned = json!("banned");
+        let wrote = plan.planned.iter().any(|planned| {
+            planned.collection == ACCOUNT.name
+                && planned.pk == zeroed.account
+                && planned.column == "status"
+                && planned.x == banned
+                && planned.step == Step::Write
+        });
+        let pk = keys::account_event_pk(&zeroed.account, source, cause, "banned", b"")?;
+        if !wrote || current[ACCOUNT_EVENT.name].rows.contains_key(&pk) || !born.insert(pk.clone())
+        {
+            continue;
+        }
+        let from = current[ACCOUNT.name]
+            .rows
+            .get(&zeroed.account)
+            .and_then(|row| row.get("status"))
+            .filter(|from| from.as_str().is_some_and(|word| word != "banned"))
+            .cloned();
+        let mut cells = vec![
+            ("account", json!(zeroed.account)),
+            ("login", json!(zeroed.login)),
+            ("provider", json!(zeroed.provider)),
+            ("recorded", json!(input.now_ms)),
+            ("to", banned),
+            ("cause", json!(cause)),
+            ("source", json!(source)),
+            ("src", zeroed.at.value()),
+            (crate::typed::LIFECYCLE, json!("live")),
+        ];
+        if let Some(from) = from {
+            cells.push(("from", from));
+        }
+        let mut changes = Vec::with_capacity(cells.len());
+        for (column, x) in cells {
+            let value = CellValue::imported(form.version, x.clone(), &zeroed.at.source);
+            changes.push(cell::change(
+                form,
+                CellKey {
+                    pk: &pk,
+                    col: column,
+                    elem: None,
+                },
+                &value,
+            )?);
+            plan.planned.push(Planned {
+                collection: ACCOUNT_EVENT.name,
+                pk: pk.clone(),
+                column: column.to_owned(),
+                x,
+                step: Step::Write,
+            });
+        }
+        let count = plan.counts.entry(ACCOUNT_EVENT.name).or_default();
+        count.rows += 1;
+        count.new_rows += 1;
+        count.cells += changes.len();
+        touched_rows.insert((zeroed.at.sheet, ACCOUNT_EVENT.name, pk));
+        match account_slots.get(&zeroed.account) {
+            Some(&slot) => written_rows[slot].extend(changes),
+            None => written_rows.push(changes),
+        }
+    }
+    Ok(())
+}
+
 /// Reorder the entries of `rows` in `slots` (each one's place and key) that `frees_first` pairs,
 /// among the places they take up, so a row freeing a name comes before the row taking it; a pair of
 /// one row frees nothing. Rows trading names have no such order: one goes first whose every row
@@ -1293,6 +1389,18 @@ struct Planner<'a> {
     /// The machine rows the roster found by the principal their Mac published (`node`): its `active`
     /// replaces the `planned` any import wrote, since the Mac has joined.
     joined: BTreeSet<String>,
+    /// The accounts a sheet's `0` bans, each born with its `account-event` once its `banned` is
+    /// written ([`zero_events`]).
+    zeros: Vec<Zeroed>,
+}
+
+/// An account a sheet's provider cell `0` reads as banned: its key, its login's, its provider and
+/// the cell.
+struct Zeroed {
+    account: String,
+    login: String,
+    provider: &'static str,
+    at: Coord,
 }
 
 /// The store entries the candidates of a secret cell (`collection.column` of row `pk`) name,
@@ -1602,6 +1710,7 @@ fn plan_with(
     let current: BTreeMap<&'static str, Projection> = [
         &ADDRESS,
         &ACCOUNT,
+        &ACCOUNT_EVENT,
         &MACHINE,
         &PREFERENCE,
         &MAILBOX,
@@ -1678,6 +1787,7 @@ impl<'a> Planner<'a> {
             frees_first: Vec::new(),
             names_kept: BTreeMap::new(),
             names_reached,
+            zeros: Vec::new(),
             joined: BTreeSet::new(),
         }
     }
@@ -2258,6 +2368,35 @@ impl Planner<'_> {
                 }
                 let (terms, paused) = match self.input.vendors.mark(provider, cell, &notes) {
                     Mark::Absent => continue,
+                    Mark::No => {
+                        self.note(&ADDRESS, &address_pk, &at);
+                        pieces.push((at, labelled(sheet, col, cell)));
+                        continue;
+                    }
+                    Mark::Zero => {
+                        // Kimi's `0` names no region, so no account key: the cell stays the
+                        // login's note.
+                        let Some((realm, _)) = provider_realm(provider, None) else {
+                            self.note(&ADDRESS, &address_pk, &at);
+                            pieces.push((at, labelled(sheet, col, cell)));
+                            continue;
+                        };
+                        // The realm is left out of what the vault decided for the login, so a
+                        // harness file still naming the account places it on no machine.
+                        let Some(pk) = self.account(&address, &address_pk, realm, &at) else {
+                            continue;
+                        };
+                        // A banned account keeps the service it was for and gains no machine.
+                        self.element(&ACCOUNT, &pk, "services", column_service(provider), &at);
+                        self.want(&ACCOUNT, &pk, "status", json!("banned"), &at);
+                        self.zeros.push(Zeroed {
+                            account: pk,
+                            login: address_pk.clone(),
+                            provider,
+                            at,
+                        });
+                        continue;
+                    }
                     Mark::Unread => {
                         self.unsettled_logins.insert(address_pk.clone());
                         self.find(Kind::FreeText, Some(ACCOUNT.name), None, vec![at.clone()]);
@@ -3519,6 +3658,7 @@ impl Planner<'_> {
             frees_first,
             names_kept,
             joined: joined_rows,
+            zeros,
             ..
         } = self;
         let mut plan = Plan {
@@ -3527,6 +3667,8 @@ impl Planner<'_> {
             ..Plan::default()
         };
         let collections = [&ADDRESS, &ACCOUNT, &MACHINE, &PREFERENCE, &MAILBOX, &PHONE];
+        // Each account row's entry in `written_rows`, which its events join.
+        let mut account_slots: BTreeMap<String, usize> = BTreeMap::new();
         let mut touched_rows: BTreeSet<(usize, &'static str, String)> = BTreeSet::new();
         let mut written_rows = Vec::new();
         let mut machine_slots: Vec<(usize, String)> = Vec::new();
@@ -4203,10 +4345,23 @@ impl Planner<'_> {
                     if name == MACHINE.name {
                         machine_slots.push((written_rows.len(), pk.clone()));
                     }
+                    if name == ACCOUNT.name {
+                        account_slots.insert(pk.clone(), written_rows.len());
+                    }
                     written_rows.push(changes);
                 }
             }
         }
+        zero_events(
+            input,
+            table,
+            &current,
+            &zeros,
+            &account_slots,
+            &mut written_rows,
+            &mut touched_rows,
+            &mut plan,
+        )?;
         free_names_first(&mut written_rows, &machine_slots, &frees_first);
         // A preference an earlier import wrote that no source states now ends, three-way: a row
         // with an owner's cell on it stays and is a finding, and an account with a cell this run

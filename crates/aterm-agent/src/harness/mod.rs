@@ -168,6 +168,7 @@ pub mod quota_scenes;
 pub mod quota_view;
 pub mod registry;
 pub mod relaunch;
+pub mod relaunch_type;
 pub mod remote_renew;
 pub mod repo_work;
 #[cfg(unix)]

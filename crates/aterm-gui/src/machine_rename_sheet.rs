@@ -41,6 +41,8 @@ pub(crate) struct Held {
     pub(crate) word: String,
     /// Whether this is the press's read rather than the window's view, which may be stale.
     pub(crate) read: bool,
+    /// An explicit selection of an automatically drawn nickname still makes it chosen.
+    pub(crate) chosen_nick: bool,
     /// Whether the number shown is one a migration still waits on, holding no claim yet
     /// ([`RenamePreview::waits`]).
     pub(crate) waits: bool,
@@ -53,6 +55,7 @@ impl Held {
             nick: view.nick.clone(),
             word: view.word.clone(),
             read: false,
+            chosen_nick: false,
             waits: false,
         }
     }
@@ -64,6 +67,7 @@ impl Held {
             nick: name.display_nick(),
             word: name.display_nick(),
             read: true,
+            chosen_nick: name.nick_class == aterm_net::fleet_member::name_record::NickClass::Chosen,
             waits: preview.waits(),
         }
     }
@@ -86,6 +90,30 @@ impl Held {
     /// Whether a rename to `num` claims the number this Mac shows but holds no claim to yet.
     fn claims(&self, num: Number) -> bool {
         self.waits && num.to_string() == self.name
+    }
+
+    /// The draft worth saving or retrying. The displayed spelling can be longer than a
+    /// valid input after word boundaries expand, so accept the held text before parsing.
+    fn typed_nick<'a>(&self, field: &'a Field) -> Option<&'a str> {
+        let text = field.typed()?;
+        if !self.read {
+            return Some(text);
+        }
+        let unchanged = if self.chosen_nick {
+            Nickname::displays_as(text, &self.word)
+        } else {
+            text.trim() == self.word
+        };
+        (!unchanged).then_some(text)
+    }
+
+    /// Keep what the person sees in the editor while a display-equivalent spelling
+    /// follows later reads like an untouched name.
+    pub(crate) fn nickname_field(&self, mut field: Field) -> Field {
+        if field.typed().is_some() && self.typed_nick(&field).is_none() {
+            field.opened = Some(field.text.clone());
+        }
+        field
     }
 }
 
@@ -237,8 +265,10 @@ impl Snapshot {
         number: &Field,
         nick: &Field,
     ) -> Option<RenameTo> {
-        (self.authorization_unknown(held) && number.typed().is_none() && nick.typed().is_none())
-            .then_some(RenameTo::Authorize)
+        (self.authorization_unknown(held)
+            && number.typed().is_none()
+            && held.typed_nick(nick).is_none())
+        .then_some(RenameTo::Authorize)
     }
 
     pub(crate) fn named(preview: RenamePreview, naming: NamingStatus) -> Self {
@@ -324,9 +354,8 @@ pub(crate) enum RenameTo {
 /// # Errors
 /// The words the line shows for a typed number or name that is none.
 pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<RenameTo, String> {
-    let nick = match nick.typed().map(str::trim) {
+    let nick = match held.typed_nick(nick).map(str::trim) {
         None | Some("") => None,
-        Some(word) if held.read && word == held.word => None,
         Some(word) => Some(Nickname::parse(word).map_err(|why| format!("Name: {why}."))?),
     };
     let num = match number.typed().map(str::trim) {
@@ -371,7 +400,7 @@ fn judged(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Field, names:
     let present =
         |text: String, renames, expected: Option<&aterm_types::machine_name::GeneratedNames>| {
             let draft = snapshot.authorization_unknown(held)
-                && (number.typed().is_some() || nick.typed().is_some());
+                && (number.typed().is_some() || held.typed_nick(nick).is_some());
             let draft = if draft {
                 "Save or revert your edits before authorizing naming."
             } else {
@@ -430,7 +459,7 @@ fn judged(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Field, names:
         return present(
             format!(
                 "The name {} is already used by another machine.",
-                nick.as_str()
+                nick.display()
             ),
             false,
             expected.as_ref(),
@@ -460,12 +489,12 @@ fn judged(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Field, names:
             if held.read && held.unnumbered() {
                 format!(
                     "This Mac has no number yet; Save makes its name {}.",
-                    nick.as_str(),
+                    nick.display(),
                 )
             } else {
                 format!(
                     "Save keeps this Mac's number and makes its name {}.",
-                    nick.as_str(),
+                    nick.display(),
                 )
             },
             true,
@@ -676,7 +705,8 @@ mod macos {
         fn fields(&self) -> (Field, Field) {
             (
                 Field::at(text(&self.number), self.number_opened.clone()),
-                Field::at(text(&self.nick), self.nick_opened.clone()),
+                self.held
+                    .nickname_field(Field::at(text(&self.nick), self.nick_opened.clone())),
             )
         }
     }

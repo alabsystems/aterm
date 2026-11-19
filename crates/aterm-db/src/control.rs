@@ -163,12 +163,15 @@ pub struct Report {
 const REFUSAL_HOLD: Duration = Duration::from_secs(60);
 
 /// Per-peer membership-record scheduling, never a claim of delivery: where the next round's
-/// selection resumes, and the run of rounds the peer took none of under one pair of complete
-/// history views.
+/// selection resumes, the run of rounds the peer took none of under one pair of complete
+/// history views, and the served root it last took nothing of.
 #[derive(Clone, Default, Debug)]
 struct MembershipHint {
     cursor: Option<Digest>,
     refused: Option<Refusal>,
+    /// A served batch (`frontier::serves`) the peer took nothing of: the digest of the views it
+    /// was served under, and when.
+    unserved: Option<(Digest, Instant)>,
 }
 
 /// Consecutive rounds a peer durably took none of, all offered under one pair of complete
@@ -235,6 +238,27 @@ impl MembershipHint {
             run.held = Some(now);
             self.cursor = None;
         }
+    }
+
+    /// Whether a round at `now`, under the history views whose digest is `key`, may serve the
+    /// peer this Mac's roots: not for [`REFUSAL_HOLD`] after the peer took nothing of a served
+    /// batch under that key, since under the same views it is served the same frame. A change
+    /// of either view ends the hold. It withholds no record: the peer is offered the records it
+    /// lacks as [`Self::offers`] says, alone.
+    fn serves(&mut self, key: &Digest, now: Instant) -> bool {
+        match self.unserved {
+            Some((held, at)) if held == *key => now.saturating_duration_since(at) >= REFUSAL_HOLD,
+            _ => {
+                self.unserved = None;
+                true
+            }
+        }
+    }
+
+    /// Note a served batch under the views whose digest is `key`, which the peer took
+    /// (`taken`) or took nothing of, at `now`.
+    fn served(&mut self, key: Digest, taken: bool, now: Instant) {
+        self.unserved = (!taken).then_some((key, now));
     }
 }
 
@@ -913,6 +937,11 @@ pub struct Endpoint {
     /// The least release a peer must report for that trade: [`hearing::RELAYS`]. Only a test
     /// sets another, since a test binary reports [`hearing::LIFTED`].
     relay_floor: Version,
+    /// The least release a peer's kept report must name for this device to state a records
+    /// bound of a later format than 1 to it ([`frontier`]'s `peer_reads`):
+    /// [`hearing::READS_FORMAT`], which names none yet, so no report is such evidence. Only a
+    /// test sets another.
+    format_floor: Option<Version>,
     /// Behave as 0.145 does: trade no version after a round.
     #[cfg(test)]
     pub(crate) legacy: bool,
@@ -940,13 +969,19 @@ pub struct Endpoint {
     pub(crate) redial_keeps_first_attempt: bool,
 }
 
-/// One exchange's absolute deadline: the product's [`crate::network::WITHIN`]. A test needs each
-/// round to complete, and waits out a loaded machine's round as a one-minute hang detector: a
-/// round the deadline cuts reads as a missing application report.
+/// One exchange's patience ([`crate::network::PATIENCE`]): the product's absolute
+/// [`crate::network::WITHIN`]. A test needs each round to complete, and its exchange is cut only
+/// by the hang detector ([`crate::network::Patience::HANG`]): a minute in which no byte moved on
+/// its stream, or a working round's guard. A loaded machine stretches a round's wall time without
+/// bound; a round the deadline cuts reads as a missing application report.
+const EXCHANGE: crate::network::Patience = crate::network::PATIENCE;
+/// How long an exchange's TLS and both proofs may take: 30 s.
 #[cfg(not(test))]
-const EXCHANGE: Duration = crate::network::WITHIN;
+const HANDSHAKE: Duration = Duration::from_secs(30);
+/// How long an exchange's TLS and both proofs may take: a unit test's dialer and listener are its
+/// own and finish the handshake, so the hang detector's minute.
 #[cfg(test)]
-pub(crate) const EXCHANGE: Duration = Duration::from_secs(60);
+const HANDSHAKE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Protocol {
@@ -1091,7 +1126,10 @@ impl Endpoint {
             .collect()
     }
     /// Legacy protocols carry no crossed-state metadata. Read the durable mark even when
-    /// the endpoint's cached witness or the current records file is short.
+    /// the endpoint's cached witness or the current records file is short. They carry no
+    /// format either: a Mac whose format mark names a later format than 1 is refused here and
+    /// at each read of [`MembershipDisk`], so the legacy records exchange never meets a log a
+    /// root dropped records of, which only a later format holds.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1537,6 +1575,7 @@ impl Endpoint {
                 pending: true,
                 reports: None,
                 relay_floor: hearing::RELAYS,
+                format_floor: hearing::READS_FORMAT,
                 #[cfg(test)]
                 legacy: false,
                 #[cfg(test)]
@@ -1670,6 +1709,7 @@ impl Endpoint {
             pending: false,
             reports: None,
             relay_floor: hearing::RELAYS,
+            format_floor: hearing::READS_FORMAT,
             #[cfg(test)]
             legacy: false,
             #[cfg(test)]
@@ -1731,6 +1771,7 @@ impl Endpoint {
             pending: false,
             reports: None,
             relay_floor: hearing::RELAYS,
+            format_floor: hearing::READS_FORMAT,
             #[cfg(test)]
             legacy: false,
             #[cfg(test)]
@@ -1749,7 +1790,8 @@ impl Endpoint {
     }
 
     /// Exchange over a connection admitted by the native LAN/loopback policy.
-    /// One absolute deadline ([`EXCHANGE`]) covers TLS, authentication and repair.
+    /// One deadline of the exchange's patience ([`EXCHANGE`]) covers TLS, authentication and
+    /// repair, the bytes its stream moves counted as its progress.
     /// Route evidence is rechecked after TLS and after the bounded exchange.
     /// This does not start any automatic network service.
     pub fn exchange(
@@ -1763,8 +1805,8 @@ impl Endpoint {
         repair.clear_application();
         let (tcp, locality) = connection.into_parts();
         locality.recheck()?;
-        let until = Instant::now() + EXCHANGE;
-        let _deadline = crate::network::Deadline::arm_within(&tcp, EXCHANGE)?;
+        let until = EXCHANGE.horizon(Instant::now());
+        let deadline = crate::network::Deadline::arm_with(&tcp, EXCHANGE)?;
         // This PUBLIC discriminator separates networks/protocols. It is not an
         // admission secret. Authority witness + exporter-bound identity below
         // are mandatory before any inventory or control repair is exposed.
@@ -1791,19 +1833,14 @@ impl Endpoint {
                     } else {
                         handshake
                     };
-                    handshake(
-                        tcp,
-                        &discriminator,
-                        Some(&self.identity),
-                        Duration::from_secs(30),
-                    )
+                    handshake(tcp, &discriminator, Some(&self.identity), HANDSHAKE)
                 } else {
                     fleet::client_handshake_as(
                         tcp,
                         &discriminator,
                         Some(&self.identity),
                         FleetOp::Database,
-                        Duration::from_secs(30),
+                        HANDSHAKE,
                     )
                 }
                 .map_err(|error| {
@@ -1816,7 +1853,7 @@ impl Endpoint {
                     .inspect_err(|_| repair.phase = Phase::Route)?;
                 let protocol = Protocol::from_alpn(channel.transport.stream().conn.alpn_protocol());
                 let result = self.connected_until(
-                    channel.transport.stream(),
+                    &mut deadline.progressing(channel.transport.stream()),
                     channel.peer.as_ref(),
                     side,
                     repair,
@@ -1841,12 +1878,7 @@ impl Endpoint {
                     } else {
                         handshake
                     };
-                    handshake(
-                        tcp,
-                        &discriminator,
-                        Some(&self.identity),
-                        Duration::from_secs(30),
-                    )
+                    handshake(tcp, &discriminator, Some(&self.identity), HANDSHAKE)
                 } else {
                     fleet::server_handshake_as(
                         tcp,
@@ -1854,7 +1886,7 @@ impl Endpoint {
                         Some(&self.identity),
                         FleetScope::Facts,
                         &[FleetOp::Database],
-                        Duration::from_secs(30),
+                        HANDSHAKE,
                     )
                 }
                 .map_err(|_| Error::new("Commons control TLS handshake failed"))?;
@@ -1863,7 +1895,7 @@ impl Endpoint {
                     .inspect_err(|_| repair.phase = Phase::Route)?;
                 let protocol = Protocol::from_alpn(channel.transport.stream().conn.alpn_protocol());
                 let result = self.connected_until(
-                    channel.transport.stream(),
+                    &mut deadline.progressing(channel.transport.stream()),
                     channel.peer.as_ref(),
                     side,
                     repair,
@@ -1891,7 +1923,7 @@ impl Endpoint {
             proof,
             side,
             repair,
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             Protocol::Legacy,
         )
     }

@@ -11,7 +11,7 @@
 use super::plan_cells as plan;
 use super::*;
 use crate::{
-    alab::registry::{ACCOUNT, ADDRESS, MACHINE, PREFERENCE},
+    alab::registry::{ACCOUNT, ACCOUNT_EVENT, ADDRESS, MACHINE, PREFERENCE},
     typed::{
         grid::tests::{Book, elem, put},
         secret::Memory,
@@ -43,7 +43,9 @@ impl Vendors for Stand {
         let paused = lower.contains("banned")
             && (provider == keys::ANTHROPIC || !any_named || names(provider));
         let terms = match (provider, cell) {
-            (_, "" | "0") => return Mark::Absent,
+            (_, "") => return Mark::Absent,
+            (_, "0") => return Mark::Zero,
+            (_, "no" | "false") => return Mark::No,
             (keys::KIMI, "1") => return Mark::Held,
             (keys::KIMI, "global") => Terms {
                 region: Some("global"),
@@ -195,6 +197,80 @@ fn apply(book: &mut Book, plan: &Plan) -> Cells {
         book.write(1, &seen, changes.clone());
     }
     book.cells()
+}
+
+/// The m30 sheet (SF-47's exit test): three logins on m30, the third's Claude cell a `0`, which
+/// the owner's sheet uses for an account its provider banned (the owner, 2026-11-16). The import
+/// gives three Claude accounts, the first two `pending` and the third `banned`, and one
+/// `account-event` that says so (source `sheet`, cause `sheet-zero`, to `banned`), born in the
+/// banned account's own record. The banned account gains no machine. A re-import of the same
+/// sheet writes nothing: the event's key collapses it into the row it already wrote.
+/// NEGATIVE CONTROL: with the vault pass skipping a `0` as it skips an empty cell
+/// (`Mark::Zero => continue` in `Planner::vault`), the import gives two accounts and the test
+/// fails: `` left: 2 right: 3 ``.
+#[test]
+fn the_m30_sheet_gives_three_accounts_and_the_third_is_banned() {
+    let sheet = vault(&[
+        ",ea@example.com,m30,,1,,,,,,,,",
+        ",ga@example.com,m30,,1,,,,,,,,",
+        ",te@example.com,m30,,0,,,,,,,,",
+    ]);
+    let mut book = Book::new();
+    let first = plan(&input(std::slice::from_ref(&sheet), &[]), &Cells::new()).unwrap();
+    let after = apply(&mut book, &first);
+    let accounts = cell::project(&ACCOUNT, &after);
+    assert_eq!(accounts.rows.len(), 3, "{:?}", accounts.rows.keys());
+    let key = |address| keys::account_pk("claude", address).unwrap();
+    let status = |address| accounts.rows[&key(address)].get("status").cloned();
+    assert_eq!(status("ea@example.com"), Some(json!("pending")));
+    assert_eq!(status("ga@example.com"), Some(json!("pending")));
+    assert_eq!(status("te@example.com"), Some(json!("banned")));
+    let banned = key("te@example.com");
+    let events = cell::project(&ACCOUNT_EVENT, &after);
+    assert_eq!(events.rows.len(), 1, "{:?}", events.rows.keys());
+    let (event_pk, event) = events.rows.iter().next().unwrap();
+    assert_eq!(
+        *event_pk,
+        keys::account_event_pk(&banned, "sheet", "sheet-zero", "banned", b"").unwrap()
+    );
+    let login = keys::address_pk("te@example.com").unwrap();
+    for (column, want) in [
+        ("account", json!(banned)),
+        ("login", json!(login)),
+        ("provider", json!("anthropic")),
+        ("source", json!("sheet")),
+        ("cause", json!("sheet-zero")),
+        ("to", json!("banned")),
+    ] {
+        assert_eq!(event.get(column), Some(&want), "{column}");
+    }
+    assert_eq!(event.get("from"), None);
+    assert!(event.live());
+    // The status and the event that says why are one record's.
+    let record = first
+        .rows
+        .iter()
+        .find(|changes| changes.iter().any(|c| c.collection == ACCOUNT_EVENT.name))
+        .unwrap();
+    assert!(
+        record
+            .iter()
+            .any(|c| c.collection == ACCOUNT.name && c.key == format!("{banned}.status"))
+    );
+    // A banned account gains no machine; the others do.
+    let preferences = cell::project(&PREFERENCE, &after);
+    assert!(
+        preferences
+            .rows
+            .contains_key(&pref("m30", "ea@example.com"))
+    );
+    assert!(
+        !preferences
+            .rows
+            .contains_key(&pref("m30", "te@example.com"))
+    );
+    let again = plan(&input(&[sheet], &[]), &after).unwrap();
+    assert!(again.rows.is_empty(), "{:?}", again.rows);
 }
 
 /// The vault sheet reads the harness's way: a bare Kimi `1` is held and makes no account (its

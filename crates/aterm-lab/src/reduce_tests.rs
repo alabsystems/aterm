@@ -41,16 +41,32 @@ fn check_folds(name: &str, source: &str, r: &Reduction) -> Result<(), String> {
     .map_err(|e| format!("{name}: {e}"))
 }
 
+/// Every fixture: its name, its text and its reduction by `rules`.
+fn reduced_by(rules: &dyn Rules) -> Vec<(String, String, Reduction)> {
+    fixtures()
+        .into_iter()
+        .map(|(n, text)| {
+            let r = reduce_with(&text, Program::Claude, rules).expect("a reduction");
+            (n, text, r)
+        })
+        .collect()
+}
+
+/// Every fixture with its [`P11`] reduction ([`reduce`]), reduced once for the binary: a
+/// reduction is a function of its text alone, and seven tests read every fixture's.
+fn reduced() -> &'static [(String, String, Reduction)] {
+    static REDUCED: std::sync::OnceLock<Vec<(String, String, Reduction)>> =
+        std::sync::OnceLock::new();
+    REDUCED.get_or_init(|| reduced_by(&P11))
+}
+
+/// What `check` says against each reduction of `set` it refuses.
 fn failures(
-    rules: &dyn Rules,
+    set: &[(String, String, Reduction)],
     check: &dyn Fn(&str, &str, &Reduction) -> Result<(), String>,
 ) -> Vec<String> {
-    fixtures()
-        .iter()
-        .filter_map(|(n, text)| {
-            let r = reduce_with(text, Program::Claude, rules).expect("a reduction");
-            check(n, text, &r).err()
-        })
+    set.iter()
+        .filter_map(|(n, text, r)| check(n, text, r).err())
         .collect()
 }
 
@@ -64,11 +80,11 @@ fn no_text(n: &str, t: &str, r: &Reduction) -> Result<(), String> {
 
 #[test]
 fn a_reduction_folds_as_its_source() {
-    let bad = failures(&P11, &folds);
+    let bad = failures(reduced(), &folds);
     assert!(bad.is_empty(), "{bad:#?}");
     let (mut walls, mut notes, mut tools, mut ends) = (0, 0, 0, 0);
-    for (_, text) in fixtures() {
-        let f = readings(&text, Program::Claude);
+    for (_, text, _) in reduced() {
+        let f = readings(text, Program::Claude);
         let count = |p: fn(&StepEvent) -> bool| f.steps.iter().filter(|s| p(&s.ev)).count();
         walls += count(|e| matches!(e, StepEvent::EndWall { .. }));
         tools += count(|e| matches!(e, StepEvent::ToolUse { .. }));
@@ -83,7 +99,7 @@ fn a_reduction_folds_as_its_source() {
 
 #[test]
 fn a_reduction_keeps_no_text() {
-    let bad = failures(&P11, &no_text);
+    let bad = failures(reduced(), &no_text);
     assert!(bad.is_empty(), "{bad:#?}");
 }
 
@@ -557,26 +573,38 @@ impl Rules for ReplacesSubtype {
 
 #[test]
 fn a_reducer_that_keeps_content_fails_the_text_check() {
-    let bad = failures(&KeepsContent, &no_text);
-    assert!(bad.len() >= 20, "{} of 24 failed: {bad:#?}", bad.len());
+    let keeps = reduced_by(&KeepsContent);
+    let bad = failures(&keeps, &no_text);
     assert!(
-        failures(&KeepsContent, &folds).is_empty(),
+        bad.len() >= 20,
+        "{} of {} failed: {bad:#?}",
+        bad.len(),
+        keeps.len()
+    );
+    assert!(
+        failures(&keeps, &folds).is_empty(),
         "it still folds as its source"
     );
 }
 
 #[test]
 fn a_reducer_that_replaces_type_fails_the_fold_check() {
-    let bad = failures(&ReplacesType, &folds);
-    assert!(bad.len() >= 20, "{} of 24 failed: {bad:#?}", bad.len());
+    let replaced = reduced_by(&ReplacesType);
+    let bad = failures(&replaced, &folds);
+    assert!(
+        bad.len() >= 20,
+        "{} of {} failed: {bad:#?}",
+        bad.len(),
+        replaced.len()
+    );
 }
 
 #[test]
 fn a_reducer_that_blanks_notice_text_fails_the_wall_check() {
-    let bad = failures(&BlanksNotices, &folds);
-    let with = fixtures()
+    let bad = failures(&reduced_by(&BlanksNotices), &folds);
+    let with = reduced()
         .iter()
-        .filter(|(_, t)| t.contains("\"isApiErrorMessage\":true"))
+        .filter(|(_, t, _)| t.contains("\"isApiErrorMessage\":true"))
         .count();
     assert!(
         with >= 15 && bad.len() == with,
@@ -633,8 +661,7 @@ fn a_closed_word_is_kept_only_where_a_reader_reads_it() {
 #[test]
 fn every_closed_word_a_reduction_keeps_is_read() {
     let mut kept = 0;
-    for (n, text) in fixtures() {
-        let r = reduce(&text, Program::Claude).expect("reduced");
+    for (n, _, r) in reduced() {
         assert_eq!(unread_words(&r.text, Program::Claude), Ok(vec![]), "{n}");
         kept += r.words.1;
     }
@@ -642,10 +669,9 @@ fn every_closed_word_a_reduction_keeps_is_read() {
     let r = reduce(&src, Program::Codex).expect("reduced");
     assert_eq!(unread_words(&r.text, Program::Codex), Ok(vec![]));
     assert!(kept >= 100, "{kept} words kept: the check is not vacuous");
-    let unread = fixtures()
+    let unread = reduced_by(&KeepsEveryCandidate)
         .iter()
-        .filter(|(_, text)| {
-            let r = reduce_with(text, Program::Claude, &KeepsEveryCandidate).expect("reduced");
+        .filter(|(_, _, r)| {
             !unread_words(&r.text, Program::Claude)
                 .expect("read")
                 .is_empty()
@@ -653,23 +679,22 @@ fn every_closed_word_a_reduction_keeps_is_read() {
         .count();
     assert_eq!(
         unread,
-        fixtures().len(),
+        reduced().len(),
         "every fixture keeps an unread word"
     );
 }
 
 #[test]
 fn a_reducer_that_blanks_a_read_word_fails_the_fold_check() {
-    let with = fixtures()
+    let with = reduced()
         .iter()
-        .filter(|(_, text)| {
-            let r = reduce(text, Program::Claude).expect("reduced");
+        .filter(|(_, _, r)| {
             r.text
                 .match_indices(r#""subtype":""#)
                 .any(|(i, m)| !r.text[i + m.len()..].starts_with('"'))
         })
         .count();
-    let bad = failures(&BlanksRead(&["subtype"]), &folds);
+    let bad = failures(&reduced_by(&BlanksRead(&["subtype"])), &folds);
     assert!(
         with >= 10 && bad.len() == with,
         "{} of {with}: {bad:#?}",
@@ -687,8 +712,7 @@ fn a_reduction_nothing_restores_is_refused() {
 
 #[test]
 fn a_reduction_reduced_again_is_itself() {
-    for (n, text) in fixtures() {
-        let once = reduce(&text, Program::Claude).expect("reduced");
+    for (n, _, once) in reduced() {
         let twice = reduce(&once.text, Program::Claude).expect("reduced again");
         let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
         assert_eq!(body(&twice.text), body(&once.text), "{n}");
@@ -1137,9 +1161,8 @@ fn harness_reads_as(source: &str, red: &Reduction) -> Result<(), String> {
 fn the_harness_reads_every_reduction_as_its_source() {
     let (mut login, mut walls, mut typed) = (0, 0, 0);
     let mut bad = Vec::new();
-    for (n, text) in fixtures() {
-        let r = reduce(&text, Program::Claude).expect("reduced");
-        if let Err(e) = harness_reads_as(&text, &r) {
+    for (n, text, r) in reduced() {
+        if let Err(e) = harness_reads_as(text, r) {
             bad.push(format!("{n}: {e}"));
         }
         login += usize::from(text.contains("authentication_failed"));
@@ -1152,10 +1175,9 @@ fn the_harness_reads_every_reduction_as_its_source() {
         "{login} {walls} {typed}"
     );
     let keys: &[&str] = &["error", "status", "rateLimitType"];
-    let with = fixtures()
+    let with = reduced()
         .iter()
-        .filter(|(_, text)| {
-            let r = reduce(text, Program::Claude).expect("reduced");
+        .filter(|(_, _, r)| {
             keys.iter().any(|k| {
                 r.text
                     .match_indices(&format!("\"{k}\":\""))
@@ -1163,7 +1185,7 @@ fn the_harness_reads_every_reduction_as_its_source() {
             })
         })
         .count();
-    let blanks = BlanksRead(&["error", "status", "rateLimitType"]);
+    let blanks = reduced_by(&BlanksRead(&["error", "status", "rateLimitType"]));
     let harness =
         |n: &str, t: &str, r: &Reduction| harness_reads_as(t, r).map_err(|e| format!("{n}: {e}"));
     let bad = failures(&blanks, &harness);

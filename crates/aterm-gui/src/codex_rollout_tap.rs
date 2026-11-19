@@ -297,6 +297,7 @@ impl Job {
 
 enum Command {
     Request(Job),
+    Adoption(crate::codex_adoption::Job, crate::codex_adoption::Master),
     /// The session's tap goes; with its timeline, `status rollout=` says
     /// `stopped` ([`stop_tap`]).
     Stop {
@@ -339,6 +340,17 @@ pub(crate) fn request_as(
     let Some(job) = Job::capture_job(session, ctx, target, wake, image) else {
         return;
     };
+    queue(Command::Request(job));
+}
+
+pub(crate) fn observe_adoption(
+    job: crate::codex_adoption::Job,
+    master: crate::codex_adoption::Master,
+) {
+    queue(Command::Adoption(job, master));
+}
+
+fn queue(command: Command) {
     let mut slot = TAP.lock().unwrap_or_else(PoisonError::into_inner);
     if slot.is_none() {
         let (tx, rx) = channel::<Command>();
@@ -355,10 +367,7 @@ pub(crate) fn request_as(
             }
         }
     }
-    if slot
-        .as_ref()
-        .is_some_and(|tx| tx.send(Command::Request(job)).is_err())
-    {
+    if slot.as_ref().is_some_and(|tx| tx.send(command).is_err()) {
         // The thread is gone (a panic in a read): a fresh one next time.
         *slot = None;
     }
@@ -405,6 +414,7 @@ fn run(rx: &Receiver<Command>) {
     let mut taps = Taps::new();
     while let Ok(cmd) = rx.recv() {
         match cmd {
+            Command::Adoption(job, master) => job.run(master),
             Command::Request(job) => {
                 if let Some(applied) = read_once(&mut taps, &job) {
                     job.wake.after(job.session, &applied);

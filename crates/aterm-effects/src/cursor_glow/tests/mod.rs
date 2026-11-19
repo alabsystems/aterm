@@ -125,19 +125,9 @@ fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
     }
 }
 
-/// The `rainbow` theme's config: the tall ribbon body, its band behind the words.
+/// The `rainbow` theme's config: the ribbon's body, its band behind the words.
 fn tall_rainbow_cfg() -> GlowConfig {
-    let c = cfg(GlowStyle::RainbowKitty, true);
-    assert!(c.ribbon_tall && !c.ribbon_flat);
-    c
-}
-
-/// The rainbow engine's config with the underline body, a shape no built-in theme picks, which
-/// these tests keep drawing as theme data.
-fn underline_rainbow_cfg() -> GlowConfig {
-    let mut c = cfg(GlowStyle::RainbowKitty, true);
-    c.ribbon_tall = false;
-    c
+    cfg(GlowStyle::RainbowKitty, true)
 }
 
 fn assert_invariants(out: &[GlowQuad], g: Geom) {

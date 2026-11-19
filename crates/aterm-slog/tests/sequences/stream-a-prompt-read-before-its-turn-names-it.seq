@@ -1,0 +1,23 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h review: while the stream feeds the turns, a vendor prompt the transcript reads before
+# the harness's `started` of its turn (the tap read first) has no turn to name and stays
+# unmapped; the turn the stream opens next, within the attribution window, adopts it, so it
+# carries the vendor turn's vref= and the vendor end writes its metrics there.
+stream started 1 by=person
+expect open t1 turn par=r1 src=harness conf=claim hseq=1 turn_by=person @0
+at 100 vendor prompt
+expect amend t1 turn src=transcript vref=v1 @100
+at 1000 vendor end
+expect amend t1 turn src=transcript vdur_ms=900 tok_in=40 tok_out=12 @1000
+at 1100 stream ended 1 done
+expect turn=none
+at 5000 vendor prompt
+expect turn=none
+at 5200 stream started 2 by=person
+expect open t2 turn par=r1 src=harness conf=claim hseq=3 turn_by=person @5200
+expect amend t2 turn src=transcript vref=v2 @5200
+at 6000 vendor end
+expect amend t2 turn src=transcript vdur_ms=900 tok_in=40 tok_out=12 @6000
+expect turn=t2
+at 6100 stream ended 2 done
+expect turn=none

@@ -288,7 +288,6 @@ impl Log {
 
     /// The frontier of the floor this log was judged above: for a read, the settled floor S's
     /// ([`crate::checkpoint::finals`]).
-    #[cfg(test)]
     pub(crate) const fn settled_frontier(&self) -> Option<&BTreeMap<Actor, Tip>> {
         self.floor.as_ref()
     }
@@ -602,7 +601,19 @@ impl Log {
                 .collect(),
             floor: self.floor.clone(),
             conflicts: self.conflicts.intersection(cut).copied().collect(),
-            opaque_authors: self.opaque_authors.clone(),
+            // A writer is opaque in the cut only by an unavailable record the cut holds: one
+            // above it is gone with the rest, so a state of the cut is the cut's alone.
+            opaque_authors: self
+                .records
+                .iter()
+                .filter(|(id, (operation, _))| {
+                    cut.contains(*id)
+                        && !operation.available
+                        && !self.is_settled(id)
+                        && self.opaque_authors.contains(&operation.header.actor)
+                })
+                .map(|(_, (operation, _))| operation.header.actor)
+                .collect(),
             opaque: self.opaque.intersection(cut).copied().collect(),
             ordered: self
                 .ordered
@@ -1054,19 +1065,6 @@ impl Log {
         }
         (records, merges)
     }
-    /// Count eligible causal-only merges by `actor` with sequence greater than `last_business`.
-    pub(crate) fn pending_merges_after(&self, actor: Actor, last_business: u64) -> usize {
-        self.eligible
-            .iter()
-            .filter(|id| {
-                self.records.get(*id).is_some_and(|(operation, command)| {
-                    matches!(command, Some(Command::Merge { .. }))
-                        && operation.header.actor == actor
-                        && operation.header.sequence > last_business
-                })
-            })
-            .count()
-    }
     pub(crate) fn snapshot(&self) -> Snapshot {
         let cells = self.project_cells(None, &BTreeSet::new(), &Unwritten::new());
         let operations = self
@@ -1169,18 +1167,28 @@ impl Log {
         }
         Some(rows)
     }
+    /// The writers [`Self::writable`] refuses, judged from the retained records `of` keeps: each
+    /// with a withheld, unavailable or refused record among them or a refused revert it is
+    /// answerable for, and each with an unavailable record above the floor. A typed read's state
+    /// keeps them (`typed::state::State::refused`): the records at or below a floor are judged
+    /// by the floor's cut alone ([`Self::judge`]), so the writers they refuse at the cut and the
+    /// writers the records above refuse are together the writers every record refuses.
+    pub(crate) fn unwritable(&self, of: impl Fn(&Digest) -> bool) -> BTreeSet<Actor> {
+        let mut writers = self.opaque_authors.clone();
+        for (id, (op, _)) in &self.records {
+            if of(id) && (!op.available || !op.catalog_eligible || op.refusal.is_some()) {
+                writers.insert(op.header.actor);
+            }
+        }
+        for id in self.faulty_reverts().filter(|id| of(id)) {
+            if let Some((op, _)) = self.records.get(id) {
+                writers.insert(op.header.actor);
+            }
+        }
+        writers
+    }
     pub(crate) fn writable(&self, actor: Actor) -> Result<()> {
-        if self.opaque_authors.contains(&actor)
-            || self.records.values().any(|(op, _)| {
-                op.header.actor == actor
-                    && (!op.available || !op.catalog_eligible || op.refusal.is_some())
-            })
-            || self.faulty_reverts().any(|id| {
-                self.records
-                    .get(id)
-                    .is_some_and(|(op, _)| op.header.actor == actor)
-            })
-        {
+        if self.unwritable(|_| true).contains(&actor) {
             return Err(Error::new(
                 "local proposal writer has withheld, unavailable or refused history; recovery required",
             ));

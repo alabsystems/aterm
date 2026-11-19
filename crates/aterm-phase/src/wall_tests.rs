@@ -3868,3 +3868,336 @@ fn the_limit_a_cancel_left_under_the_limit_dialog_is_that_limit() {
     );
     assert_eq!(left_wall(&after), None, "the dialog after the cancel");
 }
+
+/// The remedy alone under a turn (HAND-BUILT on the measured 2.1.310 rows).
+const BARE_REMEDY: &str = include_str!("fixtures/claude-2.1.310-wall-bare-please-run-login.txt");
+/// A 403 named by its status alone under the remedy (HAND-BUILT on the measured 2.1.310 rows).
+const STATUS_ALONE_403: &str = include_str!("fixtures/claude-2.1.310-wall-403-status-alone.txt");
+/// Cloudflare's bot check in the API's place under the remedy, in m2's measured 2.1.323 words
+/// (HAND-BUILT on the measured 2.1.310 rows).
+const BOT_CHECK_403: &str = include_str!("fixtures/claude-2.1.310-wall-403-bot-check.txt");
+/// A 403 whose API body names the token revoked (HAND-BUILT on the measured 2.1.310 rows).
+const REVOKED_403: &str = include_str!("fixtures/claude-2.1.310-wall-403-revoked-token.txt");
+
+/// Claude Code's 403 whose API body names the OAuth token short of the scope it needs: the
+/// credential refused, fixed by signing in again (HAND-BUILT on the API's `permission_error` body).
+const SCOPE_403: &str = "Please run /login · API Error: 403 {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"OAuth token does not meet scope requirement user:profile\"}}";
+
+/// A 403 NAMED BY ITS STATUS ALONE IS NO CREDENTIAL STRIKE (plan package UB-05): Claude Code puts
+/// its sign-in remedy before any 403 it is answered with, so `⏺ Please run /login · API Error:
+/// 403 Forbidden` reads as a login wall, yet nothing in it names the credential: its cause is a
+/// blocked path, which strikes nothing. The same status alone reads the same in a transcript's
+/// notice and in a one-shot run's error output, where it follows a sentence. So does a proxy's or
+/// a gateway's stock page whose title carries the 403 itself (Tomcat's `HTTP Status 403 –
+/// Forbidden`, Jetty's `Error 403 Forbidden`, Google Front End's `Error 403 (Forbidden)!!1`, IIS's
+/// `HTTP Error 403.14 - Forbidden`), which Claude Code prints with no status of its own first.
+/// CONTROL: a 403 whose body names the token revoked, or names the OAuth token short of its
+/// scope ([`SCOPE_403`]), a 401 (with Cloudflare's word after it too, or carried by a page's title,
+/// `Error 401 - Unauthorized`) and the API's `authentication_error` body each name a refused
+/// credential and strike; a 403 a sentence only mentions is no status read, and nor is a run of
+/// digits inside a word, a longer run, one past the first `·` or one in a goal's echo.
+/// NEGATIVE CONTROLS (2026-11-18, each restored with cp from a backup plus touch, confirmed with
+/// cmp): with `strike_cause` reading no printed 403, the status alone is `Unclassified`, a strike;
+/// with it reading no status a page's title carries (`titled_status`), `Error 403 - Forbidden` is
+/// `Unclassified`, a strike.
+#[test]
+fn a_403_named_by_its_status_alone_is_no_credential_strike() {
+    let r = crate::prompt::fixtures::screen(STATUS_ALONE_403);
+    let w = wall(&r).expect("the 403's wall");
+    assert_eq!((w.kind, w.placement), (WallKind::Auth, Placement::ErrorRow));
+    assert_eq!(w.message, "Please run /login · API Error: 403 Forbidden");
+    assert_eq!(strike_cause(&w.message), StrikeCause::Blocked);
+    assert!(!strike_cause(&w.message).strikes());
+    for text in [
+        "API Error: 403 Forbidden",
+        "  ⎿  Please run /login · API Error: 403 Forbidden",
+        "Failed to authenticate. API Error: 403 Forbidden",
+        "API Error: 403 {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Request not allowed\"}}",
+        "Please run /login · API Error: Error 403 - Forbidden",
+        "Please run /login · API Error: HTTP Status 403 – Forbidden",
+        "Please run /login · API Error: Error 403 Forbidden",
+        "Please run /login · API Error: Error 403 (Forbidden)!!1",
+        "Failed to authenticate. API Error: HTTP Error 403.14 - Forbidden",
+        "Please run /login · API Error: IIS 10.0 Detailed Error - 403.14 - Forbidden",
+    ] {
+        assert_eq!(strike_cause(text), StrikeCause::Blocked, "{text}");
+        assert!(!strike_cause(text).strikes(), "{text}");
+    }
+    for text in [
+        "Please run /login · API Error: Error 401 - Unauthorized",
+        "Please run /login · API Error: 403 {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"OAuth token has been revoked.\"}}",
+        "Please run /login · API Error: 401 Invalid bearer token",
+        "Please run /login · API Error: 401 Cloudflare",
+        "API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"x\"}}",
+        "Failed to authenticate. API Error: 401 Unauthorized",
+        SCOPE_403,
+    ] {
+        assert_eq!(
+            strike_cause(text),
+            StrikeCause::LoginGone,
+            "CONTROL: {text}"
+        );
+        assert!(strike_cause(text).strikes(), "CONTROL: {text}");
+    }
+    assert_eq!(
+        strike_cause("Please run /login after the run saw API Error: 403 Forbidden earlier"),
+        StrikeCause::Unclassified,
+        "CONTROL: a 403 a sentence only mentions"
+    );
+    for text in [
+        "Please run /login · API Error: Error 4031 - Denied",
+        "Please run /login · API Error: Request req_403abc was denied",
+        "Please run /login · API Error: Gateway error E403 Denied",
+        "Please run /login · API Error: Request denied · 403",
+        "Please run /login · API Error: Error - Denied \u{2014} Goal cleared after an unrecoverable error (authentication failed): \"stage 403\". Run /goal again to continue.",
+    ] {
+        assert_eq!(
+            strike_cause(text),
+            StrikeCause::Unclassified,
+            "CONTROL: no title's status: {text}"
+        );
+    }
+}
+
+/// EACH LOGIN WALL'S SCREEN NAMES ITS CAUSE (plan package UB-05's fixtures): the remedy alone
+/// names none and stands as a strike; a 403 by its status alone and Cloudflare's bot check (an
+/// API error on the screen, [`edge_block`]) are blocked paths, which strike nothing; `Login
+/// expired`, `Not logged in`, `OAuth token revoked`, a 401 and a 403 whose body names the token
+/// revoked are refused credentials.
+#[test]
+fn each_login_wall_screen_names_its_strike_cause() {
+    use crate::prompt::fixtures::{
+        LOGIN_EXPIRED_2_1_310, WALL_401_RUN_LOGIN_2_1_310, WALL_NOT_LOGGED_IN_NO_LOGIN_2_1_310,
+        WALL_OAUTH_REVOKED_2_1_310, screen,
+    };
+    let edge = WallKind::ApiError {
+        code: Some(403),
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    for (name, capture, kind, cause) in [
+        (
+            "the remedy alone",
+            BARE_REMEDY,
+            WallKind::Auth,
+            StrikeCause::Unclassified,
+        ),
+        (
+            "a 403 by its status alone",
+            STATUS_ALONE_403,
+            WallKind::Auth,
+            StrikeCause::Blocked,
+        ),
+        (
+            "Cloudflare's bot check",
+            BOT_CHECK_403,
+            edge,
+            StrikeCause::Blocked,
+        ),
+        (
+            "Login expired",
+            LOGIN_EXPIRED_2_1_310,
+            WallKind::Auth,
+            StrikeCause::LoginGone,
+        ),
+        (
+            "a revoked token's 403 body",
+            REVOKED_403,
+            WallKind::Auth,
+            StrikeCause::LoginGone,
+        ),
+        (
+            "Not logged in",
+            WALL_NOT_LOGGED_IN_NO_LOGIN_2_1_310,
+            WallKind::Auth,
+            StrikeCause::LoginGone,
+        ),
+        (
+            "OAuth token revoked",
+            WALL_OAUTH_REVOKED_2_1_310,
+            WallKind::Auth,
+            StrikeCause::LoginGone,
+        ),
+        (
+            "a 401 under the remedy",
+            WALL_401_RUN_LOGIN_2_1_310,
+            WallKind::Auth,
+            StrikeCause::LoginGone,
+        ),
+    ] {
+        let w = wall(&screen(capture)).unwrap_or_else(|| panic!("{name}: no wall"));
+        assert_eq!(w.kind, kind, "{name}: {}", w.message);
+        assert_eq!(strike_cause(&w.message), cause, "{name}: {}", w.message);
+        assert_eq!(
+            strike_cause(&w.message).strikes(),
+            cause != StrikeCause::Blocked,
+            "{name}"
+        );
+    }
+    let bare = wall(&screen(BARE_REMEDY)).expect("the remedy's wall");
+    assert_eq!(bare.message, crate::anchor!("wall.login"));
+}
+
+/// A 403 WHOSE BODY NAMES THE CREDENTIAL IS THE CREDENTIAL REFUSED (plan package UB-05): only a
+/// 403 whose body names no credential is a blocked path. The API's `permission_error` that names
+/// the OAuth token short of its scope, the invalid credentials and the API key each name it, and
+/// they strike as a revoked token does.
+/// CONTROL: the status alone, the `permission_error` body that names nothing (`Request not
+/// allowed`) and a 403 after a sentence that names authenticating (`Failed to authenticate.`)
+/// stay blocked paths: the phrases are read in the body after the status only. So does a
+/// corporate proxy's or a firewall's page in the API's place, which Claude Code 2.1.323 reduces to
+/// its `<title>` (no `<html` reaches the wall): its title names authenticating, a CSRF token or a
+/// session token, never the vendor's credential, and a sign-in run against the same proxy meets
+/// it again.
+/// NEGATIVE CONTROLS (2026-11-18, each restored with cp from a backup plus touch, confirmed with
+/// cmp): with `strike_cause` reading no body phrases, the scope body is `Blocked`; reading the
+/// bare nouns (`oauth`, `token`, `credential`, `scope`, `authenticat`) again, the proxy's `Proxy
+/// Authentication Required` is `LoginGone`; reading `CREDENTIAL_WORDS` inside a 403's body
+/// again, the session token's title is `LoginGone`.
+#[test]
+fn a_403_whose_body_names_the_credential_strikes_the_login() {
+    for text in [
+        SCOPE_403,
+        "API Error: 403 {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Invalid authentication credentials\"}}",
+        "Please run /login · API Error: 403 This API key is not allowed to use this organization",
+        "Please run /login · API Error: 403 OAuth authentication is currently not supported.",
+    ] {
+        assert_eq!(strike_cause(text), StrikeCause::LoginGone, "{text}");
+    }
+    for text in [
+        "Please run /login · API Error: 403 Forbidden",
+        "API Error: 403 {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Request not allowed\"}}",
+        "Failed to authenticate. API Error: 403 Forbidden",
+        "Please run /login · API Error: 403 Proxy Authentication Required",
+        "Please run /login · API Error: 403 Firewall Authentication",
+        "Please run /login · API Error: 403 Zscaler Authentication Required",
+        "Please run /login · API Error: 403 Invalid CSRF token",
+        "Please run /login · API Error: 403 Your session token expired",
+    ] {
+        assert_eq!(strike_cause(text), StrikeCause::Blocked, "CONTROL: {text}");
+    }
+}
+
+/// A STATUS-ALONE 403 WHOSE GOAL WAS CLEARED UNDER IT IS NO CREDENTIAL STRIKE (plan package
+/// UB-05): Claude Code types every 401 and 403 `authentication_failed`, so a `/goal` running at
+/// `Please run /login · API Error: 403 Forbidden` is cleared `(authentication failed)` under it,
+/// and the reader joins that echo to the 403's row (` — Goal cleared after an unrecoverable error
+/// (authentication failed): "…"`). The echo's words and the person's quoted goal are no part of
+/// what the API answered: the joined wall is the blocked path the 403 alone is, whatever its goal
+/// names (a token expired, a scope, Cloudflare's `Ray ID`).
+/// CONTROL: a revoked token's 403 and `Login expired` under the same echo still strike, and a
+/// goal that names Cloudflare's `Ray ID` makes no revoked token's 403 Cloudflare's page.
+/// NEGATIVE CONTROLS (2026-11-18, each restored with cp from a backup plus touch, confirmed with
+/// cmp): with the wall's words read past the echo's join, the goal that names a token expired is
+/// `LoginGone`; with each printed status's body read past the reader's join, the revoked token's
+/// 403 under a goal that names the `Ray ID` reads as Cloudflare's page (`edge_block`); with both,
+/// the goal that names an API key's scope is `LoginGone`.
+#[test]
+fn a_status_alone_403_whose_goal_was_cleared_under_it_is_no_credential_strike() {
+    let cleared = |goal: &str| {
+        format!(
+            "⏺ Goal cleared after an unrecoverable error (authentication failed): \"{goal}\". Run \
+             /goal again to continue."
+        )
+    };
+    let walled = |capture: &str, goal: &str| {
+        let r = screen(capture);
+        let at = wall(&r).expect("the 403's wall").row;
+        let mut v = r.clone();
+        let row = v[at].clone();
+        v.splice(at..=at, [row, String::new(), cleared(goal)]);
+        wall(&v).expect("the joined wall")
+    };
+    for goal in [
+        "stage 3",
+        "fix the token expired banner",
+        "rotate the API key scope",
+        "quote the cloudflare ray id",
+    ] {
+        let w = walled(STATUS_ALONE_403, goal);
+        assert_eq!(w.kind, WallKind::Auth, "{goal}: {}", w.message);
+        assert!(
+            w.message
+                .starts_with("Please run /login · API Error: 403 Forbidden \u{2014} Goal cleared"),
+            "PRECONDITION: the echo is joined to the 403's row: {}",
+            w.message
+        );
+        assert_eq!(
+            strike_cause(&w.message),
+            StrikeCause::Blocked,
+            "{goal}: {}",
+            w.message
+        );
+        assert!(!strike_cause(&w.message).strikes(), "{goal}");
+    }
+    for goal in ["stage 3", "quote the cloudflare ray id"] {
+        let w = walled(REVOKED_403, goal);
+        assert_eq!(w.kind, WallKind::Auth, "CONTROL {goal}: {}", w.message);
+        assert!(
+            w.message.contains(" \u{2014} Goal cleared"),
+            "{}",
+            w.message
+        );
+        assert!(!edge_block(&w.message), "CONTROL {goal}: {}", w.message);
+        assert_eq!(
+            strike_cause(&w.message),
+            StrikeCause::LoginGone,
+            "CONTROL {goal}: {}",
+            w.message
+        );
+    }
+    assert_eq!(
+        strike_cause(&format!(
+            "Login expired · Please run /login \u{2014} {}",
+            cleared("stage 3").trim_start_matches("⏺ ")
+        )),
+        StrikeCause::LoginGone,
+        "CONTROL: a lost login under the same echo"
+    );
+}
+
+/// CODEX'S RESPONSE ERROR CARRIES CLOUDFLARE'S `cf-ray` HEADER, NEVER ITS PAGE (plan package
+/// UB-05): Codex appends `, url: …, cf-ray: …, request id: …` to every unexpected status it
+/// prints, the API's own 401 included, so a dead login's refusal (an invalidated token, an
+/// incorrect API key, a token past its expiry) names `cf-ray` though no page of Cloudflare's
+/// answered. Its 401 is the credential refused, in Codex's form as in Claude Code's.
+/// Nor is the `cf-ray` a page on a Codex 403 whose body is none.
+/// CONTROL: Cloudflare's challenge page as Codex prints it (a 403 whose body is the page) is a
+/// blocked path, and the same 401 line with no diagnostics names the credential as before.
+/// NEGATIVE CONTROLS (2026-11-18, each restored with cp from a backup plus touch, confirmed with
+/// cmp): with `strike_cause` as UB-05 first landed it (page words anywhere, no Codex status),
+/// each 401 is `Blocked`; reading no Codex status, each 401 is `Unclassified`; reading page words
+/// anywhere again, the 403 whose body is no page is `Blocked`.
+#[test]
+fn a_codex_401_that_names_cloudflares_ray_strikes_the_login() {
+    for text in [
+        "ERROR: unexpected status 401 Unauthorized: Your authentication token has been invalidated. Please try signing in again., url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 9a1b2c3d4e5f6789-SJC",
+        "ERROR: unexpected status 401 Unauthorized: Provided authentication token is expired. Please try signing in again., url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 9a1b2c3d4e5f6789-SJC, request id: req-example",
+        "ERROR: unexpected status 401 Unauthorized: Incorrect API key provided: sk-exa*****mple., url: https://api.example.com/v1/responses, cf-ray: 9a1b2c3d4e5f6789-SJC",
+        "ERROR: unexpected status 401 Unauthorized: plain text error, url: https://chatgpt.com/backend-api/codex/models, cf-ray: 9a1b2c3d4e5f6789-SJC, auth error: missing_authorization_header, auth error code: token_expired",
+    ] {
+        assert_eq!(strike_cause(text), StrikeCause::LoginGone, "{text}");
+        assert!(!edge_block(text), "{text}");
+    }
+    assert_eq!(
+        strike_cause(
+            "ERROR: unexpected status 403 Forbidden: <!DOCTYPE html><html><head><title>Just a moment...</title></head></html>, url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 9a1b2c3d4e5f6789-SJC"
+        ),
+        StrikeCause::Blocked,
+        "CONTROL: Cloudflare's page as Codex prints it"
+    );
+    assert_eq!(
+        strike_cause(
+            "ERROR: unexpected status 401 Unauthorized: Your authentication token has been invalidated. Please try signing in again."
+        ),
+        StrikeCause::LoginGone,
+        "CONTROL: the 401 with no diagnostics"
+    );
+    assert_eq!(
+        strike_cause(
+            "ERROR: unexpected status 403 Forbidden: Your workspace is not allowed to use Codex, url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 9a1b2c3d4e5f6789-SJC"
+        ),
+        StrikeCause::Unclassified,
+        "a 403 whose body is no page is no blocked path by its `cf-ray` alone"
+    );
+}

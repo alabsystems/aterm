@@ -1613,6 +1613,106 @@ fn a_bash_verdict_refuses_a_secret_and_a_proof_gap() {
     }
 }
 
+/// A CLAUDE TAB AT A BLOCKED PATH PUBLISHES THE OUTAGE ITS HARNESS WAITS OUT, NEVER A LOGIN (plan
+/// package UB-05): Claude Code puts its sign-in remedy before a 403 named by its status alone
+/// (`Please run /login · API Error: 403 Forbidden`), and the turn-end policy answers that wall as
+/// the API's outage (`turn_end::answered_wall`), retried on the outage's ladder with no sign-in.
+/// The tab publishes the same wall: `wall:api-error`, no sign-in subject, so neither a supervised
+/// tab's wait (`signing Claude back in`) nor an unattended tab's need (`logged out: log in
+/// there`) names a login nobody signs in again; the host's answer is the policy outlook's for the
+/// published kind, as `HarnessHost::wall_answer` gives it to a Claude tab.
+/// CONTROL: `Login expired · Please run /login` still publishes `wall:auth`, waited on as the
+/// harness's sign-in when supervised and asked of a person when nobody answers it.
+/// NEGATIVE CONTROL (2026-11-18, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `classify` publishing the reader's raw kind, the 403 publishes `wall:auth`, waits on
+/// `WaitWord::Login` supervised and asks `NeedWord::Login` unattended.
+#[test]
+fn a_claude_tab_at_a_blocked_path_publishes_the_api_outage_never_a_login() {
+    use crate::needs::{AgentFact, NeedFacts};
+    use alab_policy::vocab::{ApiCause, WallKind};
+    use aterm_agent::supervise::policy::outlook::{Answer, answer};
+    use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED_2_1_310, screen};
+    use aterm_types::needs::{NeedWord, WaitWord};
+    const STATUS_ALONE_403: &str =
+        include_str!("../../aterm-phase/src/fixtures/claude-2.1.310-wall-403-status-alone.txt");
+    let verdict = |text: &str| {
+        agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(text),
+            Cursor::Unknown,
+            "",
+            t0(),
+        )
+    };
+    let wall_of = |v: &AgentVerdict| match v.reading().map(|r| &r.phase) {
+        Some(AgentPhase::Wall { kind, .. }) => Some(*kind),
+        _ => None,
+    };
+    // What a supervising host and an unattended tab answer the published wall with
+    // (`HarnessHost::wall_answer` for a Claude tab, which the host admits and carries the login
+    // of), and the need table's words for it.
+    let words = |v: &AgentVerdict, supervised: bool| {
+        let kind = wall_of(v).expect("a wall");
+        let cfg = aterm_agent::supervise::SupervisorConfig::default();
+        let wall_answer = match answer(kind, false, &cfg, supervised) {
+            Answer::Nobody => WallAnswer::Nobody,
+            Answer::Resumes => WallAnswer::Harness,
+            Answer::ResumesAsks(action) => WallAnswer::HarnessAsks(action),
+        };
+        let needs = crate::needs::of(&NeedFacts {
+            agent: Some(AgentFact {
+                word: v.word(),
+                detail: None,
+                rev: 7,
+                subject: v.subject().map(str::to_string),
+            }),
+            supervised,
+            wall_answer,
+            ..NeedFacts::default()
+        });
+        (
+            needs.need.as_ref().map(|n| n.word),
+            needs.waiting.as_ref().map(|w| w.word),
+        )
+    };
+    let blocked = verdict(STATUS_ALONE_403);
+    assert_eq!(
+        wall_of(&blocked),
+        Some(WallKind::ApiError {
+            code: Some(403),
+            retryable: true,
+            cause: ApiCause::Server,
+        }),
+        "{blocked:?}"
+    );
+    assert_eq!(blocked.word(), "wall:api-error");
+    assert_eq!(blocked.subject(), None);
+    for supervised in [true, false] {
+        let (need, wait) = words(&blocked, supervised);
+        assert_ne!(need, Some(NeedWord::Login), "supervised {supervised}");
+        assert_ne!(wait, Some(WaitWord::Login), "supervised {supervised}");
+    }
+    let expired = verdict(LOGIN_EXPIRED_2_1_310);
+    assert_eq!(
+        wall_of(&expired),
+        Some(WallKind::Auth),
+        "CONTROL: {expired:?}"
+    );
+    assert_eq!(expired.word(), "wall:auth", "CONTROL");
+    assert_eq!(
+        words(&expired, true),
+        (None, Some(WaitWord::Login)),
+        "CONTROL: supervised, the harness's sign-in"
+    );
+    assert_eq!(
+        words(&expired, false).0,
+        Some(NeedWord::Login),
+        "CONTROL: unattended, a person's"
+    );
+}
+
 /// A GROK BUILD OR KIMI CODE TAB PUBLISHES WHAT ITS SCREEN DECIDES (their measured frames,
 /// `aterm_phase::grok::phase` and `aterm_phase::kimi::phase`): a running turn `busy`, a
 /// turn's end `idle`, and the walls their readers read (Grok Build's sign-in screen, its

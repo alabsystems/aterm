@@ -2542,6 +2542,12 @@ impl Bootstrap {
         self.journal_dir.parent().unwrap().join("heard")
     }
 
+    /// How long [`super::hearing::FENCE`] has held here without a break
+    /// ([`super::hearing::FenceWatch`]), beside the `heard` ledger it is judged from.
+    pub fn fence_file(&self) -> PathBuf {
+        self.journal_dir.parent().unwrap().join("fence")
+    }
+
     /// This device's kept signed version reports ([`super::hearing::Reports`]).
     pub fn reports_file(&self) -> PathBuf {
         self.journal_dir.parent().unwrap().join("reports")

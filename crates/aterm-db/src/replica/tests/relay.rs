@@ -12,10 +12,14 @@ use crate::{
 use aterm_secrets::commons::{
     binding::Binding,
     hearing::{
-        CHECKPOINTS, Hold, LIFTED, Ledger, Mark, RELAYS, REPORT2_LEN, Reports, Said, Version,
+        Floor, Hold, LIFTED, Ledger, Mark, RELAYS, REPORT2_LEN, Reports, Said, Version, in_place,
         relayed,
     },
 };
+
+/// The floor a member that reports [`RELAYS`] clears: these tests judge the relay, not where a
+/// deployed fence such as `hearing::CHECKPOINTS` stands.
+const RELAYED: Floor = in_place(Some(RELAYS));
 use std::sync::{Arc, Mutex};
 
 /// The first flight with `entries` offered entries, as its frame goes on the wire.
@@ -203,7 +207,7 @@ fn a_report_crosses_two_rounds_to_a_member_that_never_met_its_signer() {
     let signer = &lab.members[0];
     let mut ledger = Ledger::read(&lab.lab.bootstrap(2));
     assert_eq!(
-        ledger.holding_below([signer], lab.now_ms, CHECKPOINTS),
+        ledger.holding_below([signer], lab.now_ms, RELAYED),
         vec![(signer.actor(), Hold::Unheard)]
     );
 
@@ -237,7 +241,7 @@ fn a_report_crosses_two_rounds_to_a_member_that_never_met_its_signer() {
     );
     assert!(
         ledger
-            .holding_below([signer], lab.now_ms, CHECKPOINTS)
+            .holding_below([signer], lab.now_ms, RELAYED)
             .is_empty()
     );
     assert!(!ledger.watch(lab.now_ms));

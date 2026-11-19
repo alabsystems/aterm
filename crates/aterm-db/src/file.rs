@@ -27,11 +27,11 @@ pub mod limits;
 pub mod materialize;
 pub mod publish;
 pub mod types;
-mod write;
+pub(crate) mod write;
 
 pub use types::{
     ACCOUNTS, Class, Computed, EVENTS, FILES, Fold, LIMITS, LINKS, LOGINS, MACHINES, MEASURES,
-    NOTES, Store, Type, USAGE, find,
+    NOTES, PACKAGES, Store, Type, USAGE, find,
 };
 
 use crate::alab::journal::mine::{Attempt, Wall};

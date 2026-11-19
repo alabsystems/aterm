@@ -34,7 +34,7 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "canary",
         synopsis: crate::canary::SYNOPSIS,
-        does: "install and execute the signed staged Trust pack and judge only the consumers named (none by default), or stage its existing signed receipt without changing the index",
+        does: "install the signed Trust pack and judge the consumers named, recheck the retained native installation, or stage its signed receipt",
     },
     Verb {
         name: "pack",

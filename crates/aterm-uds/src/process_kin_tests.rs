@@ -595,8 +595,48 @@ fn a_start_suspended_child_has_not_run_though_it_is_not_held() {
     drop(held);
 }
 
+/// [`read_session`] reads the session `getsid(2)` names: a child started with `setsid` reads its
+/// own pid, one started at the head of a group of its own (`process_group(0)`) reads this
+/// process's session, and pid 1 and below read nothing. NEGATIVE CONTROL: read the process group
+/// (`getpgid`) for the session, and the grouped child reads its own pid.
+#[test]
+fn read_session_names_the_process_that_made_the_session() {
+    use crate::spawnfd::{Child, Stdio, command};
+    /// The children, each ended by closing its input and reaped however the test ends.
+    struct Ended(Vec<Child>);
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                drop(child.stdin.take());
+                let _ = child.wait();
+            }
+        }
+    }
+    let me = i32::try_from(std::process::id()).expect("pid");
+    let mine = read_session(me).expect("this process's session reads");
+    let mut children = Ended(Vec::new());
+    for made in [true, false] {
+        let mut cat = command("/bin/cat");
+        cat.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if made {
+            cat.setsid(true);
+        } else {
+            cat.process_group(0);
+        }
+        children.0.push(cat.spawn().expect("cat starts"));
+    }
+    let pid = |child: &Child| i32::try_from(child.id()).expect("pid");
+    let (made, grouped) = (pid(&children.0[0]), pid(&children.0[1]));
+    assert_eq!(read_session(made), Some(made.unsigned_abs()));
+    assert_eq!(read_session(grouped), Some(mine));
+    assert_ne!(mine, grouped.unsigned_abs());
+    assert_eq!((read_session(1), read_session(0)), (None, None));
+}
+
 /// A hop of pid `pid` with unique id `uniqueid`, whose parent is `parent` with unique id
-/// `parent_uniqueid`, on no terminal.
+/// `parent_uniqueid`, leading its own group, on no terminal.
 fn a_hop(pid: u32, uniqueid: u64, parent: u32, parent_uniqueid: u64) -> Hop {
     Hop {
         identity: super::super::Identity {
@@ -607,6 +647,7 @@ fn a_hop(pid: u32, uniqueid: u64, parent: u32, parent_uniqueid: u64) -> Hop {
         uniqueid,
         parent_uniqueid,
         parent,
+        pgid: pid,
         tty: None,
     }
 }

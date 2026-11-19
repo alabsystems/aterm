@@ -123,6 +123,80 @@ fn the_request_fences_the_change_and_says_it_is_not_instructions() {
     assert!(r.contains("read the repository as you need to"), "{r}");
 }
 
+/// A REVIEW THAT MET A BLOCKED PATH IS NO LOGIN'S END (plan package UB-05): Claude Code puts its
+/// sign-in remedy before a 403 it is answered with, so a run that ended on `Please run /login ·
+/// API Error: 403 Forbidden` names no credential: it is `unreached`, falls through to the next
+/// reviewer, offers no sign-in as its fix, and keeps its own last line as why; a run the vendor
+/// never answered (an unreachable route) is `unreached` too.
+/// CONTROL: a 401 or a 403 whose body names the token revoked under the same remedy is the
+/// login's end, and an unrelated failure stays `failed`.
+#[test]
+fn a_review_that_met_a_blocked_path_is_unreached_never_a_lost_login() {
+    for stderr in [
+        "Please run /login · API Error: 403 Forbidden",
+        "Failed to authenticate. API Error: 403 Forbidden",
+        "API Error: Request timed out.",
+        "API Error: Unable to connect to API (ECONNREFUSED)",
+    ] {
+        let (verdict, why) = verdict_of(&CLAUDE, &Ok(ran(1, "", stderr)), None, "n", "");
+        assert_eq!(verdict, Verdict::Unreached, "{stderr}: {why:?}");
+        assert!(verdict.falls_through(), "{stderr}");
+    }
+    assert_eq!(Verdict::Unreached.word(), "unreached");
+    for stderr in [
+        "Please run /login · API Error: 401 Invalid bearer token",
+        "Please run /login · API Error: 403 {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"OAuth token has been revoked.\"}}",
+        "Login expired · Please run /login",
+    ] {
+        assert_eq!(
+            verdict_of(&CLAUDE, &Ok(ran(1, "", stderr)), None, "n", "").0,
+            Verdict::Auth,
+            "CONTROL: {stderr}"
+        );
+    }
+    assert_eq!(
+        verdict_of(
+            &CLAUDE,
+            &Ok(ran(1, "", "API Error: 500 Internal server error")),
+            None,
+            "n",
+            ""
+        )
+        .0,
+        Verdict::Failed,
+        "CONTROL: a server error"
+    );
+}
+
+/// A DEAD CODEX LOGIN'S 401 IS ITS LOGIN'S END THOUGH ITS LINE NAMES CLOUDFLARE'S RAY (plan
+/// package UB-05): Codex appends `, url: …, cf-ray: …` to every unexpected status it prints, the
+/// API's own 401 among them, so an invalidated token, a token past its expiry or an incorrect API
+/// key names `cf-ray` with no page of Cloudflare's: the review is `auth` (`Ended::ReviewAuth`,
+/// which stages a Codex login's end), never `unreached`.
+/// CONTROL: Cloudflare's challenge page as Codex prints it, under the same auth words, is a
+/// blocked path (`unreached`).
+/// NEGATIVE CONTROL (2026-11-18, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `strike_cause` reading page words anywhere in the text again, each 401 is `unreached`.
+#[test]
+fn a_codex_401_that_names_cloudflares_ray_is_its_logins_end() {
+    for stderr in [
+        "ERROR: unexpected status 401 Unauthorized: Your authentication token has been invalidated. Please try signing in again., url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 9a1b2c3d4e5f6789-SJC",
+        "ERROR: unexpected status 401 Unauthorized: Provided authentication token is expired. Please try signing in again., url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 9a1b2c3d4e5f6789-SJC",
+        "ERROR: unexpected status 401 Unauthorized: Incorrect API key provided: sk-exa*****mple., url: https://api.example.com/v1/responses, cf-ray: 9a1b2c3d4e5f6789-SJC",
+    ] {
+        let (verdict, why) = verdict_of(&CODEX, &Ok(ran(1, "", stderr)), None, "n", "");
+        assert_eq!(verdict, Verdict::Auth, "{stderr}: {why:?}");
+    }
+    let challenge = "ERROR: unexpected status 403 Forbidden: <!DOCTYPE html><title>Just a \
+                     moment...</title> sign in again, url: \
+                     https://chatgpt.com/backend-api/codex/responses, cf-ray: 9a1b2c3d4e5f6789-SJC";
+    assert_eq!(
+        verdict_of(&CODEX, &Ok(ran(1, "", challenge)), None, "n", "").0,
+        Verdict::Unreached,
+        "CONTROL: Cloudflare's page as Codex prints it"
+    );
+}
+
 #[test]
 fn only_a_failed_run_is_read_for_a_lost_login() {
     let quoted = Ok(ran(
@@ -143,13 +217,16 @@ fn only_a_failed_run_is_read_for_a_lost_login() {
     let codex = Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized"));
     assert_eq!(verdict_of(&CODEX, &codex, None, "n", "").0, Verdict::Auth);
     // Cloudflare's block page in the API's place, which Claude Code 2.1.323 words as a lost
-    // login: a failed run, never a login's end.
+    // login: a run that met a blocked path, never a login's end.
     let edge = Ok(ran(
         1,
         "",
         "Please run /login · API Error: 403 Attention Required! | Cloudflare",
     ));
-    assert_eq!(verdict_of(&CLAUDE, &edge, None, "n", "").0, Verdict::Failed);
+    assert_eq!(
+        verdict_of(&CLAUDE, &edge, None, "n", "").0,
+        Verdict::Unreached
+    );
     let under = Ok(ran(
         1,
         "",
@@ -158,7 +235,7 @@ fn only_a_failed_run_is_read_for_a_lost_login() {
     ));
     assert_eq!(
         verdict_of(&CLAUDE, &under, None, "n", "").0,
-        Verdict::Failed,
+        Verdict::Unreached,
         "the page on a line of its own under another"
     );
     let limit = Ok(ran(

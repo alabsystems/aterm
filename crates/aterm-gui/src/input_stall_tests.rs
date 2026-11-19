@@ -1569,6 +1569,7 @@ fn the_publication_names_one_remedy_wherever_it_is_read() {
         dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
         run: aterm_agent::harness::relaunch::AgentRun::Codex(
             aterm_agent::harness::relaunch::CodexRun {
+                selected_default: false,
                 home: std::path::PathBuf::from("/h/.codex"),
                 home_env: None,
                 self_claimed: None,

@@ -42,10 +42,15 @@
 //! person-owned bundle; the broker adopts an update only when its static signature meets the
 //! running image's own team requirement (an ad-hoc image adopts nothing, and the next elevation
 //! renews it); its surface is one Unix socket that opens sockets to local-network destinations and
-//! makes `DNSService*` calls, running no code, opening no file and binding nothing a client names;
+//! makes `DNSService*` calls, running no code, opening no file and binding nothing a client names,
+//! beside one act that is no LAN traffic: Spotlight's exclusion of the console account's own new
+//! top-level home folders, which it works out from what root reads (the peer's uid from the
+//! kernel, the console's owner, that account's home from directory services and its own
+//! listing, root's receipt) and which no client names ([`crate::init_spotlight::broker_duty`]);
 //! and it admits a client only by that client's code signature. A compromised aterm process gains
-//! LAN sockets from it, which the app had whenever a person pressed Allow, and nothing that runs as
-//! root.
+//! LAN sockets from it, which the app had whenever a person pressed Allow, and the exclusion of
+//! the console account's own top-level folders, which that account can make by renaming them
+//! `*.noindex`, and nothing else that runs as root.
 //!
 //! What the person's account can read of each step without root ([`owed`]) decides whether the
 //! independent root work is owed, including when the compiler refuses or cannot be read:
@@ -169,9 +174,12 @@ pub enum Owed {
     /// Spotlight still indexes a folder beside Applications, Documents, Desktop and the synced
     /// drives that setup has neither excluded nor failed to
     /// ([`crate::init_spotlight::scope_owed`]). Only a home setup's password never scoped, or
-    /// whose rest of the volume it never scoped, is asked for by itself
-    /// ([`crate::init_spotlight::automatic_scope_owed`]); a folder made since is the person's
-    /// explicit request to exclude ([`crate::init_clt::CommandLineTools::scoping_new_folders`]).
+    /// whose rest of the volume it never scoped, is asked for by itself, and only where no root
+    /// LAN broker of this build serves ([`crate::init_spotlight::automatic_scope_owed`]); a
+    /// folder made since is the broker's, with no password (`sync.spotlight`, and every clone
+    /// aterm publishes), and the person's own request asks the broker first and carries it into
+    /// the password only where none served
+    /// ([`crate::init_clt::CommandLineTools::scoping_new_folders`]).
     Spotlight,
 }
 

@@ -437,6 +437,15 @@ impl LockFile {
     pub(crate) const fn file(&self) -> &std::fs::File {
         &self.0
     }
+
+    /// The metadata of the file the lock is held on, read from its open descriptor, never by
+    /// its path again: whose file the holder locked, whatever stands at the path since.
+    ///
+    /// # Errors
+    /// The descriptor's `fstat`.
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.0.metadata()
+    }
 }
 
 /// `InvalidData` unless `file`, opened at `path`, is a regular file (on Windows, and no reparse

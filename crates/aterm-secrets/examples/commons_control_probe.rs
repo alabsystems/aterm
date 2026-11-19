@@ -16,8 +16,10 @@ fn stored_stream(
     };
 
     // Read and decoded as the store that holds them reads: its capacity and its format, which
-    // this Mac's format mark names. A records entry a rewrite made is not a records stream and
-    // is not selected here: the probe then fails with the layout's refusal.
+    // this Mac's format mark names. A records entry a rewrite made is selected only where this
+    // Mac reads format 2, and its file begins with a frame of roots, which this decode of a
+    // stream does not read: the probe then reports the file undecoded. Every other Mac's
+    // selection refuses such an entry, and the probe fails with the layout's refusal.
     let Some(bytes) = fsx::read_private(&paths.records_data_file()?, store.capacity())? else {
         return Ok(aterm_json::Value::Null);
     };

@@ -65,6 +65,94 @@ fn reader_hides_comments_but_preserves_code_and_canonical_ranges() {
     }));
 }
 
+#[test]
+fn a_list_item_lowers_wrapped_links_and_styles_from_the_whole_item() {
+    let source = "2. **A café\r\n   guide** has a [linked\r\nlazy line](part.md).\r\n  - Child\n    continuation\n3. Sibling\n\nNew paragraph";
+    let doc = parse(source);
+    let [
+        MarkdownBlock::ListItem {
+            depth: 0,
+            ordinal: Some(2),
+            text,
+            source: first,
+        },
+        MarkdownBlock::ListItem {
+            depth: 1,
+            ordinal: None,
+            text: child,
+            ..
+        },
+        MarkdownBlock::ListItem {
+            ordinal: Some(3),
+            text: sibling,
+            ..
+        },
+        MarkdownBlock::Paragraph {
+            text: paragraph, ..
+        },
+    ] = doc.blocks.as_slice()
+    else {
+        panic!(
+            "wrapped list, nested item, sibling, paragraph: {:?}",
+            doc.blocks
+        );
+    };
+    assert_eq!(text, "A café guide has a linked lazy line.");
+    assert_eq!(child, "Child continuation");
+    assert_eq!(sibling, "Sibling");
+    assert_eq!(paragraph, "New paragraph");
+    assert_eq!(
+        &source[first.clone()],
+        source.split_once("  - Child").unwrap().0
+    );
+    let [link] = doc.links.as_slice() else {
+        panic!("one link")
+    };
+    assert_eq!(link.destination.as_ref(), "part.md");
+    assert_eq!(
+        &source[link.source.clone()],
+        "[linked\r\nlazy line](part.md)"
+    );
+    let styles = doc.block_styles(0, text.len());
+    assert!(
+        styles
+            .iter()
+            .any(|(span, style)| style.strong && &text[span.clone()] == "A café guide")
+    );
+    assert!(
+        styles
+            .iter()
+            .any(|(span, style)| style.link_index == Some(0)
+                && &text[span.clone()] == "linked lazy line")
+    );
+}
+
+#[test]
+fn a_list_continuation_stops_before_another_block() {
+    for boundary in [
+        "# Heading",
+        "> Quote",
+        "```rust\nlet x = 1;\n```",
+        "| A |\n| --- |",
+        "---",
+        "- Sibling",
+        "  * Child",
+        "\nOutside",
+    ] {
+        let doc = parse(&format!("- First line\n  continuation\n{boundary}"));
+        assert_eq!(doc.blocks.len(), 2, "{boundary}");
+        assert!(
+            matches!(&doc.blocks[0], MarkdownBlock::ListItem { text, .. } if text == "First line continuation"),
+            "{boundary}"
+        );
+    }
+    let empty = parse("- \nOutside\n\n- \n  Inside");
+    let texts: Vec<_> = empty.blocks.iter().map(block_paint_text).collect();
+    assert_eq!(texts, ["", "Outside", "Inside"]);
+    assert!(matches!(empty.blocks[1], MarkdownBlock::Paragraph { .. }));
+    assert!(matches!(empty.blocks[2], MarkdownBlock::ListItem { .. }));
+}
+
 /// A backtick run its block never closes is literal, so a comment after it stays hidden; a
 /// span closes at its first unescaped equal run and never past its block, as `parse` reads
 /// the blocks; a comment inside a real span is code text, and so is any link in it, on every
@@ -73,10 +161,12 @@ fn reader_hides_comments_but_preserves_code_and_canonical_ranges() {
 #[test]
 fn only_a_closed_code_span_keeps_a_comment_visible() {
     for source in [
+        "> <!-- hidden\n[bad](https://bad.example)\n--> Outside.",
         "Price is `5 <!-- [bad](https://bad.example) -->",
         "Price is `5\n\n<!-- [bad](https://bad.example) -->",
         "`a\\` x` <!-- [bad](https://bad.example) --> `",
         "Price is `5 <!-- [bad](https://bad.example) -->\n- item ` tick",
+        "- Price `5 <!-- [bad](https://bad.example) -->\n  - Child ` tick",
         "# Price `5 <!-- [bad](https://bad.example) -->\nnext ` line",
         "> Price `5 <!-- [bad](https://bad.example) -->\nnext ` line",
         // The line scan takes these for code that the readers do not show as code.
@@ -104,6 +194,7 @@ fn only_a_closed_code_span_keeps_a_comment_visible() {
             "`<!-- [x](https://x.example) -->`",
             "<!-- [x](https://x.example) -->",
         ),
+        ("- `a\n  <!-- c --> b`", "a <!-- c --> b"),
         ("Price `a\n<!-- c --> b` end", "Price a <!-- c --> b end"),
         ("> `a\n> <!-- c --> b`", "a <!-- c --> b"),
         // A span across lines is code on every line it covers, for the links as well.
@@ -140,7 +231,7 @@ fn only_a_closed_code_span_keeps_a_comment_visible() {
     let destinations = document
         .links
         .iter()
-        .map(|link| link.destination.as_str())
+        .map(|link| link.destination.as_ref())
         .collect::<Vec<_>>();
     assert_eq!(destinations, ["https://x.example"]);
     assert_eq!(block_paint_text(&document.blocks[0]), "x `a b`");
@@ -193,7 +284,7 @@ fn a_block_lends_exactly_the_links_its_text_shows() {
 fn inline_lowering_presents_authored_text_and_keeps_malformed_literals() {
     let source = r"**strong** *em* ***both*** **outer *inner* tail** foo_bar_baz 2 * 3 \*literal\* `**code** [x](y) &amp;` [**site**](https://example.com) ![*alt*](pic.png) &amp; &#65; &#x42; &bogus;";
     assert_eq!(
-        lower_inline_text(source),
+        lower_inline_text_styled(source).0,
         "strong em both outer inner tail foo_bar_baz 2 * 3 *literal* **code** [x](y) &amp; site alt & A B &bogus;"
     );
 
@@ -201,12 +292,66 @@ fn inline_lowering_presents_authored_text_and_keeps_malformed_literals() {
     assert_eq!(document.blocks.len(), 1);
     assert_eq!(block_paint_text(&document.blocks[0]), "site alt");
     assert_eq!(document.links[0].label, "site");
-    assert_eq!(document.links[0].destination, "https://example.com");
+    assert_eq!(
+        document.links[0].destination.as_ref(),
+        "https://example.com"
+    );
     assert_eq!(document.images[0].alt.as_deref(), Some("alt"));
     assert_eq!(
         &"[**site**](https://example.com) ![*alt*](pic.png)"[document.links[0].source.clone()],
         "[**site**](https://example.com)"
     );
+}
+
+#[test]
+fn an_inner_link_keeps_its_action_and_deactivates_the_outer_brackets() {
+    let source =
+        "[outer **[inner](a.md)**][other] and [mail <me@example.org>](outer.md)\n\n[other]: b.md";
+    let doc = parse(source);
+    let text = block_paint_text(&doc.blocks[0]);
+    assert_eq!(
+        text,
+        "[outer inner]other and [mail me@example.org](outer.md)"
+    );
+    let sources: Vec<_> = doc
+        .links
+        .iter()
+        .map(|link| &source[link.source.clone()])
+        .collect();
+    assert_eq!(sources, ["[inner](a.md)", "[other]", "<me@example.org>"]);
+    let hits: Vec<_> = doc
+        .block_styles(0, text.len())
+        .into_iter()
+        .filter_map(|(range, style)| {
+            let target = &doc.links[style.link_index?].destination;
+            Some((&text[range], target.as_ref(), style.strong))
+        })
+        .collect();
+    assert_eq!(
+        hits,
+        [
+            ("inner", "a.md", true),
+            ("other", "b.md", false),
+            ("me@example.org", "mailto:me@example.org", false),
+        ]
+    );
+}
+
+#[test]
+fn links_in_image_descriptions_supply_text_and_the_enclosing_link_stays_live() {
+    let source =
+        "[![See [manual][guide] or <me@example.org>](badge.png)](index.md)\n\n[guide]: manual.md";
+    let doc = parse(source);
+    let text = block_paint_text(&doc.blocks[0]);
+    assert_eq!(text, "See manual or me@example.org");
+    assert_eq!(doc.images.len(), 1);
+    assert_eq!(doc.images[0].alt.as_deref(), Some(text.as_ref()));
+    assert_eq!(doc.links.len(), 1);
+    assert_eq!(doc.links[0].destination.as_ref(), "index.md");
+    let styles = doc.block_styles(0, text.len());
+    assert_eq!(styles.len(), 1);
+    assert_eq!(styles[0].0, 0..text.len());
+    assert_eq!(styles[0].1.link_index, Some(0));
 }
 
 /// The PAINT styling of a block, recorded by the lowering pass that produced
@@ -268,6 +413,7 @@ fn inline_styles_locate_nested_and_repeated_runs_in_the_display_text() {
                 "site",
                 InlineStyle {
                     link: true,
+                    link_index: Some(0),
                     ..InlineStyle::default()
                 }
             ),
@@ -386,14 +532,97 @@ fn image_policy_requires_gesture_and_never_allows_capability_escape() {
 }
 
 #[test]
+fn reference_definitions_in_quotes_and_lists_resolve_across_containers() {
+    let source = "π [guide][manual] and [index].\r\n\r\n\
+                  > [manual]: guide.md\r\n\
+                  > **Quoted** [index].\r\n\r\n\
+                  7. [index]:\r\n   <index.md>\r\n   \"Page list\"\r\n   Continue [manual].";
+    let doc = parse(source);
+    let [
+        MarkdownBlock::Paragraph { .. },
+        quoted @ MarkdownBlock::Quote { depth: 1, .. },
+        MarkdownBlock::ListItem {
+            ordinal: Some(7),
+            text: item,
+            ..
+        },
+    ] = doc.blocks.as_slice()
+    else {
+        panic!("expected a paragraph, quote and numbered item");
+    };
+    let MarkdownBlock::Paragraph { text: quote, .. } = quoted.content() else {
+        panic!("quoted paragraph");
+    };
+    assert_eq!(quote, "Quoted index.");
+    assert_eq!(item, "Continue manual.");
+    assert!(
+        doc.block_styles(1, quote.len())
+            .iter()
+            .any(|(span, style)| style.strong && &quote[span.clone()] == "Quoted")
+    );
+    let uses: Vec<_> = doc
+        .links
+        .iter()
+        .map(|link| (&source[link.source.clone()], link.destination.as_ref()))
+        .collect();
+    assert_eq!(
+        uses,
+        [
+            ("[guide][manual]", "guide.md"),
+            ("[index]", "index.md"),
+            ("[index]", "index.md"),
+            ("[manual]", "guide.md"),
+        ]
+    );
+    assert_eq!(doc.links[2].source.start, source.rfind("[index].").unwrap());
+    assert_eq!(doc.links[3].source.start, source.rfind("[manual]").unwrap());
+}
+
+#[test]
+fn definition_only_containers_keep_their_markers_and_skip_prose_and_code() {
+    let source = "[a] [b] [c] [prose] [code] [list-prose]\n\n\
+                  > [a]: a.md\n\n\
+                  - [b]: b.md\n\n\
+                  > Paragraph\n> [prose]: keep.md\n>\n> ~~~text\n>\n> [code]: keep.md\n> ~~~\n>\n> [c]: c.md\n\n\
+                  - Paragraph\n  [list-prose]: keep.md";
+    let doc = parse(source);
+    assert_eq!(
+        doc.links
+            .iter()
+            .map(|link| link.label.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c"]
+    );
+    assert_eq!(doc.blocks.len(), 6);
+    assert_eq!(doc.blocks[1].quote_depth(), 1);
+    assert!(
+        matches!(doc.blocks[1].content(), MarkdownBlock::Paragraph { text, .. } if text.is_empty())
+    );
+    assert!(matches!(&doc.blocks[2], MarkdownBlock::ListItem { text, .. } if text.is_empty()));
+    assert_eq!(doc.blocks[3].quote_depth(), 1);
+    assert!(
+        matches!(doc.blocks[3].content(), MarkdownBlock::Paragraph { text, .. }
+        if text == "Paragraph [prose]: keep.md")
+    );
+    assert!(
+        matches!(doc.blocks[4].content(), MarkdownBlock::CodeBlock { code, .. }
+        if code == "\n[code]: keep.md\n")
+    );
+    assert!(
+        matches!(&doc.blocks[5], MarkdownBlock::ListItem { text, .. }
+        if text == "Paragraph [list-prose]: keep.md")
+    );
+}
+
+#[test]
 fn quote_continuations_lower_inline_markup_across_source_lines() {
     let source = "> **A terminal you can read,\n> reason about, and trust.**\n\nAfter.";
     let document = parse(source);
 
     assert_eq!(document.blocks.len(), 2);
     assert!(matches!(
-        &document.blocks[0],
-        MarkdownBlock::Quote { text, source: range }
+        document.blocks[0].content(),
+        MarkdownBlock::Paragraph { text, source: range }
             if text == "A terminal you can read, reason about, and trust."
                 && &source[range.clone()]
                     == "> **A terminal you can read,\n> reason about, and trust.**\n"
@@ -410,19 +639,165 @@ fn quote_continuations_lower_inline_markup_across_source_lines() {
 }
 
 #[test]
-fn malformed_and_utf8_inline_markup_never_panics_or_eats_unmatched_text() {
-    assert_eq!(lower_inline_text("🦀 **unterminated"), "🦀 **unterminated");
+fn quote_continuation_counts_shared_levels_across_physical_gaps() {
+    let source = "> # Heading\n> - Item\n> | Column |\n> | --- |\n\
+                  >> # First nested\n>> [ref]: page.md\n>> - [ref]\n\
+                  >\n>> # Second nested\n\n>> # Separate quote\n";
+    let doc = parse(source);
     assert_eq!(
-        lower_inline_text("[label](unterminated"),
+        doc.blocks
+            .iter()
+            .map(MarkdownBlock::quote_depth)
+            .collect::<Vec<_>>(),
+        [1, 1, 1, 2, 2, 2, 2]
+    );
+    assert_eq!(
+        (0..=doc.blocks.len())
+            .map(|i| doc.quote_continuation(i))
+            .collect::<Vec<_>>(),
+        [0, 1, 1, 1, 2, 1, 0, 0]
+    );
+    assert_eq!(doc.quote_continuation(usize::MAX), 0);
+}
+
+#[test]
+fn empty_parent_quote_lines_separate_nested_leaves() {
+    let source = ">\n>> first\n>\n>> second\n>\n\n>\n\n> [page]: page.md\n\n[page]";
+    let doc = parse(source);
+    let leaves: Vec<_> = doc
+        .blocks
+        .iter()
+        .map(|block| {
+            (
+                block.quote_depth(),
+                block_paint_text(block),
+                &source[block.source().clone()],
+            )
+        })
+        .collect();
+    assert_eq!(
+        leaves,
+        [
+            (2, Cow::Borrowed("first"), ">> first\n"),
+            (2, Cow::Borrowed("second"), ">> second\n"),
+            (1, Cow::Borrowed(""), ">\n"),
+            (1, Cow::Borrowed(""), "> [page]: page.md\n"),
+            (0, Cow::Borrowed("page"), "[page]"),
+        ]
+    );
+    assert_eq!(doc.links[0].destination.as_ref(), "page.md");
+}
+
+#[test]
+fn quoted_ordered_items_keep_ordinals_wrapped_prose_and_source() {
+    let source = "> 3. **Check the build.** Read the\n>    résumé before continuing.\n>\n> 4. **Publish.**\n";
+    let doc = parse(source);
+    assert_eq!(doc.blocks.len(), 2);
+    for (i, block) in doc.blocks.iter().enumerate() {
+        assert_eq!(block.quote_depth(), 1);
+        let MarkdownBlock::ListItem {
+            ordinal,
+            text,
+            depth,
+            ..
+        } = block.content()
+        else {
+            panic!("quoted list item")
+        };
+        assert_eq!(*ordinal, Some(3 + i as u64));
+        assert_eq!(*depth, 0);
+        let lead = ["Check the build.", "Publish."][i];
+        assert!(
+            doc.block_styles(i, text.len())
+                .iter()
+                .any(|(range, style)| style.strong && &text[range.clone()] == lead)
+        );
+        assert!(source[block.source().clone()].starts_with(&format!("> {}. ", 3 + i)));
+    }
+    assert_eq!(
+        block_paint_text(&doc.blocks[0]),
+        "Check the build. Read the résumé before continuing."
+    );
+}
+
+#[test]
+fn quoted_headings_tables_and_references_use_their_physical_offsets() {
+    let source = "Préface.\r\n\r\n  > # Plan\r\n\
+                  > > | Item | See |\r\n> > |---|---|\r\n> > | π | [Docs][id] |\r\n\
+                  >\r\n> [id]:\r\n>   guide.md\r\n>\r\n\
+                  > [two\r\n> lines][id] and ![pic](icon.png)\r\n";
+    let doc = parse(source);
+    assert_eq!(
+        doc.blocks
+            .iter()
+            .map(MarkdownBlock::quote_depth)
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 1]
+    );
+    let heading = source.find("  > #").unwrap();
+    assert_eq!(doc.outline[0].source_start, heading);
+    assert_eq!(local_anchor(&doc, "#plan"), Some(heading));
+    assert_eq!(block_at_source(&doc, heading), Some(1));
+    assert!(matches!(
+        doc.blocks[2].content(),
+        MarkdownBlock::Table { .. }
+    ));
+    assert_eq!(
+        doc.links
+            .iter()
+            .map(|link| (&source[link.source.clone()], link.destination.as_ref()))
+            .collect::<Vec<_>>(),
+        [
+            ("[Docs][id]", "guide.md"),
+            ("[two\r\n> lines][id]", "guide.md")
+        ]
+    );
+    assert_eq!(&source[doc.images[0].source.clone()], "![pic](icon.png)");
+}
+
+#[test]
+fn quote_fences_keep_literal_inner_markers_and_comments() {
+    let source = "> > ~~~rust\n> > > <!-- literal -->\n> > [sample]: literal\n> > ~~~\n\
+                  > <!-- hidden\n> comment --> Visible.\n\
+                  > ~~~\n> unclosed\n\
+                  Outside.\n\n~~~text\n> # literal\n~~~";
+    let doc = parse(source);
+    assert_eq!(doc.blocks.len(), 5);
+    assert_eq!(doc.blocks[0].quote_depth(), 2);
+    assert!(
+        matches!(doc.blocks[0].content(), MarkdownBlock::CodeBlock { code, .. } if code == "> <!-- literal -->\n[sample]: literal\n")
+    );
+    assert_eq!(block_paint_text(&doc.blocks[1]), "Visible.");
+    assert_eq!(block_paint_text(&doc.blocks[2]), "unclosed\n");
+    assert_eq!(doc.blocks[3].quote_depth(), 0);
+    assert_eq!(block_paint_text(&doc.blocks[4]), "> # literal\n");
+
+    let comment = parse("> <!-- hidden\n[inside](a.md)\n--> Outside [here](b.md).");
+    assert_eq!(comment.links.len(), 1);
+    assert_eq!(comment.links[0].label, "here");
+    assert_eq!(
+        block_paint_text(comment.blocks.last().unwrap()),
+        "Outside here."
+    );
+}
+
+#[test]
+fn malformed_and_utf8_inline_markup_never_panics_or_eats_unmatched_text() {
+    assert_eq!(
+        lower_inline_text_styled("🦀 **unterminated").0,
+        "🦀 **unterminated"
+    );
+    assert_eq!(
+        lower_inline_text_styled("[label](unterminated").0,
         "[label](unterminated"
     );
     assert_eq!(
-        lower_inline_text("`unterminated **code"),
+        lower_inline_text_styled("`unterminated **code").0,
         "`unterminated **code"
     );
-    assert_eq!(lower_inline_text("<kbd>⌘K</kbd>"), "⌘K");
+    assert_eq!(lower_inline_text_styled("<kbd>⌘K</kbd>").0, "⌘K");
     assert_eq!(
-        lower_inline_text("<https://example.com>"),
+        lower_inline_text_styled("<https://example.com>").0,
         "https://example.com"
     );
 }
@@ -630,14 +1005,46 @@ fn real_markdown_history_conforms_to_derived_capacity_and_branch_model() {
 fn tables_and_semantic_text_are_structured() {
     let document = parse("| A | B |\n|---|:---:|\n| 1 | 2 |\n");
     assert_eq!(document.blocks.len(), 1);
-    match &document.blocks[0] {
-        MarkdownBlock::Table { header, rows, .. } => {
-            assert_eq!(header, &["A".to_string(), "B".to_string()]);
-            assert_eq!(rows, &[vec!["1".to_string(), "2".to_string()]]);
-        }
-        other => panic!("expected Table block, got {other:?}"),
-    }
+    assert!(matches!(document.blocks[0], MarkdownBlock::Table { .. }));
     assert_eq!(block_paint_text(&document.blocks[0]), "A  │  B\n1  │  2\n");
+}
+
+#[test]
+fn narrow_tables_keep_links_in_their_columns_and_honor_alignment() {
+    let source = "| Item | Amount |\n|:-|-:|\n| [red\\|blue](guide.md \"Guide\") | 12 |\n| | 3 |";
+    let doc = parse(source);
+    let MarkdownBlock::Table { table, .. } = &doc.blocks[0] else {
+        panic!("table")
+    };
+    let (text, styles) = table.project(11);
+    assert_eq!(doc.links[0].destination.as_ref(), "guide.md");
+    assert_eq!(
+        text,
+        "Item │Amoun\n     │    t\nred|b│   12\nlue  │     \n     │    3\n"
+    );
+    let label: String = styles
+        .iter()
+        .filter(|(_, s)| s.link_index == Some(0))
+        .map(|(span, _)| &text[span.clone()])
+        .collect();
+    assert_eq!(label, "red|blue");
+}
+
+#[test]
+fn underlined_headings_use_outline_and_fragment_navigation() {
+    let doc = parse("A *multi*\nline title\n===\n\nDetails\n---\n\n---\n");
+    assert_eq!(
+        doc.outline
+            .iter()
+            .map(|h| (h.level, h.id.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "a-multi-line-title"), (2, "details")]
+    );
+    assert_eq!(
+        local_anchor(&doc, "#details"),
+        Some(doc.blocks[1].source().start)
+    );
+    assert!(matches!(doc.blocks[2], MarkdownBlock::ThematicBreak { .. }));
 }
 
 #[test]
@@ -701,9 +1108,9 @@ fn type_at(scale: f32) -> ReaderType {
 
 /// The rows the painter wraps `block` into in a column `width` wide at `ty`.
 fn painted_rows(block: &MarkdownBlock, width: f32, ty: ReaderType) -> usize {
-    let frame = block_frame(BlockShape::of(block), ty).expect("a block with text");
+    let frame = preview_frame(block, width, ty).expect("a block with text");
     wrap_reader_text(
-        &block_paint_text(block),
+        &block_text_at_columns(block, frame.columns(width)),
         frame.columns(width),
         0,
         READER_ROW_LIMIT,
@@ -778,7 +1185,7 @@ fn a_block_lays_out_every_row_it_paints_at_every_text_size() {
         for width in [206.0_f32, 326.0, 480.0, 732.0] {
             for (index, block) in document.blocks.iter().enumerate() {
                 let measure = measure_block(block, width, ty);
-                let Some(frame) = block_frame(BlockShape::of(block), ty) else {
+                let Some(frame) = preview_frame(block, width, ty) else {
                     assert_eq!(measure.rows, 1);
                     continue;
                 };
@@ -999,7 +1406,7 @@ fn link_and_image_policies_reject_malformed_and_whitespace_targets() {
         reduce_image_action(
             &MarkdownImage {
                 alt: None,
-                source_uri: "https://example.com/img.png\n".to_string(),
+                source_uri: "https://example.com/img.png\n".into(),
                 source: 0..10,
                 remote: true,
             },
@@ -1013,7 +1420,7 @@ fn link_and_image_policies_reject_malformed_and_whitespace_targets() {
         reduce_image_action(
             &MarkdownImage {
                 alt: None,
-                source_uri: "https://".to_string(),
+                source_uri: "https://".into(),
                 source: 0..8,
                 remote: true,
             },
@@ -1034,7 +1441,7 @@ fn link_and_image_policies_reject_malformed_and_whitespace_targets() {
 fn gesture_authority_and_percent_encoded_traversal_guards_hold() {
     let local = MarkdownImage {
         alt: None,
-        source_uri: "assets/diagram.png".to_string(),
+        source_uri: "assets/diagram.png".into(),
         source: 0..20,
         remote: false,
     };
@@ -1055,7 +1462,7 @@ fn gesture_authority_and_percent_encoded_traversal_guards_hold() {
     ] {
         let candidate = MarkdownImage {
             alt: None,
-            source_uri: escaped.to_string(),
+            source_uri: escaped.into(),
             source: 0..10,
             remote: false,
         };
@@ -1084,7 +1491,7 @@ fn gesture_authority_and_percent_encoded_traversal_guards_hold() {
     }
     let remote_empty_host = MarkdownImage {
         alt: None,
-        source_uri: "https:///etc/passwd".to_string(),
+        source_uri: "https:///etc/passwd".into(),
         source: 0..20,
         remote: true,
     };
@@ -1094,5 +1501,60 @@ fn gesture_authority_and_percent_encoded_traversal_guards_hold() {
     ));
     let doc = parse("<HTTPS://example.com> <https:///etc/passwd>");
     assert_eq!(doc.links.len(), 1);
-    assert_eq!(doc.links[0].destination, "HTTPS://example.com");
+    assert_eq!(doc.links[0].destination.as_ref(), "HTTPS://example.com");
+}
+
+#[test]
+fn email_autolinks_keep_the_authored_mailbox_and_source_position() {
+    let address = "build+alerts@Linux-2.Example";
+    let source = format!("π `<{address}>` or **<{address}>**");
+    let document = parse(&source);
+    let start = source.rfind('<').unwrap();
+    let [link] = document.links.as_slice() else {
+        panic!("one actionable address")
+    };
+    assert_eq!(link.label, address);
+    assert_eq!(link.destination.as_ref(), format!("mailto:{address}"));
+    assert_eq!(link.policy, LinkPolicy::ExplicitExternal);
+    assert_eq!(link.source, start..start + address.len() + 2);
+    let run = document
+        .inline_runs
+        .iter()
+        .find(|run| matches!(run.kind, MarkdownInlineKind::Link { index: 0 }))
+        .unwrap();
+    assert_eq!(run.content_source, start + 1..start + 1 + address.len());
+    let text = block_paint_text(&document.blocks[0]);
+    assert_eq!(text, format!("π <{address}> or {address}"));
+    let styles = document.block_styles(0, text.len());
+    let (span, style) = styles
+        .iter()
+        .find(|(_, style)| style.link_index == Some(0))
+        .unwrap();
+    assert_eq!(&text[span.clone()], address);
+    assert!(style.strong);
+    let doc = parse("<a?b%23@x> <mailto:me@example.org>");
+    assert_eq!(doc.links[0].destination.as_ref(), "mailto:a%3Fb%2523@x");
+    assert_eq!(doc.links[1].destination.as_ref(), doc.links[1].label);
+}
+
+#[test]
+fn invalid_email_autolinks_remain_readable_between_real_tags() {
+    for address in [
+        "name@",
+        "name@@host",
+        "name@x..y",
+        "name@-x",
+        "name@x-",
+        "name@x_y",
+        "name@例.jp",
+        "name@two hosts",
+    ] {
+        let doc = parse(&format!("<kbd><{address}></kbd>"));
+        assert_eq!(block_paint_text(&doc.blocks[0]), format!("<{address}>"));
+        assert!(doc.links.is_empty());
+    }
+    for length in [63, 64] {
+        let doc = parse(&format!("<x@{}>", "a".repeat(length)));
+        assert_eq!(doc.links.len(), usize::from(length == 63));
+    }
 }

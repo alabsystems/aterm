@@ -63,7 +63,7 @@ pub(crate) fn configured_genesis(paths: &Paths, out: &Path) -> crate::Result<Sig
     }
 }
 
-fn private_realm(paths: &Paths, cfg: &Config) -> crate::Result<bool> {
+pub(super) fn private_realm(paths: &Paths, cfg: &Config) -> crate::Result<bool> {
     let reads = Reads::new(paths);
     if matches!(&cfg.source, Source::Url(url) if crate::is_alab_default_url(url))
         || cfg
@@ -72,14 +72,14 @@ fn private_realm(paths: &Paths, cfg: &Config) -> crate::Result<bool> {
     {
         return Ok(false);
     }
-    let (_, mut store) = records_store_selected(&reads, Some(cfg))?;
-    let selected = crate::records_storage::selected(&paths.records_file())?;
-    // Read and decoded as the store that takes them reads: its capacity, and its format.
-    let records = match fsx::read_private(selected.path(), store.capacity())? {
-        Some(bytes) => {
-            crate::membership_log::decode_records_before_cut_in(bytes.as_slice(), store.reading())?
-        }
-        None => Vec::new(),
+    let (_, store) = records_store_selected(&reads, Some(cfg))?;
+    // Selected, read and decoded as the store that takes them reads: its capacity and its
+    // format, a rewritten layout's file and its frame where it reads format 2
+    // (`records_cache::select`, `Store::framed_strictly`).
+    let selected = super::records_cache::select(paths, store.reading())?;
+    let (mut store, records) = match fsx::read_private(selected.path(), store.capacity())? {
+        Some(bytes) => store.framed_strictly(bytes.as_slice())?,
+        None => (store, Vec::new()),
     };
     selected.confirm()?;
     let compiled = crate::membership_log::genesis::compiled()?;

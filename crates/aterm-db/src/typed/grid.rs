@@ -1014,6 +1014,8 @@ struct Reader<'a> {
     collection: &'static Collection,
     text: &'a str,
     sheet: &'a Sheet,
+    /// The previous line lookup, so a bulk edit visits the bytes before each record once.
+    line_at: (usize, usize),
     problems: Vec<Problem>,
 }
 
@@ -1025,11 +1027,19 @@ impl<'a> Reader<'a> {
     }
 
     /// The 1-based line record `record` starts on; 1 for one the file does not hold.
-    fn line(&self, record: usize) -> usize {
-        self.sheet
-            .records
-            .get(record)
-            .map_or(1, |r| line_of(self.text, r.raw.start))
+    fn line(&mut self, record: usize) -> usize {
+        let Some(row) = self.sheet.records.get(record) else {
+            return 1;
+        };
+        let at = row.raw.start;
+        let (start, line) = if self.line_at.0 <= at {
+            self.line_at
+        } else {
+            (0, 1)
+        };
+        let line = line + line_of(&self.text[start..at], at - start) - 1;
+        self.line_at = (at, line);
+        line
     }
 
     fn problem(&mut self, record: usize, column: usize, rule: impl Into<String>) {
@@ -1228,16 +1238,32 @@ pub fn plan_saved(
     birth: Birth<'_>,
     absent: Absent,
 ) -> std::result::Result<Plan, Vec<Problem>> {
-    let whole = |rule: &str| {
-        vec![Problem {
-            record: 0,
-            column: 0,
-            line: 1,
-            rule: rule.to_owned(),
-        }]
-    };
+    let sheet = Sheet::scan(text, Delimiter::Tab)
+        .map_err(|_| whole_problem("the file is larger than the grid reads"))?;
+    plan_scanned(table, collection, base, text, &sheet, birth, absent)
+}
+
+fn whole_problem(rule: &str) -> Vec<Problem> {
+    vec![Problem {
+        record: 0,
+        column: 0,
+        line: 1,
+        rule: rule.to_owned(),
+    }]
+}
+
+/// Plan from the same cell ranges that the caller used to validate a saved file's header.
+pub(crate) fn plan_scanned(
+    table: &Table,
+    collection: &'static Collection,
+    base: &Base,
+    text: &str,
+    sheet: &Sheet,
+    birth: Birth<'_>,
+    absent: Absent,
+) -> std::result::Result<Plan, Vec<Problem>> {
     if base.collection != collection.name || base.version != collection.version {
-        return Err(whole(
+        return Err(whole_problem(
             "this file was exported from another collection or version",
         ));
     }
@@ -1249,15 +1275,13 @@ pub fn plan_saved(
                 .and_then(|rest| rest.strip_prefix('@'))
                 .is_some_and(|rev| !rev.is_empty() && rev.bytes().all(|b| b.is_ascii_digit()))
     }) {
-        return Err(whole("not a grid baseline"));
+        return Err(whole_problem("not a grid baseline"));
     }
-    let Ok(sheet) = Sheet::scan(text, Delimiter::Tab) else {
-        return Err(whole("the file is larger than the grid reads"));
-    };
     let mut reader = Reader {
         collection,
         text,
-        sheet: &sheet,
+        sheet,
+        line_at: (0, 1),
         problems: Vec::new(),
     };
     let width = base.header.len();
@@ -1484,6 +1508,7 @@ pub fn cell_edits(
         collection,
         text: "",
         sheet: &sheet,
+        line_at: (0, 1),
         problems: Vec::new(),
     };
     let mut edits = Vec::new();

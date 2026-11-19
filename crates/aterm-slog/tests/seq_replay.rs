@@ -10,14 +10,14 @@ use std::path::PathBuf;
 use aterm_models_session::{transcript_join_model, turn_tracker_model};
 use aterm_slog::{
     ActWord, Actor, Chose, Close, Conf, Cursor, Fields, GapWhy, Key, Kind, Limits, Log, Lvl,
-    MAX_BYTES, Mark, Node, Op, Open, Out, Rec, RunOut, ShortId, Src, Tier, TurnTracker, TxEvent,
-    TxPos, TxState, Verdict, WallJudge, WallKind, encode,
+    MAX_BYTES, Mark, Node, Op, Open, Out, Rec, RunOut, ShortId, Src, Tier, TurnOut, TurnTracker,
+    TxEvent, TxPos, TxState, Verdict, WallJudge, WallKind, encode,
 };
 use aterm_spec::derive::{InvariantKind, Model};
 use aterm_spec::interp::{State, admits, with_buggy};
 
 use crate::conformance_transcript::{self, project_parts};
-use crate::conformance_turn::{self, Rig, Step, handoff};
+use crate::conformance_turn::{self, Rig, Step, StreamEdge, handoff};
 use crate::seq_twins::{self, Took};
 use crate::support::{self, WALL0, agent_session, at, time_order_holds};
 
@@ -40,6 +40,10 @@ pub enum RigKind {
     Screen,
     /// Transcript-bound replay rig.
     Transcript,
+    /// The screen rig with a harness's record stream beside it (HX-15h): its `turn` records
+    /// (`stream started|ended`) and the host's word on whether the stream feeds the turns
+    /// (`stream on|off`), each checked against the turn model's stream source.
+    Stream,
 }
 
 /// Parsed `.seq` replay specification.
@@ -119,6 +123,19 @@ pub enum Ev {
         after: u64,
         unmapped: Option<ShortId>,
     },
+    /// A harness's `turn` record the stream applied (`stream started <n> [by=<w>]`, `stream
+    /// ended <n> done|failed|interrupted|walled`).
+    Stream(StreamEdge),
+    /// The host's word that the stream feeds the turns (`stream on`), or no longer does
+    /// (`stream off`).
+    StreamFeeds(bool),
+    /// The transcript reads the next vendor turn's prompt (`vendor prompt [row=<ms>]`), its
+    /// row dated `row` (a prompt read late), else now: the stream rig's, while the stream feeds
+    /// the turns.
+    VendorPrompt(Option<u64>),
+    /// The transcript reads the vendor turn's end now (`vendor end`): the stream rig's, while
+    /// the stream feeds the turns.
+    VendorEnd,
     Expect(Expect),
 }
 
@@ -429,8 +446,43 @@ fn expect(rest: &str) -> Result<Expect, String> {
     })
 }
 
+/// A `stream` step's words (the stream rig's): a `turn` record or the host's word.
+fn stream_step(toks: &[&str]) -> Result<Ev, String> {
+    match toks {
+        ["on"] => Ok(Ev::StreamFeeds(true)),
+        ["off"] => Ok(Ev::StreamFeeds(false)),
+        ["started", n, rest @ ..] => {
+            let (opts, bare) = split_opts(rest);
+            if let Some(k) = opts.keys().find(|k| **k != "by") {
+                return Err(format!("`{k}=` is no option of `stream started`"));
+            }
+            if !bare.is_empty() {
+                return Err(format!("`{bare:?}` after `stream started {n}`"));
+            }
+            let by = opts.get("by").copied().unwrap_or("harness");
+            let by = aterm_slog::vocab::TURN_BY_WORDS
+                .iter()
+                .copied()
+                .find(|w| *w == by)
+                .ok_or_else(|| format!("`by={by}` is no turn_by word"))?;
+            Ok(Ev::Stream(StreamEdge::Started(num(n)?, by)))
+        }
+        ["ended", n, out] => {
+            let out = match *out {
+                "done" => TurnOut::Done,
+                "failed" => TurnOut::Error,
+                "interrupted" => TurnOut::Interrupted,
+                "walled" => TurnOut::Wall(None),
+                o => return Err(format!("`{o}` is no turn record's end")),
+            };
+            Ok(Ev::Stream(StreamEdge::Ended(num(n)?, out)))
+        }
+        _ => Err(format!("`stream {}` is no stream step", toks.join(" "))),
+    }
+}
+
 fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
-    let screen = rig == RigKind::Screen;
+    let screen = matches!(rig, RigKind::Screen | RigKind::Stream);
     let only = |ok: bool, ev: Ev| {
         if ok {
             Ok(ev)
@@ -580,6 +632,16 @@ fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
             )
         }
         ["tx", rest @ ..] => only(!screen, Ev::Tx(tx_row(rest)?)),
+        ["stream", rest @ ..] => only(rig == RigKind::Stream, stream_step(rest)?),
+        ["vendor", "prompt", rest @ ..] => {
+            let (opts, bare) = split_opts(rest);
+            if !bare.is_empty() || opts.keys().any(|k| *k != "row") {
+                return Err(format!("`vendor prompt {}`", rest.join(" ")));
+            }
+            let row = opts.get("row").map(|ms| num(ms)).transpose()?;
+            only(rig == RigKind::Stream, Ev::VendorPrompt(row))
+        }
+        ["vendor", "end"] => only(rig == RigKind::Stream, Ev::VendorEnd),
         _ => Err(format!("`{}` is no step", toks.join(" "))),
     }
 }
@@ -669,6 +731,7 @@ pub fn parse(name: &str, text: &str) -> Result<Seq, String> {
     let rig = match opts.get("rig") {
         Some(&"screen") => RigKind::Screen,
         Some(&"transcript") => RigKind::Transcript,
+        Some(&"stream") => RigKind::Stream,
         r => return Err(format!("{name}: rig {r:?}")),
     };
     let field = |k: &str| {
@@ -958,6 +1021,9 @@ impl TxRig {
             | Ev::Accept
             | Ev::Person(_) => {
                 return Err("a screen rig's step".to_string());
+            }
+            Ev::Stream(_) | Ev::StreamFeeds(_) | Ev::VendorPrompt(_) | Ev::VendorEnd => {
+                return Err("a stream rig's step".to_string());
             }
             Ev::Nothing | Ev::Expect(_) => {}
         }
@@ -1336,7 +1402,7 @@ pub fn replay(seq: &Seq, broken: Broken) -> Result<Replay, String> {
     };
     let m = turn_tracker_model();
     let mut live = match seq.rig {
-        RigKind::Screen => Live::Screen(Box::new(Rig::with_limits(limits))),
+        RigKind::Screen | RigKind::Stream => Live::Screen(Box::new(Rig::with_limits(limits))),
         RigKind::Transcript => Live::Tx(Box::new(TxRig::new(limits, broken))),
     };
     let mut all: Vec<Rec> = live.log().window().cloned().collect();
@@ -1404,6 +1470,10 @@ pub fn replay(seq: &Seq, broken: Broken) -> Result<Replay, String> {
                         Ev::Admit(by, act, chose) => Step::Admit(*by, *act, *chose),
                         Ev::Accept => Step::Accept,
                         Ev::Person(chose) => Step::Person(*chose),
+                        Ev::Stream(edge) => Step::Stream(*edge),
+                        Ev::StreamFeeds(on) => Step::StreamFeeds(*on),
+                        Ev::VendorPrompt(row) => Step::TxPrompt(*row),
+                        Ev::VendorEnd => Step::TxEndAlone,
                         other => return Err(at_line(format!("{other:?} on the screen rig"))),
                     };
                     catch_unwind(AssertUnwindSafe(|| conformance_turn::apply(&m, rig, s)))
@@ -1599,7 +1669,7 @@ pub const TURN_MUTANTS: &[Mutant] = &[
         join: false,
         dial: 1,
         name: "TxCloseTakesWall",
-        law: "WallNeedOutlivesTxClose",
+        law: "WallNeedOutlivesItsTurn",
         hand: |s| {
             set(
                 s,
@@ -1715,6 +1785,49 @@ pub const TURN_MUTANTS: &[Mutant] = &[
         name: "ActorSwap",
         law: "ActorKeepsItsAct",
         hand: |s| set(s, &[("ba", 3 - s["ba"])]),
+    },
+    Mutant {
+        join: false,
+        dial: 3,
+        name: "ScreenOpensUnderStream",
+        law: "OnlyTheStreamMovesItsTurns",
+        hand: |s| set(s, &[("turn", 1), ("sg", 1)]),
+    },
+    Mutant {
+        join: false,
+        dial: 3,
+        name: "TxClosesUnderStream",
+        law: "OnlyTheStreamMovesItsTurns",
+        hand: |s| set(s, &[("turn", 0), ("cw", 12), ("cticks", 0), ("sg", 1)]),
+    },
+    Mutant {
+        join: false,
+        dial: 3,
+        name: "StreamRestArms",
+        law: "StreamTurnsNeverSettle",
+        hand: |s| set(s, &[("pend", 1), ("ticks", 0)]),
+    },
+    Mutant {
+        join: false,
+        dial: 3,
+        name: "StreamEndTakesWall",
+        law: "WallNeedOutlivesItsTurn",
+        hand: |s| {
+            set(
+                s,
+                &[
+                    ("sf", 1),
+                    ("turn", 0),
+                    ("cw", 13),
+                    ("cticks", 0),
+                    ("step", 0),
+                    ("sturn", 0),
+                    ("pend", 0),
+                    ("ticks", 0),
+                    ("wg", 1),
+                ],
+            )
+        },
     },
 ];
 
@@ -1939,10 +2052,10 @@ pub fn measure(
     let (tm, jm) = (turn_tracker_model(), transcript_join_model());
     let mut out = BTreeMap::new();
     for mu in TURN_MUTANTS.iter().chain(JOIN_MUTANTS) {
-        let (m, rig) = if mu.join {
-            (&jm, RigKind::Transcript)
+        let (m, rigs): (_, &[RigKind]) = if mu.join {
+            (&jm, &[RigKind::Transcript])
         } else {
-            (&tm, RigKind::Screen)
+            (&tm, &[RigKind::Screen, RigKind::Stream])
         };
         let buggy = &with_buggy(m, mu.dial);
         assert!(
@@ -1955,7 +2068,7 @@ pub fn measure(
         let states = || {
             replays
                 .iter()
-                .filter(|(_, r)| r.rig == rig)
+                .filter(|(_, r)| rigs.contains(&r.rig))
                 .flat_map(|(n, r)| {
                     r.trace
                         .iter()
@@ -2004,7 +2117,7 @@ fn every_corpus_file_replays_and_meets_its_expects() {
             s.name
         );
         let programs: &[&str] = match s.rig {
-            RigKind::Screen => &["claude", "codex"],
+            RigKind::Screen | RigKind::Stream => &["claude", "codex"],
             RigKind::Transcript => &["claude"],
         };
         assert!(
@@ -2015,7 +2128,7 @@ fn every_corpus_file_replays_and_meets_its_expects() {
             s.build
         );
     }
-    for rig in [RigKind::Screen, RigKind::Transcript] {
+    for rig in [RigKind::Screen, RigKind::Transcript, RigKind::Stream] {
         assert!(seqs.iter().any(|s| s.rig == rig), "no {rig:?} file");
     }
     let replays = replay_all(&seqs);
@@ -2380,6 +2493,45 @@ fn the_parser_refuses_what_the_format_does_not_say() {
         assert!(
             parse("bad.seq", &format!("{tx}{bad}\n")).is_err(),
             "`{bad}` parsed"
+        );
+    }
+    for bad in ["stream on", "stream started 1", "stream ended 1 done"] {
+        assert!(
+            parse("bad.seq", &format!("{head}{bad}\n")).is_err(),
+            "`{bad}` parsed on the screen rig"
+        );
+    }
+    let stream = "seq v=1 rig=stream program=claude build=2.1.0\n";
+    for good in [
+        "stream on",
+        "stream off",
+        "stream started 1",
+        "stream started 2 by=person",
+        "stream ended 2 walled",
+        "see busy",
+    ] {
+        assert!(
+            parse("good.seq", &format!("{stream}{good}\n")).is_ok(),
+            "`{good}` refused on the stream rig"
+        );
+    }
+    for bad in [
+        "stream",
+        "stream maybe",
+        "stream started",
+        "stream started x",
+        "stream started 1 by=vendor",
+        "stream started 1 as=t2",
+        "stream started 1 soon",
+        "stream ended 1",
+        "stream ended 1 superseded",
+        "stream ended x done",
+        "tx prompt v1",
+        "bind 10",
+    ] {
+        assert!(
+            parse("bad.seq", &format!("{stream}{bad}\n")).is_err(),
+            "`{bad}` parsed on the stream rig"
         );
     }
     assert!(parse("bad.seq", "seq v=2 rig=screen program=claude build=1\n").is_err());

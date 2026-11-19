@@ -535,6 +535,7 @@ impl Writer {
             parents,
             authored_ms: self.authored_ms,
             body,
+            statement: None,
         }
         .sign(&mac.seed, mac.incarnation)?;
         let id = *record.id();

@@ -2162,8 +2162,10 @@ pub(in super::super) fn sign_waiting_writes_by(
     Ok(Some(minted))
 }
 
-/// The op that holds `name` in `[everyone]` now, as `opened` reads `log`: its winning `Put`, or the
-/// `Delete` that removed it; `None` where the log names neither.
+/// The op that holds `name` in `[everyone]` now, as `opened` reads `log`: the op its winner
+/// stands for, or the `Delete` that removed it; `None` where the log names neither. Its signer
+/// and clock are read off its stub where a prune dropped it ([`Log::drafted`]): a carry's rep
+/// may be such an op.
 pub(super) fn overtaker(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
@@ -2174,15 +2176,15 @@ pub(super) fn overtaker(
         Some(id) => (*id, false),
         None => (*opened.winning_deletes.get(&key)?, true),
     };
-    let signed = log.get(&record)?;
+    let signed = log.drafted(&record)?;
     let label = log
         .membership()
-        .label(signed.actor())
+        .label(&signed.actor)
         .map_or_else(|| "a Mac".to_owned(), str::to_owned);
     Some(Overtaker {
         record,
         label,
-        authored_ms: signed.authored_ms(),
+        authored_ms: signed.authored_ms,
         deleted,
     })
 }

@@ -313,26 +313,80 @@ impl Nickname {
         &self.0
     }
 
-    /// The unique comparison key, independent of display spelling and whitespace.
+    /// The unique comparison key for both historical spellings and a displayed nickname.
     #[must_use]
     pub fn canonical(word: &str) -> String {
-        word.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
+        Self::parse(word).map_or_else(
+            |_| {
+                word.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+            },
+            |nick| nick.display().to_lowercase(),
+        )
     }
 
-    /// The nickname as the menu bar shows it: an all-lowercase ASCII one (a drawn noun,
-    /// `heron`) with its first letter capitalised, any other as typed.
+    /// A saved compact name and its spaced title name the same machine. Use this only
+    /// for nicknames; principal keys, account handles and network aliases have their own grammar.
+    #[must_use]
+    pub fn equivalent(a: &str, b: &str) -> bool {
+        let compact = |word: &str| Self::canonical(word).replace(' ', "");
+        compact(a) == compact(b)
+    }
+
+    /// Does the draft produce this saved display spelling, with the same word boundaries?
+    /// A displayed name can exceed the input length limit after formatting.
+    #[must_use]
+    pub fn displays_as(draft: &str, shown: &str) -> bool {
+        draft.trim() == shown || Self::parse(draft).is_ok_and(|nick| nick.display() == shown)
+    }
+
+    /// A registry spelling that this build can read back as a nickname. Other free text
+    /// and legacy names whose expansion would exceed the nickname limit stay intact.
+    #[must_use]
+    pub fn registry_spelling(word: &str) -> Option<String> {
+        let shown = Self::parse(word).ok()?.display();
+        (word != shown && Self::parse(&shown).is_ok()).then_some(shown)
+    }
+
+    /// Title-case words separated by spaces. A hyphen, camel-case boundary or digit run
+    /// starts a word. Apostrophes within a word stay in it.
     #[must_use]
     pub fn display(&self) -> String {
-        let lower_ascii = self.0.is_ascii() && !self.0.bytes().any(|b| b.is_ascii_uppercase());
-        if !lower_ascii {
-            return self.0.clone();
-        }
-        let mut shown = self.0.clone();
-        if let Some(first) = shown.get_mut(..1) {
-            first.make_ascii_uppercase();
+        self.word_title()
+    }
+
+    /// Title-case words separated by spaces. A hyphen, camel-case boundary or digit run
+    /// starts a word. Apostrophes within a word stay in it.
+    #[must_use]
+    pub fn word_title(&self) -> String {
+        let mut shown = String::new();
+        let mut letters = self.0.chars().peekable();
+        let mut previous: Option<char> = None;
+        while let Some(c) = letters.next() {
+            if c.is_whitespace() || c == '-' {
+                previous = None;
+                continue;
+            }
+            let boundary = previous.is_none_or(|last| {
+                last.is_alphanumeric()
+                    && c.is_alphanumeric()
+                    && (last.is_numeric() != c.is_numeric()
+                        || c.is_uppercase()
+                            && (last.is_lowercase()
+                                || last.is_uppercase()
+                                    && letters.peek().is_some_and(|next| next.is_lowercase())))
+            });
+            if boundary {
+                if !shown.is_empty() {
+                    shown.push(' ');
+                }
+                shown.extend(c.to_uppercase());
+            } else {
+                shown.extend(c.to_lowercase());
+            }
+            previous = Some(c);
         }
         shown
     }

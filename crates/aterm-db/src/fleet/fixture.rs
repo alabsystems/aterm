@@ -25,7 +25,8 @@ use super::band::{
 use super::fold::{Inputs, Source};
 use super::read::{
     Access, AccountWord, AgentSeen, Answer, Answered, Harness, Latest, Limits, Load, Look,
-    MachineSeen, OutSrc, Pressure, Read, State, Tally, Task, TurnFacts, WaitTally, Work, WorkTally,
+    MachineSeen, OutSrc, Own, Pressure, Read, State, Tally, Task, TurnFacts, WaitTally, Work,
+    WorkTally,
 };
 use super::rows::Reach;
 use crate::alab::journal::event::{Event, SIGNIN_ENDED, SIGNIN_IN};
@@ -777,6 +778,15 @@ pub fn inputs(now_ms: u64) -> Inputs {
         },
         read: Source::Live {
             value: Arc::new(latest),
+            at_ms: read_at_ms,
+        },
+        // This Mac's own reading, from its vitals at the read's time: the figures its own answer
+        // says, so its column reads the same either way.
+        own: Source::Live {
+            value: Arc::new(Own {
+                look: look_of(0, read_at_ms),
+                home_free_mb: Some(40_000),
+            }),
             at_ms: read_at_ms,
         },
     }

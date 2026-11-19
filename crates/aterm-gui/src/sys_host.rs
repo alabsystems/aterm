@@ -484,6 +484,12 @@ impl Shared {
         self.lock().held.clone()
     }
 
+    /// The newest snapshot of either kind, a machine-only one the probe makes while no deck is
+    /// in view included, without pulling: the fleet tables' own reading (FP-10).
+    pub(crate) fn latest_now(&self) -> Option<Held> {
+        self.lock().latest.clone()
+    }
+
     fn head_seq(&self) -> u64 {
         self.lock().head_seq
     }

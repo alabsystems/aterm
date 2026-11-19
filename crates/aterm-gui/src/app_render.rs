@@ -7556,13 +7556,11 @@ impl App {
             },
             sound_seam: ws.fx.cursor().glow.sound_seam_open(),
             ribbon_look: if presentation.style.style
-                != Some(crate::cursor_glow::GlowStyle::RainbowKitty)
+                == Some(crate::cursor_glow::GlowStyle::RainbowKitty)
             {
-                "none"
-            } else if glow_cfg.ribbon_tall {
                 "tall"
             } else {
-                "underline"
+                "none"
             },
             tally: ws.fx.cursor().glow.admission_tally(),
             spawns: ws.fx.cursor().glow.spawns(),

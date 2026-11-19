@@ -238,6 +238,8 @@ kinds! {
     Tab => "tab",
     Desc => "desc",
     Refused => "refused",
+    Msg => "msg",
+    Diff => "diff",
 }
 
 impl Kind {
@@ -326,6 +328,8 @@ impl Kind {
                 | Kind::Tab
                 | Kind::Desc
                 | Kind::Refused
+                | Kind::Msg
+                | Kind::Diff
         )
     }
 
@@ -845,6 +849,7 @@ pub const NEED_WORDS: &[&str] = &[
     "login",
     "memory",
     "wall",
+    "unsupervised",
     "ask",
     "approval",
 ];
@@ -1082,9 +1087,10 @@ pub const END_WORDS: &[&str] = &[
 /// Closed `cause_k=` cause kind vocabulary.
 pub const CAUSE_WORDS: &[&str] = &["mail", "rec", "unknown"];
 
-/// Closed `turn_by=` vocabulary (gap 25): the role a vendor's own row names as a turn's starter,
-/// beside an open whose `by=` names nobody; never an actor.
-pub const TURN_BY_WORDS: &[&str] = &["harness"];
+/// Closed `turn_by=` vocabulary: the role that started a turn, never an actor. `harness` is the
+/// one a vendor's own row names beside an open whose `by=` names nobody (gap 25); a harness's
+/// `turn` record (HX-15h) names any of the five, `peer` with the tab in `as=`.
+pub const TURN_BY_WORDS: &[&str] = &["harness", "person", "ctl", "agent", "peer"];
 
 /// Closed `dur=` duration clock basis vocabulary.
 pub const DUR_WORDS: &[&str] = &["mono", "wall", "unknown"];

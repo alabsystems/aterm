@@ -172,9 +172,33 @@ fn every_frame_survives_the_wire() {
             code: libc::EACCES,
             words: "not local network".into(),
         },
+        Frame::Request(Request::ScopeHome),
+        Frame::Scoped { added: 0 },
+        Frame::Scoped { added: 64 },
     ] {
         round(&frame);
     }
+}
+
+/// The Spotlight scope request carries its own tags, 19 and 35, beside the Spotlight store
+/// sizes' 17 and 34, which stay that request's and answer's; a wire that predates them refuses
+/// the bytes as an unknown kind, which an older broker answers by closing after its hello. The
+/// request has no field, so a byte past its tag is refused.
+#[test]
+fn the_scope_request_has_its_own_tags_and_no_field() {
+    let request = encode(&Frame::Request(Request::ScopeHome)).unwrap();
+    assert_eq!(&request[4..], &[19]);
+    let answer = encode(&Frame::Scoped { added: 7 }).unwrap();
+    assert_eq!(&answer[4..], &[35, 0, 0, 0, 7]);
+    assert!(decode(&[19, 0]).is_err());
+    assert_eq!(
+        decode(&[17]).unwrap(),
+        Frame::Request(Request::SpotlightStore)
+    );
+    assert!(!matches!(
+        decode(&[34, 0, 0, 0, 7]),
+        Ok(Frame::Scoped { .. })
+    ));
 }
 
 #[test]

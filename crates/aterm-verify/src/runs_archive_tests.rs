@@ -29,7 +29,8 @@ fn fixture(bytes: &[u8]) -> (aterm_tempfile::TempDir, Runs, FakeKernel) {
         made: Mutex::new(BTreeMap::new()),
         said: Mutex::new(Vec::new()),
         may_forget: AtomicBool::new(false),
-        poster: Box::new(Inert),
+        poster: Arc::new(Inert),
+        kin: runs_kin::KinLedger::new(dir.path().join("x.kin"), None, Vec::new()),
     };
     let mut kernel = FakeKernel::default();
     let mut owner = lin(41983, 100, 41983, 1);

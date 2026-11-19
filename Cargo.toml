@@ -20,7 +20,7 @@ default-members = [
     "crates/aterm-conformance", "crates/aterm-containment", "crates/aterm-control",
     "crates/aterm-converge", "crates/aterm-cores",
     "crates/aterm-core", "crates/aterm-ctl",
-    "crates/aterm-dbus", "crates/aterm-digest", "crates/aterm-dirfd", "crates/aterm-diskwalk", "crates/aterm-dl",
+    "crates/aterm-dbus", "crates/aterm-digest", "crates/aterm-dirfd", "crates/aterm-diskindex", "crates/aterm-diskwalk", "crates/aterm-dl",
     "crates/aterm-durable", "crates/aterm-db", "crates/aterm-db-core",
     "crates/aterm-effects", "crates/aterm-evidence", "crates/aterm-file", "crates/aterm-value-guard", "crates/aterm-font", "crates/aterm-getrandom", "crates/aterm-gpu",
     "crates/aterm-gpu-web", "crates/aterm-grapheme", "crates/aterm-grid",
@@ -91,7 +91,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit.
 [workspace.package]
-version = "0.208.0"
+version = "0.209.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"

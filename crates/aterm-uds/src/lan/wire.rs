@@ -124,6 +124,11 @@ pub enum Request {
         /// The record type.
         rrtype: u16,
     },
+    /// Spotlight's exclusion of the asking account's own new top-level home folders, which
+    /// the broker works out itself from what root reads (the peer's uid, the console's owner,
+    /// the account's home in directory services, root's receipt): the request names nothing.
+    /// The answer is [`Frame::Scoped`] or a [`Frame::Error`] ([`super::ScopeAnswer`]).
+    ScopeHome,
     /// A Bonjour advert, for as long as the connection lasts.
     Register(Advert),
     /// The size of Spotlight's store on each mounted local volume, as the broker last walked it
@@ -265,6 +270,11 @@ pub enum Frame {
     SpotlightStores(SpotlightStores),
     /// What a Bonjour request heard.
     Event(Event),
+    /// A [`Request::ScopeHome`] excluded this many of the account's folders.
+    Scoped {
+        /// How many folders the exclusion added (none where nothing was owed).
+        added: u32,
+    },
     /// The request failed: an `errno` (a socket request's) or a DNS-SD error code (a Bonjour
     /// request's), and the words.
     Error {
@@ -292,6 +302,9 @@ const ADDRESSES: u8 = 31;
 const EVENT: u8 = 32;
 const ERROR: u8 = 33;
 const SPOTLIGHT_STORES: u8 = 34;
+/// [`Request::ScopeHome`] and its answer, [`Frame::Scoped`].
+const SCOPE_HOME: u8 = 19;
+const SCOPED: u8 = 35;
 
 const ADDED: u8 = 1;
 const REMOVED: u8 = 2;
@@ -630,6 +643,10 @@ fn frame_body<B: WireBuffer>(out: &mut Out<B>, frame: &Frame) {
             }
         }
         Frame::Event(event) => event_body(out, event),
+        Frame::Scoped { added } => {
+            out.u8(SCOPED);
+            out.u32(*added);
+        }
         Frame::Error { code, words } => {
             out.u8(ERROR);
             out.i32(*code);
@@ -640,6 +657,7 @@ fn frame_body<B: WireBuffer>(out: &mut Out<B>, frame: &Frame) {
 
 fn request_body<B: WireBuffer>(out: &mut Out<B>, request: &Request) {
     match request {
+        Request::ScopeHome => out.u8(SCOPE_HOME),
         Request::Connect {
             target,
             port,
@@ -798,6 +816,8 @@ fn decode_by<const OWN: bool>(body: &[u8]) -> io::Result<Frame> {
         },
         REFUSED => Frame::Refused { words: at.text()? },
         UNCHECKED => Frame::Unchecked { words: at.text()? },
+        SCOPE_HOME => Frame::Request(Request::ScopeHome),
+        SCOPED => Frame::Scoped { added: at.u32()? },
         CONNECT => {
             let target = match at.u8()? {
                 HOST => Target::Host(at.text()?),

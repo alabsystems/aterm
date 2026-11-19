@@ -805,8 +805,11 @@ fn witness_searched(paths: &Paths, state: &State, log: &Log) -> Option<Witness> 
 /// applied, or `log` still holds the applied one whole. The store only grows (intake writes
 /// records and moves no applied digest), so equality with the applied digest fails for good once
 /// one record lands after the last apply; containment is what a floor needs. It is shown by
-/// exhibiting the applied heads ([`Log::down_set_named`]): held records whose heads digest is
-/// the applied one, a SHA-256 preimage, so `log` holds them and every record in their pasts.
+/// exhibiting the applied heads ([`Log::down_set_named`]): records whose heads digest is the
+/// applied one, a SHA-256 preimage, so `log` holds them and every record in their pasts, or, in
+/// a log rooted at a final checkpoint, holds or dropped them (a root's stub stands for a record
+/// its cut held; the search reads a dropped head too, and is never complete there, so such a log
+/// reads [`Witness::Unsearched`], never [`Witness::Absent`], where it names nothing).
 /// `stamp` (the applied envelope's stamp heads) only orders the search. A store put back to an
 /// older snapshot, or one that kept the stamp's records and lost a later record this Mac
 /// applied, holds no such heads and is refused as before.
@@ -5421,7 +5424,9 @@ pub(super) fn author_and_commit_records<T>(
         let observation = draft_observation(paths, None)?;
         let raw = super::load_records(paths)?;
         let before = raw.inventory();
-        let snapshot = author_snapshot(paths, raw)?;
+        let writer = writer_of(paths, &raw)?;
+        let mut snapshot = author_snapshot(paths, raw)?;
+        attach_writer(paths, writer, &mut snapshot)?;
         let (minted, out) = draft(&snapshot)?;
         drop(observation);
         if minted.is_empty() {
@@ -5435,7 +5440,7 @@ pub(super) fn author_and_commit_records<T>(
         if attempt < 3 && current.inventory() != before {
             continue;
         }
-        commit_authored_records(paths, &mut current, &wire, &minted)?;
+        commit_written(paths, writer, &mut current, &wire, &minted)?;
         return Ok((minted, current, out));
     }
     unreachable!("bounded loop returns on attempt == 3")
@@ -5465,6 +5470,65 @@ fn draft_observation(
     }
 }
 
+/// What an author's next write from `raw` signs (`super::format_two::writer`): record version
+/// 1 on every Mac whose build reads no format 2, which is every running build.
+#[cfg(unix)]
+fn writer_of(paths: &Paths, raw: &Store) -> crate::Result<super::format_two::Writer> {
+    super::format_two::writer(paths, raw)
+}
+
+/// What an author's next write signs: record version 1, as a Mac that stores no format mark.
+#[cfg(not(unix))]
+fn writer_of(_: &Paths, _: &Store) -> crate::Result<()> {
+    Ok(())
+}
+
+/// Make `snapshot` draft as `writer` signs (`super::format_two::attach`).
+#[cfg(unix)]
+fn attach_writer(
+    paths: &Paths,
+    writer: super::format_two::Writer,
+    snapshot: &mut Store,
+) -> crate::Result<()> {
+    super::format_two::attach(paths, writer, snapshot)
+}
+
+#[cfg(not(unix))]
+fn attach_writer(_: &Paths, (): (), _: &mut Store) -> crate::Result<()> {
+    Ok(())
+}
+
+/// [`commit_authored_records`] as `writer` commits (`super::format_two::commit`): the first
+/// format-2 write stores the format mark first and holds its records in the store read again
+/// at format 2.
+#[cfg(unix)]
+fn commit_written(
+    paths: &Paths,
+    writer: super::format_two::Writer,
+    current: &mut Store,
+    wire: &[u8],
+    minted: &[Record],
+) -> crate::Result<()> {
+    if writer == super::format_two::Writer::First && super::format_two::signs_two(minted) {
+        return super::format_two::commit(paths, writer, minted, || {
+            *current = super::load_records(paths)?;
+            commit_authored_records(paths, current, wire, minted)
+        });
+    }
+    commit_authored_records(paths, current, wire, minted)
+}
+
+#[cfg(not(unix))]
+fn commit_written(
+    paths: &Paths,
+    (): (),
+    current: &mut Store,
+    wire: &[u8],
+    minted: &[Record],
+) -> crate::Result<()> {
+    commit_authored_records(paths, current, wire, minted)
+}
+
 /// Network ingress may keep the valid part of an offered stream. Local authoring
 /// promises the complete signed operation, including its wraps and resealed
 /// values. Check causal retention, allowing already-held records, before any
@@ -5476,6 +5540,14 @@ pub(super) fn commit_authored_records(
     minted: &[Record],
 ) -> crate::Result<()> {
     require_author_custody(paths, current)?;
+    // A version-2 record is taken as it was signed: the stream reader reads version 1 alone.
+    #[cfg(unix)]
+    let added = if super::format_two::signs_two(minted) {
+        current.ingest_records(minted.to_vec())?
+    } else {
+        current.ingest(wire)?
+    };
+    #[cfg(not(unix))]
     let added = current.ingest(wire)?;
     if minted.iter().any(|record| !current.holds(record.id())) {
         return Err(Error::new(
@@ -5572,7 +5644,9 @@ pub(super) fn author_and_commit_records_held<T>(
         let observation = super::Observing::new(observation, paths);
         let raw = super::load_records(paths)?;
         let before = raw.inventory();
-        let snapshot = author_snapshot(paths, raw)?;
+        let writer = writer_of(paths, &raw)?;
+        let mut snapshot = author_snapshot(paths, raw)?;
+        attach_writer(paths, writer, &mut snapshot)?;
         let (minted, out) = draft(&snapshot)?;
         drop(observation);
         if minted.is_empty() {
@@ -5588,7 +5662,7 @@ pub(super) fn author_and_commit_records_held<T>(
         if attempt < 3 && current.inventory() != before {
             continue;
         }
-        commit_authored_records(paths, &mut current, &wire, &minted)?;
+        commit_written(paths, writer, &mut current, &wire, &minted)?;
         return Ok(Some((minted, current, out)));
     }
     unreachable!("bounded loop returns on attempt == 3")
@@ -7047,10 +7121,11 @@ pub(super) fn reseal_audience(
             || opened
                 .winning_ops
                 .get(&(text.clone(), name.clone()))
-                .and_then(|op| log.get(op))
-                .is_some_and(|record| match record.body() {
-                    Body::Put { epoch, .. } => attest.contains(epoch),
-                    _ => false,
+                // A winner's rep a prune dropped is read off its stub: its kind and epoch.
+                .and_then(|op| log.drafted(op))
+                .is_some_and(|drafted| {
+                    drafted.kind == crate::membership_log::Kind::Put
+                        && drafted.epoch.is_some_and(|epoch| attest.contains(&epoch))
                 })
     };
     let Some(text) = text_audience(audience) else {

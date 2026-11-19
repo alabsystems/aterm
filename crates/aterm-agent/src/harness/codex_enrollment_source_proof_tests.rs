@@ -79,6 +79,12 @@ fn replacement_image_is_authenticated_and_leased_with_its_original_launch() {
     let task = world.retained_upgrade_task(&before, &after).unwrap();
     let launch = SourceProofLaunch::admit(world.env(), &task, &app, &scope, "t00000pr00f").unwrap();
     assert_eq!(launch.retained_images().unwrap().len(), 2);
+    assert!(launch.native_transport_only());
+    assert_eq!(
+        launch.retained_backend_images().unwrap().len(),
+        1,
+        "the same original A backend survives the admitted UI image replacement"
+    );
     let canonical_after = std::fs::canonicalize(&after).unwrap();
     assert_eq!(
         launch.replacement_candidate(),

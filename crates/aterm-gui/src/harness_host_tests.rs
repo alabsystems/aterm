@@ -13,6 +13,12 @@ mod upgrade_rung;
 #[path = "harness_startup_hold_clock_tests.rs"]
 mod startup_hold_clock;
 
+/// The memory ceiling of a harness-led tab (HX-15m): the worker the record stream's test drives,
+/// and the end of a memory restart its harness does not obey.
+#[cfg(unix)]
+#[path = "harness_host_memory_tests.rs"]
+pub(crate) mod memory;
+
 use super::*;
 
 #[cfg(target_os = "macos")]
@@ -6337,13 +6343,17 @@ fn a_self_claimed_crash_relaunches_on_the_serving_pool_row() {
         "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string(),
     ];
     let dead = gone_pid();
-    let run = |sid: &str, seen: self_claimed::Seen, moves: bool| {
+    let run = |sid: &str,
+               seen: self_claimed::Seen,
+               from: Option<&'static str>,
+               to: Option<&'static str>| {
         let a = Arc::new(Acting::default());
         *a.self_relaunch_steps.lock().unwrap() =
             std::iter::repeat_n("wait:shell-prompt".to_string(), 64).collect();
         a.open.lock().unwrap().insert(sid.to_string());
         a.set(&[(sid, Program::Codex)]);
-        let copy = self_copy(&a, sid, seen, Ok(line.clone()));
+        let mut copy = self_copy(&a, sid, seen, Ok(line.clone()));
+        copy.resume.as_mut().unwrap().codex_auth_path = from.map(str::to_string);
         a.self_copies.lock().unwrap().insert(sid.to_string(), copy);
         let asked = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let typed = Arc::new(Mutex::new(Vec::<(Vec<String>, Option<String>)>::new()));
@@ -6362,22 +6372,18 @@ fn a_self_claimed_crash_relaunches_on_the_serving_pool_row() {
                 assert!(before_admission.lock().unwrap().is_empty());
                 return Err("account temporarily held".into());
             }
-            if !moves {
+            if from == to {
                 return Ok(None);
             }
-            let mut moved = snap.clone();
-            moved
-                .codex_mut()
-                .unwrap()
-                .self_claimed
-                .as_mut()
-                .unwrap()
-                .codex_auth_path = Some(SERVING.into());
-            Ok(Some(moved))
+            admitted_codex_login(snap, to.map(str::to_string)).map(Some)
         });
         let relaunch = Arc::clone(&h.acts.self_relaunch);
         let seen_typed = Arc::clone(&typed);
         h.acts.self_relaunch = Arc::new(move |sid, grace, snap, resume, cause| {
+            assert_eq!(
+                snap.codex().unwrap().selected_default,
+                from != to && to.is_none()
+            );
             seen_typed
                 .lock()
                 .unwrap()
@@ -6405,7 +6411,19 @@ fn a_self_claimed_crash_relaunches_on_the_serving_pool_row() {
                 || crate::harness_host::published_snapshot(sid).is_none()
         });
         let owed = host.pending_restored_for(sid).map(|owed| {
-            let resume = aterm_agent::harness::relaunch::self_claimed_line(&owed.snap)
+            // The attempt waits at the shell. The outgoing host can hand this exact debt to a successor.
+            let leaf = crate::restore::AgentRestore::owed(owed.snap, owed.asked);
+            let wire = aterm_toml::to_string(&leaf).expect("serialize owed relaunch");
+            let restored: crate::restore::AgentRestore =
+                aterm_toml::from_str(&wire).expect("restore debt");
+            let back = restored
+                .snapshot(sid.to_string(), 7777)
+                .expect("restorable Codex");
+            assert_eq!(
+                back.codex().unwrap().selected_default,
+                from != to && to.is_none()
+            );
+            let resume = aterm_agent::harness::relaunch::self_claimed_line(&back)
                 .expect("owed on a self-claimed line");
             (resume.argv.clone(), resume.codex_auth_path.clone())
         });
@@ -6432,7 +6450,7 @@ fn a_self_claimed_crash_relaunches_on_the_serving_pool_row() {
         );
         (asked, typed, owed)
     };
-    let (asked, typed, owed) = run("s-pool-moved", standing_record(), true);
+    let (asked, typed, owed) = run("s-pool-moved", standing_record(), None, Some(SERVING));
     assert_eq!(
         asked,
         std::slice::from_ref(&line),
@@ -6449,7 +6467,16 @@ fn a_self_claimed_crash_relaunches_on_the_serving_pool_row() {
         Some(moved),
         "the owed relaunch carries the moved line"
     );
-    let (asked, typed, owed) = run("s-pool-kept", standing_record(), false);
+    let (asked, typed, owed) = run("s-pool-default", standing_record(), Some(SERVING), None);
+    assert_eq!(asked, std::slice::from_ref(&line));
+    let default_line = (line.clone(), None);
+    assert_eq!(typed, std::slice::from_ref(&default_line));
+    assert_eq!(
+        owed,
+        Some(default_line),
+        "the admitted default survives a host interruption"
+    );
+    let (asked, typed, owed) = run("s-pool-kept", standing_record(), None, None);
     assert_eq!(asked, std::slice::from_ref(&line));
     let kept = (line.clone(), None);
     assert_eq!(
@@ -6458,7 +6485,12 @@ fn a_self_claimed_crash_relaunches_on_the_serving_pool_row() {
         "CONTROL: a row that still serves keeps the copy's line"
     );
     assert_eq!(owed, Some(kept), "CONTROL: owed on the copy's line");
-    let (asked, typed, owed) = run("s-pool-orderly", self_claimed::Seen::Removed, true);
+    let (asked, typed, owed) = run(
+        "s-pool-orderly",
+        self_claimed::Seen::Removed,
+        None,
+        Some(SERVING),
+    );
     assert!(
         asked.is_empty() && typed.is_empty() && owed.is_none(),
         "CONTROL: an orderly end asks nothing and relaunches nothing: {asked:?} {typed:?} {owed:?}"
@@ -6701,6 +6733,7 @@ fn a_self_claimed_snapshot_publishes_the_line_its_copy_validated() {
         start: a.start_of(sid, snap(sid).pid),
         session: Some("0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string()),
         run: aterm_agent::harness::relaunch::AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: "/u/.codex".into(),
             home_env: None,
             self_claimed: None,
@@ -6752,6 +6785,7 @@ fn a_handed_self_claimed_agent_keeps_no_line_its_successor_never_validated() {
     let handed = Snapshot {
         start: a.start_of(sid, snap(sid).pid),
         run: aterm_agent::harness::relaunch::AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: "/u/.codex".into(),
             home_env: None,
             self_claimed: Some(line.clone()),
@@ -6925,6 +6959,7 @@ fn a_handed_self_claimed_line_survives_publication_into_the_crash_image() {
         let snapshot = Snapshot {
             start: copy.start.clone(),
             run: aterm_agent::harness::relaunch::AgentRun::Codex(CodexRun {
+                selected_default: false,
                 home: copy.home.clone(),
                 home_env: None,
                 self_claimed: carried.then(|| resume.clone()),
@@ -8353,6 +8388,7 @@ impl Acting {
                 observe_snapshot: Arc::new(|_| {}),
                 scoped: Arc::new(|_| None),
                 scoped_restart: Arc::new(|_, _, _, _| false),
+                scoped_memory_restart: Arc::new(|_| crate::restart_act::MEMORY_UNCLAIMED),
                 reprove_claims: Arc::new(|| {}),
                 tap_born: Arc::new(|_| None),
                 account_screen_wall: Arc::new(|_, _| None),
@@ -8491,6 +8527,7 @@ impl Acting {
                         run: if program == Program::Codex {
                             aterm_agent::harness::relaunch::AgentRun::Codex(
                                 aterm_agent::harness::relaunch::CodexRun {
+                                    selected_default: false,
                                     home: "/u/.codex".into(),
                                     home_env: None,
                                     self_claimed: None,
@@ -12386,6 +12423,7 @@ fn codex_pool_advice_records_thread_rollout_sample_and_plans_at_measured_wall() 
     snap.login = None;
     snap.route = aterm_agent::harness::accounts::AuthRoute::Outside;
     snap.run = relaunch::AgentRun::Codex(relaunch::CodexRun {
+        selected_default: false,
         home: codex_home.clone(),
         home_env: None,
         self_claimed: None,
@@ -17919,6 +17957,7 @@ fn a_cold_codex_relaunch_starts_under_the_login_the_codex_cold_act_names() {
             program: "/opt/bin/codex".into(),
             argv: vec!["/opt/bin/codex".into()],
             run: AgentRun::Codex(CodexRun {
+                selected_default: false,
                 home: "/tmp/codex-home".into(),
                 home_env: None,
                 self_claimed: Some(Resume {
@@ -18046,6 +18085,7 @@ fn the_cold_codex_act_judges_the_program_its_resume_line_runs() {
             program: program.clone().into(),
             argv: vec![program.clone()],
             run: AgentRun::Codex(CodexRun {
+                selected_default: false,
                 home: home.join(".codex"),
                 home_env: None,
                 self_claimed: Some(Resume {
@@ -18170,6 +18210,7 @@ fn held_codex_relaunch(root: &std::path::Path, home: &std::path::Path) -> Snapsh
         program: program.clone().into(),
         argv: vec![program.clone()],
         run: AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: home.join(".codex"),
             home_env: None,
             self_claimed: Some(Resume {
@@ -28414,6 +28455,7 @@ fn codex_snap(sid: &str, argv: &[&str]) -> Snapshot {
         session: Some(THREAD.to_string()),
         run: aterm_agent::harness::relaunch::AgentRun::Codex(
             aterm_agent::harness::relaunch::CodexRun {
+                selected_default: false,
                 home: std::path::PathBuf::from("/h/.codex"),
                 home_env: None,
                 self_claimed: None,
@@ -33423,6 +33465,641 @@ fn a_restart_ignored_past_the_stall_bound_is_term_then_kill() {
             "{case:?}: its SIGTERM ignored, SIGKILL ends it"
         );
     }
+}
+
+/// The child a contract 4 claim keeps, for [`an_unobeyed_restart_ends_the_group_then_the_kept_child`]:
+/// the kept signed `sleep` stand-in, run in place outside the claimant's process group (as a
+/// vendor that left it) with the signals that end a process at their defaults. Its waiter reaps
+/// it and reads, as it ends, whether the claimant was already gone.
+#[cfg(target_os = "macos")]
+struct KeptSleep {
+    pid: u32,
+    birth: aterm_uds::process::Birth,
+    /// How it ended, and whether the claimant was gone by then.
+    ended: Arc<Mutex<Option<(std::process::ExitStatus, bool)>>>,
+    waiter: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl KeptSleep {
+    fn start(claimant: &RealAgent) -> Self {
+        Self::beside(claimant.upid(), claimant.start.clone())
+    }
+
+    /// The kept child of the claimant `claimant` started at `start`, which need not run.
+    fn beside(claimant: u32, start: String) -> Self {
+        let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
+            "/bin/sleep",
+        )))
+        .expect("the kept stand-in");
+        let sleep_s = sleep.to_string_lossy().into_owned();
+        let defaults = aterm_spec::start::at_defaults(&aterm_spec::start::TERMINATING);
+        let mut child = aterm_uds::spawnfd::command(&sleep)
+            .arg("600")
+            .spawn()
+            .expect("spawn sleep");
+        drop(defaults);
+        let pid = child.id();
+        until("the kept child runs from the stand-in", || {
+            atpkg::caller_shell::process_args(pid).is_some_and(|a| a.argv.first() == Some(&sleep_s))
+        });
+        let birth =
+            aterm_uds::process::read_birth(i32::try_from(pid).expect("pid")).expect("its birth");
+        let ended = Arc::new(Mutex::new(None));
+        let reaped = Arc::clone(&ended);
+        let waiter = std::thread::spawn(move || {
+            let status = child.wait().expect("reap");
+            let claimant_gone = !restart_stamp::alive_as(claimant, &start);
+            *reaped.lock().unwrap() = Some((status, claimant_gone));
+        });
+        Self {
+            pid,
+            birth,
+            ended,
+            waiter: Some(waiter),
+        }
+    }
+
+    fn ended(&self) -> Option<(std::process::ExitStatus, bool)> {
+        *self.ended.lock().unwrap()
+    }
+
+    /// The child a claim keeps of it, as aterm read it.
+    fn kept(&self) -> crate::harness_claim::KeptChild {
+        crate::harness_claim::KeptChild {
+            pid: self.pid,
+            claimed_us: self.birth.0,
+            birth: self.birth,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for KeptSleep {
+    fn drop(&mut self) {
+        if self.ended().is_none() {
+            // SAFETY: our own unreaped child, so its pid has not been reused.
+            unsafe { libc::kill(i32::try_from(self.pid).unwrap_or(0), libc::SIGKILL) };
+        }
+        if let Some(waiter) = self.waiter.take() {
+            let _ = waiter.join();
+        }
+    }
+}
+
+/// HX-15e EXIT TEST: AN UNOBEYED RESTART ENDS THE GROUP, THEN THE KEPT CHILD (D16). A contract 4
+/// harness proven on its tab's real pty keeps a child outside its own process group. Asked to
+/// restart, it ignores the event and its `SIGTERM`: past the bound aterm sends its group
+/// `SIGTERM`, then `SIGKILL`, which ends it. Once the claimant is proven gone (its pid at its
+/// kernel start), the watchdog releases its claim at once (no re-exec grace is kept for a
+/// harness aterm ended), ends the kept child by the identity aterm keeps (`SIGTERM`, which ends
+/// it, read after the claimant was gone) and hands the tab to the relaunch: its need reads
+/// `unsupervised`.
+/// NEGATIVE HALF: while the restart is only asked, the kept child runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unobeyed_restart_ends_the_group_then_the_kept_child() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let agent = RealAgent::spawn(true, 7410);
+    let (a, _host) = agent.world();
+    let kept = KeptSleep::start(&agent);
+    let holder = format!("grok-alab@{}", agent.pid);
+    let mut scoped = crate::harness_claim::Scoped {
+        proven: crate::self_claim::Proven {
+            pid: agent.upid(),
+            start: agent.start.clone(),
+        },
+        child: Some(crate::harness_claim::KeptChild {
+            pid: kept.pid,
+            claimed_us: kept.birth.0,
+            birth: kept.birth,
+        }),
+        ..crate::session_timeline::scoped_input_tests::scoped(&[
+            aterm_agent::harness::contract::Scope::Relaunch,
+        ])
+    };
+    scoped.claim.contract = aterm_agent::harness::contract::UNIVERSAL;
+    crate::session_timeline::claim_supervisor_scoped(
+        &agent.ctx,
+        &holder,
+        Some(111),
+        scoped,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the harness's claim");
+    let _bound = crate::restart_act::stall_bound_for_test(Duration::from_millis(400));
+    let _deadline = crate::restart_act::deadline_for_test(Duration::from_secs(2));
+    assert_eq!(
+        agent.restart(&a, &format!("pid={}", agent.pid)),
+        format!("OK restarting pid {} cause=asked\n", agent.pid)
+    );
+    assert!(
+        kept.ended().is_none(),
+        "the kept child runs while the restart is asked"
+    );
+
+    until("the deaf harness ends", || agent.ended().is_some());
+    assert_eq!(
+        agent.ended().and_then(|status| status.signal()),
+        Some(libc::SIGKILL),
+        "its group's SIGTERM ignored, SIGKILL ends it"
+    );
+    until("its kept child ends", || kept.ended().is_some());
+    let (status, claimant_gone) = kept.ended().expect("ended");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "the watchdog's SIGTERM to the kept child, outside the group, ends it"
+    );
+    assert!(
+        claimant_gone,
+        "the kept child is ended only once the claimant is gone"
+    );
+    until("the tab reads unsupervised", || {
+        agent.ctx.meta.lock().unwrap().unsupervised.is_some()
+    });
+    assert!(
+        agent.ctx.meta.lock().unwrap().supervisor.is_none(),
+        "its claim was released, no grace kept"
+    );
+}
+
+/// HX-15f EXIT TEST: AN UNOBEYED RESTART ENDS THE GROUP, THEN THE KEPT CHILD, AND RELAUNCHES
+/// (D16, D21, D22). A contract 4 harness proven on its tab's real pty keeps a real child outside
+/// its group, whose built-in relaunch snapshot is taken while the claim keeps it (read by a
+/// stand-in reader, through the live kernel's identity of that child). Asked to restart, it
+/// ignores the event and its `SIGTERM`: its group is ended, then its kept child by the identity
+/// aterm keeps, and only once that child is read gone does the live watchdog relaunch the tab:
+/// it waits the back-off's first step (1 s) and hands the typer the claim's row's verified
+/// tool, `run`, `--` and the snapshot's resume arguments. The live world's tap records both, so
+/// nothing is slept or typed.
+/// NEGATIVE HALF: while the restart is only asked, nothing is typed and the kept child runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unobeyed_restart_ends_the_group_then_the_kept_child_and_relaunches() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let agent = RealAgent::spawn(true, 7413);
+    let (a, _host) = agent.world();
+    let kept = KeptSleep::start(&agent);
+    let (holder, _) = universal_claim(&agent, Some(&kept), 114);
+    let sid = agent.ctx.self_id.as_str().to_string();
+    crate::harness_watchdog::tap::on(&sid);
+    let conversation = "4f1c2a9e-0d6b-4a1e-9c3f-5b7e8d2a1c00";
+    let read = |at: &str, pid: u32| {
+        (at == sid && pid == kept.pid).then(|| crate::session_timeline::Resume {
+            words: vec!["--resume".to_string(), conversation.to_string()],
+            cwd: None,
+        })
+    };
+    assert!(crate::harness_watchdog::take_snapshot(
+        &agent.ctx.meta,
+        &sid,
+        kept.kept(),
+        &read,
+        &mut aterm_uds::process::EndControlLive,
+    ));
+    let _bound = crate::restart_act::stall_bound_for_test(Duration::from_millis(400));
+    let _deadline = crate::restart_act::deadline_for_test(Duration::from_secs(2));
+    assert_eq!(
+        agent.restart(&a, &format!("pid={}", agent.pid)),
+        format!("OK restarting pid {} cause=asked\n", agent.pid)
+    );
+    assert!(
+        kept.ended().is_none(),
+        "the kept child runs while the restart is asked"
+    );
+    assert_eq!(
+        crate::harness_watchdog::tap::read(&sid).map(|tapped| tapped.typed),
+        Some(Vec::new()),
+        "nothing is typed while the restart is asked"
+    );
+
+    until("the deaf harness ends", || agent.ended().is_some());
+    assert_eq!(
+        agent.ended().and_then(|status| status.signal()),
+        Some(libc::SIGKILL)
+    );
+    until("the tab is relaunched", || {
+        crate::harness_watchdog::tap::read(&sid).is_some_and(|tapped| !tapped.typed.is_empty())
+    });
+    let (status, claimant_gone) = kept
+        .ended()
+        .expect("the kept child ended before the relaunch");
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert!(claimant_gone);
+    let tapped = crate::harness_watchdog::tap::read(&sid).expect("tapped");
+    let tool = aterm_agent::harness::registry::current()
+        .entry("grok-alab")
+        .expect("the grok seed row")
+        .tool
+        .clone();
+    assert!(holder.starts_with("grok-alab@"), "{holder}");
+    assert_eq!(
+        tapped.typed,
+        [vec![
+            tool,
+            "run".to_string(),
+            "--".to_string(),
+            "--resume".to_string(),
+            conversation.to_string(),
+        ]]
+    );
+    assert_eq!(tapped.paused, [Duration::from_secs(1)]);
+    assert!(agent.ctx.meta.lock().unwrap().unsupervised.is_some());
+}
+
+/// A contract 4 claim of `relaunch` on `agent`'s tab by its own process on connection `conn`,
+/// keeping `kept`'s child: its holder and its claimant.
+#[cfg(target_os = "macos")]
+fn universal_claim(
+    agent: &RealAgent,
+    kept: Option<&KeptSleep>,
+    conn: u64,
+) -> (String, crate::self_claim::Proven) {
+    let holder = format!("grok-alab@{}", agent.pid);
+    let proven = crate::self_claim::Proven {
+        pid: agent.upid(),
+        start: agent.start.clone(),
+    };
+    let mut scoped = crate::harness_claim::Scoped {
+        proven: proven.clone(),
+        child: kept.map(KeptSleep::kept),
+        ..crate::session_timeline::scoped_input_tests::scoped(&[
+            aterm_agent::harness::contract::Scope::Relaunch,
+        ])
+    };
+    scoped.claim.contract = aterm_agent::harness::contract::UNIVERSAL;
+    crate::session_timeline::claim_supervisor_scoped(
+        &agent.ctx,
+        &holder,
+        Some(conn),
+        scoped,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the harness's claim");
+    (holder, proven)
+}
+
+/// How many `restart cause=beat` rows `ctx`'s timeline holds.
+#[cfg(target_os = "macos")]
+fn beat_restart_rows(ctx: &crate::SessionCtx) -> usize {
+    ctx.timeline
+        .lock()
+        .unwrap()
+        .view_copy(None, 0)
+        .rows()
+        .iter()
+        .filter(|row| {
+            row.kind == crate::restart_act::RESTART_EVENT && &*row.payload == "cause=beat"
+        })
+        .count()
+}
+
+/// REVIEW OF HX-15e: AN UNOBEYED BEAT RESTART WAITS FOR QUIET, THEN ENDS THE GROUP, THEN THE KEPT
+/// CHILD (D16, "Hands"). A deaf contract 4 harness on its real pty, keeping a child outside its
+/// group, missed its beats: the watchdog's `restart cause=beat` is written and watched for three
+/// more beat periods (shortened here). A person typed into the tab just before: past the bound
+/// its group's `SIGTERM` waits until that input is older than `quiet=`, then `SIGTERM` and
+/// `SIGKILL` end it, and the watchdog ends the kept child by its identity once the claimant is
+/// gone and hands the tab over (`unsupervised`).
+/// NEGATIVE HALF: before the fix the group was signalled at the bound, a person's input
+/// within `quiet=` notwithstanding.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_beat_restart_waits_for_quiet_then_ends_the_group_then_the_kept_child() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let agent = RealAgent::spawn(true, 7411);
+    let (a, _host) = agent.world();
+    let kept = KeptSleep::start(&agent);
+    let (_, proven) = universal_claim(&agent, Some(&kept), 112);
+    let (bound, quiet, deadline) = (
+        Duration::from_millis(300),
+        Duration::from_secs(4),
+        Duration::from_secs(1),
+    );
+    let _deadline = crate::restart_act::deadline_for_test(deadline);
+    crate::app_input::note_person(&agent.ctx, crate::human_input::Gesture::Typed);
+    let typed = Instant::now();
+    assert!(crate::harness_host::with_harness_state(
+        a.stamp_dir(),
+        || {
+            crate::restart_act::watchdog_restart(
+                &agent.ctx,
+                &proven,
+                restart_stamp::Cause::Beat,
+                Some(bound),
+                quiet,
+            )
+        }
+    ));
+    assert_eq!(beat_restart_rows(&agent.ctx), 1);
+
+    std::thread::sleep(bound + deadline + Duration::from_millis(700));
+    assert!(
+        agent.ended().is_none(),
+        "a person's input within quiet= holds its group's SIGTERM back"
+    );
+    until("the deaf harness ends", || agent.ended().is_some());
+    assert!(typed.elapsed() >= quiet, "nothing is sent within quiet=");
+    assert_eq!(
+        agent.ended().and_then(|status| status.signal()),
+        Some(libc::SIGKILL),
+        "its group's SIGTERM ignored, SIGKILL ends it"
+    );
+    until("its kept child ends", || kept.ended().is_some());
+    let (status, claimant_gone) = kept.ended().expect("ended");
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert!(claimant_gone, "ended only once the claimant is gone");
+    until("the tab reads unsupervised", || {
+        agent.ctx.meta.lock().unwrap().unsupervised.is_some()
+    });
+}
+
+/// REVIEW OF HX-15e: A CLAIMANT STOPPED PAST ITS BEAT RESTART'S BOUND IS NOT SIGNALLED (D16: a
+/// stopped claimant is never ended for the beats it misses). A deaf contract 4 harness on its
+/// real pty missed its beats and was told to restart; it is stopped (`SIGSTOP`, as a debugger
+/// attaching does) before the bound: its group gets nothing while it stays stopped, and once it
+/// runs again the watch's `SIGTERM` and `SIGKILL` end it.
+/// NEGATIVE HALF: before the fix the stopped claimant was sent `SIGTERM` and then the
+/// `SIGKILL` that ends a stopped process.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_claimant_stopped_past_its_beat_restarts_bound_is_not_signalled() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let agent = RealAgent::spawn(true, 7412);
+    let (a, _host) = agent.world();
+    let (_, proven) = universal_claim(&agent, None, 113);
+    let (bound, deadline) = (Duration::from_millis(300), Duration::from_secs(1));
+    let _deadline = crate::restart_act::deadline_for_test(deadline);
+    assert!(crate::harness_host::with_harness_state(
+        a.stamp_dir(),
+        || {
+            crate::restart_act::watchdog_restart(
+                &agent.ctx,
+                &proven,
+                restart_stamp::Cause::Beat,
+                Some(bound),
+                Duration::ZERO,
+            )
+        }
+    ));
+    // SAFETY: our own unreaped child, so its pid has not been reused.
+    assert_eq!(unsafe { libc::kill(agent.pid, libc::SIGSTOP) }, 0);
+    until("the kernel reports it stopped", || {
+        crate::input_stall::claimant_stopped(agent.upid()) == Some(true)
+    });
+
+    std::thread::sleep(bound + deadline + Duration::from_millis(700));
+    assert!(
+        agent.ended().is_none(),
+        "a stopped claimant is not signalled past the bound"
+    );
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(agent.pid, libc::SIGCONT) }, 0);
+    until("the deaf harness ends once it runs", || {
+        agent.ended().is_some()
+    });
+    assert_eq!(
+        agent.ended().and_then(|status| status.signal()),
+        Some(libc::SIGKILL)
+    );
+}
+
+/// REVIEW OF HX-15e: A WATCHED RESTART TAKES NO BEAT RESTART BESIDE IT. A deaf contract 4 harness
+/// on its real pty is asked to restart (the verb's restart, watched for the policy's
+/// `stall_term_after_s`); its beats are missed meanwhile: the watchdog writes no `restart
+/// cause=beat`, and no watch with the beat restart's shorter bound ends it.
+/// NEGATIVE HALF: before the fix a second restart was written and its 30 s watch (shortened
+/// here) sent the group `SIGTERM`, then `SIGKILL`, long before the verb's bound.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_watched_restart_takes_no_beat_restart_beside_it() {
+    let agent = RealAgent::spawn(true, 7413);
+    let (a, _host) = agent.world();
+    let (_, proven) = universal_claim(&agent, None, 114);
+    let _bound = crate::restart_act::stall_bound_for_test(Duration::from_secs(60));
+    assert_eq!(
+        agent.restart(&a, &format!("pid={}", agent.pid)),
+        format!("OK restarting pid {} cause=asked\n", agent.pid)
+    );
+    let (bound, deadline) = (Duration::from_millis(300), Duration::from_secs(1));
+    let _deadline = crate::restart_act::deadline_for_test(deadline);
+    assert!(!crate::harness_host::with_harness_state(
+        a.stamp_dir(),
+        || {
+            crate::restart_act::watchdog_restart(
+                &agent.ctx,
+                &proven,
+                restart_stamp::Cause::Beat,
+                Some(bound),
+                Duration::ZERO,
+            )
+        }
+    ));
+    assert_eq!(beat_restart_rows(&agent.ctx), 0);
+    std::thread::sleep(bound + deadline + Duration::from_millis(700));
+    assert!(
+        agent.ended().is_none(),
+        "the verb's watch, not a beat restart's, ends it"
+    );
+}
+
+/// REVIEW OF HX-15e: A LIVE CLAIMANT PAST ITS GRACE HAS ITS GROUP ENDED, THEN ITS KEPT CHILD (D28).
+/// A deaf contract 4 harness on its real pty, keeping a child outside its group, loses its
+/// connection and its re-exec grace runs out with it still running. A `restart` asked of it
+/// 280 s before left its stamp standing, with less than the margin a `SIGKILL` is read by: the
+/// watchdog's end joins that stamp and renews it, sends its group `SIGTERM`, then `SIGKILL`, and
+/// once it is gone ends the kept child by its identity and hands the tab over.
+/// NEGATIVE HALF: before the fix the joined stamp was not renewed, so the `SIGKILL` was withheld
+/// as lapsed and the deaf harness and its kept child were left running.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_live_claimant_past_its_grace_has_its_group_ended_then_its_kept_child() {
+    use restart_stamp::{Cause, Stamp};
+    use std::os::unix::process::ExitStatusExt as _;
+    let agent = RealAgent::spawn(true, 7414);
+    let (a, _host) = agent.world();
+    let kept = KeptSleep::start(&agent);
+    let (holder, proven) = universal_claim(&agent, Some(&kept), 115);
+    let now_s = aterm_time::unix_secs().expect("the clock");
+    restart_stamp::write(
+        a.stamp_dir(),
+        &agent.sid,
+        &Stamp {
+            pid: proven.pid,
+            start: proven.start.clone(),
+            cause: Cause::Asked,
+            at: now_s - (aterm_agent::harness::relaunch::STALE_S - 20),
+            wanted: None,
+            input: None,
+        },
+    )
+    .expect("the standing stamp");
+    let now_us = crate::metrics::now_us();
+    assert!(crate::session_timeline::release_closed_connection(
+        &agent.ctx,
+        115,
+        now_us,
+        Some(alab_wire::record::REEXEC_GRACE_MS * 1000)
+    ));
+    let expiry = agent
+        .ctx
+        .meta
+        .lock()
+        .unwrap()
+        .supervisor_expiry()
+        .expect("the grace");
+    let lapsed = crate::session_timeline::publish_lapse_supervisor(&agent.ctx, expiry)
+        .published()
+        .expect("the grace ran out");
+    assert_eq!(lapsed.holder, holder);
+    let scoped = lapsed.universal.expect("a contract 4 claim");
+    let _deadline = crate::restart_act::deadline_for_test(Duration::from_secs(1));
+    let ending = crate::harness_host::with_harness_state(a.stamp_dir(), || {
+        crate::harness_watchdog::end_harness(
+            &Arc::downgrade(&agent.ctx),
+            &holder,
+            &scoped,
+            crate::harness_watchdog::Why::Grace,
+            &crate::harness_watchdog::Live::POLICY,
+            &mut aterm_uds::process::EndControlLive,
+        )
+    });
+    assert!(
+        matches!(
+            ending,
+            crate::harness_watchdog::Ending::Ended { child: Some(Ok(_)) }
+        ),
+        "{ending:?}"
+    );
+    // Its end was read by its kernel start; its exit status is reaped on a thread of its own.
+    until("the deaf harness is reaped", || agent.ended().is_some());
+    assert_eq!(
+        agent.ended().and_then(|status| status.signal()),
+        Some(libc::SIGKILL),
+        "its group's SIGTERM ignored, SIGKILL ends it"
+    );
+    until("its kept child ends", || kept.ended().is_some());
+    let (status, claimant_gone) = kept.ended().expect("ended");
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert!(claimant_gone, "ended only once the claimant is gone");
+    assert!(agent.ctx.meta.lock().unwrap().unsupervised.is_some());
+}
+
+/// A headless window with a contract 4 claim on its front session by a claimant that is gone
+/// (pid 4242 at a start it never had), keeping `kept`'s child, bound to connection `conn`: the
+/// session's id and its context.
+#[cfg(target_os = "macos")]
+fn gone_claimant_keeping(
+    app: &crate::App,
+    kept: &KeptSleep,
+    conn: u64,
+) -> (u64, Arc<crate::SessionCtx>) {
+    let id = app
+        .focused_session_id(crate::WindowId(0))
+        .expect("a front session");
+    let ctx = Arc::clone(&app.pool.get(id).expect("pooled").ctx);
+    let mut scoped = crate::session_timeline::scoped_input_tests::scoped(&[
+        aterm_agent::harness::contract::Scope::Relaunch,
+    ]);
+    scoped.claim.contract = aterm_agent::harness::contract::UNIVERSAL;
+    scoped.child = Some(kept.kept());
+    crate::session_timeline::claim_supervisor_scoped(
+        &ctx,
+        "grok-alab@4242",
+        Some(conn),
+        scoped,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the claim");
+    (id, ctx)
+}
+
+/// REVIEW OF HX-15e: THE WINDOW'S LAPSE HANDS A CONTRACT 4 CLAIM TO THE WATCHDOG (D28). A contract
+/// 4 claim whose claimant is gone keeps a child and loses its connection; the window's lapse
+/// timer (`Desk::lapse_supervisor`) fires past the re-exec grace: the claim is released and the
+/// watchdog, on a thread of its own, ends the kept child by its identity and hands the tab over.
+/// NEGATIVE HALF: without the lapse's hand-off (`harness_watchdog::past_grace`) the kept child
+/// runs on and the tab is never handed over.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_windows_lapse_hands_a_contract_4_claim_to_the_watchdog() {
+    use aterm_messages::presence::drive::Desk as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut app = crate::App::headless_for_test();
+    let kept = KeptSleep::beside(4242, "fixture-birth".to_string());
+    let (id, ctx) = gone_claimant_keeping(&app, &kept, 116);
+    let grace = Duration::from_millis(alab_wire::record::REEXEC_GRACE_MS);
+    assert!(crate::session_timeline::release_closed_connection(
+        &ctx,
+        116,
+        crate::metrics::now_us(),
+        Some(alab_wire::record::REEXEC_GRACE_MS * 1000)
+    ));
+    crate::app_presence::set_presence_clock_for_test(Some(
+        Instant::now() + grace + Duration::from_secs(1),
+    ));
+    app.lapse_supervisor(id);
+    crate::app_presence::set_presence_clock_for_test(None);
+    assert!(
+        ctx.meta.lock().unwrap().supervisor.is_none(),
+        "the lapse released it"
+    );
+    until("the kept child ends", || kept.ended().is_some());
+    assert_eq!(
+        kept.ended().and_then(|(status, _)| status.signal()),
+        Some(libc::SIGTERM)
+    );
+    until("the tab reads unsupervised", || {
+        ctx.meta.lock().unwrap().unsupervised.is_some()
+    });
+}
+
+/// REVIEW OF HX-15e: THE STATUS SWEEP HANDS A GONE CONTRACT 4 CLAIMANT TO THE WATCHDOG. A contract
+/// 4 claim whose claimant is gone keeps a child; the sweep reads another group in front, and
+/// releases the claim of a claimant gone (grace or not): the watchdog, on a thread of its own,
+/// ends the kept child by its identity and hands the tab over.
+/// NEGATIVE HALF: without the sweep's hand-off (`harness_watchdog::released_gone`) the kept child
+/// runs on and the tab is never handed over.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_status_sweep_hands_a_gone_contract_4_claimant_to_the_watchdog() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut app = crate::App::headless_for_test();
+    let kept = KeptSleep::beside(4242, "fixture-birth".to_string());
+    let (id, ctx) = gone_claimant_keeping(&app, &kept, 117);
+    let (master, slave) = aterm_pty::open_pty_pair().expect("a pty");
+    app.pool
+        .sessions
+        .get_mut(&id)
+        .expect("pooled")
+        .session
+        .master = master;
+    app.session_factory.fg_probe = |_| 4243;
+    let _ = app.observe_session_statuses(Instant::now());
+    app.pool
+        .sessions
+        .get_mut(&id)
+        .expect("pooled")
+        .session
+        .master = -1;
+    aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
+    assert!(
+        ctx.meta.lock().unwrap().supervisor.is_none(),
+        "the sweep released the claim of a claimant gone"
+    );
+    until("the kept child ends", || kept.ended().is_some());
+    assert_eq!(
+        kept.ended().and_then(|(status, _)| status.signal()),
+        Some(libc::SIGTERM)
+    );
+    until("the tab reads unsupervised", || {
+        ctx.meta.lock().unwrap().unsupervised.is_some()
+    });
 }
 
 /// Who an unasked `SIGTERM`'s exit is, in [`unasked_term`]'s world.
@@ -49905,6 +50582,7 @@ fn a_kept_codex_thread_name_rides_a_read_that_names_none() {
         session: session.map(str::to_string),
         run: aterm_agent::harness::relaunch::AgentRun::Codex(
             aterm_agent::harness::relaunch::CodexRun {
+                selected_default: false,
                 home: "/u/.codex".into(),
                 home_env: None,
                 self_claimed: None,

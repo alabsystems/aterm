@@ -249,7 +249,7 @@ fn forced_digest_collision_cannot_turn_a_changed_value_into_a_carry() {
     let repeated = fixture.put(epoch, &key, &entry(TARGET, b"bbbb", Audience::Everyone));
     let resolved = fixture
         .log
-        .resolve_audience_entries(&fixture.identity, |_| [0; 32])
+        .resolve_audience_entries(&fixture.identity, |_| [0; 32], None)
         .unwrap()
         .unwrap();
     let name = (Audience::Everyone, TARGET.to_owned());

@@ -2678,6 +2678,9 @@ pub struct Session<'a, C: Ctl> {
     memory_refused: bool,
     beside_memory_ended: Option<u32>,
     beside_idle_at: Option<(u32, u64, Instant)>,
+    /// Beside a contract 4 claimant holding `relaunch`, the host's deferrals of the memory
+    /// restart so far and when it is asked again ([`Self::beside_scoped_memory`]).
+    beside_memory_retry: Option<(u32, Instant)>,
     wait_told: Option<Option<ToldWait>>,
     /// Reason a test seeded runtime-learned state that cannot be replayed from a setup tape.
     #[cfg(test)]
@@ -3009,6 +3012,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             memory_refused: false,
             beside_memory_ended: None,
             beside_idle_at: None,
+            beside_memory_retry: None,
             memory_wall: false,
             memory_over_wall: false,
             memory_told: None,
@@ -7521,7 +7525,9 @@ impl<C: Ctl> Session<'_, C> {
             self.memory_warn(&seen.screen, over, opts, review);
         }
         if self.beside_self_claim() {
-            self.beside_memory_remedy(over, seen.screen.seq, opts, review)?;
+            if !self.beside_scoped_memory(over, seen, opts, review)? {
+                self.beside_memory_remedy(over, seen.screen.seq, opts, review)?;
+            }
             return Ok(false);
         }
         let at_point = matches!(seen.phase, Phase::Idle | Phase::Limited { .. });
@@ -7584,7 +7590,11 @@ impl<C: Ctl> Session<'_, C> {
         let Some(host) = opts.idle_host.as_ref() else {
             return;
         };
-        let makes = if self.beside_self_claim() {
+        // Beside a contract 4 claimant holding `relaunch` the memory restart is the host's
+        // (`Self::beside_scoped_memory`), as where the loop supervises.
+        let makes = if self.beside_self_claim()
+            && !host.scoped_restart(&super::policy::turn_end::Restart::Memory)
+        {
             host.relaunches_after_stall()
         } else {
             host.can_restart()

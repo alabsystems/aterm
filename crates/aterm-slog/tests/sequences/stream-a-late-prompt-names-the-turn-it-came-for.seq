@@ -1,0 +1,28 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h review: while the stream feeds the turns, a vendor prompt the transcript reads late,
+# after the short harness turn it belongs to closed and the next one opened, names the closed
+# turn it came for (opened nearer its row than the open turn), and its end writes that turn's
+# metrics; the open turn keeps its own vendor turn's name and metrics.
+stream started 1 by=person
+expect open t1 turn par=r1 src=harness hseq=1 @0
+at 100 vendor prompt
+expect amend t1 turn src=transcript vref=v1 @100
+at 1000 vendor end
+expect amend t1 turn src=transcript vdur_ms=900 @1000
+at 1100 stream ended 1 done
+at 1200 stream started 2 by=person
+expect open t2 turn par=r1 src=harness hseq=3 @1200
+at 1300 stream ended 2 done
+at 1400 stream started 3 by=person
+expect open t3 turn par=r1 src=harness hseq=5 @1400
+at 1500 vendor prompt row=1150
+expect amend t2 turn src=transcript vref=v2
+at 1600 vendor end
+expect amend t2 turn src=transcript vdur_ms=900
+expect turn=t3
+at 2000 vendor prompt row=1450
+expect amend t3 turn src=transcript vref=v3
+at 2500 vendor end
+expect amend t3 turn src=transcript vdur_ms=900
+at 3000 stream ended 3 done
+expect turn=none

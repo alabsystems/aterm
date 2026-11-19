@@ -25,12 +25,28 @@
 //! again; and `usage`, `account`, `progress`, `goal` and `compact`, each kept in the
 //! current-state record and (all but `account`, which writes no row) written under its own
 //! word through the same arm ([`crate::session_timeline::SessionTimeline::
-//! publish_stream_record`]). From the first record of a kind applied, that kind's built-in
-//! source stands down for that tab (the screen reader for `state` and the composer, the usage
-//! tap and the context-left mark for `usage`, the `auth=` and `token=` readers for `account`,
-//! the goal readers for `goal`, the transcript's compact step for `compact`), until the claim
-//! ends (through the re-exec grace of a closed connection, to the grace's end); every source
-//! goes on feeding each kind the stream has not applied.
+//! publish_stream_record`]); and the conversation records `turn`, `tool`, `subagent`, `msg` and
+//! `diff`, each written as a harness claim under its own word (a `turn` through the run's turn
+//! tracker, a `tool` or `subagent` as a step, a `msg` or `diff` as a mark), a `msg`'s or `diff`'s
+//! body and any record longer than one log record kept in the tab's Out ring behind a row that
+//! carries its `hseq=` and `fp=` ([`crate::session_timeline::SessionTimeline::
+//! publish_stream_conversation`], [`crate::out_ring`]); and `ask`, `asked` and `wall` (HX-15i1),
+//! each a harness claim too: an `ask` is an approval or question step under the open turn, else
+//! the agent run, whose open raises its need; its `asked` is `mark act word=approve|deny|answer
+//! rule=asked as=<who answered>` on that step, which it closes; a `wall` is a wall step of its
+//! kind under the run, standing until the stream says it passed ([`crate::session_timeline::
+//! SessionTimeline::publish_stream_asking`]); `asking` and `walled` take their kind from the
+//! newest applied `ask` and `wall` first (D13). From the first record of a kind applied,
+//! that kind's built-in source stands down for that tab (the screen reader for `state` and the
+//! composer, the usage tap and the context-left mark for `usage`, the `auth=` and `token=`
+//! readers for `account`, the goal readers for `goal`, the transcript's compact step for
+//! `compact`, the turn tracker's screen verdicts, claimed edges and transcript turns for
+//! `turn`, the transcript feeders' steps for `tool` and `subagent`, the prompt parser for `ask`
+//! under a claim holding `approvals` and the question parser under one holding `questions`, the
+//! wall readers for `wall`), until the claim ends (through the re-exec grace of a closed
+//! connection, to the grace's end); every source goes on feeding each kind the stream has not
+//! applied. The records of the agent's progress feed aterm's progress watch on the same lane
+//! ([`crate::harness_watchdog`]).
 //!
 //! The acts (HX-15j): `act`, `need`, `clear` and `land` are admitted by the scope of the
 //! `meta set` each replaces (an `act` by its rule's, `acts::act_scope`; `wait` under `state`,
@@ -67,7 +83,8 @@
 //! `CLAIM_REFILL_MS`): one over it is acknowledged `dropped=rate` and proves nothing.
 //!
 //! ATERM'S OWN RECORDS ([`owed`]), each numbered in this epoch (`in`) and written by the same
-//! codec: as the stream opens, the current `hand` and a `policy`; then a `hand` when the
+//! codec: as the stream opens, the current `hand`, a `want` where the tab's Out ring holds none
+//! of the claimant's conversation, and a `policy`; then a `hand` when the
 //! person's gesture count, the composer or the hold moves, at most one every `HAND_EVERY_MS` of
 //! the awake clock and always the latest ([`HandGate`]); a `policy` when the person's policy
 //! moves or a placement moves the claim's grant or revision; and a `restart` for every
@@ -88,8 +105,9 @@ use std::time::{Duration, Instant};
 
 use alab_wire::Scope as WireScope;
 use alab_wire::record::{
-    Body, CompactState, Composer, Did, Dropped, HAND_EVERY_MS, ItemState, LINE_MAX, Landing,
-    LineError, NeedKind, RATE_BURST, RATE_PER_S, Record, STREAM_VERSION, Side, State,
+    AskKind, Body, By, CompactState, Composer, Did, Dropped, HAND_EVERY_MS, ItemState, LINE_MAX,
+    Landing, LineError, NeedKind, RATE_BURST, RATE_PER_S, Record, Reply, STREAM_VERSION, Side,
+    State, Step as WireStep, TurnState,
 };
 use aterm_agent::harness::contract::{self, UNIVERSAL};
 use aterm_agent::harness::leftover::LeftRead;
@@ -104,8 +122,10 @@ use super::{Request, Scope, Selector, ServeDisposition, Sid, Store};
 use crate::harness_claim::{Proven, Scoped};
 use crate::session_store::SessionHandle;
 use crate::session_timeline::{
-    ACT_KIND, CLEAR_KIND, LAND_KIND, NEED_KIND, SessionMeta, StreamBinding, StreamFed, StreamLimit,
-    StreamNeed, StreamRecord, StreamStamp, StreamState, StreamedItem, StreamedState,
+    ACT_KIND, CLEAR_KIND, ConversationTaken, LAND_KIND, NEED_KIND, OPTIONAL_KINDS, OutSpill,
+    SessionMeta, StreamAsking, StreamBinding, StreamConversation, StreamFed, StreamLimit,
+    StreamNeed, StreamRecord, StreamSession, StreamStamp, StreamState, StreamedAsk, StreamedItem,
+    StreamedReply, StreamedState, StreamedStep, StreamedTurn,
 };
 
 /// The verb's one spelling: verb first, as `subscribe @<sid> events` is, so `@<sid> stream v=1`
@@ -145,11 +165,6 @@ impl Budget {
             claims: Bucket::new(CLAIM_BURST, CLAIM_REFILL_MS, now),
         }
     }
-}
-
-/// The awake clock in milliseconds, the stream's clock for its budget and its `beat`.
-pub(super) fn awake_now() -> u64 {
-    aterm_uds::process::awake_ms().unwrap_or(0)
 }
 
 /// The session `stream`'s `rest` names: exactly `@<sid> v=1`.
@@ -303,19 +318,100 @@ enum Sent {
     Over,
     /// A line within the bound that the codec does not read.
     Unread(LineError),
-    /// A record.
-    Record(Record),
+    /// A record, with what a conversation record comes to ([`conversation`]), made here.
+    Record(Record, Option<Conversation>),
 }
 
 impl Sent {
-    /// Read `line` with the wire library's codec; `None` is a line over the bound.
+    /// Read `line` with the wire library's codec; `None` is a line over the bound. A
+    /// conversation record's row fields, and for one longer than one log record its escaped line
+    /// and digest, are made here too: a line is up to 256 KiB, and none of this is done under the
+    /// session's lock.
     fn read(line: Option<&[u8]>) -> Self {
         match line.map(Record::read) {
             None => Self::Over,
-            Some(Ok(decoded)) => Self::Record(decoded.record),
+            Some(Ok(decoded)) => {
+                let conversation = conversation(&decoded.record);
+                Self::Record(decoded.record, conversation)
+            }
             Some(Err(error)) => Self::Unread(error),
         }
     }
+}
+
+/// A conversation record ([`StreamConversation`]) and, for one longer than one log record, what
+/// the Out ring keeps of it.
+#[derive(Debug, PartialEq, Eq)]
+struct Conversation {
+    record: StreamConversation,
+    spill: Option<OutSpill>,
+}
+
+/// What a `turn`, `tool`, `subagent`, `msg` or `diff` record comes to, under the names the
+/// every-platform record keeps it by; `None` for every other kind, and for a record the codec
+/// read and cannot write back (which is not applied). The record spills
+/// ([`StreamConversation::spills`]) by the length of its line as the codec writes it, and a
+/// spilled one's line is escaped ([`crate::out_ring::escape`]) and digested
+/// ([`crate::out_ring::fp`]) from that same line.
+fn conversation(record: &Record) -> Option<Conversation> {
+    let step = |state: &WireStep| match state {
+        WireStep::Started => StreamedStep::Started,
+        WireStep::Done => StreamedStep::Done,
+        WireStep::Failed => StreamedStep::Failed,
+        WireStep::Interrupted => StreamedStep::Interrupted,
+    };
+    let kept = match &record.body {
+        Body::Turn { turn, state, by } => StreamConversation::Turn {
+            turn: *turn,
+            state: match state {
+                TurnState::Started => StreamedTurn::Started,
+                TurnState::Done => StreamedTurn::Done,
+                TurnState::Failed => StreamedTurn::Failed,
+                TurnState::Interrupted => StreamedTurn::Interrupted,
+                TurnState::Walled => StreamedTurn::Walled,
+            },
+            by: by.as_ref().map(alab_wire::record::By::word),
+        },
+        Body::Tool {
+            id,
+            name,
+            state,
+            text,
+            ..
+        } => StreamConversation::Tool {
+            id: id.clone(),
+            name: name.clone(),
+            state: step(state),
+            text: text.is_some(),
+        },
+        Body::Subagent { id, title, state } => StreamConversation::Subagent {
+            id: id.clone(),
+            state: step(state),
+            titled: title.is_some(),
+        },
+        Body::Msg { .. } => StreamConversation::Msg,
+        Body::Diff { .. } => StreamConversation::Diff,
+        _ => return None,
+    };
+    let line = record.line().ok()?;
+    let spill = kept.spills(line.len()).then(|| OutSpill {
+        fp: crate::out_ring::fp(&line),
+        body: crate::out_ring::escape(&line),
+    });
+    Some(Conversation {
+        record: kept,
+        spill,
+    })
+}
+
+/// A record [`step`] applies to the session's timeline after the run is open.
+enum Kept {
+    /// One of the kinds the current-state record keeps beside `state`.
+    Record(u64, StreamRecord),
+    /// A conversation record.
+    Conversation(u64, Conversation),
+    /// An `ask`, `asked` or `wall` record.
+    Asking(u64, StreamAsking),
 }
 
 /// What one line comes to.
@@ -353,6 +449,14 @@ enum Applied {
     /// A `refused`: the harness cannot act on aterm's record `of`, for `why`. Counted, and
     /// logged by the stream's write arm.
     Refused { of: u64, why: String },
+    /// Record `seq`, a `turn`, `tool`, `subagent`, `msg` or `diff`, made into its row's fields
+    /// (and, for one longer than one log record, what the Out ring keeps) before the lock.
+    Conversation {
+        seq: u64,
+        conversation: Conversation,
+    },
+    /// Record `seq`, an `ask`, `asked` or `wall`, under the every-platform record's own names.
+    Asking { seq: u64, record: StreamAsking },
 }
 
 /// A `land` record's state, as `meta set harness_land` tells it and aterm keeps it.
@@ -385,12 +489,13 @@ struct Told {
     told: (bool, Vec<String>, Option<Option<String>>),
 }
 
-/// WHAT [`serve`] SERVES WITH: the awake clock (the budget's and the `beat`'s), the claim line
-/// server a `claim` record's line goes through ([`ServeClaim`]), the window's wake sink, and the
-/// land check a `land` record saying `landed` asks for ([`check_landed_live`] in the window,
-/// [`finish_landed`] over a test's reads).
+/// WHAT [`serve`] SERVES WITH: what aterm's harness watchdog reads
+/// ([`crate::harness_watchdog::World`]: the awake clock, the budget's, the `beat`'s and the
+/// watchdog's), the claim line server a `claim` record's line goes through ([`ServeClaim`]), the
+/// window's wake sink, and the land check a `land` record saying `landed` asks for
+/// ([`check_landed_live`] in the window, [`finish_landed`] over a test's reads).
 pub(super) struct Services<'a> {
-    pub(super) now_ms: &'a dyn Fn() -> u64,
+    pub(super) world: &'a dyn crate::harness_watchdog::World,
     pub(super) claims: &'a ServeClaim<'a>,
     pub(super) post: &'a dyn Fn(crate::Wake),
     pub(super) landed: &'a dyn Fn(&SessionHandle, &Proven),
@@ -701,6 +806,26 @@ fn kept(body: &Body, line: impl FnOnce() -> Option<String>) -> Option<StreamReco
     })
 }
 
+/// What an `ask` or `asked` record's kind asks for, under the every-platform record's name.
+const fn asked_kind(kind: AskKind) -> StreamedAsk {
+    match kind {
+        AskKind::Approval => StreamedAsk::Approval,
+        AskKind::Question => StreamedAsk::Question,
+    }
+}
+
+/// WHO ANSWERED AN `ask` (an `asked` record's `by`), as its `act` row's `as=` names them: the
+/// wire's word (`person`, `agent`, `peer:<tab>`), save the two the log keeps for its own
+/// actors, which no name may take: an `aterm ctl` command (`ctl`) is `aterm ctl`, and the
+/// harness answering by its own rule (`harness`) is `harness rule`.
+fn answerer(by: &By) -> String {
+    match by {
+        By::Ctl => "aterm ctl".to_string(),
+        By::Harness => "harness rule".to_string(),
+        other => other.word(),
+    }
+}
+
 /// A `need` record's need as the stream keeps it, read as `meta set harness_needs` reads a
 /// set ([`super::control_session::needs_told_of`]: one to 32 needs, each a need a set may tell,
 /// and an entry left once sanitized); `None` for one that line would refuse, which is
@@ -768,6 +893,25 @@ fn act_scope(rule: &str) -> Option<WireScope> {
     aterm_agent::harness::acts::act_scope(rule).and_then(|scope| WireScope::from_word(scope.word()))
 }
 
+/// Whether the claim's grant admits every conversation kind the Out ring keeps (the wire
+/// table's scope for each, `state` today), so a `want` can be answered with records aterm keeps.
+fn conversation_granted(scoped: &Scoped) -> bool {
+    use alab_wire::record::{Kind, Needs};
+    let granted = granted(scoped);
+    [
+        Kind::Turn,
+        Kind::Tool,
+        Kind::Subagent,
+        Kind::Msg,
+        Kind::Diff,
+    ]
+    .into_iter()
+    .all(|kind| match kind.needs() {
+        Needs::Scope(scope) => granted.contains(&scope),
+        _ => true,
+    })
+}
+
 /// The claim's grant, as the wire library spells it.
 fn granted(scoped: &Scoped) -> Vec<WireScope> {
     scoped
@@ -802,7 +946,7 @@ fn granted(scoped: &Scoped) -> Vec<WireScope> {
 /// `harness_land` would refuse is dropped `refused:usage`); and `took` and `refused`, the
 /// harness's answers to aterm's own records, each counted (a `refused` is handed back for
 /// [`step`] to log), and dropped `refused:in` where it names no record aterm sent in this
-/// epoch; `title`, an unknown kind and every kind this aterm does not apply yet are
+/// epoch; `title`, an unknown kind and a record the codec read and cannot write back are
 /// acknowledged and counted, and are not added to the applied kinds.
 fn judge(
     state: &mut StreamState,
@@ -813,8 +957,8 @@ fn judge(
     now: u64,
 ) -> (Step, Option<Applied>) {
     let next = state.acked.saturating_add(1);
-    let record = match sent {
-        Sent::Record(record) => record,
+    let (record, conversation) = match sent {
+        Sent::Record(record, conversation) => (record, conversation),
         unnumbered => {
             state.acked = next;
             state.dropped += 1;
@@ -831,13 +975,14 @@ fn judge(
             );
         }
     };
-    judge_record(state, record, granted, login, bucket, now)
+    judge_record(state, record, conversation, granted, login, bucket, now)
 }
 
-/// [`judge`] for a line that read as a record.
+/// [`judge`] for a line that read as a record (`conversation`, what [`conversation`] made of it).
 fn judge_record(
     state: &mut StreamState,
     record: Record,
+    conversation: Option<Conversation>,
     granted: &[WireScope],
     login: Option<&str>,
     bucket: &mut Bucket,
@@ -899,6 +1044,8 @@ fn judge_record(
         } => match record.line() {
             Ok(line) => {
                 state.applied.insert(alab_wire::Kind::State.word());
+                // The harness's own end (D23): its tab is not relaunched while it stands.
+                state.ended = *said == State::Ended;
                 applied = Some(Applied::State(StateRecord {
                     seq,
                     state: *said,
@@ -959,6 +1106,105 @@ fn judge_record(
                 why: why.clone(),
             });
         }
+        Body::Turn { .. }
+        | Body::Tool { .. }
+        | Body::Subagent { .. }
+        | Body::Msg { .. }
+        | Body::Diff { .. } => match (body.kind(), conversation) {
+            (Some(kind), Some(conversation)) => {
+                state.applied.insert(kind.word());
+                // The progress watch's reading (HX-15i1): every conversation record is the
+                // agent's progress.
+                state.progress_ms = Some(now);
+                applied = Some(Applied::Conversation { seq, conversation });
+            }
+            // A record the codec read and cannot write back: not applied.
+            _ => state.unapplied += 1,
+        },
+        // The claimant's `session`: kept, its latest line only, in the current-state record and
+        // outside the log's retention (no row is written), for the relaunch and the gate of the
+        // optional kinds aterm sends (D21, D22, D27).
+        Body::Session {
+            agent,
+            version,
+            vendor,
+            account,
+            cwd,
+            resume,
+            takes,
+            ..
+        } => match record.line() {
+            Ok(line) => {
+                state.applied.insert(alab_wire::Kind::Session.word());
+                state.vendor.clone_from(vendor);
+                applied = Some(Applied::Kept {
+                    seq,
+                    record: StreamRecord::Session(StreamSession {
+                        proven: state.proven.clone(),
+                        agent: agent.clone(),
+                        version: version.clone(),
+                        vendor: vendor.clone(),
+                        account: account.clone(),
+                        resume: resume.clone(),
+                        cwd: cwd.clone(),
+                        takes: takes.iter().map(|kind| kind.word()).collect(),
+                        // Stamped as it is published.
+                        epoch: String::new(),
+                        hseq: seq,
+                        line,
+                    }),
+                });
+            }
+            // A record the codec read and cannot write back: not applied.
+            Err(_) => state.unapplied += 1,
+        },
+        Body::Ask {
+            kind, will_in_ms, ..
+        } => {
+            state.applied.insert(alab_wire::Kind::Ask.word());
+            state.progress_ms = Some(now);
+            applied = Some(Applied::Asking {
+                seq,
+                record: StreamAsking::Ask {
+                    kind: asked_kind(*kind),
+                    will: will_in_ms.map(|ms| (now, ms)),
+                    approvals: granted.contains(&WireScope::Approvals),
+                    questions: granted.contains(&WireScope::Questions),
+                },
+            });
+        }
+        Body::Asked {
+            ask,
+            kind,
+            by,
+            reply,
+            ..
+        } => {
+            state.applied.insert(alab_wire::Kind::Asked.word());
+            state.progress_ms = Some(now);
+            applied = Some(Applied::Asking {
+                seq,
+                record: StreamAsking::Asked {
+                    ask: *ask,
+                    kind: asked_kind(*kind),
+                    reply: match reply {
+                        Reply::Approve => StreamedReply::Approve,
+                        Reply::Deny => StreamedReply::Deny,
+                        Reply::Answer => StreamedReply::Answer,
+                    },
+                    by: answerer(by),
+                },
+            });
+        }
+        Body::Wall { kind, .. } => {
+            state.applied.insert(alab_wire::Kind::Wall.word());
+            applied = Some(Applied::Asking {
+                seq,
+                record: StreamAsking::Wall {
+                    kind: aterm_slog::WallKind::from_name(kind),
+                },
+            });
+        }
         Body::Title { .. } => state.titles += 1,
         Body::Unknown { .. } => state.unknown += 1,
         _ => match (body.kind(), kept(body, || record.line().ok())) {
@@ -966,8 +1212,8 @@ fn judge_record(
                 state.applied.insert(kind.word());
                 applied = Some(Applied::Kept { seq, record });
             }
-            // A kind this aterm does not apply yet, and a record the codec read and cannot
-            // write back.
+            // A record the codec read and cannot write back: every kind a harness sends is
+            // applied.
             _ => state.unapplied += 1,
         },
     }
@@ -1084,7 +1330,11 @@ fn step(
                     timeline.stream_refused(of, &why, &standing.holder, by);
                     None
                 }
-                Applied::Kept { seq, record } => Some((seq, record)),
+                Applied::Kept { seq, record } => Some(Kept::Record(seq, record)),
+                Applied::Conversation { seq, conversation } => {
+                    Some(Kept::Conversation(seq, conversation))
+                }
+                Applied::Asking { seq, record } => Some(Kept::Asking(seq, record)),
                 // The act kinds and `claim` were served above.
                 Applied::Beat
                 | Applied::Took
@@ -1097,26 +1347,48 @@ fn step(
             // D15: an applied record of any kind opens the agent run of the claim's row where
             // none is open, whether or not it moved the agent word.
             timeline.stream_applied_record(agent, by);
-            // After the run is open: a `progress`, `goal` or `compact` row is written on it.
-            if let Some((seq, record)) = kept {
-                let stamp = StreamStamp {
-                    epoch: state.epoch.clone(),
-                    hseq: seq,
-                    holder: standing.holder,
-                    by,
-                };
-                let kind = record.kind();
-                if !timeline.publish_stream_record(stamp, record) {
-                    // The log refused the record's row: the timeline kept nothing of the kind
-                    // and its built-in source feeds, so the kind is not applied and the
-                    // harness is told.
-                    state.applied.remove(kind);
-                    state.dropped += 1;
-                    return Step::Ack {
-                        seq,
-                        dropped: Some(Dropped::Refused(NO_ROW.to_string())),
-                    };
+            // After the run is open: a `progress`, `goal` or `compact` row, and a conversation
+            // record's rows, are written on it.
+            let stamp = |seq| StreamStamp {
+                epoch: state.epoch.clone(),
+                hseq: seq,
+                holder: standing.holder.clone(),
+                by,
+            };
+            let refused = match kept {
+                Some(Kept::Record(seq, record)) => {
+                    let kind = record.kind();
+                    (!timeline.publish_stream_record(stamp(seq), record))
+                        .then_some((seq, kind, NO_ROW))
                 }
+                Some(Kept::Conversation(seq, Conversation { record, spill })) => {
+                    let kind = record.kind();
+                    match timeline.publish_stream_conversation(stamp(seq), record, spill, proven) {
+                        ConversationTaken::Applied => None,
+                        ConversationTaken::Refused(why) => Some((seq, kind, why)),
+                    }
+                }
+                Some(Kept::Asking(seq, record)) => {
+                    let kind = record.kind();
+                    match timeline.publish_stream_asking(stamp(seq), record) {
+                        ConversationTaken::Applied => None,
+                        ConversationTaken::Refused(why) => Some((seq, kind, why)),
+                    }
+                }
+                None => None,
+            };
+            if let Some((seq, kind, why)) = refused {
+                // The log refused the record's row (or the stream holds as many steps open as
+                // it may): the timeline kept nothing of it. A kind that has no record of this
+                // stream standing goes back to its built-in source; the harness is told.
+                if why == NO_ROW {
+                    state.applied.remove(kind);
+                }
+                state.dropped += 1;
+                return Step::Ack {
+                    seq,
+                    dropped: Some(Dropped::Refused(why.to_string())),
+                };
             }
             step
         }
@@ -1755,9 +2027,12 @@ impl HandGate {
 }
 
 /// WHAT ATERM OWES ITS HARNESS ON THIS STREAM NOW, as lines the wire library wrote, taken under
-/// the session's metadata lock (the hand is read just before it): the `hand` where the gate admits it ([`HandGate`]), a `policy`
-/// where one is owed, and a `restart` for each `restart` row written since the last look, in
-/// that order; as the stream opens, the current `hand` and a `policy` always (D8). Each takes
+/// the session's metadata lock (the hand, and as it opens the Out ring, are read just before
+/// it): the `hand` where the gate admits it ([`HandGate`]), a `policy` where one is owed, and a
+/// `restart` for each `restart` row written since the last look, in that order; as the stream
+/// opens, the current `hand`, then a `want` where the tab's Out ring holds none of the
+/// claimant's conversation and its grant admits the conversation records (HX-15h), then a
+/// `policy`, always (D8). Each takes
 /// the next number of this epoch (`in`), never the number of a record that could not be
 /// written, and is taken off what is owed here: aterm never sends its own record again. A
 /// stream whose claim left this connection, or whose state is another claimant's or another
@@ -1771,10 +2046,28 @@ fn owed(
 ) -> Result<Vec<String>, String> {
     let ctx = handle.ctx.as_ref();
     let now_hand = HandNow::read(ctx);
+    // As the stream opens: whether the tab's Out ring holds none of this claimant's
+    // conversation (a new aterm, a new claimant, a first open), so it is asked for (`want`).
+    // And the optional kinds the claimant's latest `session` takes (D27): read before the
+    // metadata lock, as the timeline is never taken under it here.
+    let (want, takes) = {
+        let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let takes: Vec<&'static str> = OPTIONAL_KINDS
+            .into_iter()
+            .filter(|kind| timeline.session_takes(&binding.proven, kind))
+            .collect();
+        (
+            opening && !timeline.out_ring().holds(&binding.proven),
+            takes,
+        )
+    };
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    if binding.claim(&meta).is_none() {
+    let Some((_, scoped)) = binding.claim(&meta) else {
         return Err("the claim left this connection".to_string());
-    }
+    };
+    // Only a claim granted the scope the conversation records need could send them again: one
+    // without it would have each dropped for its scope, its rate budget spent for nothing.
+    let want = want && conversation_granted(scoped);
     let Some(state) = meta
         .stream
         .as_mut()
@@ -1784,10 +2077,14 @@ fn owed(
     };
     let policy = std::mem::take(&mut state.policy_due) || opening;
     let restarts = std::mem::take(&mut state.restarts);
-    let mut bodies = Vec::with_capacity(2 + restarts.len());
+    let offered = std::mem::take(&mut state.offered);
+    let mut bodies = Vec::with_capacity(3 + restarts.len() + offered.len());
     let send_hand = hand.admits(now_hand, now);
     if send_hand {
         bodies.push(now_hand.body());
+    }
+    if want {
+        bodies.push(Body::Want);
     }
     if policy {
         bodies.push(Body::Policy);
@@ -1806,6 +2103,7 @@ fn owed(
             ),
         }
     }
+    bodies.extend(optional_bodies(offered, &takes, handle.sid.as_str()));
     let ms = wall_ms();
     let mut lines = Vec::with_capacity(bodies.len());
     for body in bodies {
@@ -1826,6 +2124,38 @@ fn owed(
         }
     }
     Ok(lines)
+}
+
+/// THE GATE OF THE OPTIONAL KINDS (D27): of the records of aterm's `offered` to the stream
+/// ([`SessionMeta::offer_stream_record`]), the bodies of those whose kind the claimant's latest
+/// `session` lists in `takes`, renumbered as they are sent. A record of a kind it does not take,
+/// a harness that sent no `session` included, is not sent: its sender's other route stands.
+fn optional_bodies(
+    offered: std::collections::VecDeque<(&'static str, String)>,
+    takes: &[&'static str],
+    sid: &str,
+) -> Vec<Body> {
+    offered
+        .into_iter()
+        .filter_map(|(kind, line)| {
+            if !takes.contains(&kind) {
+                aterm_log::info!(
+                    "stream @{sid}: the latest `session` does not take `{kind}`; the record is \
+                     not sent"
+                );
+                return None;
+            }
+            match Record::read(line.as_bytes()) {
+                Ok(decoded) if decoded.record.body.word() == kind => Some(decoded.record.body),
+                _ => {
+                    aterm_log::info!(
+                        "stream @{sid}: an offered `{kind}` record reads as no `{kind}`; not sent"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// [`owed`], written to the stream after every lock is dropped: `Err` (why) closes it, a
@@ -1862,16 +2192,23 @@ impl Drop for Closing<'_> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .close_stream(&self.binding.proven, self.binding.conn);
+        // What its watchdog read of the claimant ends with the stream that counted it.
+        crate::harness_watchdog::stream_closed(
+            &self.handle.ctx,
+            &self.binding.proven,
+            self.binding.conn,
+        );
     }
 }
 
 /// SERVE ONE RECORD STREAM for its whole life, on the stream lane that entered the connection
 /// (its serial, descriptor, direct peer, principal and caller). `buffered` is what was read
-/// past the verb line; `services` holds the awake clock (which the budget, `beat` and the
-/// `hand` gate read), the server of a `claim` record's line ([`ServeClaim`]), the window's
-/// wake sink and the land check ([`Services`]). What a record left to do with no lock held
-/// ([`After`]) is done before its acknowledgement is written. Returning ends the connection,
-/// and the stream is no longer open ([`Closing`]).
+/// past the verb line; `services` holds what aterm's harness watchdog reads (its world, whose
+/// awake clock the budget, `beat` and the `hand` gate read and on which the watchdog counts the
+/// claimant's beats, [`crate::harness_watchdog::look`]), the server of a `claim` record's line
+/// ([`ServeClaim`]), the window's wake sink and the land check ([`Services`]). What a record
+/// left to do with no lock held ([`After`]) is done before its acknowledgement is written.
+/// Returning ends the connection, and the stream is no longer open ([`Closing`]).
 ///
 /// The claim was read on a request lane ([`open`]) and is read again here. Where it left this
 /// connection in between (released, placed from another connection, lapsed), the connection
@@ -1884,10 +2221,13 @@ pub(super) fn serve(
     buffered: Vec<u8>,
     services: &Services<'_>,
 ) {
-    let now_ms = services.now_ms;
+    let world = services.world;
     let Some(conn) = super::serving_connection() else {
         return;
     };
+    // The stream's clock for its budget and its `beat`s: the awake clock, which stands still
+    // while the machine sleeps.
+    let now_ms = || world.awake_ms().unwrap_or(0);
     let head = request.head();
     let Some(handle) = target(head.rest).and_then(|sid| hosted(store, sid)) else {
         aterm_log::info!(
@@ -1951,19 +2291,33 @@ pub(super) fn serve(
         aterm_log::info!("stream @{sid} closed: {why}");
         return;
     }
+    // aterm's harness watchdog counts the claimant's beats on this lane: a look after every
+    // record and every wake, and the lane wakes for the next one due.
+    let mut count = crate::harness_watchdog::Count::new(now_ms());
+    let look = |count: &mut crate::harness_watchdog::Count| {
+        crate::harness_watchdog::look(&handle.ctx, &binding.proven, conn, count, world)
+            .map(|due| Instant::now() + due)
+    };
+    let mut watch_due = look(&mut count);
     let mut budget = Budget::new(now_ms());
     let mut lines = Lines::new(buffered);
     // The first line of this connection the codec did not read is logged; the rest are counted.
     let mut unread_logged = false;
     let why = loop {
-        let until = hand.deadline(now_ms());
+        let until = [hand.deadline(now_ms()), watch_due]
+            .into_iter()
+            .flatten()
+            .min();
         let line = match lines.next(stream, &binding.revoked, bell, doorbell.fd(), until) {
             Line::Whole(line) => Some(line),
             Line::Over => None,
             Line::Owed => {
                 doorbell.clear();
                 match send_owed(stream, &handle, &binding, &mut hand, false, now_ms()) {
-                    Ok(()) => continue,
+                    Ok(()) => {
+                        watch_due = look(&mut count);
+                        continue;
+                    }
                     Err(why) => break why,
                 }
             }
@@ -2006,6 +2360,7 @@ pub(super) fn serve(
         {
             break why;
         }
+        watch_due = look(&mut count);
     };
     aterm_log::info!("stream @{sid} closed: {why}");
 }

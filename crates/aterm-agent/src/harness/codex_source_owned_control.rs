@@ -57,7 +57,7 @@ impl Control {
             _ => Err(Error::Stale),
         }
     }
-    pub(super) fn send_attachment(&self, stream: &aterm_uds::CtlStream) -> Result<(), Error> {
+    pub(super) fn send_attachment(&self, stream: &aterm_uds::CtlStream) -> Result<String, Error> {
         use std::os::fd::AsFd;
         let _delivery = lock(&self.delivery)?;
         self.bound()?;
@@ -94,7 +94,7 @@ impl Control {
             // concurrent metadata reader must not turn that completed transfer
             // into an uncertain send. OwnedService separately rechecks the
             // original constructor, SDK and foreground before exposing a right.
-            Ok(())
+            Ok(nonce.clone())
         })();
         if result.is_err() {
             // An uncertain receipt cannot be consumed by a different delivery.
@@ -102,6 +102,12 @@ impl Control {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         result
+    }
+    pub(super) fn send_packet(&self, packet: &[u8]) -> Result<(), Error> {
+        let _delivery = lock(&self.delivery)?;
+        self.bound()?;
+        let mut stream = &self.stream;
+        stream.write_all(packet).map_err(|_| Error::Unavailable)
     }
     fn begin(&self, connection: &Connection, member: &str, operation: &str) -> Result<(), Error> {
         if self

@@ -2699,6 +2699,7 @@ use super::control_session::{
     cmd_sessions_store, cmd_timeline, cmd_turn, cmd_who, cmd_whoami, raise_target,
 };
 use super::*;
+
 use crate::TabAction;
 use crate::budget::UnitUsage;
 use crate::input::InputEvent;
@@ -25830,4 +25831,92 @@ fn prefix_selector_is_spelled_whole_and_an_ambiguous_one_is_refused_naming_both(
     for typed in ["@tab12 status", "@tqn5r status"] {
         assert_eq!(read(typed, edge), (typed.to_owned(), None), "{typed}");
     }
+}
+
+#[test]
+fn codex_adoption_status_discloses_only_to_the_direct_local_instance() {
+    let h = crate::session_store::test_handle(321);
+    let source = crate::self_claim::Proven {
+        pid: 1234,
+        start: "birth".into(),
+    };
+    let claim = crate::session_timeline::claim_supervisor_as(
+        &h.ctx,
+        "codex-alab@1234",
+        Some(41),
+        None,
+        Some(source.clone()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    {
+        let mut timeline = h.ctx.timeline.lock().unwrap();
+        assert!(timeline.observe_codex_adoption(
+            claim.revision,
+            &source,
+            1234,
+            crate::codex_adoption::Reading {
+                running: None,
+                selected: None
+            },
+        ));
+    }
+    let foreground = std::cell::Cell::new(1234);
+    let probes = std::cell::Cell::new(0);
+    let read = |scope, reply: &str| {
+        let mut body = reply.to_string();
+        append_local_package_reading(&mut body, scope, &h.ctx, || {
+            probes.set(probes.get() + 1);
+            foreground.get()
+        });
+        body
+    };
+    let record = format!(
+        "OK phase=unknown supervisor_proven=1 supervisor_revision={}\n",
+        claim.revision
+    );
+    let ok = record.as_str();
+    let earlier = "OK phase=unknown supervisor_proven=1 supervisor_revision=0\n";
+    assert_eq!(read(Scope::Owner, earlier), earlier);
+    let fields = read(Scope::Owner, ok);
+    assert!(
+        fields.contains(
+            " codex_adoption=unknown codex_running_build=- codex_selected_build=- codex_sampled_ms="
+        ),
+        "{fields}"
+    );
+    assert!(fields.ends_with('\n'));
+    foreground.set(3210);
+    assert_eq!(
+        read(Scope::Owner, ok),
+        ok,
+        "Codex has left the terminal foreground"
+    );
+    let authorized_probes = probes.get();
+    assert_eq!(read(Scope::Owner, "ERR busy\n"), "ERR busy\n");
+    for scope in [
+        Scope::Bridge,
+        Scope::Edge(EdgeToken::generate()),
+        Scope::Fleet {
+            content: true,
+            drive: true,
+        },
+    ] {
+        assert_eq!(read(scope, ok), ok);
+    }
+    {
+        let _harness = ServingPrincipal::enter(Principal::Harness);
+        assert_eq!(read(Scope::Owner, ok), ok);
+    }
+    let _remote = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+        node: "test-peer".into(),
+        host: "other machine".into(),
+    });
+    assert_eq!(read(Scope::Owner, ok), ok);
+    assert_eq!(
+        probes.get(),
+        authorized_probes,
+        "denied reads never probe the terminal"
+    );
 }

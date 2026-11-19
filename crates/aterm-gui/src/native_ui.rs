@@ -1558,12 +1558,11 @@ pub(crate) struct RichTextSpec {
 }
 
 /// Presentation vocabulary for the native Markdown reader.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum MarkdownBlockKind {
     Heading(u8),
     Paragraph,
     ListItem { depth: usize, ordinal: Option<u64> },
-    Quote,
     Code { language: Option<String> },
     Table,
     Rule,
@@ -1571,8 +1570,15 @@ pub(crate) enum MarkdownBlockKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MarkdownBlockSpec {
+    pub(crate) focused_link: Option<usize>,
     pub(crate) text: String,
     pub(crate) kind: MarkdownBlockKind,
+    pub(crate) quote_depth: usize,
+    /// The outer quote rails shared with the preceding and following blocks.
+    pub(crate) quote_above: usize,
+    pub(crate) quote_below: usize,
+    /// The part of the layout slot after the content, available to a continuing quote.
+    pub(crate) gap_after: f32,
     pub(crate) dense: bool,
     pub(crate) selectable: bool,
     pub(crate) action: Option<ActionId>,
@@ -1582,6 +1588,15 @@ pub(crate) struct MarkdownBlockSpec {
     pub(crate) visual_row: usize,
     pub(crate) total_visual_rows: usize,
     pub(crate) inline: Vec<(std::ops::Range<usize>, crate::native_markdown::InlineStyle)>,
+}
+
+impl MarkdownBlockSpec {
+    fn content_rect(&self, slot: LogicalRect) -> LogicalRect {
+        LogicalRect {
+            height: (slot.height - self.gap_after).max(0.0),
+            ..slot
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3203,10 +3218,18 @@ impl UiTree {
                 UiContent::Slider(control) => Some(&mut control.state),
                 UiContent::TextField(control) => Some(&mut control.state),
                 UiContent::ColorWheel(control) => Some(&mut control.state),
-                UiContent::Group(_)
-                | UiContent::Text(_)
-                | UiContent::RichText(_)
-                | UiContent::MarkdownBlock(_) => None,
+                UiContent::Group(_) | UiContent::Text(_) | UiContent::RichText(_) => None,
+                UiContent::MarkdownBlock(spec) => {
+                    spec.focused_link = focus.filter(|_| focus_visible).and_then(|focus| {
+                        focus
+                            .as_str()
+                            .strip_prefix(key.as_str())?
+                            .strip_prefix("/link/")?
+                            .parse()
+                            .ok()
+                    });
+                    None
+                }
                 UiContent::TextViewport(spec) => {
                     spec.focused = spec.selectable && focus == Some(key);
                     spec.focus_visible = spec.focused && focus_visible;
@@ -4974,6 +4997,32 @@ impl CompiledUi {
         for node in &self.paint {
             index.entry(&node.key).or_default().0 += 1;
         }
+        // One inline link can paint on several lines of its parent block. Check
+        // its pointer regions against those lines individually, including clipping.
+        let mut inline = std::collections::BTreeMap::new();
+        for node in &self.paint {
+            if let UiContent::MarkdownBlock(spec) = &node.content
+                && spec
+                    .inline
+                    .iter()
+                    .any(|(_, style)| style.link_index.is_some())
+                && let Some(parent) = self.semantic(&node.key)
+            {
+                for (i, region) in markdown_link_regions(spec, node.rect, parent.rect) {
+                    let key = UiKey::new(format!("{}/link/{i}", node.key.as_str()));
+                    if !self
+                        .hits
+                        .iter()
+                        .filter(|h| h.key == key)
+                        .map(|h| h.rect)
+                        .eq(region.rows.iter().copied())
+                    {
+                        return Err(CompileError::ObserverMismatch(key));
+                    }
+                    inline.insert(key, region.rows.len());
+                }
+            }
+        }
         for node in &self.hits {
             let entry = index.entry(&node.key).or_default();
             entry.1 += 1;
@@ -4985,7 +5034,11 @@ impl CompiledUi {
             !node.offscreen && node.action.is_some() && node.state.is_none_or(|state| state.enabled)
         }) {
             let (painted, hit, hit_action) = index.get(&semantic.key).copied().unwrap_or_default();
-            if painted != 1 || hit != 1 {
+            let matches_paint = match inline.get(&semantic.key) {
+                Some(rows) => painted == 0 && hit as usize == *rows,
+                None => painted == 1 && hit == 1,
+            };
+            if !matches_paint {
                 return Err(CompileError::ObserverMismatch(semantic.key.clone()));
             }
             if hit_action != semantic.action.as_ref() {
@@ -5751,12 +5804,14 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
         }
         UiContent::Custom(spec) => {
             let available = effective_horizontal_width(node, node.rect.x, node.rect.right());
-            // Scroll indicators, comprehension marks and resource histories paint no text.
+            // Scroll indicators, comprehension marks, resource histories and sheet charts paint
+            // no text.
             if matches!(
                 spec.audit_id,
                 MESSAGES_SCROLL_AUDIT
                     | COMPREHENSION_MARK_AUDIT
                     | crate::navigator::resources::AUDIT
+                    | crate::native_sheets::CHART_AUDIT
             ) {
                 return Some(finish_text_fit(
                     node,
@@ -5819,7 +5874,8 @@ fn markdown_audit_layout(
 ) -> Option<MarkdownAuditLayout> {
     use crate::widget::TextFace;
 
-    let frame = markdown_frame(spec)?;
+    let frame = markdown_frame(spec, rect.width)?;
+    let rect = spec.content_rect(rect);
     let text_y = rect.y + frame.inset_top;
     let max_lines = frame.rows_in(rect.height);
     Some(MarkdownAuditLayout {
@@ -5856,14 +5912,16 @@ pub(crate) fn reader_type() -> crate::native_markdown::ReaderType {
 
 /// The frame a Markdown block paints in ([`crate::native_markdown::block_frame`]); `None`
 /// for a rule.
-fn markdown_frame(spec: &MarkdownBlockSpec) -> Option<crate::native_markdown::BlockFrame> {
+fn markdown_frame(
+    spec: &MarkdownBlockSpec,
+    width: f32,
+) -> Option<crate::native_markdown::BlockFrame> {
     use crate::native_markdown::BlockShape;
 
     let shape = match &spec.kind {
         MarkdownBlockKind::Heading(level) => BlockShape::Heading(*level),
         MarkdownBlockKind::Paragraph => BlockShape::Paragraph,
         MarkdownBlockKind::ListItem { depth, .. } => BlockShape::ListItem { depth: *depth },
-        MarkdownBlockKind::Quote => BlockShape::Quote,
         MarkdownBlockKind::Code { language } => BlockShape::Code {
             labelled: language
                 .as_deref()
@@ -5873,7 +5931,7 @@ fn markdown_frame(spec: &MarkdownBlockSpec) -> Option<crate::native_markdown::Bl
         MarkdownBlockKind::Table => BlockShape::Table,
         MarkdownBlockKind::Rule => BlockShape::Rule,
     };
-    crate::native_markdown::block_frame(shape, reader_type())
+    crate::native_markdown::block_frame(shape, spec.quote_depth, width, reader_type())
 }
 
 /// The type step a reader frame's text paints at.
@@ -5894,7 +5952,6 @@ fn markdown_kind_label(kind: &MarkdownBlockKind) -> String {
             || format!("list-item:depth-{depth}:unordered"),
             |ordinal| format!("list-item:depth-{depth}:ordinal-{ordinal}"),
         ),
-        MarkdownBlockKind::Quote => "quote".to_string(),
         MarkdownBlockKind::Code { language } => format!(
             "code:{}",
             language
@@ -5904,30 +5961,6 @@ fn markdown_kind_label(kind: &MarkdownBlockKind) -> String {
         ),
         MarkdownBlockKind::Table => "table".to_string(),
         MarkdownBlockKind::Rule => "rule".to_string(),
-    }
-}
-
-fn hash_markdown_kind<H: std::hash::Hasher>(kind: &MarkdownBlockKind, hash: &mut H) {
-    use std::hash::Hash;
-
-    match kind {
-        MarkdownBlockKind::Heading(level) => {
-            0_u8.hash(hash);
-            level.hash(hash);
-        }
-        MarkdownBlockKind::Paragraph => 1_u8.hash(hash),
-        MarkdownBlockKind::ListItem { depth, ordinal } => {
-            2_u8.hash(hash);
-            depth.hash(hash);
-            ordinal.hash(hash);
-        }
-        MarkdownBlockKind::Quote => 3_u8.hash(hash),
-        MarkdownBlockKind::Code { language } => {
-            4_u8.hash(hash);
-            language.hash(hash);
-        }
-        MarkdownBlockKind::Table => 5_u8.hash(hash),
-        MarkdownBlockKind::Rule => 6_u8.hash(hash),
     }
 }
 
@@ -5943,7 +5976,11 @@ fn markdown_paint_fingerprint(node: &PaintNode, spec: &MarkdownBlockSpec) -> u64
     node.clip.y.to_bits().hash(&mut hash);
     node.clip.width.to_bits().hash(&mut hash);
     node.clip.height.to_bits().hash(&mut hash);
-    hash_markdown_kind(&spec.kind, &mut hash);
+    spec.kind.hash(&mut hash);
+    spec.quote_depth.hash(&mut hash);
+    spec.quote_above.hash(&mut hash);
+    spec.quote_below.hash(&mut hash);
+    spec.gap_after.to_bits().hash(&mut hash);
     spec.text.hash(&mut hash);
     spec.dense.hash(&mut hash);
     spec.selectable.hash(&mut hash);
@@ -5954,6 +5991,7 @@ fn markdown_paint_fingerprint(node: &PaintNode, spec: &MarkdownBlockSpec) -> u64
     spec.estimated_height.to_bits().hash(&mut hash);
     spec.visual_row.hash(&mut hash);
     spec.total_visual_rows.hash(&mut hash);
+    spec.focused_link.hash(&mut hash);
     for (span, style) in &spec.inline {
         span.start.hash(&mut hash);
         span.end.hash(&mut hash);
@@ -5966,13 +6004,14 @@ fn markdown_paint_audit(node: &PaintNode, spec: &MarkdownBlockSpec) -> String {
     let fingerprint = markdown_paint_fingerprint(node, spec);
     let Some(layout) = markdown_audit_layout(node.rect, spec) else {
         return format!(
-            "paint-markdown key={:?} block-kind=rule source={}..{} selected={} selectable={} dense={} visual-row={}/{} estimated-height={:.1} wrapped-lines=0 visible-lines=0 elided=false required-width=0.0 available=0.0 required-height=1.0 text={:?} paint-fingerprint={fingerprint:016x}",
+            "paint-markdown key={:?} block-kind=rule source={}..{} selected={} selectable={} dense={} quote-depth={} visual-row={}/{} estimated-height={:.1} wrapped-lines=0 visible-lines=0 elided=false required-width=0.0 available=0.0 required-height=1.0 text={:?} paint-fingerprint={fingerprint:016x}",
             node.key.as_str(),
             spec.source.start,
             spec.source.end,
             spec.selected,
             spec.selectable,
             spec.dense,
+            spec.quote_depth,
             spec.visual_row,
             spec.total_visual_rows,
             spec.estimated_height,
@@ -6005,7 +6044,7 @@ fn markdown_paint_audit(node: &PaintNode, spec: &MarkdownBlockSpec) -> String {
         || visible_lines < painted.len()
         || available + 0.5 < layout.text_w;
     format!(
-        "paint-markdown key={:?} block-kind={} source={}..{} selected={} selectable={} dense={} visual-row={}/{} estimated-height={:.1} wrapped-lines={} visible-lines={} elided={} required-width={:.1} available={:.1} required-height={:.1} text={:?} paint-fingerprint={fingerprint:016x}",
+        "paint-markdown key={:?} block-kind={} source={}..{} selected={} selectable={} dense={} quote-depth={} visual-row={}/{} estimated-height={:.1} wrapped-lines={} visible-lines={} elided={} required-width={:.1} available={:.1} required-height={:.1} text={:?} paint-fingerprint={fingerprint:016x}",
         node.key.as_str(),
         markdown_kind_label(&spec.kind),
         spec.source.start,
@@ -6013,6 +6052,7 @@ fn markdown_paint_audit(node: &PaintNode, spec: &MarkdownBlockSpec) -> String {
         spec.selected,
         spec.selectable,
         spec.dense,
+        spec.quote_depth,
         spec.visual_row,
         spec.total_visual_rows,
         spec.estimated_height,
@@ -7349,6 +7389,11 @@ fn paint_compiled_node_at(
                 crate::comprehension_words::paint_mark(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
+            if spec.audit_id == crate::native_sheets::CHART_AUDIT {
+                // A chart paints its bars and its gaps' rails; its words are its label.
+                crate::native_sheets::paint_chart(prims, rect, spec.paint.as_deref(), &roles);
+                return;
+            }
             if spec.audit_id == WORDMARK_AUDIT {
                 let (size, face) = wordmark_typography(&spec.label, rect.width);
                 prims.push(text_prim(
@@ -7899,17 +7944,30 @@ fn paint_button_icon_prims(
     }
 }
 
+/// A panel continuing past an edge is drawn past its clip so that edge has square ends.
+fn markdown_panel_extent(rect: LogicalRect, open_top: bool, open_bottom: bool) -> (f32, f32) {
+    const RUN_ON: f32 = 16.0;
+    let y = if open_top { rect.y - RUN_ON } else { rect.y };
+    let bottom = if open_bottom {
+        rect.bottom() + RUN_ON
+    } else {
+        rect.bottom()
+    };
+    (y, (bottom - y).max(0.0))
+}
+
 fn paint_markdown_block(
     prims: &mut Vec<crate::widget::DrawPrim>,
-    rect: LogicalRect,
+    slot: LogicalRect,
     spec: &MarkdownBlockSpec,
     roles: crate::settings::Roles,
 ) {
     use crate::tray_raster::row_baseline;
     use crate::type_scale::TypeStep;
     use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
-    use MarkdownBlockKind::{Code, Heading, ListItem, Paragraph, Quote, Rule, Table};
+    use MarkdownBlockKind::{Code, Heading, ListItem, Paragraph, Rule, Table};
 
+    let rect = spec.content_rect(slot);
     if spec.selected && !matches!(&spec.kind, Rule) {
         prims.push(DrawPrim::Panel {
             x: rect.x - 6.0,
@@ -7921,45 +7979,90 @@ fn paint_markdown_block(
         });
     }
 
-    if matches!(&spec.kind, Rule) {
-        prims.push(DrawPrim::Stroke {
+    let frame = markdown_frame(spec, rect.width);
+    let gutter =
+        crate::native_markdown::QuoteGutter::new(spec.quote_depth, rect.width, reader_type());
+    let content_x = rect.x + gutter.width();
+    let content_w = rect.width - gutter.width();
+    let color = if spec.quote_depth > 0 && matches!(spec.kind, Paragraph | ListItem { .. }) {
+        mix_rgb(roles.text_secondary, roles.text_primary, 0.55)
+    } else {
+        roles.text_primary
+    };
+    // A block the reader shows only part of (scrolled into, or ended at the preview's
+    // last whole row) keeps its panel open at that edge: the panel runs past the block's
+    // rectangle there and is cut by it, so it reads as continuing, never as a block that
+    // ends with the rows shown.
+    let open_top = frame.is_some() && spec.visual_row > 0;
+    let open_bottom = frame.is_some_and(|frame| {
+        spec.visual_row.saturating_add(frame.rows_in(rect.height)) < spec.total_visual_rows
+    });
+    if gutter.rails > 0 {
+        let quote_rect = if spec.quote_below > 0 && !open_bottom {
+            slot
+        } else {
+            rect
+        };
+        let joined_top = open_top || spec.quote_above > 0;
+        let joined_bottom = open_bottom || spec.quote_below > 0;
+        let (panel_y, panel_h) = markdown_panel_extent(quote_rect, joined_top, joined_bottom);
+        if joined_top || joined_bottom {
+            prims.push(DrawPrim::ClipPush {
+                x: quote_rect.x,
+                y: quote_rect.y,
+                w: quote_rect.width,
+                h: quote_rect.height,
+            });
+        }
+        prims.push(DrawPrim::Panel {
             x: rect.x,
-            y: rect.y + rect.height.min(24.0) / 2.0,
+            y: panel_y,
             w: rect.width,
+            h: panel_h,
+            radius: 8.0,
+            fill: rgba(mix_rgb(roles.elevated, roles.accent, 0.06), 225),
+        });
+        for rail in 0..gutter.rails {
+            // Run a shared rail's rounded end past the join. An inner rail that ends
+            // here stays inside the leaf while the common outer rails bridge its gap.
+            let bar_top = if open_top || rail < spec.quote_above {
+                rect.y - 2.0
+            } else {
+                rect.y + 2.0
+            };
+            let bar_bottom = if open_bottom || rail < spec.quote_below {
+                quote_rect.bottom() + 2.0
+            } else {
+                rect.bottom() - 2.0
+            };
+            prims.push(DrawPrim::Panel {
+                x: rect.x + rail as f32 * gutter.step,
+                y: bar_top,
+                w: gutter.step.min(3.0),
+                h: (bar_bottom - bar_top).max(0.0),
+                radius: 1.5,
+                fill: rgba(roles.accent, 220),
+            });
+        }
+        if joined_top || joined_bottom {
+            prims.push(DrawPrim::ClipPop);
+        }
+    }
+    let Some(frame) = frame else {
+        prims.push(DrawPrim::Stroke {
+            x: content_x,
+            y: rect.y + rect.height / 2.0,
+            w: content_w,
             h: 1.0,
             radius: 0.5,
             width: 1.0,
             color: rgba(roles.separator, 190),
         });
         return;
-    }
-
-    let Some(frame) = markdown_frame(spec) else {
-        return;
     };
-    let color = match &spec.kind {
-        Quote => mix_rgb(roles.text_secondary, roles.text_primary, 0.55),
-        _ => roles.text_primary,
-    };
-    // A block the reader shows only part of (scrolled into, or ended at the preview's
-    // last whole row) keeps its panel open at that edge: the panel runs past the block's
-    // rectangle there and is cut by it, so it reads as continuing, never as a block that
-    // ends with the rows shown.
-    let open_top = spec.visual_row > 0;
-    let open_bottom =
-        spec.visual_row.saturating_add(frame.rows_in(rect.height)) < spec.total_visual_rows;
-    let (panel_y, panel_h) = {
-        const RUN_ON: f32 = 16.0;
-        let top = if open_top { rect.y - RUN_ON } else { rect.y };
-        let bottom = if open_bottom {
-            rect.bottom() + RUN_ON
-        } else {
-            rect.bottom()
-        };
-        (top, (bottom - top).max(0.0))
-    };
-    let opened = open_top || open_bottom;
-    if opened && matches!(&spec.kind, Quote | Code { .. } | Table) {
+    let (panel_y, panel_h) = markdown_panel_extent(rect, open_top, open_bottom);
+    let clip_panel = (open_top || open_bottom) && matches!(&spec.kind, Code { .. } | Table);
+    if clip_panel {
         prims.push(DrawPrim::ClipPush {
             x: rect.x,
             y: rect.y,
@@ -7968,43 +8071,19 @@ fn paint_markdown_block(
         });
     }
     match &spec.kind {
-        Quote => {
-            prims.push(DrawPrim::Panel {
-                x: rect.x,
-                y: panel_y,
-                w: rect.width,
-                h: panel_h,
-                radius: 8.0,
-                fill: rgba(mix_rgb(roles.elevated, roles.accent, 0.06), 225),
-            });
-            let bar_top = if open_top { rect.y } else { rect.y + 2.0 };
-            let bar_bottom = if open_bottom {
-                rect.bottom()
-            } else {
-                rect.bottom() - 2.0
-            };
-            prims.push(DrawPrim::Panel {
-                x: rect.x,
-                y: bar_top,
-                w: 3.0,
-                h: (bar_bottom - bar_top).max(0.0),
-                radius: 1.5,
-                fill: rgba(roles.accent, 220),
-            });
-        }
         Code { language } => {
             prims.push(DrawPrim::Panel {
-                x: rect.x,
+                x: content_x,
                 y: panel_y,
-                w: rect.width,
+                w: content_w,
                 h: panel_h,
                 radius: 9.0,
                 fill: rgba(mix_rgb(roles.elevated, roles.surface, 0.20), 255),
             });
             prims.push(DrawPrim::Stroke {
-                x: rect.x + 0.5,
+                x: content_x + 0.5,
                 y: panel_y + 0.5,
-                w: (rect.width - 1.0).max(0.0),
+                w: (content_w - 1.0).max(0.0),
                 h: (panel_h - 1.0).max(0.0),
                 radius: 9.0,
                 width: 1.0,
@@ -8026,17 +8105,17 @@ fn paint_markdown_block(
         }
         Table => {
             prims.push(DrawPrim::Panel {
-                x: rect.x,
+                x: content_x,
                 y: panel_y,
-                w: rect.width,
+                w: content_w,
                 h: panel_h,
                 radius: 8.0,
                 fill: rgba(roles.elevated, 245),
             });
             prims.push(DrawPrim::Stroke {
-                x: rect.x + 0.5,
+                x: content_x + 0.5,
                 y: panel_y + 0.5,
-                w: (rect.width - 1.0).max(0.0),
+                w: (content_w - 1.0).max(0.0),
                 h: (panel_h - 1.0).max(0.0),
                 radius: 8.0,
                 width: 1.0,
@@ -8046,7 +8125,7 @@ fn paint_markdown_block(
         Heading(_) | Paragraph | ListItem { .. } => {}
         Rule => unreachable!("rule returned above"),
     }
-    if opened && matches!(&spec.kind, Quote | Code { .. } | Table) {
+    if clip_panel {
         prims.push(DrawPrim::ClipPop);
     }
     let face = if frame.mono {
@@ -8072,10 +8151,12 @@ fn paint_markdown_block(
         preserve_lines,
     );
 
-    if let ListItem { ordinal, .. } = &spec.kind {
+    if let ListItem { ordinal, .. } = &spec.kind
+        && spec.visual_row == 0
+    {
         let marker = ordinal.map_or_else(|| "•".to_string(), |value| format!("{value}."));
         prims.push(text_prim(
-            text_x - 20.0 * reader_type().scale(),
+            (text_x - 20.0 * reader_type().scale()).max(content_x),
             row_baseline(text_y, line_h, size.get()),
             marker,
             size,
@@ -8084,18 +8165,75 @@ fn paint_markdown_block(
             rgba(roles.accent, 255),
         ));
     }
-    if !spec.inline.is_empty() && !preserve_lines {
-        let base = StyledBase {
-            x: text_x,
-            y: text_y,
-            bottom: rect.bottom(),
-            line_h,
-            size,
-            face,
-            weight,
-            color,
-        };
-        paint_styled_markdown_rows(prims, spec, &base, max_columns, lines.len(), roles);
+    if !spec.inline.is_empty() {
+        visit_markdown_segments(spec, slot, |segment| {
+            let StyledSegment {
+                x,
+                y,
+                w,
+                line_h,
+                baseline,
+                size,
+                face,
+                weight,
+                text,
+                style,
+            } = segment;
+            let px = size.get();
+            let color = if style.link {
+                roles.accent_ink
+            } else if style.emphasis {
+                mix_rgb(color, roles.accent, 0.35)
+            } else {
+                color
+            };
+            if style.code {
+                prims.push(DrawPrim::Panel {
+                    x: x - 2.0,
+                    y: baseline - px * 0.95,
+                    w: w + 4.0,
+                    h: px * 1.3,
+                    radius: 4.0,
+                    fill: rgba(mix_rgb(roles.elevated, roles.surface, 0.20), 255),
+                });
+            }
+            if style.link_index.is_some() && style.link_index == spec.focused_link {
+                prims.push(DrawPrim::Panel {
+                    x,
+                    y,
+                    w,
+                    h: line_h,
+                    radius: 2.0,
+                    fill: rgba(roles.accent, 45),
+                });
+            }
+            for line in [
+                style.strike.then_some(baseline - px * 0.32),
+                style.link.then_some(baseline + 2.0),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                prims.push(DrawPrim::Stroke {
+                    x,
+                    y: line,
+                    w,
+                    h: 1.0,
+                    radius: 0.5,
+                    width: 1.0,
+                    color: rgba(color, 220),
+                });
+            }
+            prims.push(text_prim(
+                x,
+                baseline,
+                text,
+                size,
+                weight,
+                face,
+                rgba(color, 255),
+            ));
+        });
         return;
     }
     for (line_index, line) in lines.into_iter().enumerate() {
@@ -8108,7 +8246,7 @@ fn paint_markdown_block(
             row_baseline(y, line_h, size.get()),
             line,
             size,
-            if matches!(&spec.kind, Table) && line_index == 0 {
+            if matches!(&spec.kind, Table) && spec.visual_row == 0 && line_index == 0 {
                 TextWeight::Bold
             } else {
                 weight
@@ -8119,15 +8257,57 @@ fn paint_markdown_block(
     }
 }
 
-struct StyledBase {
+struct MarkdownLinkRegion {
+    label: String,
+    rows: Vec<LogicalRect>,
+}
+
+fn markdown_link_regions(
+    spec: &MarkdownBlockSpec,
+    rect: LogicalRect,
+    clip: LogicalRect,
+) -> std::collections::BTreeMap<usize, MarkdownLinkRegion> {
+    let mut links = std::collections::BTreeMap::new();
+    visit_markdown_segments(spec, rect, |segment| {
+        let Some(index) = segment.style.link_index else {
+            return;
+        };
+        let Some(hit) =
+            LogicalRect::new(segment.x, segment.y, segment.w, segment.line_h).intersect(clip)
+        else {
+            return;
+        };
+        let link = links.entry(index).or_insert_with(|| MarkdownLinkRegion {
+            label: String::new(),
+            rows: Vec::new(),
+        });
+        if let Some(last) = link.rows.last_mut().filter(|last| last.y == hit.y) {
+            if hit.x > last.right() + 0.1 {
+                link.label.push(' ');
+            }
+            *last = last.union(hit);
+        } else {
+            if !link.label.is_empty() && !matches!(spec.kind, MarkdownBlockKind::Table) {
+                link.label.push(' ');
+            }
+            link.rows.push(hit);
+        }
+        link.label.push_str(&segment.text);
+    });
+    links
+}
+
+struct StyledSegment {
     x: f32,
     y: f32,
-    bottom: f32,
+    w: f32,
     line_h: f32,
+    baseline: f32,
     size: crate::type_scale::StepPx,
     face: crate::widget::TextFace,
     weight: crate::widget::TextWeight,
-    color: [u8; 3],
+    text: String,
+    style: crate::native_markdown::InlineStyle,
 }
 
 fn wrapped_piece_ranges(
@@ -8180,18 +8360,28 @@ fn wrapped_piece_ranges(
         .collect()
 }
 
-fn paint_styled_markdown_rows(
-    prims: &mut Vec<crate::widget::DrawPrim>,
+fn visit_markdown_segments(
     spec: &MarkdownBlockSpec,
-    base: &StyledBase,
-    max_columns: usize,
-    visible_rows: usize,
-    roles: crate::settings::Roles,
+    rect: LogicalRect,
+    mut visit: impl FnMut(StyledSegment),
 ) {
     use crate::tray_raster::{measure_text, row_baseline, ui_text_width_for};
-    use crate::widget::{DrawPrim, TextFace, rgba, text_prim};
-
-    let px = base.size.get();
+    use crate::widget::{TextFace, TextWeight};
+    let rect = spec.content_rect(rect);
+    let Some(frame) = markdown_frame(spec, rect.width) else {
+        return;
+    };
+    let max_columns = frame.columns(rect.width);
+    let visible_rows = frame.rows_in(rect.height);
+    let size = native_type_px(reader_step(frame.step));
+    let px = size.get();
+    let base_face = if frame.mono {
+        TextFace::Mono
+    } else if frame.bold {
+        TextFace::UiBold
+    } else {
+        TextFace::Ui
+    };
     let measure = |face: TextFace, weight, s: &str| match face {
         TextFace::Mono => measure_text(s, px, weight),
         TextFace::Ui | TextFace::UiBold | TextFace::Display(_) | TextFace::Brand(_) => {
@@ -8205,22 +8395,41 @@ fn paint_styled_markdown_rows(
         .saturating_add(visible_rows.max(1))
         .saturating_add(1)
         .clamp(1, crate::native_markdown::READER_ROW_LIMIT);
-    let rows =
-        crate::native_markdown::wrap_reader_text(&spec.text, max_columns, 0, requested, false);
-    let pieces = wrapped_piece_ranges(&spec.text, &rows);
-    let space = measure(base.face, base.weight, " ");
+    let rows = crate::native_markdown::wrap_reader_text(
+        &spec.text,
+        max_columns,
+        0,
+        requested,
+        frame.preserve_lines,
+    );
+    let pieces = if frame.preserve_lines {
+        let mut offset = 0;
+        rows.into_iter()
+            .map(|row| {
+                let range = spec.text[offset..].find(&row).map(|at| {
+                    let start = offset + at;
+                    offset = start + row.len();
+                    start..offset
+                });
+                vec![(row, range)]
+            })
+            .collect()
+    } else {
+        wrapped_piece_ranges(&spec.text, &rows)
+    };
+    let space = measure(base_face, TextWeight::Regular, " ");
     for (line_index, row) in pieces
         .into_iter()
         .skip(spec.visual_row)
         .take(visible_rows)
         .enumerate()
     {
-        let y = base.y + line_index as f32 * base.line_h;
-        if y >= base.bottom {
+        let y = (rect.y + frame.inset_top) + line_index as f32 * frame.line_h;
+        if y >= rect.bottom() {
             break;
         }
-        let baseline = row_baseline(y, base.line_h, px);
-        let mut x = base.x;
+        let baseline = row_baseline(y, frame.line_h, px);
+        let mut x = rect.x + frame.inset_left;
         for (piece_index, (piece, range)) in row.into_iter().enumerate() {
             if piece_index > 0 {
                 x += space;
@@ -8249,62 +8458,31 @@ fn paint_styled_markdown_rows(
                 }
             }
             for (s, style) in segments {
-                let face = if style.code {
+                let face = if style.code || frame.mono {
                     TextFace::Mono
                 } else if style.strong {
                     TextFace::UiBold
                 } else {
-                    base.face
+                    base_face
                 };
-                let color = if style.link {
-                    roles.accent
-                } else if style.emphasis {
-                    mix_rgb(base.color, roles.accent, 0.35)
+                let weight = if frame.mono && style.strong {
+                    TextWeight::Bold
                 } else {
-                    base.color
+                    TextWeight::Regular
                 };
-                let w = measure(face, base.weight, &s);
-                if style.code {
-                    prims.push(DrawPrim::Panel {
-                        x: x - 2.0,
-                        y: baseline - px * 0.95,
-                        w: w + 4.0,
-                        h: px * 1.3,
-                        radius: 4.0,
-                        fill: rgba(mix_rgb(roles.elevated, roles.surface, 0.20), 255),
-                    });
-                }
-                if style.strike {
-                    prims.push(DrawPrim::Stroke {
-                        x,
-                        y: baseline - px * 0.32,
-                        w,
-                        h: 1.0,
-                        radius: 0.5,
-                        width: 1.0,
-                        color: rgba(color, 220),
-                    });
-                }
-                if style.link {
-                    prims.push(DrawPrim::Stroke {
-                        x,
-                        y: baseline + 2.0,
-                        w,
-                        h: 1.0,
-                        radius: 0.5,
-                        width: 1.0,
-                        color: rgba(roles.accent, 200),
-                    });
-                }
-                prims.push(text_prim(
+                let w = measure(face, weight, &s);
+                visit(StyledSegment {
                     x,
+                    y,
+                    w,
+                    line_h: frame.line_h,
                     baseline,
-                    s,
-                    base.size,
-                    base.weight,
+                    size,
                     face,
-                    rgba(color, 255),
-                ));
+                    weight,
+                    text: s,
+                    style,
+                });
                 x += w;
             }
         }
@@ -10277,10 +10455,16 @@ impl Compiler {
             }
             return Ok(());
         };
-        let live_visible = match list {
-            Some(list) => visible.intersect(list.room),
-            None => Some(visible),
+        // The preview's inter-block strip belongs to the quote paint. Text, links and
+        // block selection end at the last row's own rectangle.
+        let content_visible = match &content {
+            UiContent::MarkdownBlock(block) => visible.intersect(block.content_rect(rect)),
+            _ => Some(visible),
         };
+        let live_visible = content_visible.and_then(|shown| match list {
+            Some(list) => shown.intersect(list.room),
+            None => Some(shown),
+        });
         let edge_cut = list.is_some_and(|list| {
             rect.y < list.room.y - CLIP_EDGE_EPSILON
                 || rect.bottom() > list.room.bottom() + CLIP_EDGE_EPSILON
@@ -10444,6 +10628,56 @@ impl Compiler {
                     action,
                     look_first,
                     drags,
+                });
+            }
+        }
+
+        if let Some(shown) = live
+            && let Some(PaintNode {
+                content: UiContent::MarkdownBlock(spec),
+                ..
+            }) = self.output.paint.last()
+            && spec
+                .inline
+                .iter()
+                .any(|(_, style)| style.link_index.is_some())
+        {
+            for (index, link) in markdown_link_regions(spec, rect, shown) {
+                let link_key = UiKey::new(format!("{}/link/{index}", key.as_str()));
+                let action = ActionId::new(format!("markdown/link/{index}"));
+                for rect in &link.rows {
+                    self.output.hits.push(HitRegion {
+                        key: link_key.clone(),
+                        rect: *rect,
+                        action: action.clone(),
+                        look_first: false,
+                        drags: false,
+                    });
+                }
+                let label = link.label;
+                let rect = link
+                    .rows
+                    .into_iter()
+                    .reduce(LogicalRect::union)
+                    .expect("a visible link");
+                self.output.focus_order.push(link_key.clone());
+                self.output.semantics.push(SemanticNode {
+                    key: link_key,
+                    parent: Some(key.clone()),
+                    rect,
+                    role: SemanticRole::Button,
+                    label,
+                    value: SemanticValue::None,
+                    state: Some(ControlState {
+                        focused: spec.focused_link == Some(index),
+                        focus_visible: spec.focused_link == Some(index),
+                        ..Default::default()
+                    }),
+                    action: Some(action),
+                    audit_id: None,
+                    description: None,
+                    offscreen: false,
+                    value_text: None,
                 });
             }
         }

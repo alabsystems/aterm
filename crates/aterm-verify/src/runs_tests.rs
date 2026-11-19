@@ -5,7 +5,7 @@
 
 use super::*;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -130,6 +130,10 @@ struct FakeKernel {
     markers_read: RefCell<Vec<i32>>,
     /// One change after run-record admission, before the cleanup pass captures its uid table.
     before_uid_table: RefCell<Option<Box<dyn FnOnce()>>>,
+    /// [`Kernel::by_design`]'s answers; otherwise its verb names no program kept by design.
+    verbs: HashMap<i32, Option<bool>>,
+    /// [`Kernel::session`]'s answers; otherwise its session does not read.
+    sessions: HashMap<i32, u32>,
 }
 
 impl FakeKernel {
@@ -247,6 +251,16 @@ impl Kernel for FakeKernel {
     }
     fn held(&self, pid: i32) -> Option<bool> {
         self.held.get(&pid).copied().unwrap_or(Some(false))
+    }
+    fn by_design(&self, pid: i32) -> Option<bool> {
+        self.verbs.get(&pid).copied().unwrap_or(Some(false))
+    }
+    fn session(&self, pid: i32) -> Option<u32> {
+        self.lineages
+            .borrow()
+            .contains_key(&pid)
+            .then(|| self.sessions.get(&pid).copied())
+            .flatten()
     }
     fn held_now(&self) -> Option<HeldNow> {
         self.held_now
@@ -1128,7 +1142,8 @@ fn an_unconfirmed_exit_keeps_the_end_result_and_run_record() {
         made: Mutex::new(BTreeMap::new()),
         said: Mutex::new(Vec::new()),
         may_forget: AtomicBool::new(false),
-        poster: Box::new(Inert),
+        poster: Arc::new(Inert),
+        kin: runs_kin::KinLedger::new(dir.path().join("x.kin"), None, Vec::new()),
     };
     let mut k = FakeKernel::default();
     k.put(lin(41983, 100, 41983, 1), "/usr/local/bin/aterm-verify");
@@ -1491,7 +1506,8 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
         made: Mutex::new(BTreeMap::new()),
         said: Mutex::new(Vec::new()),
         may_forget: AtomicBool::new(false),
-        poster: Box::new(Inert),
+        poster: Arc::new(Inert),
+        kin: runs_kin::KinLedger::new(dir.path().join("x.kin"), None, Vec::new()),
     };
     let mut k = FakeKernel::default();
     let mut verify = lin(41983, 100, 41983, 1);
@@ -1831,7 +1847,8 @@ fn only_a_group_proven_empty_is_recorded_closed() {
         made: Mutex::new(BTreeMap::new()),
         said: Mutex::new(Vec::new()),
         may_forget: AtomicBool::new(false),
-        poster: Box::new(Inert),
+        poster: Arc::new(Inert),
+        kin: runs_kin::KinLedger::new(dir.path().join("x.kin"), None, Vec::new()),
     };
     for (pgid, listed, named) in [
         (500, Some(true), vec![]),
@@ -3305,3 +3322,302 @@ fn the_default_poster_is_inert() {
 
 #[path = "runs_archive_tests.rs"]
 mod archive;
+
+/// W-kin's judge over `k` for the kin `booked`: no roots, no run id, no groups, so it proves by
+/// W-kin alone, as the run's ender judges ([`runs_kin::end_kin`]).
+fn kin_judge<'a>(
+    k: &'a FakeKernel,
+    claims: &'a Claims,
+    booked: &'a BTreeSet<Kin>,
+    spared: &'a [PathBuf],
+    tty: Option<u32>,
+) -> Judge<'a, FakeKernel> {
+    Judge {
+        kernel: k,
+        roots: &[],
+        id: None,
+        run_uniqueid: 100,
+        groups: Vec::new(),
+        horizon: u64::MAX,
+        launchd: k.launchd_version(),
+        claims,
+        kin: Some(KinJudge {
+            booked,
+            spared,
+            tty,
+        }),
+    }
+}
+
+/// A booked kin is ended by its identity alone, outside every root and with no run id, `proof
+/// kin`; the pid of another booked kin, taken since by a process with another birth and unique
+/// id, is never signalled, and without W-kin neither is. NEGATIVE CONTROL: look a booked kin up
+/// by pid alone (`Judge::kin_read`), and 701, the reused pid, takes a `SIGTERM`.
+#[test]
+fn w_kin_ends_a_booked_kin_by_identity_and_never_a_reused_pid() {
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 9000);
+    let kin = lin(700, 7000, 700, 1);
+    k.put(kin, "/bin/sh");
+    k.put(lin(701, 7010, 701, 1), "/bin/sh");
+    let reused = Kin {
+        pid: 701,
+        birth: birth(5),
+        uniqueid: 50,
+    };
+    let booked = BTreeSet::from([Kin::of(&kin), reused]);
+    let claims = Claims::default();
+    let unbooked = Judge {
+        kin: None,
+        ..kin_judge(&k, &claims, &booked, &[], None)
+    };
+    assert_eq!(
+        unbooked.judge(700),
+        Verdict::NotOurs,
+        "W-kin alone proves it"
+    );
+    let left = runs_kin::end_kin(
+        &kin_judge(&k, &claims, &booked, &[], None),
+        &booked,
+        runs_kin::in_turn,
+    );
+    assert_eq!(k.termed(), vec![700]);
+    assert_eq!(left.ended, ["sh"]);
+    let line = left.told[0].line("left by stage `t`'s test binary");
+    assert!(
+        line.contains("(pid 700)") && line.contains(": proof kin; SIGTERM; gone"),
+        "{line}"
+    );
+}
+
+/// W-kin never proves a booked kin whose thread is held or unread, whose program is the
+/// toolchain's, an aterm image, a `trustd` or a verb launchd keeps by design (or whose verb does
+/// not read),
+/// that a live run claims, whose parent lives, or that sits on a terminal another holds; it
+/// proves one on the run's own terminal. The run's end names the unproven and leaves the spared
+/// to the judgment every process has. NEGATIVE CONTROL: drop any one condition from
+/// `Judge::kin_read`, and its pid takes a `SIGTERM`.
+#[test]
+fn w_kin_signals_no_held_spared_claimed_parented_or_attached_kin() {
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 9000);
+    let spared = [PathBuf::from("/store/trust/27009.noindex")];
+    let put = |k: &mut FakeKernel, pid: i32, exe: &str| {
+        let l = lin(
+            pid,
+            7000 + u64::try_from(pid).unwrap(),
+            pid.unsigned_abs(),
+            1,
+        );
+        k.put(l, exe);
+        l
+    };
+    let mut booked = BTreeSet::new();
+    for (pid, exe) in [
+        (710, "/bin/sh"),
+        (711, "/bin/sh"),
+        (712, "/store/trust/27009.noindex/bin/trustd"),
+        (713, "/bin/sh"),
+        (714, "/Applications/aterm.app/Contents/MacOS/aterm"),
+        (709, "/opt/other-trust/bin/trustd"),
+        (715, "/bin/sh"),
+        (718, "/bin/sh"),
+    ] {
+        booked.insert(Kin::of(&put(&mut k, pid, exe)));
+    }
+    k.held.insert(710, Some(true));
+    k.held.insert(711, None);
+    k.verbs.insert(713, Some(true));
+    k.verbs.insert(718, None);
+    // 716's parent, 800, lives and is no kin.
+    k.put(lin(800, 6000, 800, 1), "/bin/zsh");
+    let parented = lin(716, 7716, 716, 800);
+    k.put(parented, "/bin/sh");
+    booked.insert(Kin::of(&parented));
+    // 717 on a terminal another holds; 719 on the run's own.
+    let mut attached = lin(717, 7717, 717, 1);
+    attached.tty = Some(5);
+    k.put(attached, "/bin/sh");
+    k.ttys.insert(5, Some(true));
+    let mut own = lin(719, 7719, 719, 1);
+    own.tty = Some(16);
+    k.put(own, "/bin/sh");
+    k.ttys.insert(16, Some(true));
+    booked.extend([Kin::of(&attached), Kin::of(&own)]);
+    let live = Record::parse(
+        "run v=1 boot=B id=50-1 uniqueid=1 start=1 sid=-\n\
+         group pgid=715 leader_birth=1 leader_uniqueid=1 stage=s\n",
+    );
+    let claims = Claims::of(std::iter::once(&live));
+    let judge = kin_judge(&k, &claims, &booked, &spared, Some(16));
+    let left = runs_kin::end_kin(&judge, &booked, runs_kin::in_turn);
+    assert_eq!(
+        k.termed(),
+        vec![719],
+        "only the kin on the run's own terminal"
+    );
+    assert_eq!(left.ended, ["sh"]);
+    let pids: Vec<i32> = k.lineages.borrow().keys().copied().collect();
+    let named = pass(&judge, &pids);
+    let mut names: Vec<i32> = named.named.iter().map(|s| s.pid).collect();
+    names.sort_unstable();
+    assert_eq!(names, [710, 711, 715, 716, 717, 718]);
+    assert_eq!(
+        k.termed(),
+        vec![719],
+        "the run's end ends none of them either"
+    );
+}
+
+/// What a reaped test binary's end makes of `book` over `k` ([`aterm_uds::runs::kin_at_end`],
+/// with no unique ids naming parents), then what W-kin's ender ends of it: the kin, and who took
+/// a `SIGTERM`, in pid order.
+fn closed_and_ended(k: &FakeKernel, book: &BTreeSet<Kin>) -> (BTreeSet<Kin>, Vec<i32>) {
+    let root = Kin {
+        pid: 500,
+        birth: birth(born(500)),
+        uniqueid: 500,
+    };
+    let kin = aterm_uds::runs::kin_at_end(
+        k,
+        root,
+        500,
+        book,
+        &[PathBuf::from("/store/trust/27009.noindex")],
+        aterm_uds::runs::Link::Birth,
+        &mut 0,
+    );
+    let claims = Claims::default();
+    let spared = [PathBuf::from("/store/trust/27009.noindex")];
+    runs_kin::end_kin(
+        &kin_judge(k, &claims, &kin, &spared, None),
+        &kin,
+        runs_kin::in_turn,
+    );
+    let mut termed = k.termed();
+    termed.sort_unstable();
+    (kin, termed)
+}
+
+/// A test binary's end books, and its ender signals, no process that joined a kin's group from
+/// the session of verify's launcher: of 600's group, which it made in that session
+/// (`process_group(0)`), its child 610 is booked; 620, a process of that session that joined
+/// the group by its own `setpgid` and was adopted since, is neither booked nor signalled. Of
+/// 700's, which it made with its own session (`setsid`), 710 is booked though adopted. Each kin
+/// booked is ended. NEGATIVE CONTROL: give every member of a kin's group (drop both proofs from
+/// `group_kin`), and 620 is booked and takes a `SIGTERM`.
+#[test]
+fn w_kin_books_and_signals_no_joiner_of_a_kins_group() {
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 9000);
+    let leader = lin(600, 6000, 600, 1);
+    let made = lin(700, 7000, 700, 1);
+    for (l, session) in [
+        (leader, 100),
+        (lin(610, 6100, 600, 600), 100),
+        (lin(620, 6200, 600, 1), 100),
+        (made, 700),
+        (lin(710, 7100, 700, 1), 700),
+    ] {
+        k.put(l, "/bin/sh");
+        k.sessions.insert(l.identity.pid, session);
+    }
+    k.groups.insert(600, vec![600, 610, 620]);
+    k.groups.insert(700, vec![700, 710]);
+    let (kin, termed) = closed_and_ended(&k, &BTreeSet::from([Kin::of(&leader), Kin::of(&made)]));
+    let pids: Vec<i32> = kin.iter().map(|kin| kin.pid).collect();
+    assert_eq!(pids, [600, 610, 700, 710], "620 is not booked");
+    assert_eq!(termed, [600, 610, 700, 710], "620 is not signalled");
+}
+
+/// A test binary's end books, and its ender signals, nothing a living spared program started:
+/// 800, a booked kin that runs `trustd` now, leads a session of its own whose member 810
+/// (adopted) is not booked; 820's group, a `/bin/sh` kin's, gives its child 821. 800 is judged
+/// as any process is and left. NEGATIVE CONTROL: let a spared leader give its group (drop
+/// `program_of` from `group_kin`'s leader test, and read only the leader's lineage again once
+/// its members are read), and 810 is booked and takes a `SIGTERM`.
+#[test]
+fn w_kin_books_and_signals_nothing_a_spared_kin_started() {
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 9000);
+    let trustd = lin(800, 8000, 800, 1);
+    let sh = lin(820, 8200, 820, 1);
+    k.put(trustd, "/store/trust/27009.noindex/bin/trustd");
+    k.put(lin(810, 8100, 800, 1), "/bin/sh");
+    k.put(sh, "/bin/sh");
+    k.put(lin(821, 8210, 820, 820), "/bin/sleep");
+    for (pid, session) in [(800, 800), (810, 800), (820, 100), (821, 100)] {
+        k.sessions.insert(pid, session);
+    }
+    k.groups.insert(800, vec![800, 810]);
+    k.groups.insert(820, vec![820, 821]);
+    let (kin, termed) = closed_and_ended(&k, &BTreeSet::from([Kin::of(&trustd), Kin::of(&sh)]));
+    let pids: Vec<i32> = kin.iter().map(|kin| kin.pid).collect();
+    assert_eq!(pids, [800, 820, 821], "810 is not booked");
+    assert_eq!(termed, [820, 821], "neither trustd nor 810 is signalled");
+}
+
+/// Kin end parents first: a booked child whose booked parent lives is not proven (A4) until
+/// the round that ends the parent has orphaned it.
+#[test]
+fn w_kin_ends_a_parent_before_the_child_it_orphans() {
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 9000);
+    let parent = lin(720, 7200, 720, 1);
+    let child = lin(721, 7210, 720, 720);
+    k.put(parent, "/bin/sh");
+    k.put(child, "/bin/sleep");
+    let booked = BTreeSet::from([Kin::of(&child), Kin::of(&parent)]);
+    let claims = Claims::default();
+    let left = runs_kin::end_kin(
+        &kin_judge(&k, &claims, &booked, &[], None),
+        &booked,
+        runs_kin::in_turn,
+    );
+    assert_eq!(k.termed(), vec![720, 721]);
+    assert_eq!(left.ended, ["sh", "sleep"]);
+}
+
+/// The next run's start reads a dead run's kin sidecar and ends the kin it booked, `proof
+/// kin`, then forgets the record with its sidecar; a sidecar naming another run gives none, and
+/// one whose record is gone is forgotten. NEGATIVE CONTROL: read no sidecar in
+/// `end_dead_runs`, and 700 outlives the pass.
+#[test]
+fn the_start_pass_ends_a_dead_runs_booked_kin_from_its_sidecar() {
+    let kin = lin(700, 7000, 700, 1);
+    let booked = Kin::of(&kin);
+    let id = RunId::parse(DEAD_ID).expect("the dead run's id");
+    let sidecar = |id: RunId| {
+        format!(
+            "{}{}\n",
+            aterm_uds::runs::kin_header_text("B", id, None, &[]),
+            aterm_uds::runs::kin_line(&booked, 500)
+        )
+    };
+    let whole = sidecar(id);
+    let other = sidecar(RunId::parse("41983-1").expect("an id"));
+    let dir = records(&[
+        (&format!("{DEAD_ID}.run"), &dead_record()),
+        (&format!("{DEAD_ID}.kin"), &whole),
+        ("9-9.kin", &sidecar(RunId::parse("9-9").expect("an id"))),
+    ]);
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 9000);
+    k.put(kin, "/bin/sh");
+    let (ended, lines) = start_pass(dir.path(), &k);
+    assert_eq!((ended, k.termed()), (1, vec![700]), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("ended sh")), "{lines:?}");
+    assert!(!dir.path().join(format!("{DEAD_ID}.run")).exists());
+    assert!(!dir.path().join(format!("{DEAD_ID}.kin")).exists());
+    assert!(!dir.path().join("9-9.kin").exists(), "a lone sidecar goes");
+
+    let dir = records(&[
+        (&format!("{DEAD_ID}.run"), &dead_record()),
+        (&format!("{DEAD_ID}.kin"), &other),
+    ]);
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 9000);
+    k.put(kin, "/bin/sh");
+    let (ended, lines) = start_pass(dir.path(), &k);
+    assert_eq!((ended, k.termed()), (0, Vec::new()), "{lines:?}");
+}

@@ -220,6 +220,10 @@ fn an_existing_seat_recovers_by_proof_on_a_headless_members_port_off_home() {
             .as_slice(),
         b"fixture-value"
     );
+    assert!(
+        !f.paths.home.join(".secrets/recovery-token").exists(),
+        "the vault writes no file of the entry under the home"
+    );
     assert!(matches!(
         client::status(&f.paths).unwrap().membership,
         client::Membership::In { .. }

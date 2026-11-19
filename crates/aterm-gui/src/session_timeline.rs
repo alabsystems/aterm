@@ -257,6 +257,58 @@ pub(crate) struct SessionMeta {
     /// Whether `pin` or `unpin` wrote [`Self::pinned`] on this process, so a carried pin grafted
     /// later does not undo it ([`restore_carried_meta`]).
     pub(crate) pin_written: bool,
+    /// THE TAB'S HARNESS WAS ENDED BY ATERM'S WATCHDOG (`crate::harness_watchdog`): a dead
+    /// harness's kept child, or a harness deaf to `restart` and its kept child, and nothing
+    /// supervises the tab until a claim is placed on it again, which clears this
+    /// ([`Self::set_supervisor`]). The tab's need reads `unsupervised` while it stands
+    /// ([`crate::needs::NeedFacts::unsupervised`]). Never serialized.
+    pub(crate) unsupervised: Option<Unsupervised>,
+    /// WHAT aterm'S HARNESS WATCHDOG KEEPS FOR THE TAB'S RELAUNCH (`crate::harness_watchdog`,
+    /// HX-15f): the kept child's built-in snapshot, a claimant's own release, a `restart
+    /// model=` owed to the relaunch, and the relaunch's back-off. Never serialized.
+    pub(crate) relaunch: Relaunch,
+}
+
+/// What aterm's harness watchdog keeps for a tab's relaunch ([`SessionMeta::relaunch`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Relaunch {
+    /// The kept child's built-in relaunch snapshot (the HX-15 plan's D22): the child, by its
+    /// pid and birth, and what resumes its conversation, read of that very child when a claim
+    /// kept it and at each change of child, and read again as the watchdog ends its harness,
+    /// while the child still reads at its birth (`crate::harness_watchdog::refresh_snapshot`).
+    pub(crate) snapshot: Option<(crate::harness_claim::KeptChild, Resume)>,
+    /// The claimant that released its own claim (`meta unset supervisor`): a normal exit, which
+    /// is never relaunched (D23). A claim placed on the tab again clears it.
+    pub(crate) released: Option<crate::harness_claim::Proven>,
+    /// The model a `restart model=<word>` named for that claimant while that restart is still
+    /// to be obeyed: its relaunch types it as `--model` (D21), once. A claim placed on the tab
+    /// again (a harness claims again after every child start: it obeyed) and a later restart
+    /// that names no model clear it.
+    pub(crate) model: Option<(crate::harness_claim::Proven, String)>,
+    /// The relaunch back-off (alab-wire's `relaunch::Ladder`): the crash relaunches standing
+    /// unforgiven, an attempt counted as it starts to wait, and the awake clock at the last one
+    /// made.
+    pub(crate) streak: u32,
+    pub(crate) last_ms: Option<u64>,
+}
+
+/// WHAT RESUMES A CONVERSATION on its vendor's command line ([`Relaunch::snapshot`], a
+/// `session` record's [`StreamSession::resume`] and [`StreamSession::cwd`]): the arguments a
+/// relaunch types after `--`, never none, and the directory the conversation ran in, which the
+/// relaunch `cd`s its shell back to where the shell stands elsewhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Resume {
+    pub(crate) words: Vec<String>,
+    pub(crate) cwd: Option<String>,
+}
+
+/// What aterm's harness watchdog ended ([`SessionMeta::unsupervised`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Unsupervised {
+    /// When it ended the harness ([`crate::metrics::now_us`]): the need's key.
+    pub(crate) at_us: u64,
+    /// The holder of the claim it ended (`<id>@<pid>`).
+    pub(crate) holder: String,
 }
 
 impl PartialEq for SessionMeta {
@@ -292,6 +344,8 @@ impl PartialEq for SessionMeta {
             continuation_activity: _,
             pinned,
             pin_written: _,
+            unsupervised: _,
+            relaunch: _,
         } = self;
         *user_title == other.user_title
             && *description == other.description
@@ -432,6 +486,8 @@ impl SessionMeta {
             driver_writes: 0,
             pinned: self.pinned,
             pin_written: false,
+            unsupervised: None,
+            relaunch: Relaunch::default(),
         }
     }
 
@@ -553,6 +609,7 @@ impl SessionMeta {
         };
         state.open = Some(conn);
         state.restarts.clear();
+        state.offered.clear();
         state.policy_due = false;
         self.stream.insert(state)
     }
@@ -569,6 +626,7 @@ impl SessionMeta {
         {
             state.open = None;
             state.restarts.clear();
+            state.offered.clear();
             state.policy_due = false;
         }
     }
@@ -599,6 +657,27 @@ impl SessionMeta {
     pub(crate) fn owe_stream_restart(&mut self, payload: &str, now_us: u64) -> bool {
         self.open_stream_state(now_us)
             .map(|state| state.restarts.push_back(payload.to_string()))
+            .is_some()
+    }
+
+    /// OFFER THE OPEN STREAM ONE OF aterm'S OPTIONAL RECORDS (a `prompt`, `answer`, `touch`,
+    /// `interrupt` or `set`, [`OPTIONAL_KINDS`]): `line` is the record as the wire codec writes
+    /// it, its number given as it is sent, and `kind` its kind's word. Whether a stream is open
+    /// to take it; its sender sends it only where the claimant's latest `session` takes the kind
+    /// ([`SessionTimeline::session_takes`], D27). Nothing calls it yet but the gate's test: the
+    /// senders are HX-16b, HX-16c, HX-38 and HX-39.
+    #[cfg_attr(
+        not(all(test, unix)),
+        expect(dead_code, reason = "HX-16b, HX-16c, HX-38 and HX-39 send through it")
+    )]
+    pub(crate) fn offer_stream_record(
+        &mut self,
+        kind: &'static str,
+        line: String,
+        now_us: u64,
+    ) -> bool {
+        self.open_stream_state(now_us)
+            .map(|state| state.offered.push_back((kind, line)))
             .is_some()
     }
 
@@ -678,6 +757,37 @@ impl SessionMeta {
             }
             _ => false,
         }
+    }
+
+    /// Whether the live scoped claim's own record stream, opened in `epoch`, feeds the tab: it
+    /// applied a record of a kind the tab shows under a scope the claim still holds
+    /// ([`Self::stream_applied_under`]): `state`, `progress`, `goal`, `compact` (`state`),
+    /// `usage` (`walls`), `account` (`accounts`), `need` and `clear` ([`NEED_SCOPES`]), `land`
+    /// (`turn-end`), `ask` (`approvals` or `questions`), `wall` (`walls`), and `model`,
+    /// `upgrade` and `act` (an `act` under whichever duty admitted it). A `beat`, a `took` and a
+    /// `refused` feed the tab nothing.
+    #[must_use]
+    pub(crate) fn stream_applied_any(&self, epoch: &str, now_us: u64) -> bool {
+        use aterm_agent::harness::contract::Scope;
+        let kinds: [(&str, &[Scope]); 14] = [
+            (STATE_KIND, &[Scope::State]),
+            (PROGRESS_KIND, &[Scope::State]),
+            (GOAL_KIND, &[Scope::State]),
+            (COMPACT_KIND, &[Scope::State]),
+            (USAGE_KIND, &[Scope::Walls]),
+            (ACCOUNT_KIND, &[Scope::Accounts]),
+            (NEED_KIND, &NEED_SCOPES),
+            (CLEAR_KIND, &NEED_SCOPES),
+            (LAND_KIND, &[Scope::TurnEnd]),
+            (ASK_KIND, &[Scope::Approvals, Scope::Questions]),
+            (WALL_KIND, &[Scope::Walls]),
+            (MODEL_KIND, &[]),
+            (UPGRADE_KIND, &[]),
+            (ACT_KIND, &[]),
+        ];
+        kinds
+            .into_iter()
+            .any(|(kind, scopes)| self.stream_applied_under(kind, scopes, epoch, now_us))
     }
 
     /// D29 FOR THE `meta set harness_*` WRITERS: whether the live claim's own record stream,
@@ -1071,6 +1181,15 @@ impl SessionMeta {
         }
         if needs {
             self.claim_needs = None;
+        }
+        // Any claim placed on the tab supervises it (a harness's scoped claim, or a proven or
+        // unproven supervisor's): what the watchdog's ending left (`unsupervised`) is over.
+        // A harness claims again after every child start: a `restart model=` it was told is
+        // obeyed, and no relaunch owes that model any more.
+        if claim.is_some() {
+            self.unsupervised = None;
+            self.relaunch.released = None;
+            self.relaunch.model = None;
         }
         self.settle_stream_run(claim.as_ref(), now_us);
         self.supervisor = claim;
@@ -1823,6 +1942,16 @@ pub(crate) const PROGRESS_KIND: &str = "progress";
 pub(crate) const GOAL_KIND: &str = "goal";
 /// The `compact` record's kind: the vendor compacts its context.
 pub(crate) const COMPACT_KIND: &str = "compact";
+/// The `turn` record's kind: a turn started or ended.
+pub(crate) const TURN_KIND: &str = "turn";
+/// The `tool` record's kind: a tool call and its state.
+pub(crate) const TOOL_KIND: &str = "tool";
+/// The `subagent` record's kind: a subagent started or ended.
+pub(crate) const SUBAGENT_KIND: &str = "subagent";
+/// The `msg` record's kind: text the conversation holds.
+pub(crate) const MSG_KIND: &str = "msg";
+/// The `diff` record's kind: a patch the session made.
+pub(crate) const DIFF_KIND: &str = "diff";
 /// The `act` record's kind: what the harness did and by which rule, its continuation
 /// observation (`wait`) and its own typing's stop (`held`); `meta set harness_act`,
 /// `harness_activity` and `harness_held` stand down for it.
@@ -1847,6 +1976,38 @@ pub(crate) const LAND_KIND: &str = "land";
 pub(crate) const MODEL_KIND: &str = "model";
 /// The `upgrade` record's kind: a move to a newer vendor build.
 pub(crate) const UPGRADE_KIND: &str = "upgrade";
+/// The `session` record's kind: the harness, its conversation and how to resume it, and the
+/// kinds of aterm's records it takes.
+pub(crate) const SESSION_KIND: &str = "session";
+/// The kinds of aterm's records sent only to a harness whose latest `session` lists the kind
+/// among those it takes ([`SessionTimeline::session_takes`], the HX-15 plan's D27).
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "only the Unix control stream sends a record")
+)]
+pub(crate) const OPTIONAL_KINDS: [&str; 5] = ["prompt", "answer", "touch", "interrupt", "set"];
+/// The `ask` record's kind: an approval or question the agent asks (HX-15i1). The prompt
+/// parser stands down for it under a claim holding `approvals`, the question parser under one
+/// holding `questions`.
+pub(crate) const ASK_KIND: &str = "ask";
+/// The `wall` record's kind: a wall the agent hit, by its kind (HX-15i1). The wall readers stand
+/// down for it under a claim holding `walls`.
+pub(crate) const WALL_KIND: &str = "wall";
+
+/// WHAT A STALL OF THE PROGRESS WATCH WAS COUNTED FROM (HX-15i1, `crate::harness_watchdog`):
+/// its identity, which neither the watch's floor (the stream's open, a resume, a hand's lift)
+/// nor a pause of the turn rule (a wall, an open tool step) moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "made by the unix-only `harness_watchdog`")
+)]
+pub(crate) enum StallOf {
+    /// The open `ask` of this `seq`, past its answer time.
+    Ask(u64),
+    /// The open turn, whose last record of progress arrived at this time on the awake clock.
+    Turn(u64),
+}
 
 /// A `need` record the claim's stream applied and no `clear` has ended yet, kept by the record's
 /// `seq` ([`StreamState::needs`]): what a `clear` naming that `seq` ends.
@@ -1887,7 +2048,8 @@ pub(crate) struct StreamState {
     pub(crate) dropped: u64,
     /// Records of a kind this aterm does not know (`stream_unknown=`).
     pub(crate) unknown: u64,
-    /// Records of a known kind this aterm does not apply yet (`stream_unapplied=`).
+    /// Records of a known kind the codec read and cannot write back, so not applied
+    /// (`stream_unapplied=`): every well-formed kind a harness sends is applied.
     pub(crate) unapplied: u64,
     /// `title` records, acknowledged and written by nothing yet (`stream_titles=`).
     pub(crate) titles: u64,
@@ -1898,6 +2060,24 @@ pub(crate) struct StreamState {
         expect(dead_code, reason = "kept by the unix-only `control_stream::judge`")
     )]
     pub(crate) last_beat_ms: Option<u64>,
+    /// THE PROGRESS WATCH'S READING (HX-15i1, `crate::harness_watchdog`): when the last record
+    /// of the agent's progress arrived (a `turn`, `tool`, `subagent`, `msg`, `diff`, `ask` or
+    /// `asked`), on the awake clock, as [`Self::last_beat_ms`] is kept.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "kept by the unix-only `control_stream::judge`")
+    )]
+    pub(crate) progress_ms: Option<u64>,
+    /// THE STALL THE PROGRESS WATCH LAST ACTED ON (HX-15i1 review): its `restart cause=stall`
+    /// was written (or, under `stall_term = false`, its warning logged). Kept by the claim, not
+    /// by one stream's lane, so a reconnect, a wall or a pause inside the same stall acts on it
+    /// no more: only what the stall was counted from moving (the ask answered, a record of
+    /// progress) makes the next one.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "kept by the unix-only `harness_watchdog::look`")
+    )]
+    pub(crate) stall_acted: Option<StallOf>,
     /// The open stream owes its harness a `policy` record ("read your grant again"): the
     /// person's policy moved ([`SessionMeta::owe_stream_policy`]), or a placement moved the
     /// claim's grant or revision under its own open stream ([`SessionMeta::set_supervisor`]).
@@ -1924,6 +2104,26 @@ pub(crate) struct StreamState {
     /// aterm's records the harness answered `refused` (`stream_refused=`), each logged as
     /// `mark - refused in=<n> text=<why>`.
     pub(crate) refused: u64,
+    /// The last `state` record applied said `ended`: the harness's own end, which aterm's
+    /// watchdog never relaunches (D23). It outlives the claim, as this state does.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "kept by the unix-only `control_stream::judge`")
+    )]
+    pub(crate) ended: bool,
+    /// The vendor CLI's version the claimant's latest `session` record stated:
+    /// `supervisor_vendor=` where its claim states none (D7).
+    pub(crate) vendor: Option<String>,
+    /// aterm's records of the optional kinds ([`OPTIONAL_KINDS`]) offered to the open stream
+    /// and not yet sent, each as the record's line with its number to be given
+    /// ([`SessionMeta::offer_stream_record`]): the stream's sender sends one only where the
+    /// claimant's latest `session` takes its kind ([`SessionTimeline::session_takes`]) and drops
+    /// the rest. A stream that closes forgets them, as it forgets a `restart` (D8).
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "sent by the unix-only `control_stream::owed`")
+    )]
+    pub(crate) offered: std::collections::VecDeque<(&'static str, String)>,
 }
 
 impl StreamState {
@@ -1939,12 +2139,17 @@ impl StreamState {
             unapplied: 0,
             titles: 0,
             last_beat_ms: None,
+            progress_ms: None,
+            stall_acted: None,
             policy_due: false,
             needs: std::collections::BTreeMap::new(),
             open: None,
             restarts: std::collections::VecDeque::new(),
             took: 0,
             refused: 0,
+            ended: false,
+            vendor: None,
+            offered: std::collections::VecDeque::new(),
         }
     }
 
@@ -3325,6 +3530,15 @@ impl<T> SupervisorTransition<T> {
         &self.published
     }
 
+    /// The same transition, what it published read through `f`; its drain is kept.
+    #[cfg(test)]
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> SupervisorTransition<U> {
+        SupervisorTransition {
+            published: f(self.published),
+            drain: self.drain,
+        }
+    }
+
     /// Called only by the explicit control reply lane, with no GUI-needed locks held.
     pub(crate) fn acknowledge(self) -> T {
         self.drain.wait();
@@ -3916,12 +4130,24 @@ pub(crate) fn release_closed_connection(
     let grace = grace_us.map_or(Grace::None, |grace_us| {
         let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         let grace = meta.keep_through_grace(conn, now_us, grace_us);
-        #[cfg(unix)]
         if grace == Grace::Armed {
-            ctx.timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .settle_stream_binding(&meta);
+            let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            #[cfg(unix)]
+            timeline.settle_stream_binding(&meta);
+            // A stream that fed the tab closed: what the harness does now is unknown until it
+            // claims again or the grace ends, and the readers of the kinds it applied stay down
+            // meanwhile. A tab its stream fed nothing (only beats) keeps its screen reader's word.
+            if let Some((proven, epoch)) = meta
+                .stream
+                .as_ref()
+                .map(|stream| (stream.proven.clone(), stream.epoch.clone()))
+                && meta.stream_applied_any(&epoch, now_us)
+            {
+                let _ = timeline.set_watched(Some(WatchedClaimant {
+                    watched: Watched::Closed,
+                    proven,
+                }));
+            }
         }
         grace
     });
@@ -3931,14 +4157,36 @@ pub(crate) fn release_closed_connection(
     close_claim_connection(ctx, conn, now_us) || released || grace == Grace::Armed
 }
 
-/// `meta unset supervisor holder=<h>`.
+/// `meta unset supervisor holder=<h>`: an explicit release ([`publish_unset_supervisor`]).
 pub(crate) fn publish_release_supervisor_held_by(
     ctx: &crate::SessionCtx,
     holder: &str,
     now_us: u64,
     by: aterm_slog::Actor,
 ) -> SupervisorTransition<bool> {
-    release_supervisor_if(ctx, now_us, by, |claim| claim.holder == holder)
+    release_supervisor_as(ctx, now_us, by, Release::Unset, |claim| {
+        claim.holder == holder
+    })
+}
+
+/// `meta unset supervisor`: AN EXPLICIT RELEASE of the session's claim, whoever holds it. A
+/// contract 4 claimant released so is not relaunched by aterm's harness watchdog: it is a
+/// normal exit (D23, [`Relaunch::released`]).
+pub(crate) fn publish_unset_supervisor(
+    ctx: &crate::SessionCtx,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> SupervisorTransition<bool> {
+    release_supervisor_as(ctx, now_us, by, Release::Unset, |_| true)
+}
+
+/// How a claim is released ([`release_supervisor_as`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Release {
+    /// By aterm, or by its connection's close: what follows is aterm's watchdog's to judge.
+    Aterm,
+    /// By `meta unset supervisor`: an explicit release ([`Relaunch::released`]).
+    Unset,
 }
 
 #[cfg(test)]
@@ -3957,6 +4205,16 @@ fn release_supervisor_if(
     by: aterm_slog::Actor,
     ours: impl FnOnce(&SupervisorClaim) -> bool,
 ) -> SupervisorTransition<bool> {
+    release_supervisor_as(ctx, now_us, by, Release::Aterm, ours)
+}
+
+fn release_supervisor_as(
+    ctx: &crate::SessionCtx,
+    now_us: u64,
+    by: aterm_slog::Actor,
+    release: Release,
+    ours: impl FnOnce(&SupervisorClaim) -> bool,
+) -> SupervisorTransition<bool> {
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let Some(claim) = meta.supervisor.as_ref() else {
         return SupervisorTransition::unchanged(false);
@@ -3969,8 +4227,21 @@ fn release_supervisor_if(
         .supervisor
         .as_ref()
         .and_then(|claim| claim.proven.clone());
+    // A contract 4 claimant that released its claim itself ended normally (D23).
+    let released = meta
+        .supervisor
+        .as_ref()
+        .and_then(|claim| claim.scoped.as_ref())
+        .filter(|scoped| {
+            release == Release::Unset
+                && scoped.claim.contract == aterm_agent::harness::contract::UNIVERSAL
+        })
+        .map(|scoped| scoped.proven.clone());
     let drain = ctx.fenced_writes.capture_drain();
     let (revision, lapsed) = meta.set_supervisor(None, now_us);
+    if released.is_some() {
+        meta.relaunch.released = released;
+    }
     if lapsed.effective {
         record_attention(ctx, &meta, by);
     }
@@ -3995,25 +4266,43 @@ fn release_supervisor_if(
     }
 }
 
+/// What a lapse removed ([`publish_lapse_supervisor`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Lapsed {
+    /// The holder whose claim lapsed.
+    pub(crate) holder: String,
+    /// A contract 4 claim's proof and kept child, whose re-exec grace ran out: aterm's harness
+    /// watchdog acts on it (`crate::harness_watchdog::past_grace`). `None` for any other claim.
+    pub(crate) universal: Option<crate::harness_claim::Scoped>,
+}
+
 /// Remove a claim whose expiry passed at `now_us` (a `ttl=` lease, or the re-exec grace of a
 /// contract 4 claim whose connection closed, [`SessionMeta::keep_through_grace`]) and record
 /// `meta-change field=supervisor value=-`, as a release does. The record ends a stream's
-/// stand-down and wakes the session's readers.
+/// stand-down and wakes the session's readers. What lapsed is returned, `None` where nothing
+/// did: a contract 4 claim is handed back whole, for the watchdog.
 pub(crate) fn publish_lapse_supervisor(
     ctx: &crate::SessionCtx,
     now_us: u64,
-) -> SupervisorTransition<bool> {
+) -> SupervisorTransition<Option<Lapsed>> {
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     if meta.supervisor_expiry().is_none_or(|at| at > now_us) {
-        return SupervisorTransition::unchanged(false);
+        return SupervisorTransition::unchanged(None);
     }
+    let lapsed = meta.supervisor.as_ref().map(|claim| Lapsed {
+        holder: claim.holder.clone(),
+        universal: claim
+            .scoped
+            .clone()
+            .filter(|scoped| scoped.claim.contract == aterm_agent::harness::contract::UNIVERSAL),
+    });
     let proven = meta
         .supervisor
         .as_ref()
         .and_then(|claim| claim.proven.clone());
     let drain = ctx.fenced_writes.capture_drain();
-    let (revision, lapsed) = meta.set_supervisor(None, now_us);
-    if lapsed.effective {
+    let (revision, moved) = meta.set_supervisor(None, now_us);
+    if moved.effective {
         record_attention(ctx, &meta, aterm_slog::Actor::Aterm);
     }
     record_supervisor(ctx, &meta, None, aterm_slog::Actor::Aterm);
@@ -4023,14 +4312,14 @@ pub(crate) fn publish_lapse_supervisor(
     }
     crate::harness_host::note_claim_released();
     SupervisorTransition {
-        published: true,
+        published: lapsed,
         drain,
     }
 }
 
 #[cfg(test)]
 pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
-    publish_lapse_supervisor(ctx, now_us).published()
+    publish_lapse_supervisor(ctx, now_us).published().is_some()
 }
 
 /// The longest `ttl=` a `meta set supervisor` accepts (ms).
@@ -4382,6 +4671,18 @@ pub(crate) struct TimelineEvent {
 /// The timeline kind of an act a self-supervising agent recorded.
 pub(crate) const HARNESS_ACT: &str = "harness-act";
 
+/// A change in the observed running and selected Codex package for one foreground run.
+pub(crate) const CODEX_ADOPTION: &str = "codex-adoption";
+
+#[derive(Debug)]
+struct CodexAdoption {
+    revision: u64,
+    generation: u64,
+    source: crate::self_claim::Proven,
+    reading: crate::codex_adoption::Reading,
+    sampled: aterm_slog::Stamp,
+}
+
 /// The timeline kind of a move of the program's own state report as the status sweep honoured it.
 pub(crate) const PROGRAM_STATE: &str = "program-state";
 
@@ -4497,6 +4798,7 @@ pub(crate) struct SessionTimeline {
     /// lifts once the stream holds no need of that word open under a claim that feeds `need`.
     stream_needs: std::collections::BTreeMap<&'static str, (String, aterm_slog::Actor)>,
     foreground_generation: u64,
+    codex_adoption: Option<CodexAdoption>,
     /// Earliest provider event this foreground stretch can own.
     foreground_since: Option<std::time::Instant>,
     claude_footer: Option<(i32, Option<u64>, aterm_agent::harness::footer::FooterFacts)>,
@@ -4656,6 +4958,9 @@ pub(crate) struct SessionTimeline {
     card_seen: Option<u64>,
     card_frames: CardFrameMemo,
     registry_drift: RegistryDriftMemo,
+    /// The tab's Out ring ([`crate::out_ring`]): the bodies of the stream's `msg` and `diff`
+    /// records and of every record longer than one log record. Never carried.
+    out: crate::out_ring::OutRing,
 }
 
 #[derive(Default)]
@@ -4792,12 +5097,17 @@ pub(crate) enum StreamedState {
 
 impl StreamedState {
     /// The agent word and detail this state reads as (`docs/HARNESS-CONTRACT.md`, "The `state`
-    /// record"), beside what the screen reader reads now. `asking` and `walled` name no kind:
-    /// until `ask` and `wall` records are applied the kind is the screen's (its `prompt` with
-    /// the box, its `question`, its `wall:<kind>`), else `prompt` and a bare `wall`, never a
-    /// kind nothing showed.
+    /// record"), beside what the claim's stream applied of `ask` and `wall` and what the screen
+    /// reader reads now (D13). `asking` and `walled` name no kind themselves: `asking` reads
+    /// `question` or `prompt` from the newest applied `ask` (`ask`), `walled` reads `wall:<kind>`
+    /// from the newest applied `wall` (`wall`, whose kind `None` is one aterm does not know: the
+    /// bare `wall`); with no such record the kind is the screen's (its `prompt` with the box, its
+    /// `question`, its `wall:<kind>`), else `prompt` and a bare `wall`, never a kind nothing
+    /// showed.
     fn reads(
         self,
+        ask: Option<StreamedAsk>,
+        wall: Option<Option<aterm_slog::WallKind>>,
         screen_word: &'static str,
         screen_detail: Option<&String>,
     ) -> (&'static str, Option<String>) {
@@ -4806,14 +5116,127 @@ impl StreamedState {
             Self::Working => ("busy", None),
             Self::Idle => ("idle", None),
             Self::Ended => ("-", None),
-            Self::Asking if matches!(screen_word, "prompt" | "question") => {
-                (screen_word, screen_detail.cloned())
-            }
-            Self::Asking => ("prompt", None),
-            Self::Walled if screen_word.starts_with("wall:") => {
-                (screen_word, screen_detail.cloned())
-            }
-            Self::Walled => ("wall", None),
+            Self::Asking => match ask {
+                Some(StreamedAsk::Approval) => ("prompt", None),
+                Some(StreamedAsk::Question) => ("question", None),
+                None if matches!(screen_word, "prompt" | "question") => {
+                    (screen_word, screen_detail.cloned())
+                }
+                None => ("prompt", None),
+            },
+            Self::Walled => match wall {
+                Some(kind) => (kind.map_or("wall", aterm_slog::WallKind::wire), None),
+                None if screen_word.starts_with("wall:") => (screen_word, screen_detail.cloned()),
+                None => ("wall", None),
+            },
+        }
+    }
+}
+
+/// Whether the screen's word `word` reads a wall the wall readers read (`wall` or `wall:<kind>`),
+/// not the input stall's `wall:unresponsive`, which aterm's own watch decides.
+fn screen_wall(word: &str) -> bool {
+    word == "wall" || (word.starts_with("wall:") && word != "wall:unresponsive")
+}
+
+/// What an `ask` record asks for (HX-15i1): an approval (a permission, trust or plan box) or a
+/// question. Every platform builds this file and the wire library is Unix only, so the record's
+/// word is kept here under its own type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream reads a record into one"
+    )
+)]
+pub(crate) enum StreamedAsk {
+    Approval,
+    Question,
+}
+
+impl StreamedAsk {
+    /// The step it is written as.
+    pub(crate) const fn step(self) -> aterm_slog::Kind {
+        match self {
+            Self::Approval => aterm_slog::Kind::Approval,
+            Self::Question => aterm_slog::Kind::Question,
+        }
+    }
+}
+
+/// How an `ask` was answered (`asked`), as its `act` row words it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream reads a record into one"
+    )
+)]
+pub(crate) enum StreamedReply {
+    Approve,
+    Deny,
+    Answer,
+}
+
+impl StreamedReply {
+    /// Its `word=`.
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+            Self::Answer => "answer",
+        }
+    }
+
+    /// How the ask's step closes.
+    pub(crate) const fn out(self) -> aterm_slog::StepOut {
+        match self {
+            Self::Approve => aterm_slog::StepOut::Approved,
+            Self::Deny => aterm_slog::StepOut::Declined,
+            Self::Answer => aterm_slog::StepOut::Answered,
+        }
+    }
+}
+
+/// AN `ask`, `asked` OR `wall` RECORD the claim's stream applied (HX-15i1), under the
+/// every-platform record's own names ([`SessionTimeline::publish_stream_asking`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "only the Unix control stream applies a record")
+)]
+pub(crate) enum StreamAsking {
+    /// `ask`: what it asks for; when it arrived and how long after the harness said it will
+    /// answer it, on the awake clock (its `will_in_ms`; `None` where it named no time, as while
+    /// it waits for a person); and whether the claim holds `approvals` and `questions`, each of
+    /// which stands its parser down.
+    Ask {
+        kind: StreamedAsk,
+        will: Option<(u64, u64)>,
+        approvals: bool,
+        questions: bool,
+    },
+    /// `asked`: the `seq` of the ask answered and its kind, how, and who answered (the name
+    /// `as=` takes).
+    Asked {
+        ask: u64,
+        kind: StreamedAsk,
+        reply: StreamedReply,
+        by: String,
+    },
+    /// `wall`: its kind, `None` for a kind aterm does not know (the bare `wall`).
+    Wall { kind: Option<aterm_slog::WallKind> },
+}
+
+impl StreamAsking {
+    /// Its kind's wire word.
+    pub(crate) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Ask { .. } => ASK_KIND,
+            Self::Asked { .. } => "asked",
+            Self::Wall { .. } => WALL_KIND,
         }
     }
 }
@@ -4937,6 +5360,10 @@ pub(crate) enum StreamRecord {
         to: String,
         line: String,
     },
+    /// `session`: what the harness says of itself and its conversation, for the claimant
+    /// `proven` whose stream sent it ([`StreamSession`]), with the record's line as the wire
+    /// codec writes it.
+    Session(StreamSession),
 }
 
 impl StreamRecord {
@@ -4954,8 +5381,190 @@ impl StreamRecord {
             Self::Compact { .. } => COMPACT_KIND,
             Self::Model { .. } => MODEL_KIND,
             Self::Upgrade { .. } => UPGRADE_KIND,
+            Self::Session(_) => SESSION_KIND,
         }
     }
+}
+
+/// Where a `turn` record's turn is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream reads a record into one"
+    )
+)]
+pub(crate) enum StreamedTurn {
+    Started,
+    Done,
+    Failed,
+    Interrupted,
+    Walled,
+}
+
+/// Where a `tool` record's call or a `subagent` record's subagent is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream reads a record into one"
+    )
+)]
+pub(crate) enum StreamedStep {
+    Started,
+    Done,
+    Failed,
+    Interrupted,
+}
+
+impl StreamedStep {
+    /// The step's close, `None` for `started`.
+    pub(crate) fn out(self) -> Option<aterm_slog::StepOut> {
+        match self {
+            Self::Started => None,
+            Self::Done => Some(aterm_slog::StepOut::Ok),
+            Self::Failed => Some(aterm_slog::StepOut::Error),
+            Self::Interrupted => Some(aterm_slog::StepOut::Interrupted),
+        }
+    }
+}
+
+/// A CONVERSATION RECORD (`turn`, `tool`, `subagent`, `msg`, `diff`), as [`SessionTimeline::
+/// publish_stream_conversation`] takes it: the fields its row is written from, under no wire
+/// type. Content (a message's text, a patch, a tool's text, a subagent's title) is no field of a
+/// row: it reaches the tab only through the Out ring ([`Self::spills`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream reads a record into one"
+    )
+)]
+pub(crate) enum StreamConversation {
+    /// `turn`: the harness's turn `turn`, where it is, and who opened it (its wire word:
+    /// `person`, `ctl`, `harness`, `agent` or `peer:<tab>`).
+    Turn {
+        turn: u64,
+        state: StreamedTurn,
+        by: Option<String>,
+    },
+    /// `tool`: the call `id` of the tool `name`, where it is, and whether it names its text.
+    Tool {
+        id: String,
+        name: String,
+        state: StreamedStep,
+        text: bool,
+    },
+    /// `subagent`: the subagent `id`, where it is, and whether it names its title.
+    Subagent {
+        id: String,
+        state: StreamedStep,
+        titled: bool,
+    },
+    /// `msg`: a message; its text is the Out ring's.
+    Msg,
+    /// `diff`: a patch; it is the Out ring's.
+    Diff,
+}
+
+impl StreamConversation {
+    /// The record's kind, by its wire word, as [`StreamState::applied`] names it.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix control stream reads it")
+    )]
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Turn { .. } => TURN_KIND,
+            Self::Tool { .. } => TOOL_KIND,
+            Self::Subagent { .. } => SUBAGENT_KIND,
+            Self::Msg => MSG_KIND,
+            Self::Diff => DIFF_KIND,
+        }
+    }
+
+    /// WHETHER THE RECORD IS LONGER THAN ONE LOG RECORD (HX-15h), so its line goes to the tab's
+    /// Out ring behind its row, which then carries `fp=`: `line_len` is its line as the wire
+    /// codec writes it. A `msg` or `diff` always is (its body is the Out ring's). Any other is
+    /// when its line is over one log record's 512 bytes ([`aterm_slog::MAX_RECORD_BYTES`]), or
+    /// when its row cannot carry it whole: it names content no row carries (a `tool`'s text, a
+    /// `subagent`'s title), or a field its row writes does not fit that row's key (a call or
+    /// subagent `id` that is no log ID, a tool `name` over `tool=`'s 64 bytes or holding
+    /// characters the log drops, a peer's tab over `as=`'s 40). A log record's other bound, 12
+    /// fields, decides nothing here: no record of these kinds has more than 12 (a `tool`, the
+    /// most, has eight) and no row written for one more than seven. One rule for every kind, so
+    /// a later kind's row reuses it.
+    pub(crate) fn spills(&self, line_len: usize) -> bool {
+        use aterm_slog::{BoundedText, Key, ShortId};
+        let fits = |key: Key, raw: &str| {
+            BoundedText::new(key, raw).is_some_and(|kept| kept.as_str() == raw)
+        };
+        if line_len > aterm_slog::MAX_RECORD_BYTES {
+            return true;
+        }
+        match self {
+            Self::Msg | Self::Diff => true,
+            Self::Turn { by, .. } => by
+                .as_deref()
+                .and_then(|by| by.strip_prefix("peer:"))
+                .is_some_and(|tab| !fits(Key::As, tab)),
+            Self::Tool { id, name, text, .. } => {
+                *text || ShortId::new(id).is_none() || !fits(Key::Tool, name)
+            }
+            Self::Subagent { id, titled, .. } => *titled || ShortId::new(id).is_none(),
+        }
+    }
+}
+
+/// What the Out ring keeps of a record longer than one log record: its digest (`fp=` on its
+/// row) and its line, escaped (`crate::out_ring`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "only the Unix control stream makes one")
+)]
+pub(crate) struct OutSpill {
+    pub(crate) fp: String,
+    pub(crate) body: String,
+}
+
+/// A conversation kind the claim's stream feeds (`turn`, `tool`), by the epoch whose stream
+/// applied it and the last record's `seq`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamFeed {
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+}
+
+/// THE OPEN SUBAGENTS, from the `subagent` records the claim's stream applied, each by its id
+/// and the step its record opened: a `started` adds it (one already open adds nothing), a `done`,
+/// `failed` or `interrupted` takes it away, and so does its step's close by any other source (its
+/// turn's close ends it `out=gone`): the log's open steps are the one truth, and an id whose step
+/// closed counts nothing ([`SessionTimeline::open_subagents`]) and leaves at the next record. The
+/// navigator's use of the number is ST-04's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamSubagents {
+    pub(crate) ids: std::collections::BTreeMap<String, aterm_slog::Node>,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+}
+
+/// How [`SessionTimeline::publish_stream_conversation`] took a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "only the Unix control stream applies a record")
+)]
+pub(crate) enum ConversationTaken {
+    /// Applied: its rows are written (or it repeated what stands and wrote none).
+    Applied,
+    /// Not applied, for the word that follows `refused:` in its acknowledgement: `log` (the
+    /// log refused its row) or `steps` (as many of its kind's steps are open as the log keeps
+    /// for the stream).
+    Refused(&'static str),
 }
 
 /// THE `model` RECORD the claim's stream last applied, kept in the current-state record while
@@ -4971,6 +5580,38 @@ pub(crate) struct StreamModel {
     /// The models on offer, each with its effort levels.
     pub(crate) offers: Vec<(String, Vec<String>)>,
     pub(crate) permission: Option<String>,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+    /// The record as the wire codec writes it, kept as text.
+    pub(crate) line: String,
+}
+
+/// THE `session` RECORD a claimant's stream last applied (HX-15f), kept in the current-state
+/// record as text and never in the session's log, so no log retention drops it (D31): who the
+/// harness says it is, the arguments that resume its conversation, the account it says it ran
+/// on, and the kinds of aterm's records it takes ([`SessionTimeline::session_takes`]). It is its
+/// claimant's and outlives the claim: aterm's harness watchdog relaunches the tab from it once
+/// the harness is gone (`crate::harness_watchdog`), and the next claimant's `session` replaces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamSession {
+    /// The claimant (pid and kernel start) whose stream sent it.
+    pub(crate) proven: crate::harness_claim::Proven,
+    /// The agent word.
+    pub(crate) agent: String,
+    /// The harness's version, as it states it (`supervisor_version=` reads the verified one, D7).
+    pub(crate) version: String,
+    /// The vendor CLI's version, as it states it.
+    pub(crate) vendor: Option<String>,
+    /// The account label it says the child runs on: kept, and never typed (a relaunch's account is
+    /// the claim's `login=`, D21).
+    pub(crate) account: Option<String>,
+    /// The vendor's arguments that resume the conversation: a relaunch types them after `--`.
+    /// None names no conversation to resume: the relaunch reads the kept child's snapshot.
+    pub(crate) resume: Vec<String>,
+    /// The directory the conversation runs in, as it states it: the relaunch `cd`s back to it.
+    pub(crate) cwd: Option<String>,
+    /// The kinds of aterm's records it takes, by their wire words.
+    pub(crate) takes: Vec<&'static str>,
     pub(crate) epoch: String,
     pub(crate) hseq: u64,
     /// The record as the wire codec writes it, kept as text.
@@ -5094,8 +5735,49 @@ pub(crate) struct StreamKinds {
     pub(crate) progress: Option<StreamProgress>,
     pub(crate) goal: Option<StreamGoal>,
     pub(crate) compact: Option<StreamCompact>,
+    /// `turn`, while the stream feeds it: the turn tracker takes turns from the stream alone.
+    pub(crate) turn: Option<StreamFeed>,
+    /// `tool`, while the stream feeds it: the transcript feeders open no tool step.
+    pub(crate) tool: Option<StreamFeed>,
+    /// `subagent`, while the stream feeds it, with the subagents open: the transcript feeders
+    /// open no subagent step.
+    pub(crate) subagent: Option<StreamSubagents>,
     pub(crate) model: Option<StreamModel>,
     pub(crate) upgrade: Option<StreamUpgrade>,
+    /// The latest `session` record, kept whoever's claim stands ([`StreamSession`]).
+    pub(crate) session: Option<StreamSession>,
+    /// `ask`, while the stream feeds it (D13, D29): the newest applied ask's kind, which
+    /// `asking` reads, and which of the prompt and question parsers stand down.
+    pub(crate) ask: Option<StreamAskFeed>,
+    /// `wall`, while the stream feeds it: the newest applied wall's kind, which `walled` reads;
+    /// the wall readers stand down.
+    pub(crate) wall: Option<StreamWallFeed>,
+}
+
+/// The `ask` kind as the claim's stream feeds it ([`StreamKinds::ask`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamAskFeed {
+    /// What the newest applied `ask` asked for.
+    pub(crate) kind: StreamedAsk,
+    /// The claim holds `approvals`: the prompt parser stands down.
+    pub(crate) approvals: bool,
+    /// The claim holds `questions`: the question parser stands down.
+    pub(crate) questions: bool,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+}
+
+/// The `wall` kind as the claim's stream feeds it ([`StreamKinds::wall`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamWallFeed {
+    /// The newest applied `wall`'s kind, `None` for one aterm does not know.
+    pub(crate) kind: Option<aterm_slog::WallKind>,
+    /// That wall stands: the stream has not said it passed (a `state` that is not `walled`, a
+    /// `turn` that starts). Only a standing wall names the kind `walled` reads; a later
+    /// `walled` with no new `wall` record reads the screen's kind again, never the old one.
+    pub(crate) stands: bool,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
 }
 
 impl StreamKinds {
@@ -5141,6 +5823,48 @@ pub(crate) struct AgentPublication {
     /// The other kinds the claim's stream feeds: `usage`, `account` (its kept line), `progress`,
     /// `goal` and `compact`.
     pub(crate) streamed: StreamKinds,
+    /// What aterm's harness watchdog reads of the claimant itself, over the stream's state and
+    /// the screen's ([`SessionTimeline::set_watched`]): its beats missed or its stream closed
+    /// inside the re-exec grace (`unknown`), or the kernel's report that it is stopped
+    /// (`stopped`). It stands only under its own claimant's live claim
+    /// ([`SessionTimeline::settle_stream_claim`]).
+    pub(crate) watched: Option<WatchedClaimant>,
+}
+
+/// What aterm's harness watchdog reads of a claimant ([`AgentPublication::watched`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Watched {
+    /// No `beat` for `BEATS_MISSED × BEAT_EVERY` of awake time while its stream is open.
+    Missed,
+    /// Its stream closed and its claim is kept through the re-exec grace.
+    Closed,
+    /// The kernel reports the claimant stopped: never restarted for its missed beats.
+    Stopped,
+    /// THE PROGRESS WATCH (HX-15i1): its beats come, but an `ask` stands open
+    /// `restart_act::GRACE` past the time its record said the harness would answer it, or an
+    /// open turn has had no progress for `stall_term_after_s`.
+    Stalled,
+}
+
+impl Watched {
+    /// The agent word it publishes: `unknown` (aterm cannot say what the harness does),
+    /// `stopped`, or `wall:unresponsive` for a stalled agent (the input stall's word, whose step
+    /// raises the need `unresponsive`).
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Missed | Self::Closed => "unknown",
+            Self::Stopped => "stopped",
+            Self::Stalled => "wall:unresponsive",
+        }
+    }
+}
+
+/// [`Watched`], of one claimant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WatchedClaimant {
+    pub(crate) watched: Watched,
+    /// The claimant it was read of (pid and kernel start).
+    pub(crate) proven: crate::harness_claim::Proven,
 }
 
 /// What the program in front last said about itself ([`SessionTimeline::note_program_state`]).
@@ -5225,6 +5949,18 @@ impl GridRead {
     }
 }
 
+/// What decided the published agent word ([`AgentPublication::effective`]), so its log row
+/// names its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decided {
+    /// The screen reader, or aterm's input-stall watch over it.
+    Screen,
+    /// The claim's stream's `state`.
+    Stream,
+    /// aterm's harness watchdog ([`AgentPublication::watched`]).
+    Watchdog,
+}
+
 /// Which screen an agent verdict was read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AgentStamp {
@@ -5257,6 +5993,7 @@ impl Default for AgentPublication {
             screen_composer: aterm_messages::presence::ComposerState::Unknown,
             stream: None,
             streamed: StreamKinds::default(),
+            watched: None,
         }
     }
 }
@@ -5278,22 +6015,55 @@ impl AgentPublication {
         }
     }
 
-    /// The word and detail to publish, and whether the stream's `state` decided them. aterm's
-    /// own input-stall watch comes first, then the stream's state, then the screen.
-    fn effective(&self) -> (&'static str, Option<String>, bool) {
-        match (&self.input, &self.stream) {
-            (Some(stall), _) if self.reader.is_some() => (
+    /// The word and detail to publish, and what decided them. aterm's own input-stall watch
+    /// comes first, then its harness watchdog's reading of the claimant, then the stream's
+    /// state, then the screen.
+    fn effective(&self) -> (&'static str, Option<String>, Decided) {
+        match (&self.input, &self.watched, &self.stream) {
+            (Some(stall), _, _) if self.reader.is_some() => (
                 "wall:unresponsive",
                 stall.stopped.then(|| "stopped".to_string()),
-                false,
+                Decided::Screen,
             ),
-            (_, Some(fed)) => {
-                let (word, detail) = fed
-                    .state
-                    .reads(self.screen_word, self.screen_detail.as_ref());
-                (word, detail, true)
+            (_, Some(watched), _) => (watched.watched.word(), None, Decided::Watchdog),
+            (_, _, Some(fed)) => {
+                let (word, detail) = fed.state.reads(
+                    // The newest ask's kind only while the claim still feeds that kind: else the
+                    // screen's (HX-15i1 review).
+                    self.streamed
+                        .ask
+                        .as_ref()
+                        .filter(|ask| match ask.kind {
+                            StreamedAsk::Approval => ask.approvals,
+                            StreamedAsk::Question => ask.questions,
+                        })
+                        .map(|ask| ask.kind),
+                    self.streamed
+                        .wall
+                        .as_ref()
+                        .filter(|wall| wall.stands)
+                        .map(|wall| wall.kind),
+                    self.screen_word,
+                    self.screen_detail.as_ref(),
+                );
+                (word, detail, Decided::Stream)
             }
-            _ => (self.screen_word, self.screen_detail.clone(), false),
+            _ => match self.streamed.wall.as_ref().filter(|wall| wall.stands) {
+                // The stream's standing wall names the kind of a wall the screen reads (D13): the
+                // wall readers stand down for it (HX-15i1 review).
+                Some(wall) if screen_wall(self.screen_word) => {
+                    let word = wall.kind.map_or("wall", aterm_slog::WallKind::wire);
+                    let detail = (word == self.screen_word)
+                        .then(|| self.screen_detail.clone())
+                        .flatten();
+                    (word, detail, Decided::Screen)
+                }
+                _ => (
+                    self.screen_word,
+                    self.screen_detail.clone(),
+                    Decided::Screen,
+                ),
+            },
         }
     }
 
@@ -5650,7 +6420,8 @@ impl SessionTimeline {
     pub(crate) fn settle_stream_claim(&mut self, meta: &SessionMeta) -> bool {
         #[cfg(unix)]
         self.settle_stream_binding(meta);
-        self.settle_stream_kinds(meta);
+        let kinds_moved = self.settle_stream_kinds(meta);
+        self.settle_watched(meta);
         // A placement that moved the claim's grant or revision under its open stream owes it a
         // `policy` record ([`SessionMeta::set_supervisor`]): the stream looks.
         if meta.stream.as_ref().is_some_and(|stream| stream.policy_due) {
@@ -5666,8 +6437,35 @@ impl SessionTimeline {
         });
         if ended {
             self.end_stream_state();
+        } else if kinds_moved {
+            // The kinds `asking` and `walled` read, and the readers given back, settle with the
+            // word (HX-15i1).
+            let old_word = self.agent.word;
+            if self.settle_agent_word(false) {
+                self.ring();
+            }
+            if self.agent.word != old_word {
+                crate::harness_host::ring_phase();
+            }
         }
         ended
+    }
+
+    /// [`Self::settle_stream_claim`] for the watchdog's reading of the claimant
+    /// ([`AgentPublication::watched`]): it stands only while its claimant holds the live claim,
+    /// and the reading of a closed stream (`Closed`) only while that claim is kept through the
+    /// re-exec grace. A released, lapsed or replaced claim, and one its claimant placed again
+    /// (no grace any more), hand the word back to the stream's state or the screen.
+    fn settle_watched(&mut self, meta: &SessionMeta) {
+        let now = crate::metrics::now_us();
+        let stands = self.agent.watched.as_ref().is_none_or(|watched| {
+            meta.live_scoped(now)
+                .is_some_and(|scoped| scoped.proven == watched.proven)
+                && (watched.watched != Watched::Closed || meta.supervisor_expiry().is_some())
+        });
+        if !stands {
+            let _ = self.set_watched(None);
+        }
     }
 
     /// [`Self::settle_stream_claim`] for the kinds beside `state`: each stands only under its
@@ -5683,8 +6481,8 @@ impl SessionTimeline {
     /// stream sends a record for the account the claim now names.
     ///
     /// A `compact` step the stream opened and did not close ends with the feed
-    /// ([`crate::session_log::SessionLog::end_stream_compact`]).
-    fn settle_stream_kinds(&mut self, meta: &SessionMeta) {
+    /// ([`crate::session_log::SessionLog::end_stream_compact`]). Whether any kind moved.
+    fn settle_stream_kinds(&mut self, meta: &SessionMeta) -> bool {
         use aterm_agent::harness::contract::Scope;
         let now = crate::metrics::now_us();
         let feeds =
@@ -5711,6 +6509,15 @@ impl SessionTimeline {
         kinds
             .compact
             .take_if(|fed| !feeds(COMPACT_KIND, Scope::State, &fed.epoch));
+        kinds
+            .turn
+            .take_if(|fed| !feeds(TURN_KIND, Scope::State, &fed.epoch));
+        kinds
+            .tool
+            .take_if(|fed| !feeds(TOOL_KIND, Scope::State, &fed.epoch));
+        kinds
+            .subagent
+            .take_if(|fed| !feeds(SUBAGENT_KIND, Scope::State, &fed.epoch));
         // `model` and `upgrade` need no scope beyond the open stream.
         kinds
             .model
@@ -5718,8 +6525,18 @@ impl SessionTimeline {
         kinds
             .upgrade
             .take_if(|fed| !meta.stream_applied_under(UPGRADE_KIND, &[], &fed.epoch, now));
+        // `ask` stands each parser down while the claim holds that parser's own scope.
+        if let Some(ask) = kinds.ask.as_mut() {
+            ask.approvals = feeds(ASK_KIND, Scope::Approvals, &ask.epoch);
+            ask.questions = feeds(ASK_KIND, Scope::Questions, &ask.epoch);
+        }
+        kinds.ask.take_if(|fed| !fed.approvals && !fed.questions);
+        kinds
+            .wall
+            .take_if(|fed| !feeds(WALL_KIND, Scope::Walls, &fed.epoch));
         let compact_ended = before.compact.is_some() && kinds.compact.is_none();
-        if *kinds != before {
+        let moved = *kinds != before;
+        if moved {
             self.settle_stream_down();
         }
         if compact_ended {
@@ -5729,6 +6546,7 @@ impl SessionTimeline {
             }
         }
         self.settle_stream_needs(meta);
+        moved
     }
 
     /// [`Self::settle_stream_claim`] for the needs the stream raised ([`Self::stream_needs`]): a
@@ -5774,7 +6592,8 @@ impl SessionTimeline {
 
     /// Tell the session log which of its built-in writers the stream stands down: the usage
     /// tap's mark and the context-left mark under `usage`, the goal edge under `goal`, the
-    /// transcript's compact step under `compact`. Each stands down by kind, not by the parts
+    /// transcript's compact step under `compact`, the prompt and question parsers under `ask`
+    /// (each by its own scope) and the wall readers under `wall`. Each stands down by kind, not by the parts
     /// the latest record states (D29): a `usage` record with no `context_left` still stands the
     /// context-left mark down, so the kind never has two writers.
     fn settle_stream_down(&mut self) {
@@ -5783,6 +6602,12 @@ impl SessionTimeline {
             usage: kinds.usage.is_some(),
             goal: kinds.goal.is_some(),
             compact: kinds.compact.is_some(),
+            turn: kinds.turn.is_some(),
+            tool: kinds.tool.is_some(),
+            subagent: kinds.subagent.is_some(),
+            approvals: kinds.ask.as_ref().is_some_and(|ask| ask.approvals),
+            questions: kinds.ask.as_ref().is_some_and(|ask| ask.questions),
+            walls: kinds.wall.is_some(),
         };
         self.slog.set_stream_down(down);
     }
@@ -6153,6 +6978,90 @@ impl SessionTimeline {
     /// The server's published program and agent verdict for this session.
     pub(crate) const fn agent(&self) -> &AgentPublication {
         &self.agent
+    }
+
+    /// Identity boundary for an off-thread observation of the proven foreground's package.
+    pub(crate) const fn adoption_generation(&self) -> u64 {
+        self.foreground_generation
+    }
+
+    /// Publish a sample after the caller rechecks the live claim and captured generation.
+    /// Repeated samples refresh their time, and a changed observation rings the log once.
+    pub(crate) fn observe_codex_adoption(
+        &mut self,
+        revision: u64,
+        source: &crate::self_claim::Proven,
+        observed_pgid: i32,
+        reading: crate::codex_adoption::Reading,
+    ) -> bool {
+        if u32::try_from(observed_pgid).ok() != Some(source.pid)
+            || self.foreground_generation == u64::MAX
+        {
+            return false;
+        }
+        let sampled = self.slog.now();
+        if let Some(previous) = self.codex_adoption.as_mut()
+            && previous.revision == revision
+            && previous.generation == self.foreground_generation
+            && previous.source == *source
+            && previous.reading == reading
+        {
+            previous.sampled = sampled;
+            return false;
+        }
+        let payload = format!(
+            "{} pid={} start={} revision={} generation={}",
+            reading.fields(),
+            source.pid,
+            aterm_control::wire::pct_encode(&source.start),
+            revision,
+            self.foreground_generation
+        );
+        self.codex_adoption = Some(CodexAdoption {
+            revision,
+            generation: self.foreground_generation,
+            source: source.clone(),
+            reading,
+            sampled,
+        });
+        self.record_row(CODEX_ADOPTION, payload);
+        true
+    }
+
+    /// The most recent sample for this exact local claim and foreground stretch.
+    pub(crate) fn codex_adoption_fields(
+        &self,
+        meta: &SessionMeta,
+        now_us: u64,
+        live_pgid: i32,
+    ) -> Option<String> {
+        let source = crate::codex_adoption::claim(meta, now_us)?;
+        let observed = self.codex_adoption.as_ref()?;
+        (observed.source == *source
+            && observed.revision == meta.supervisor_revision
+            && observed.generation == self.foreground_generation
+            && u32::try_from(live_pgid).ok() == Some(source.pid))
+        .then(|| {
+            let now = self.slog.now();
+            // Wall time includes sleep; monotonic time keeps a wall-clock correction from
+            // extending an old reading. Only a new sample can refresh its boundary.
+            let age_ms = now
+                .wall_ms
+                .saturating_sub(observed.sampled.wall_ms)
+                .max(now.mono_ms.saturating_sub(observed.sampled.mono_ms));
+            let reading = if std::time::Duration::from_millis(age_ms)
+                < crate::codex_rollout_tap::REST_FAR * 2
+            {
+                observed.reading
+            } else {
+                crate::codex_adoption::Reading::default()
+            };
+            format!(
+                "{} codex_sampled_ms={}",
+                reading.fields(),
+                observed.sampled.wall_ms
+            )
+        })
     }
 
     /// The identity already published for input to this foreground group.
@@ -6662,6 +7571,21 @@ impl SessionTimeline {
     #[cfg(any(unix, test))]
     pub(crate) fn publish_stream_state(&mut self, fed: StreamFed) -> bool {
         let old_word = self.agent.word;
+        // A state that is not `walled` says the stream's wall passed (HX-15i1).
+        if fed.state != StreamedState::Walled
+            && let Some(stamp) = aterm_slog::HarnessStamp::new(&fed.holder, fed.by, Some(fed.hseq))
+        {
+            let at = self.slog.now();
+            if self.pass_stream_wall(&stamp, at) {
+                self.ring_rows();
+            }
+        }
+        // The agent is gone: no subagent of it is open.
+        if fed.state == StreamedState::Ended
+            && let Some(subagents) = self.agent.streamed.subagent.as_mut()
+        {
+            subagents.ids.clear();
+        }
         self.agent.stream = Some(fed);
         self.settle_composer();
         let changed = self.settle_agent_word(false);
@@ -6838,10 +7762,369 @@ impl SessionTimeline {
                 });
                 true
             }
+            // D31: `session` writes no log row; it is kept here, outside the log's retention.
+            StreamRecord::Session(session) => {
+                kinds.session = Some(StreamSession {
+                    epoch,
+                    hseq,
+                    ..session
+                });
+                true
+            }
         };
         self.settle_stream_down();
         self.ring_rows();
         written
+    }
+
+    /// WHETHER THE LATEST `session` RECORD OF CLAIMANT `proven` LISTS `kind` among the kinds of
+    /// aterm's records it takes (D27): `prompt`, `answer`, `touch`, `interrupt` and `set`
+    /// ([`OPTIONAL_KINDS`]) are sent to its stream only then. A harness that sent no `session`,
+    /// or whose latest `session` is another claimant's, takes none of them.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix control stream sends a record")
+    )]
+    pub(crate) fn session_takes(&self, proven: &crate::harness_claim::Proven, kind: &str) -> bool {
+        self.agent.streamed.session.as_ref().is_some_and(|session| {
+            session.proven == *proven && session.takes.iter().any(|taken| *taken == kind)
+        })
+    }
+
+    /// The latest `session` record of claimant `proven` ([`StreamSession`]), `None` where its
+    /// stream sent none or another claimant's replaced it.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix harness watchdog relaunches")
+    )]
+    pub(crate) fn session_of(
+        &self,
+        proven: &crate::harness_claim::Proven,
+    ) -> Option<&StreamSession> {
+        self.agent
+            .streamed
+            .session
+            .as_ref()
+            .filter(|session| session.proven == *proven)
+    }
+
+    /// THE STREAM'S ARM of the conversation records (HX-15h): a `turn`, `tool`, `subagent`,
+    /// `msg` or `diff` record the claim's stream applied for `claimant`, written under its kind's
+    /// own word as a harness claim, every row stamped `holder=`, `hseq=`, `src=harness`,
+    /// `conf=claim` and `by=<the tab's session>` ([`crate::session_log::conversation`]). A record
+    /// with a `spill` (a `msg`, a `diff`, any record longer than one log record:
+    /// [`StreamConversation::spills`]) carries `fp=` on its rows too, and its line goes to the
+    /// tab's Out ring ([`crate::out_ring`]), the oldest entry dropped first, where a row carrying
+    /// that `fp=` was written: a record that wrote none (a repeated `started`, an end with
+    /// nothing to end) puts nothing there.
+    ///
+    /// From the first `turn` applied the run's turn tracker takes turns from the stream alone,
+    /// and from the first `tool` or `subagent` the transcript feeders open no step of that kind,
+    /// until the claim stops feeding it ([`Self::settle_stream_claim`]). The current-state
+    /// record keeps the subagents open ([`Self::open_subagents`]).
+    ///
+    /// A record whose row the log refused, or a `started` past the bound on the stream's open
+    /// steps ([`crate::session_log::conversation::STREAM_STEPS_MAX`]), is not applied: nothing of
+    /// it is kept, and the caller acknowledges it `dropped=refused:<word>`.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix control stream applies a record")
+    )]
+    pub(crate) fn publish_stream_conversation(
+        &mut self,
+        stamp: StreamStamp,
+        record: StreamConversation,
+        spill: Option<OutSpill>,
+        claimant: &crate::harness_claim::Proven,
+    ) -> ConversationTaken {
+        const LOG: ConversationTaken = ConversationTaken::Refused("log");
+        let StreamStamp {
+            epoch,
+            hseq,
+            holder,
+            by,
+        } = stamp;
+        let stamped = aterm_slog::HarnessStamp::new(&holder, by, Some(hseq));
+        let stamped = match spill.as_ref() {
+            Some(spill) => stamped.and_then(|stamp| stamp.with_fp(&spill.fp)),
+            None => stamped,
+        };
+        let Some(stamped) = stamped else {
+            return LOG;
+        };
+        let at = self.slog.now();
+        let seq0 = self.slog.log().last_seq();
+        let taken = match &record {
+            StreamConversation::Turn { turn, state, by } => {
+                let turn = *turn;
+                let edge = match state {
+                    StreamedTurn::Started => aterm_slog::StreamTurn::Started {
+                        turn,
+                        by: by
+                            .as_deref()
+                            .map(|by| if by.starts_with("peer:") { "peer" } else { by }),
+                        peer: by.as_deref().and_then(|by| by.strip_prefix("peer:")),
+                    },
+                    StreamedTurn::Done => aterm_slog::StreamTurn::Ended {
+                        turn,
+                        out: aterm_slog::TurnOut::Done,
+                    },
+                    StreamedTurn::Failed => aterm_slog::StreamTurn::Ended {
+                        turn,
+                        out: aterm_slog::TurnOut::Error,
+                    },
+                    StreamedTurn::Interrupted => aterm_slog::StreamTurn::Ended {
+                        turn,
+                        out: aterm_slog::TurnOut::Interrupted,
+                    },
+                    // The wall's kind is the newest applied `wall` record's (HX-15i1, D13), else
+                    // a bare wall: never a kind nothing named.
+                    StreamedTurn::Walled => aterm_slog::StreamTurn::Ended {
+                        turn,
+                        out: aterm_slog::TurnOut::Wall(
+                            self.agent
+                                .streamed
+                                .wall
+                                .as_ref()
+                                .filter(|wall| wall.stands)
+                                .and_then(|wall| wall.kind),
+                        ),
+                    },
+                };
+                // A turn that starts ran past the stream's wall: it passed.
+                if *state == StreamedTurn::Started {
+                    self.pass_stream_wall(&stamped, at);
+                }
+                if self.slog.stream_turn(edge, &stamped, at) {
+                    ConversationTaken::Applied
+                } else {
+                    LOG
+                }
+            }
+            StreamConversation::Tool {
+                id, name, state, ..
+            } => {
+                self.slog
+                    .stream_step(aterm_slog::Kind::Tool, id, Some(name), *state, &stamped, at)
+            }
+            StreamConversation::Subagent { id, state, .. } => {
+                self.slog
+                    .stream_step(aterm_slog::Kind::Subagent, id, None, *state, &stamped, at)
+            }
+            StreamConversation::Msg => {
+                if self.slog.stream_out(aterm_slog::Kind::Msg, &stamped, at) {
+                    ConversationTaken::Applied
+                } else {
+                    LOG
+                }
+            }
+            StreamConversation::Diff => {
+                if self.slog.stream_out(aterm_slog::Kind::Diff, &stamped, at) {
+                    ConversationTaken::Applied
+                } else {
+                    LOG
+                }
+            }
+        };
+        if taken == ConversationTaken::Applied {
+            // The step a `subagent started` opened (or found open), by the stream's own list.
+            let step = match &record {
+                StreamConversation::Subagent { id, .. } => {
+                    self.slog.stream_step_node(aterm_slog::Kind::Subagent, id)
+                }
+                _ => None,
+            };
+            // A spill stands behind a row carrying its `fp=`: a record that wrote none (a
+            // repeat, an end with nothing to end) puts nothing in the ring.
+            let spill = spill.filter(|spill| {
+                self.slog
+                    .log()
+                    .window()
+                    .rev()
+                    .take_while(|rec| rec.seq > seq0)
+                    .any(|rec| rec.f.get_str(aterm_slog::Key::Fp) == Some(spill.fp.as_str()))
+            });
+            let log = self.slog.log();
+            let kinds = &mut self.agent.streamed;
+            let feed = || StreamFeed {
+                epoch: epoch.clone(),
+                hseq,
+            };
+            match &record {
+                StreamConversation::Turn { .. } => kinds.turn = Some(feed()),
+                StreamConversation::Tool { .. } => kinds.tool = Some(feed()),
+                StreamConversation::Subagent { id, state, .. } => {
+                    let open = kinds.subagent.get_or_insert_with(|| StreamSubagents {
+                        ids: std::collections::BTreeMap::new(),
+                        epoch: epoch.clone(),
+                        hseq,
+                    });
+                    open.epoch.clone_from(&epoch);
+                    open.hseq = hseq;
+                    open.ids.retain(|_, step| log.is_open(*step));
+                    match step.filter(|_| *state == StreamedStep::Started) {
+                        Some(step) => {
+                            open.ids.insert(id.clone(), step);
+                        }
+                        None => {
+                            open.ids.remove(id);
+                        }
+                    }
+                }
+                StreamConversation::Msg | StreamConversation::Diff => {}
+            }
+            if let Some(spill) = spill {
+                self.out.push(crate::out_ring::OutEntry {
+                    claimant: claimant.clone(),
+                    epoch,
+                    hseq,
+                    kind: record.kind(),
+                    fp: spill.fp,
+                    body: spill.body,
+                });
+            }
+        }
+        if taken == LOG {
+            // The log refused the row: the kind goes back to its built-in source, as the caller
+            // takes it out of the applied kinds.
+            let kinds = &mut self.agent.streamed;
+            match &record {
+                StreamConversation::Turn { .. } => kinds.turn = None,
+                StreamConversation::Tool { .. } => kinds.tool = None,
+                StreamConversation::Subagent { .. } => kinds.subagent = None,
+                StreamConversation::Msg | StreamConversation::Diff => {}
+            }
+        }
+        self.settle_stream_down();
+        self.ring_rows();
+        taken
+    }
+
+    /// THE STREAM SAYS ITS WALL PASSED (a `state` that is not `walled`, a `turn` that starts),
+    /// in the record of `stamp`: the wall it fed no longer names the kind `walled` reads, and the
+    /// wall step it opened closes `out=passed` ([`crate::session_log::SessionLog::
+    /// stream_wall_passed`]). Whether a step closed.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix control stream applies a record")
+    )]
+    fn pass_stream_wall(
+        &mut self,
+        stamp: &aterm_slog::HarnessStamp,
+        at: aterm_slog::Stamp,
+    ) -> bool {
+        if let Some(wall) = self.agent.streamed.wall.as_mut() {
+            wall.stands = false;
+        }
+        self.slog.stream_wall_passed(stamp, at)
+    }
+
+    /// THE STREAM'S ARM of `ask`, `asked` and `wall` (HX-15i1): an `ask` opens an approval or
+    /// question step and raises its need, an `asked` writes `mark act word= rule=asked as=` on
+    /// the ask's step and closes it, a `wall` opens a wall step of its kind, each stamped
+    /// ([`crate::session_log::SessionLog::stream_ask`], `stream_asked`, `stream_wall`). An applied
+    /// `ask` is kept as the newest ask's kind, which `asking` then reads, and stands down the
+    /// prompt parser under a claim holding `approvals` and the question parser under one holding
+    /// `questions`; an applied `wall` is kept as the newest wall's kind, which `walled` and a turn
+    /// that ends `walled` read, and stands the wall readers down (D13, D29). The stand-down comes
+    /// first, so a step the parser holds of the kind closes (`out=passed`) before the stream's
+    /// own opens: one step per box. Until the claim stops feeding the kind
+    /// ([`Self::settle_stream_claim`]).
+    ///
+    /// A record whose row the log refused, an `ask` past the bound on the stream's open steps
+    /// (`steps`), and an `asked` of an ask already answered or of another kind (`ask`) are not
+    /// applied: what the stream kept of its kind before stands (none after a refused row, as the
+    /// caller then takes the kind out of the applied set), and the caller acknowledges it
+    /// `dropped=refused:<word>`.
+    #[cfg(unix)]
+    pub(crate) fn publish_stream_asking(
+        &mut self,
+        stamp: StreamStamp,
+        record: StreamAsking,
+    ) -> ConversationTaken {
+        const LOG: ConversationTaken = ConversationTaken::Refused("log");
+        let StreamStamp {
+            epoch,
+            hseq,
+            holder,
+            by,
+        } = stamp;
+        let Some(stamped) = aterm_slog::HarnessStamp::new(&holder, by, Some(hseq)) else {
+            return LOG;
+        };
+        let at = self.slog.now();
+        let old_word = self.agent.word;
+        let taken = match record {
+            StreamAsking::Ask {
+                kind,
+                will,
+                approvals,
+                questions,
+            } => {
+                let before = self.agent.streamed.ask.replace(StreamAskFeed {
+                    kind,
+                    approvals,
+                    questions,
+                    epoch,
+                    hseq,
+                });
+                self.settle_stream_down();
+                let taken = self.slog.stream_ask(kind, will, &stamped, at);
+                if taken != ConversationTaken::Applied {
+                    self.agent.streamed.ask = if taken == LOG { None } else { before };
+                    self.settle_stream_down();
+                }
+                taken
+            }
+            StreamAsking::Asked {
+                ask,
+                kind,
+                reply,
+                by,
+            } => self.slog.stream_asked(ask, kind, reply, &by, &stamped, at),
+            StreamAsking::Wall { kind } => {
+                self.agent.streamed.wall = Some(StreamWallFeed {
+                    kind,
+                    stands: true,
+                    epoch,
+                    hseq,
+                });
+                self.settle_stream_down();
+                if self.slog.stream_wall(kind, &stamped, at) {
+                    ConversationTaken::Applied
+                } else {
+                    self.agent.streamed.wall = None;
+                    self.settle_stream_down();
+                    LOG
+                }
+            }
+        };
+        let _ = self.settle_agent_word(false);
+        if self.agent.word != old_word {
+            crate::harness_host::ring_phase();
+        }
+        self.ring_rows();
+        taken
+    }
+
+    /// THE NUMBER OF SUBAGENTS OPEN that the current-state record keeps, from the `subagent`
+    /// records of the stream that feeds the kind: each whose step the log still holds open (0
+    /// where the stream feeds no `subagent`).
+    #[cfg_attr(not(test), allow(dead_code, reason = "drawn by ST-04"))]
+    pub(crate) fn open_subagents(&self) -> usize {
+        let log = self.slog.log();
+        self.agent.streamed.subagent.as_ref().map_or(0, |open| {
+            open.ids.values().filter(|step| log.is_open(**step)).count()
+        })
+    }
+
+    /// The tab's Out ring ([`crate::out_ring`]).
+    #[cfg_attr(
+        not(any(unix, test)),
+        allow(dead_code, reason = "read by the Unix stream")
+    )]
+    pub(crate) const fn out_ring(&self) -> &crate::out_ring::OutRing {
+        &self.out
     }
 
     /// A `need` (`clear` false) or `clear` RECORD's row, `mark - need|clear word=<the need's
@@ -6995,9 +8278,41 @@ impl SessionTimeline {
         changed
     }
 
+    /// THE END OF A STAND-DOWN OF `ask` OR `wall` (HX-15i1), at a settle of the published word:
+    /// the readers the stream gave back take the box or wall the word still shows
+    /// ([`crate::session_log::SessionLog::retake_shown`]); a word that moved opened it already.
+    fn retake_shown(&mut self) {
+        if self.slog.retake_due() {
+            let at = self.slog.now();
+            if self.slog.retake_shown(at) {
+                self.ring_rows();
+            }
+        }
+    }
+
+    /// Publish (`Some`) or clear (`None`) what aterm's harness watchdog reads of the claimant
+    /// ([`AgentPublication::watched`]) and re-settle the effective word, which a move writes as
+    /// `mark agent word= src=aterm`; a move wakes the session's readers. Whether the word moved.
+    pub(crate) fn set_watched(&mut self, watched: Option<WatchedClaimant>) -> bool {
+        if self.agent.watched == watched {
+            return false;
+        }
+        let old_word = self.agent.word;
+        self.agent.watched = watched;
+        let changed = self.settle_agent_word(false);
+        if self.agent.word != old_word {
+            crate::harness_host::ring_phase();
+        }
+        if changed {
+            self.ring();
+        }
+        changed
+    }
+
     fn settle_agent_word(&mut self, regrid: bool) -> bool {
-        let (word, detail, streamed) = self.agent.effective();
+        let (word, detail, decided) = self.agent.effective();
         if self.agent.word == word && self.agent.detail == detail {
+            self.retake_shown();
             return false;
         }
         self.agent.word = word;
@@ -7016,16 +8331,21 @@ impl SessionTimeline {
             stamp: self.agent.stamp,
             reader: self.agent.reader,
             pgid: self.agent.program_pgid,
-            stream: self.agent.stream.as_ref().filter(|_| streamed).map(|fed| {
-                crate::session_log::StreamMove {
+            aterm: decided == Decided::Watchdog,
+            stream: self
+                .agent
+                .stream
+                .as_ref()
+                .filter(|_| decided == Decided::Stream)
+                .map(|fed| crate::session_log::StreamMove {
                     hseq: fed.hseq,
                     holder: &fed.holder,
                     by: fed.by,
                     agent: fed.agent,
-                }
-            }),
+                }),
         };
         let _ = self.slog.agent_moved(moved, at);
+        self.retake_shown();
         // A box the verdict closed with no answer and opened again keeps the supervisor's
         // standing ask (fix E3 review).
         self.slog.carry_escalation(at);

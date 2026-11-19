@@ -275,7 +275,100 @@ pub fn processes_keeping(
     opts: SweepOpts,
     ids: &mut crate::coalitions::CoalitionIds,
 ) -> Option<Sweep> {
+    processes_keeping_table(opts, ids).map(|(sweep, _)| sweep)
+}
+
+/// [`processes_keeping`], and the read of the whole process table the sweep made, where it made
+/// one (macOS, for [`ProcessReading::reaps_unwaited`]; [`crate::kproc::table`]): a reader of
+/// other processes' kernel records in the same reading reads them there, not from the kernel
+/// again. Off macOS the sweep reads no such table.
+#[must_use]
+pub fn processes_keeping_table(
+    opts: SweepOpts,
+    ids: &mut crate::coalitions::CoalitionIds,
+) -> Option<(Sweep, Option<crate::kproc::Table>)> {
     imp::processes(opts, ids)
+}
+
+/// `root` and every current descendant of it, at most `most` processes: `root` first, each
+/// process's children after it. On macOS each row holds what the process's own usage record gives
+/// (its start, its own and its reaped children's CPU time, its disk reads and writes, …, as a
+/// sweep's row does; every other field, its parent's among them, is the default), read by its pid,
+/// and each one's children, zombies among them, are listed by themselves (`proc_listchildpids`):
+/// no process outside the tree is read, and nothing of the `kern.proc` table, which a process in
+/// the middle of an exec holds. A process's usage is read before its children are listed and
+/// theirs after, so a child it reaps meanwhile is counted in at most one of the two. Elsewhere
+/// the rows are a [`processes`] sweep's, selected the same way. A descendant that left between
+/// its parent's listing and its own read is not in the tree.
+///
+/// `None` where no process holds `root`, a listing is refused or the sweep was cut
+/// ([`Sweep::truncated`]), a pid appears twice, the tree holds more than `most` processes, or the
+/// platform has no reader.
+#[must_use]
+pub fn process_tree(root: u32, most: usize) -> Option<Vec<ProcessReading>> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::tree(root, most)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tree_in(&processes()?, root, most)
+    }
+}
+
+/// [`process_tree`]'s walk from `root`, breadth first: `row` reads a process (`None`: no process
+/// holds the pid), and `children` lists a process's children, given how many more the tree may
+/// hold (`None`: unread, or more than that). Each process is read before its children are listed.
+fn tree_by(
+    root: u32,
+    most: usize,
+    mut row: impl FnMut(u32) -> Option<ProcessReading>,
+    mut children: impl FnMut(u32, usize) -> Option<Vec<u32>>,
+) -> Option<Vec<ProcessReading>> {
+    let mut open = std::collections::VecDeque::from([root]);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut rows = Vec::new();
+    while let Some(pid) = open.pop_front() {
+        if !seen.insert(pid) || rows.len() >= most {
+            return None;
+        }
+        let Some(reading) = row(pid) else {
+            if pid == root {
+                return None;
+            }
+            continue;
+        };
+        rows.push(reading);
+        open.extend(children(pid, most - rows.len())?);
+    }
+    Some(rows)
+}
+
+/// [`process_tree`] over an existing sweep, retaining that sweep's full process rows.
+/// A cut sweep or duplicate PID cannot establish the tree.
+#[must_use]
+pub fn tree_in(sweep: &Sweep, root: u32, most: usize) -> Option<Vec<ProcessReading>> {
+    use std::collections::BTreeMap;
+    if sweep.truncated {
+        return None;
+    }
+    let mut by_pid = BTreeMap::new();
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for process in &sweep.procs {
+        if by_pid.insert(process.pid, process).is_some() {
+            return None;
+        }
+        children.entry(process.ppid).or_default().push(process.pid);
+    }
+    tree_by(
+        root,
+        most,
+        |pid| by_pid.get(&pid).map(|process| (*process).clone()),
+        |pid, more| {
+            let kids = children.get(&pid).map_or(&[][..], Vec::as_slice);
+            (kids.len() <= more).then(|| kids.to_vec())
+        },
+    )
 }
 
 /// `pid`'s pid version (`p_idversion`, `PROC_PIDUNIQIDENTIFIERINFO`, which any process may read
@@ -567,9 +660,8 @@ pub(crate) mod imp {
         fn image_name(&self, pid: c_int) -> Option<Vec<u8>>;
         /// `pid`'s kernel record ([`crate::jobs::macos_kinfo`]).
         fn kinfo(&self, pid: c_int) -> Option<Kinfo>;
-        /// The whole table's `(pid, ppid, reaps unwaited)` rows
-        /// ([`crate::kproc::reaps_unwaited_all`]).
-        fn unwaited(&self) -> Option<Vec<(u32, u32, bool)>>;
+        /// One read of the whole table ([`crate::kproc::table`]).
+        fn table(&self) -> Option<crate::kproc::Table>;
         /// This process's effective uid (`geteuid`), the one the kernel compares a target's with
         /// before it answers that target's usage.
         fn own_uid(&self) -> u32;
@@ -631,8 +723,8 @@ pub(crate) mod imp {
             crate::jobs::macos_kinfo(pid)
         }
 
-        fn unwaited(&self) -> Option<Vec<(u32, u32, bool)>> {
-            crate::kproc::reaps_unwaited_all()
+        fn table(&self) -> Option<crate::kproc::Table> {
+            crate::kproc::table()
         }
 
         fn own_uid(&self) -> u32 {
@@ -813,16 +905,101 @@ pub(crate) mod imp {
     pub(super) fn processes(
         opts: SweepOpts,
         ids: &mut crate::coalitions::CoalitionIds,
-    ) -> Option<Sweep> {
+    ) -> Option<(Sweep, Option<crate::kproc::Table>)> {
         sweep(&Native, opts, ids)
     }
 
-    /// The sweep ([`super::processes_keeping`]), each of its kernel reads made through `kernel`.
+    /// [`super::process_tree`] on macOS: each process's usage read by its pid
+    /// ([`rusage_result`]; one the kernel refuses keeps its row with its counters unread, and one
+    /// no process holds is not in the tree) and each one's children listed by themselves
+    /// ([`children`]).
+    pub(super) fn tree(root: u32, most: usize) -> Option<Vec<ProcessReading>> {
+        let (numer, denom) = timebase();
+        super::tree_by(
+            root,
+            most,
+            |pid| {
+                let native = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
+                match rusage_result(native) {
+                    Err(libc::ESRCH) => None,
+                    read => Some(usage_row(pid, read.ok().as_ref(), numer, denom)),
+                }
+            },
+            |pid, more| children(c_int::try_from(pid).ok()?, more),
+        )
+    }
+
+    unsafe extern "C" {
+        /// libproc's `proc_listchildpids` (`libproc.h`): `ppid`'s children into `buffer`, how
+        /// many.
+        pub(crate) fn proc_listchildpids(
+            ppid: c_int,
+            buffer: *mut std::ffi::c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+
+    /// The slots [`children`] lists into first.
+    const CHILD_ROOM: usize = 64;
+
+    /// `pid`'s children, zombies among them, in the kernel's order (`proc_listchildpids`, which
+    /// compares each process's parent under the kernel's process-list lock and reads nothing of
+    /// the `kern.proc` table): `None` where refused, or where it has more than `most`. The list
+    /// starts at [`CHILD_ROOM`] slots and grows as far as `most` needs.
+    pub(crate) fn children(pid: c_int, most: usize) -> Option<Vec<u32>> {
+        children_by(most, |kids| {
+            let size = c_int::try_from(std::mem::size_of_val(kids)).ok()?;
+            crate::lane::mark("proc_listchildpids", u32::try_from(pid).ok());
+            // SAFETY: `kids` is `size` writable bytes of pid slots; libproc writes at most that
+            // many and answers how many pids it wrote, or -1. `__error` is this thread's errno
+            // slot, cleared before the call and read with its answer.
+            let (listed, errno) = unsafe {
+                *libc::__error() = 0;
+                let listed = proc_listchildpids(pid, kids.as_mut_ptr().cast(), size);
+                (listed, *libc::__error())
+            };
+            // libproc answers 0 both for no children and for a refusal, which alone sets errno.
+            usize::try_from(listed)
+                .ok()
+                .filter(|n| *n > 0 || errno == 0)
+        })
+    }
+
+    /// [`children`] over its kernel call: `list` fills the pid slots it is given and answers how
+    /// many it filled (`None`: refused). A list that fills every slot may have been cut, so it is
+    /// made again with four times the slots, as far as one past `most`; one that fills those too
+    /// holds more than `most`.
+    pub(super) fn children_by(
+        most: usize,
+        mut list: impl FnMut(&mut [libc::pid_t]) -> Option<usize>,
+    ) -> Option<Vec<u32>> {
+        let mut room = most.saturating_add(1).min(CHILD_ROOM);
+        loop {
+            let mut kids = vec![0 as libc::pid_t; room];
+            let listed = list(&mut kids)?;
+            if listed < room {
+                return Some(
+                    kids[..listed]
+                        .iter()
+                        .filter_map(|kid| u32::try_from(*kid).ok())
+                        .filter(|kid| *kid > 0)
+                        .collect(),
+                );
+            }
+            if room > most {
+                return None;
+            }
+            room = room.saturating_mul(4).min(most.saturating_add(1));
+        }
+    }
+
+    /// The sweep and the table it read ([`super::processes_keeping_table`]), each of its kernel
+    /// reads made through `kernel`.
     pub(super) fn sweep(
         kernel: &impl Reads,
         opts: SweepOpts,
         ids: &mut crate::coalitions::CoalitionIds,
-    ) -> Option<Sweep> {
+    ) -> Option<(Sweep, Option<crate::kproc::Table>)> {
         let mut pids = kernel.pids()?;
         let truncated = pids.len() > MAX_PROCESSES;
         pids.truncate(MAX_PROCESSES);
@@ -1029,8 +1206,8 @@ pub(crate) mod imp {
             });
         }
         ids.end_sweep();
-        read_unwaited(kernel, &mut procs);
-        Some(Sweep { procs, truncated })
+        let table = read_unwaited(kernel, &mut procs);
+        Some((Sweep { procs, truncated }, table))
     }
 
     /// Past this many processes to read [`ProcessReading::reaps_unwaited`] of, one read of the
@@ -1046,11 +1223,19 @@ pub(crate) mod imp {
     /// more than [`UNWAITED_AT_ONCE`]; one whose record names another parent is a new process at
     /// the pid and stays unread. Where the table was wanted and not read, every one stays unread:
     /// a table the kernel did not answer in time ([`crate::kproc::records`]) waits on a process
-    /// in the middle of an exec, and its own `kinfo_proc` would wait on it too.
-    fn read_unwaited(kernel: &impl Reads, procs: &mut [ProcessReading]) {
+    /// in the middle of an exec, and its own `kinfo_proc` would wait on it too. The table it read,
+    /// where it read one.
+    fn read_unwaited(
+        kernel: &impl Reads,
+        procs: &mut [ProcessReading],
+    ) -> Option<crate::kproc::Table> {
+        let mut read = None;
         read_unwaited_by(
             procs,
-            || kernel.unwaited(),
+            || {
+                read = kernel.table();
+                read.as_ref()?.reaps_unwaited()
+            },
             |pid| {
                 c_int::try_from(pid)
                     .ok()
@@ -1058,6 +1243,7 @@ pub(crate) mod imp {
                     .map(|k| (k.ppid, k.reaps_unwaited))
             },
         );
+        read
     }
 
     /// [`read_unwaited`] by `table`, the whole table's `(pid, ppid, reaps unwaited)` rows, and
@@ -1077,7 +1263,7 @@ pub(crate) mod imp {
             table().map(|all| {
                 all.into_iter()
                     .map(|(pid, ppid, flag)| (pid, (ppid, flag)))
-                    .collect::<std::collections::HashMap<u32, (u32, bool)>>()
+                    .collect::<aterm_hash::FxHashMap<u32, (u32, bool)>>()
             })
         });
         for i in wanted {
@@ -1099,14 +1285,14 @@ mod imp {
     pub(super) fn processes(
         _opts: super::SweepOpts,
         _ids: &mut crate::coalitions::CoalitionIds,
-    ) -> Option<super::Sweep> {
+    ) -> Option<(super::Sweep, Option<crate::kproc::Table>)> {
         // SAFETY: `sysconf` reads a constant.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         let hz = u64::try_from(hz).ok().filter(|h| *h > 0).unwrap_or(100);
         // SAFETY: as above.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = u64::try_from(page).ok().filter(|p| *p > 0).unwrap_or(4096);
-        crate::linux::Root::system().processes(hz, page)
+        Some((crate::linux::Root::system().processes(hz, page)?, None))
     }
 }
 
@@ -1115,8 +1301,8 @@ mod imp {
     pub(super) fn processes(
         _opts: super::SweepOpts,
         _ids: &mut crate::coalitions::CoalitionIds,
-    ) -> Option<super::Sweep> {
-        crate::win::processes()
+    ) -> Option<(super::Sweep, Option<crate::kproc::Table>)> {
+        Some((crate::win::processes()?, None))
     }
 }
 
@@ -1129,7 +1315,7 @@ mod imp {
     pub(super) fn processes(
         _opts: super::SweepOpts,
         _ids: &mut crate::coalitions::CoalitionIds,
-    ) -> Option<super::Sweep> {
+    ) -> Option<(super::Sweep, Option<crate::kproc::Table>)> {
         None
     }
 }

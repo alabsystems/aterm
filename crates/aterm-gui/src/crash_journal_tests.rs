@@ -278,6 +278,7 @@ fn only_an_agent_with_a_conversation_is_resumed_and_only_when_relaunching() {
         cwd: "/work/c".into(),
         version: None,
         run: Some(restore::RunRestore::Codex(restore::CodexRestore {
+            selected_default: false,
             home: "/h/.codex".into(),
             home_env: None,
             embedded: true,
@@ -1594,6 +1595,7 @@ fn a_parents_leaf_of_an_agent_with_no_lane_is_no_agent_a_status_read_names() {
     }
     let codex = restore::AgentRestore {
         run: Some(restore::RunRestore::Codex(restore::CodexRestore {
+            selected_default: false,
             home: "/h/.codex".into(),
             home_env: None,
             embedded: false,

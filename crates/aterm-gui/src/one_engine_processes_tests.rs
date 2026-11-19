@@ -808,7 +808,7 @@ fn one_engine_processes_live_reader_feeds_the_stand_ins_group_and_ceiling() {
     }
     let mut reader = Reader::new(Arc::default());
     reader.procs = ProcsRead::lane(HANG);
-    reader.split.probe.sweep = aterm_sysprobe::processes_keeping;
+    reader.split.probe.sweep = aterm_sysprobe::processes_keeping_table;
     reader.memory_probes = memory::Probes {
         roots: live_roots,
         ..memory::Probes::NATIVE

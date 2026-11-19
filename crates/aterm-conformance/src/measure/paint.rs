@@ -215,10 +215,6 @@ pub enum Reach {
     /// The `rainbow` theme's body, its band behind the typed words (aterm-effects `TALL_UP_CH`
     /// above its spine, `TALL_CORE_CH` of it at full strength).
     Tall,
-    /// The underline body (aterm-effects `UNDERLINE_UP_CH` above its spine, `LEAD_CH` at full
-    /// strength and the rest a wash at `SHOULDER_UNDERLINE`). No style lays it now; the scanner
-    /// keeps its bounds while the engine keeps the body.
-    Underline,
 }
 
 impl Reach {
@@ -227,7 +223,6 @@ impl Reach {
     pub const fn bounds(self) -> (usize, usize) {
         match self {
             Self::Tall => (TALL_REACH_MIN_PCT, TALL_REACH_MAX_PCT),
-            Self::Underline => (UNDERLINE_REACH_MIN_PCT, UNDERLINE_REACH_MAX_PCT),
         }
     }
 
@@ -235,7 +230,6 @@ impl Reach {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Tall => "tall",
-            Self::Underline => "underline",
         }
     }
 
@@ -244,7 +238,6 @@ impl Reach {
     pub const fn laid_by(self, style: Style) -> bool {
         match self {
             Self::Tall => matches!(style, Style::Default | Style::Rainbow),
-            Self::Underline => false,
         }
     }
 
@@ -262,11 +255,6 @@ impl Reach {
 pub const TALL_REACH_MIN_PCT: usize = 55;
 /// The greatest.
 pub const TALL_REACH_MAX_PCT: usize = 100;
-/// The underline profile reaches 0.20 cell above the spine; the pixel scanner sees its
-/// bright center rather than the translucent outer wash, usually 1–2 px in a 14 px row.
-pub const UNDERLINE_REACH_MIN_PCT: usize = 5;
-/// Allow the rasterized bright band up to 0.30 cell above the row edge.
-pub const UNDERLINE_REACH_MAX_PCT: usize = 30;
 
 /// The fewest measured frames a reach verdict is decided on.
 pub const REACH_MIN_FRAMES: usize = 6;

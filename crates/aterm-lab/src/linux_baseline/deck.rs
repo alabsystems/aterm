@@ -144,6 +144,8 @@ fn drive(
             results: results.to_path_buf(),
             rec: Recording::default(),
             roles: Vec::new(),
+            dock: Default::default(),
+            hostname: String::new(),
             end_terminal: None,
             marks: Vec::new(),
         };

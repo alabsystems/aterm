@@ -1210,15 +1210,28 @@ mod world {
             })
         }
 
-        fn unwaited(&self) -> Option<Vec<(u32, u32, bool)>> {
-            let inner = self.read("unwaited", 0);
-            Some(
-                inner
-                    .procs
-                    .keys()
-                    .map(|pid| (pid.unsigned_abs(), 1, false))
-                    .collect(),
-            )
+        fn table(&self) -> Option<crate::kproc::Table> {
+            let inner = self.read("table", 0);
+            let rows: Vec<(crate::kproc::Record, bool)> = inner
+                .procs
+                .iter()
+                .map(|(pid, p)| {
+                    let record = crate::kproc::Record {
+                        pid: pid.unsigned_abs(),
+                        ppid: 1,
+                        pgid: p.pgid,
+                        tpgid: 0,
+                        tty: None,
+                        uid: p.uid,
+                        comm: String::from_utf8_lossy(cut(&p.program, 16)).into_owned(),
+                        start_s: p.start,
+                        start_us: 0,
+                        zombie: p.zombie,
+                    };
+                    (record, false)
+                })
+                .collect();
+            Some(crate::kproc::Table::of_records(&rows))
         }
 
         fn own_uid(&self) -> u32 {
@@ -1240,6 +1253,7 @@ fn swept(world: &world::World, ids: &mut crate::coalitions::CoalitionIds) -> Vec
     };
     imp::sweep(world, opts, ids)
         .expect("a sweep")
+        .0
         .procs
         .into_iter()
         .map(|p| ProcessReading { read_at: None, ..p })
@@ -2321,6 +2335,7 @@ fn a_sweep_reads_scheduling_only_when_asked() {
             &mut crate::coalitions::CoalitionIds::default(),
         )
         .expect("a sweep")
+        .0
         .procs;
         let reads = world.take_reads();
         let count = |kind: &str| {
@@ -2347,5 +2362,267 @@ fn a_sweep_reads_scheduling_only_when_asked() {
     assert_eq!(
         usage, asked_usage,
         "the usage reads are the same either way"
+    );
+}
+
+/// THE TREE WALK READS A PROCESS BEFORE IT LISTS ITS CHILDREN, AND TAKES ONLY WHAT IS THERE
+/// (`tree_by`): root 10's children 11 and 12, 11's child 13, and 12 gone by its read give 10, 11
+/// and 13, each process read before its children are listed, so a child its parent reaps between
+/// the two is counted in at most one; a tree of exactly `most` is whole and one past it is none;
+/// an absent root, a refused listing and a pid two members list (10 and 11 both listing 13, no
+/// cycle: a child of 10's that exited and was reaped, its pid taken by a child of 11's between the
+/// two listings) give none. NEGATIVE CONTROLS: a walk that listed a process's children before
+/// reading it starts with `list 10`; one that kept no set of the pids it took reads 13 twice, as
+/// `[10, 11, 13, 13]`.
+#[test]
+fn the_tree_walk_reads_each_process_before_listing_its_children() {
+    let kids = |pid: u32| -> Option<Vec<u32>> {
+        match pid {
+            10 => Some(vec![11, 12]),
+            11 => Some(vec![13]),
+            13 => Some(Vec::new()),
+            _ => None,
+        }
+    };
+    let calls = std::cell::RefCell::new(Vec::new());
+    let walk = |root: u32, most: usize, kids: &dyn Fn(u32) -> Option<Vec<u32>>| {
+        tree_by(
+            root,
+            most,
+            |pid| {
+                calls.borrow_mut().push(format!("read {pid}"));
+                (pid != 12).then(|| ProcessReading {
+                    pid,
+                    ..ProcessReading::default()
+                })
+            },
+            |pid, more| {
+                calls.borrow_mut().push(format!("list {pid}"));
+                kids(pid).filter(|listed| listed.len() <= more)
+            },
+        )
+        .map(|rows| rows.iter().map(|row| row.pid).collect::<Vec<_>>())
+    };
+    assert_eq!(walk(10, 8, &kids), Some(vec![10, 11, 13]));
+    assert_eq!(
+        calls.take(),
+        [
+            "read 10", "list 10", "read 11", "list 11", "read 12", "read 13", "list 13"
+        ],
+        "each process read before its children are listed; a gone one lists none"
+    );
+    assert_eq!(walk(10, 3, &kids), Some(vec![10, 11, 13]), "exactly `most`");
+    assert_eq!(walk(10, 2, &kids), None, "past `most`");
+    assert_eq!(walk(12, 8, &kids), None, "no process holds the root");
+    let refused = |pid| if pid == 11 { None } else { kids(pid) };
+    assert_eq!(walk(10, 8, &refused), None, "a refused listing");
+    let twice = |pid| {
+        if pid == 10 {
+            Some(vec![11, 13])
+        } else {
+            kids(pid)
+        }
+    };
+    assert_eq!(walk(10, 8, &twice), None, "a pid two members list");
+}
+
+/// THE CHILDREN LIST GROWS PAST ITS FIRST SLOTS AND CUTS PAST `most` (`imp::children_by`, the
+/// macOS reader of a process's children, over a kernel that fills the slots it is given with a
+/// process's n children and answers how many it filled): below 64 children one call reads them
+/// all; a list that fills its slots is made again with four times as many, as far as one past
+/// `most`, so 64 children take 64 then 256 slots and 300 take 64, 256 and 1024; a `most` of 4096
+/// reads 4096 children in five calls and 4097 as none; `child_pids`' 255 reads 255 in two
+/// and 256 as none, as does a `most` of 2 its 3 in one; a refused list reads none. NEGATIVE
+/// CONTROLS: a reader that answered a full first list as none reads 64 children as none; one whose
+/// slots stopped at `most` rather than one past it reads exactly `most` children as none.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_children_list_grows_past_its_first_slots_and_cuts_past_most() {
+    let read = |n: usize, most: usize| {
+        let mut rooms = Vec::new();
+        let kids = imp::children_by(most, |slots| {
+            rooms.push(slots.len());
+            let filled = n.min(slots.len());
+            for (slot, pid) in slots[..filled].iter_mut().zip(1000..) {
+                *slot = pid;
+            }
+            Some(filled)
+        });
+        let count = kids.map(|kids| {
+            assert!(
+                kids.iter().copied().eq((1000..).take(kids.len())),
+                "{n} children read as {kids:?}"
+            );
+            kids.len()
+        });
+        (count, rooms)
+    };
+    assert_eq!(read(0, 4096), (Some(0), vec![64]), "no children");
+    assert_eq!(read(63, 4096), (Some(63), vec![64]), "one call below 64");
+    assert_eq!(
+        read(64, 4096),
+        (Some(64), vec![64, 256]),
+        "a full list grows"
+    );
+    assert_eq!(read(300, 4096), (Some(300), vec![64, 256, 1024]));
+    let tree = vec![64, 256, 1024, 4096, 4097];
+    assert_eq!(
+        read(4096, 4096),
+        (Some(4096), tree.clone()),
+        "exactly `most`"
+    );
+    assert_eq!(read(4097, 4096), (None, tree), "past `most`");
+    assert_eq!(
+        read(255, 255),
+        (Some(255), vec![64, 256]),
+        "`child_pids`' most"
+    );
+    assert_eq!(
+        read(256, 255),
+        (None, vec![64, 256]),
+        "past `child_pids`' most"
+    );
+    assert_eq!(
+        read(2, 2),
+        (Some(2), vec![3]),
+        "a `most` below the first slots"
+    );
+    assert_eq!(read(3, 2), (None, vec![3]), "and past it");
+    let mut refused = 0;
+    let none = imp::children_by(4096, |_| {
+        refused += 1;
+        None
+    });
+    assert_eq!((none, refused), (None, 1), "a refused list, asked once");
+}
+
+/// A SWEEP'S TREE IS ITS ROOT AND ITS DESCENDANTS ALONE (`tree_in`, every platform's reader but
+/// macOS's): of 1, its children 10 and 20, 10's children 11 and 12 and 11's child 13, the tree of
+/// 10 is 10, 11, 12 and 13; a cut sweep, and one naming a pid twice, give none.
+#[test]
+fn a_sweeps_tree_is_its_root_and_its_descendants_alone() {
+    let row = |pid, ppid| ProcessReading {
+        pid,
+        ppid,
+        ..ProcessReading::default()
+    };
+    let mut sweep = Sweep {
+        procs: vec![
+            row(1, 0),
+            row(10, 1),
+            row(11, 10),
+            row(12, 10),
+            row(13, 11),
+            row(20, 1),
+        ],
+        truncated: false,
+    };
+    let tree =
+        |sweep: &Sweep| tree_in(sweep, 10, 8).map(|rows| rows.iter().map(|r| r.pid).collect());
+    assert_eq!(tree(&sweep), Some(vec![10, 11, 12, 13]));
+    sweep.truncated = true;
+    assert_eq!(tree(&sweep), None, "a cut sweep");
+    sweep.truncated = false;
+    sweep.procs.push(row(13, 1));
+    assert_eq!(tree(&sweep), None, "a pid named twice");
+}
+
+/// ON MACOS THE TREE READ BY ITS OWN PROCESSES IS THE ONE A WHOLE SWEEP SELECTS
+/// (`process_tree`): a shell holding 70 subshells (forks, no exec) and a shell that holds a
+/// `sleep` reads as the same 73 processes, each with the start the sweep reads for it and every
+/// counter the progress probe needs, as `tree_in` selects them from a whole sweep; the root's 71
+/// children take the children list past its first 64 slots, and `child_pids` reads all 71; a cap
+/// of 72 reads none, as does a pid no process holds. NEGATIVE CONTROLS: a reader that listed no
+/// grandchildren reads 72 of the 73; one that passed the kernel its slot count as the byte size
+/// reads 16 of the root's children.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_tree_read_by_its_own_processes_is_the_one_a_sweep_selects() {
+    use aterm_uds::spawnfd::Stdio;
+    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+    cmd.args([
+        "-c",
+        "exec 3<&0; i=0; while [ $i -lt 70 ]; do (read x <&3) & i=$((i+1)); done; \
+         /bin/sh -c '/bin/sleep 600 & wait' & wait",
+    ])
+    .stdin(Stdio::piped())
+    .process_group(0);
+    let mut root = cmd.spawn().expect("the shell starts");
+    let pid = root.id();
+    let swept = aterm_spec::wait::until_while_working(pid, "the tree's 73 processes", || {
+        tree_in(&processes()?, pid, 4096).filter(|rows| rows.len() == 73)
+    });
+    let read = process_tree(pid, 73);
+    let capped = process_tree(pid, 72);
+    let children = crate::jobs::child_pids(pid);
+    let group = i32::try_from(pid).expect("a pid");
+    let killed = aterm_uds::process::kill_group_until_empty(group);
+    let _ = root.wait();
+    killed.expect("the tree's group ends");
+    let identities = |rows: &[ProcessReading]| {
+        let mut ids = rows.iter().map(|r| (r.pid, r.start)).collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    let read = read.expect("the tree reads");
+    assert_eq!(identities(&read), identities(&swept));
+    assert_eq!(capped, None, "a cap below the tree");
+    assert_eq!(
+        children.map(|kids| kids.len()),
+        Some(71),
+        "the root's children"
+    );
+    for row in &read {
+        assert!(
+            row.start.is_some()
+                && row.cpu_ns.is_some()
+                && row.child_cpu_ns.is_some()
+                && row.disk_read.is_some()
+                && row.disk_written.is_some(),
+            "{row:?}"
+        );
+    }
+    assert_eq!(process_tree(99_999_999, 64), None, "a pid no process holds");
+}
+
+/// A sweep hands on the one read of the whole table its `reaps_unwaited` read made, as its reader
+/// answered it, so a reader of the same reading's records reads none again
+/// ([`processes_keeping_table`]); a sweep of no more than `UNWAITED_AT_ONCE` rows to read reads
+/// no table and hands on none. NEGATIVE CONTROL: a sweep that drops the table it read (as before
+/// 2026-11-18, when only `processes_keeping`'s sweep was returned) hands on `None` from the
+/// thirteen-row world, which the second assertion refuses.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sweep_hands_on_the_table_it_read() {
+    use imp::Reads as _;
+    use world::{OWN, World};
+    let swept = |rows: std::ffi::c_int| {
+        let world = World::default();
+        for pid in 300..300 + rows {
+            world.spawn(pid, "worker", OWN);
+        }
+        let (sweep, table) = imp::sweep(
+            &world,
+            SweepOpts::default(),
+            &mut crate::coalitions::CoalitionIds::default(),
+        )
+        .expect("a sweep");
+        let reads = world.take_reads().get(&("table", 0)).copied().unwrap_or(0);
+        let answered = (reads > 0).then(|| world.table()).flatten();
+        (sweep.procs.len(), table, reads, answered)
+    };
+    let (rows, table, reads, answered) = swept(13);
+    assert_eq!(
+        (rows, reads),
+        (13, 1),
+        "thirteen rows to read: one table read"
+    );
+    assert!(table.is_some(), "the table read is handed on");
+    assert_eq!(table, answered, "as its reader answered it");
+    let (rows, table, reads, _) = swept(12);
+    assert_eq!(
+        (rows, reads, table),
+        (12, 0, None),
+        "twelve: each one's record, no table"
     );
 }

@@ -522,11 +522,13 @@ impl SessionLog {
     /// command whose block line did not read, a turn no tracker knows. The
     /// tracker holds its turn, its screen step and its claimed box's step.
     ///
-    /// A `compact` step a claim's record stream opened (`src=harness`) is the
-    /// stream's, and no stream feeds this log yet (its claim and its records
-    /// come again after the update): it is closed as the end of the stream's
-    /// feed closes it, `out=passed src=aterm conf=strong by=aterm holder=<who
-    /// opened it>` ([`SessionLog::end_stream_compact`]), not as a node gone.
+    /// A `compact`, approval, question or wall step a claim's record stream
+    /// opened (`src=harness`) is the stream's, and no stream feeds this log yet
+    /// (its claim and its records come again after the update): it is closed
+    /// as the end of the stream's feed closes it, `out=passed src=aterm
+    /// conf=strong by=aterm holder=<who opened it>`
+    /// ([`SessionLog::end_stream_compact`], [`SessionLog::end_stream_asks`]),
+    /// not as a node gone.
     fn reconcile(&mut self, at: Stamp) {
         let mut held: Vec<Node> = Vec::new();
         held.extend(self.cmd.map(|c| c.node));
@@ -543,7 +545,7 @@ impl SessionLog {
         for n in open.into_iter().rev() {
             if self.log.is_open(n) && !holds(&self.log, n) {
                 let close = self
-                    .stream_compact_opener(n)
+                    .stream_step_opener(n)
                     .and_then(|holder| Self::passed_stream_compact(&holder))
                     .unwrap_or_else(|| {
                         Close::new(Out::gone(n.lvl), Src::Aterm, Conf::Exact).by(Actor::Aterm)
@@ -554,10 +556,14 @@ impl SessionLog {
     }
 
     /// The holder whose record opened `node`, where `node` is an open
-    /// `compact` step a claim's record stream opened: its open record (an open
-    /// node's is never evicted) says `src=harness holder=<the claim's holder>`.
-    fn stream_compact_opener(&self, node: Node) -> Option<String> {
-        if self.log.open_entry(node)?.kind != Kind::Compact {
+    /// `compact`, approval, question or wall step a claim's record stream
+    /// opened: its open record (an open node's is never evicted) says
+    /// `src=harness holder=<the claim's holder>`.
+    fn stream_step_opener(&self, node: Node) -> Option<String> {
+        if !matches!(
+            self.log.open_entry(node)?.kind,
+            Kind::Compact | Kind::Approval | Kind::Question | Kind::Wall
+        ) {
             return None;
         }
         let open = self

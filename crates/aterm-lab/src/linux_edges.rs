@@ -1323,6 +1323,39 @@ impl Run<'_> {
         }
     }
 
+    /// Mapping announces a client before Sway and the GUI have necessarily
+    /// applied the same configure. Aim only with dimensions both have observed.
+    fn pointer_placement(
+        &self,
+        sway: &Sway,
+        peer_pid: u32,
+        owners: &[u32],
+    ) -> Result<(String, NativeGeometry, (i32, i32)), String> {
+        let mut work = native_pointer::Progress::new(owners);
+        let mut window = aterm_uds::deadline::ProgressWindow::new(HANG, Instant::now());
+        let mut generation = None;
+        loop {
+            crate::stop::check().map_err(|stopped| format!("{stopped:?}"))?;
+            let dims = self.dims()?;
+            let geometry = NativeGeometry::parse(&dims)?;
+            let tree = self.swaymsg(sway, &["-r", "-t", "get_tree"])?;
+            match native_pointer::client_origin(&tree, peer_pid, geometry)? {
+                native_pointer::Placement::Ready(origin) => return Ok((dims, geometry, origin)),
+                native_pointer::Placement::Pending(why) => {
+                    let left = window.observe(Instant::now(), 0, || generation);
+                    if left.is_zero() {
+                        return Err(format!("native placement did not settle: {why}"));
+                    }
+                    // Both IPC queries make their owners do work. Only sample
+                    // the interval when the driver leaves them alone.
+                    work.after_probe(|pid| self.native_pointer_work(pid))?;
+                    crate::stop::sleep(left).map_err(|stopped| format!("{stopped:?}"))?;
+                    generation = work.observe(|pid| self.native_pointer_work(pid))?;
+                }
+            }
+        }
+    }
+
     fn native_pointer_at(
         &self,
         want: (i32, i32),
@@ -1622,13 +1655,7 @@ impl Run<'_> {
         let mut owners = vec![gui_pid, sway_pid, peer_pid];
         owners.sort_unstable();
         owners.dedup();
-        let d = self.dims()?;
-        let geometry = NativeGeometry::parse(&d)?;
-        let origin = native_pointer::client_origin(
-            &self.swaymsg(sway, &["-r", "-t", "get_tree"])?,
-            peer_pid,
-            geometry,
-        )?;
+        let (d, geometry, origin) = self.pointer_placement(sway, peer_pid, &owners)?;
         let warmup = native_pointer::grid_cell(&d, 1, 1)?;
         let target = if edge {
             geometry.right_midpoint(-2)?

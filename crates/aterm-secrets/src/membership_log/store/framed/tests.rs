@@ -129,6 +129,7 @@ fn layout_reader_keeps_unknown_large_frames_without_relaxing_known_reader() {
             salt: [43; 32],
             ciphertext: vec![44; 80 * 1024].into(),
         },
+        statement: None,
     }
     .sign(&[17; 32], [18; 16])
     .unwrap();

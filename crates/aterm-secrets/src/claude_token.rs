@@ -1509,12 +1509,34 @@ pub(crate) enum Plan {
 /// # Errors
 /// As [`settle`].
 pub(crate) fn plan(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Plan> {
-    let held = |why: &str| Ok(Plan::Done(Settled::Held(why.to_owned())));
     let (entry, meta_entry) = (key.entry(), key.meta_entry());
     let Some(snapshot) = read_claude_token_until(paths, &[&entry, &meta_entry], by)? else {
-        return held("this Mac's vault state could not be read just now");
+        return Ok(Plan::Done(Settled::Held(
+            "this Mac's vault state could not be read just now".to_owned(),
+        )));
     };
-    let (log, identity) = (&snapshot.log, &snapshot.identity);
+    plan_of(paths, &snapshot.log, &snapshot.identity, key, now, by)
+}
+
+/// [`plan`] over `log` as `identity` opens it, a log whose roots may have dropped ops the
+/// pair's registers stand on: each op's draft (its signer, clock and epoch) is read off its
+/// record or its stub ([`Log::drafted`]), so a carry whose rep a prune dropped settles as the
+/// whole log's would. A meta whose draft's token `Put` a prune dropped, where no op of the token
+/// register carries that `Put`, holds the pair: no stub holds the token it was written beside.
+/// The sighting is recorded at `paths` ([`sighted`]).
+///
+/// # Errors
+/// As [`settle`].
+pub(crate) fn plan_of(
+    paths: &Paths,
+    log: &Log,
+    identity: &crate::age::Identity,
+    key: &Key,
+    now: u64,
+    by: Instant,
+) -> Result<Plan> {
+    let held = |why: &str| Ok(Plan::Done(Settled::Held(why.to_owned())));
+    let (entry, meta_entry) = (key.entry(), key.meta_entry());
     let Some(opened) = log.open_audience_entries(identity)? else {
         return held("this Mac's vault state could not be read just now");
     };
@@ -1541,12 +1563,15 @@ pub(crate) fn plan(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Pl
     let (Some(tokens), Some(metas)) = (opened_values(&tokens), opened_values(&metas)) else {
         return held("a write of the pair is a removal, or does not open here");
     };
+    // The draft of a `Put`, held or dropped: a carry's rep may be an op a prune dropped, whose
+    // stub keeps its signer, clock and epoch.
     let draft_of = |id: &crate::membership_log::RecordId| {
-        let record = log.get(id)?;
-        let crate::membership_log::Body::Put { epoch, .. } = record.body() else {
-            return None;
-        };
-        Some((*record.actor(), record.authored_ms(), *epoch))
+        let drafted = log.drafted(id)?;
+        (drafted.kind == crate::membership_log::Kind::Put).then_some((
+            drafted.actor,
+            drafted.authored_ms,
+            drafted.epoch?,
+        ))
     };
     let Some(first) = tokens.first() else {
         return held("the pair holds no token");
@@ -1565,8 +1590,8 @@ pub(crate) fn plan(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Pl
         if current(&actor) {
             writers.insert(actor);
         }
-        let write = log.get(&opened.stands_for(id));
-        drafted_ms = drafted_ms.max(write.map_or(authored_ms, |write| write.authored_ms()));
+        let write = log.drafted(&opened.stands_for(id));
+        drafted_ms = drafted_ms.max(write.map_or(authored_ms, |write| write.authored_ms));
     }
     let since = turns_since(sighting, drafted_ms / 1_000);
     let one_token = tokens.iter().all(|token| aterm_digest::ct_eq(token, first));
@@ -1577,7 +1602,9 @@ pub(crate) fn plan(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Pl
     // token the register no longer holds is another token's (a verification whose put of the
     // token it compared a concurrent replacement took out), so it never lands beside this one.
     // A write this Mac cannot open may be the token a meta stands beside: the pair is then not
-    // this Mac's to settle, and a Mac that opens it settles it.
+    // this Mac's to settle, and a Mac that opens it settles it. So may a `Put` of the draft that a
+    // prune dropped and no op of the token register carries: its stub keeps no value, and the
+    // pair is held on a rooted log, where the whole log may keep that token.
     let mut drafts = Vec::with_capacity(metas.len());
     for id in &ops[1] {
         let Some((actor, authored_ms, epoch)) = draft_of(&opened.stands_for(id)) else {
@@ -1587,10 +1614,56 @@ pub(crate) fn plan(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Pl
     }
     let mut beside = Vec::with_capacity(metas.len());
     let written = log.everyone_puts_of_drafts(&opened, &entry, &drafts)?;
-    for ((id, meta), put) in ops[1].iter().zip(metas.iter().copied()).zip(written) {
+    // The token a draft put where a prune dropped that `Put`: the token register's op that stands
+    // for a dropped `Put` of that draft carries its value, which no stub holds.
+    let carried_token = |draft: &(MemberId, u64, crate::membership_log::RecordId)| {
+        ops[0].iter().zip(&tokens).find_map(|(op, token)| {
+            let rep = opened.stands_for(op);
+            (log.is_dropped(&rep) && draft_of(&rep).as_ref() == Some(draft)).then_some(*token)
+        })
+    };
+    // Whether a prune dropped a `Put` of the draft other than a meta the register's ops stand
+    // for: a stub keeps no name, so it may be the token the draft put, whose value no stub holds.
+    let meta_reps: BTreeSet<_> = ops[1].iter().map(|id| opened.stands_for(id)).collect();
+    let dropped_put =
+        |(actor, authored_ms, epoch): &(MemberId, u64, crate::membership_log::RecordId)| {
+            log.rooting().is_some_and(|rooting| {
+                rooting.stubs.iter().any(|(id, stub)| {
+                    stub.kind == crate::membership_log::Kind::Put
+                        && stub.actor == *actor
+                        && stub.authored_ms == *authored_ms
+                        && stub.epoch.as_ref() == Some(epoch)
+                        && !meta_reps.contains(id)
+                })
+            })
+        };
+    for (((id, meta), put), draft) in ops[1]
+        .iter()
+        .zip(metas.iter().copied())
+        .zip(written)
+        .zip(&drafts)
+    {
         let put = match put {
             DraftPut::Wrote(put) => put,
-            DraftPut::Nothing => continue,
+            DraftPut::Nothing => match carried_token(draft) {
+                Some(token) => {
+                    if let Some(place) = tokens
+                        .iter()
+                        .position(|held| aterm_digest::ct_eq(held, token))
+                    {
+                        beside.push((place, *id, meta));
+                    }
+                    continue;
+                }
+                // The draft's token `Put` may be the one dropped: which token the whole log
+                // reads beside this meta is not known here, so a settle could keep another.
+                None if dropped_put(draft) => {
+                    return held(
+                        "a write a meta of the pair stands for was dropped by a checkpoint",
+                    );
+                }
+                None => continue,
+            },
             DraftPut::Unopened => {
                 return held("a write a meta of the pair stands for does not open here");
             }

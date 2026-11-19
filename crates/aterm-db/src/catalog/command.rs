@@ -228,8 +228,33 @@ pub(crate) fn commons_status_until(
 /// `bytes_by_kind` are the reading `aterm secrets status` says on its `log:` line
 /// ([`aterm_secrets::membership_log::Log::fill`]): the wire bytes of the complete records, the
 /// bound the class stops are shares of, and each kind's bytes. `record_bytes` counts the waiting
-/// records too.
+/// records too, and `limits.record_bytes` is the capacity of the store at the records format it
+/// is read at.
+///
+/// A Mac whose format mark names a later records format than 1 also says
+/// `limits.records_format`: the format the mark names, or `null` where the mark does not read.
+/// The frontier protocols state that format only where the build reads it (`control::frontier`),
+/// and speak nothing otherwise. A Mac with no format mark says no such key: its status is what
+/// it was.
 fn membership_history(paths: &Paths, deadline: std::time::Instant) -> Value {
+    let mut value = held_history(paths, deadline);
+    let format = aterm_secrets::client::records_marked_format(paths);
+    if !matches!(format, Ok(aterm_secrets::crossing::FORMAT_ONE))
+        && let Some(limits) = value
+            .as_object_mut()
+            .and_then(|history| history.get_mut("limits"))
+            .and_then(Value::as_object_mut)
+    {
+        limits.insert(
+            "records_format".into(),
+            format.map_or(Value::Null, Value::from),
+        );
+    }
+    value
+}
+
+/// [`membership_history`] but for the format: what the held log says of itself.
+fn held_history(paths: &Paths, deadline: std::time::Instant) -> Value {
     match aterm_secrets::client::inspect_membership_history_until(paths, deadline) {
         Ok(Some(history)) => json!({
             "state": "available", "scope": "authenticated-local-membership-history",

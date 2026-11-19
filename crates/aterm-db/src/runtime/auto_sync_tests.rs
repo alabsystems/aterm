@@ -180,8 +180,8 @@ pub(super) struct Seams<'a> {
     pub(super) pause: Duration,
 }
 
-/// How often a wait whose repair runs in processes this one started reads their progress: a
-/// sweep of the process table, so not once a report.
+/// How often a wait whose repair runs in processes this one started reads their progress: a read
+/// of each process in this one's tree (a whole-table sweep off macOS), so not once a report.
 const WORK_TICK: Duration = Duration::from_millis(500);
 
 /// What a wait for one table's operations saw ([`Attachment::observe_until`]).

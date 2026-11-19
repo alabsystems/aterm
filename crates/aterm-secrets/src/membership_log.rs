@@ -7,8 +7,8 @@
 //! - [`Record`]: one signed record, addressed by the SHA-256 of its bytes, that names its causal
 //!   parents. Record version 2 ([`VERSION_TWO`]) signs a `Put`'s or `Delete`'s ciphertext by its
 //!   digest, so the ciphertext can be shed under the same id, and carries the `Checkpoint` kind;
-//!   only a reader whose format admits it reads it ([`Reading`]), and nothing in this build
-//!   writes it. A `Genesis` founds a network, whose id is the genesis record's id, and names the
+//!   only a reader whose format admits it reads it ([`Reading`]), and only a writer of format 2
+//!   signs it ([`writer`]), which no running build is. A `Genesis` founds a network, whose id is the genesis record's id, and names the
 //!   Commons root ([`Root`]) every member's binding names. `Admit`, `Remove`, `Name` and `Node`
 //!   are signed by a member's device key: the Ed25519 writer key of its Commons binding, with the
 //!   binding's incarnation as the rest of its 48-byte actor.
@@ -83,6 +83,7 @@ pub mod genesis;
 pub(crate) mod head;
 #[cfg(any(unix, windows))]
 pub(crate) mod history;
+pub(crate) mod pass;
 mod payload;
 mod reach;
 pub mod rekey;
@@ -92,6 +93,7 @@ pub mod store;
 pub(crate) mod stored;
 #[cfg(any(unix, windows))]
 pub(crate) mod untaken;
+pub(crate) mod writer;
 
 pub use admission::{Gap, SeatAudience, Signer, admission_audiences};
 pub use astream_wire::sync::MAX_PARENTS;
@@ -106,6 +108,8 @@ pub use entries::{
 pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, RevokingRow, Undo};
 pub use fold::{NETWORK_KEY_INFO, fold_network_key};
 pub use genesis::Proof;
+#[cfg(test)]
+pub(crate) use pass::tests::{PassingVault, passing_vault};
 pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
 pub use rooted::{Rooting, Stub};
@@ -213,11 +217,12 @@ pub type MemberId = astream_wire::sync::Actor;
 
 const MAGIC: &[u8; 4] = b"ALM1";
 /// Record layout version 1: every record every build since 0.146 reads and writes.
-const VERSION: u8 = 1;
+pub(crate) const VERSION: u8 = 1;
 /// Record layout version 2 (`docs/DESIGN-vault-log-2026-11-14.md` step 4): it signs a `Put`'s or
 /// `Delete`'s clear fields and its ciphertext's length and SHA-256, not the ciphertext, so the
 /// ciphertext can be shed and the record still verifies ([`Record::is_shed`]). Only a reader
-/// whose format admits it reads it ([`Reading`]); nothing in this build signs it.
+/// whose format admits it reads it ([`Reading`]); only a writer of format 2 signs it
+/// ([`writer`]), which no running build is.
 ///
 /// The layout, byte by byte (every number big-endian):
 ///
@@ -250,7 +255,7 @@ const VERSION: u8 = 1;
 /// record's shed form, every byte through the signature with a zero tail length, so a whole
 /// record and its shed frame share one id, and a shed record's id is the SHA-256 of its bytes,
 /// as every version-1 record's is.
-const VERSION_TWO: u8 = 2;
+pub(crate) const VERSION_TWO: u8 = 2;
 /// Where a record's kind byte sits: after the magic, the layout version and the network.
 const KIND_AT: usize = 4 + 1 + 32;
 /// Bytes through the parent-count field, before the variable parent list.
@@ -759,27 +764,40 @@ pub struct Draft {
     pub authored_ms: u64,
     /// What it says.
     pub body: Body,
+    /// What a `Put` or `Delete` states of its register, where its log signs version 2
+    /// ([`writer`]): [`Draft::sign`] then signs it as record version 2 ([`VERSION_TWO`]). `None`
+    /// for every other draft, which signs as version 1, byte for byte as every build since 0.146
+    /// does. Only a log a writer of format 2 drafts from fills it ([`Log::write_two`]).
+    pub statement: Option<Statement>,
 }
 
 impl Draft {
     /// Sign as the device whose Ed25519 writer seed is `seed` and whose incarnation is
-    /// `incarnation`, which together give the record's actor.
+    /// `incarnation`, which together give the record's actor: as record version 2 where the
+    /// draft states its register ([`Draft::statement`]) and for a checkpoint share, which is
+    /// version 2 alone; as version 1 otherwise. Only the format-2 pass drafts a share
+    /// ([`Log::share_draft`], called from `client::log_pass` behind its gate).
     ///
     /// # Errors
     /// The seed is not an Ed25519 seed, the body is a genesis ([`Record::found`] signs those),
-    /// or the record is malformed (see [`Record::decode`]).
-    pub fn sign(self, seed: &[u8; 32], incarnation: [u8; 16]) -> Result<Record> {
+    /// or a body other than a `Put` or `Delete` with a statement, or the record is malformed
+    /// (see [`Record::decode`]).
+    pub fn sign(mut self, seed: &[u8; 32], incarnation: [u8; 16]) -> Result<Record> {
+        if let Some(statement) = self.statement.take() {
+            if !matches!(self.body.kind(), Kind::Put | Kind::Delete) {
+                return Err(Error::new(
+                    "only a Put or a Delete states what it read of its register",
+                ));
+            }
+            return self.sign_layout_two(seed, incarnation, Some(&statement));
+        }
         match self.body.kind() {
             Kind::Genesis => {
                 return Err(Error::new(
                     "a genesis is founded with Record::found, not signed as a draft",
                 ));
             }
-            Kind::Checkpoint => {
-                return Err(Error::new(
-                    "a checkpoint is record version 2, which this build does not sign",
-                ));
-            }
+            Kind::Checkpoint => return self.sign_layout_two(seed, incarnation, None),
             _ => {}
         }
         let pair = key_pair(seed)?;
@@ -808,14 +826,29 @@ impl Draft {
     }
 
     /// Sign as [`Draft::sign`] does, but as record version 2 ([`VERSION_TWO`]), stating
-    /// `statement` for a `Put` or `Delete` (`None` for a `Checkpoint`). A test's alone: nothing in
-    /// this build signs version 2 (tracker FL-148f writes it, behind the format fence).
+    /// `statement` for a `Put` or `Delete` (`None` for a `Checkpoint`), whatever the draft
+    /// states: a test's alone, of this crate or of one that builds a format-2 store (aterm-db's
+    /// records exchange), which signs what it chooses. A writer signs version 2 by the
+    /// statement its log drafts ([`Draft::statement`], [`writer`]); a build without debug
+    /// assertions does not hold this.
     ///
     /// # Errors
     /// The seed is not an Ed25519 seed, the body is of a kind version 2 does not carry, or the
     /// record is malformed (see [`Record::decode_in`]).
-    #[cfg(test)]
-    pub(crate) fn sign_two(
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn sign_two(
+        self,
+        seed: &[u8; 32],
+        incarnation: [u8; 16],
+        statement: Option<&Statement>,
+    ) -> Result<Record> {
+        self.sign_layout_two(seed, incarnation, statement)
+    }
+
+    /// Sign as record version 2 ([`VERSION_TWO`]), stating `statement` for a `Put` or `Delete`
+    /// (`None` for a `Checkpoint`).
+    fn sign_layout_two(
         self,
         seed: &[u8; 32],
         incarnation: [u8; 16],
@@ -1187,9 +1220,8 @@ impl Record {
         }
     }
     /// This version-2 `Put` or `Delete` with its ciphertext shed: the same id and every field but
-    /// the ciphertext; `None` for any other record, or one that cannot be read. A test's alone:
-    /// nothing in this build sheds (tracker FL-148f).
-    #[cfg(test)]
+    /// the ciphertext; `None` for any other record, or one that cannot be read. What the
+    /// format-2 shedding pass holds in a replaced op's place ([`pass`]).
     pub(crate) fn shed(&self) -> Option<Self> {
         if !matches!(self.kind(), Kind::Put | Kind::Delete) {
             return None;
@@ -1793,7 +1825,6 @@ pub fn record_id(wire: &[u8]) -> Option<RecordId> {
 /// A version-2 record's clear fields and ciphertext, as [`VERSION_TWO`] lays them out: for a
 /// `Put` or `Delete`, its audience, epoch, salt, `statement`, and its ciphertext's length and
 /// SHA-256, with the ciphertext as the tail; for a `Checkpoint`, its fields and no tail.
-#[cfg(test)]
 fn encode_clear(body: &Body, statement: Option<&Statement>) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     match (body, statement) {
@@ -1827,7 +1858,6 @@ fn encode_clear(body: &Body, statement: Option<&Statement>) -> Result<(Vec<u8>, 
     }
 }
 
-#[cfg(test)]
 fn encode_statement(out: &mut Vec<u8>, statement: &Statement) -> Result<()> {
     put_len(out, statement.supersedes.len(), 2)?;
     for id in &statement.supersedes {
@@ -2524,6 +2554,10 @@ pub struct Log {
     /// The bytes `rooting`'s stubs take ([`rooted::Stub::bytes`]), counted against the byte bound
     /// with `held_bytes`; `0` for a whole log.
     stub_bytes: usize,
+    /// The writer of format 2 this log drafts for ([`Log::write_two`]): its `Put`s and
+    /// `Delete`s state their register and sign as record version 2 ([`writer`]). `None` for
+    /// every log no such writer drafts from, whose drafts sign as version 1. Clones share it.
+    writing: Option<Arc<writer::Writing>>,
 }
 
 /// The Macs a log let back in after a removal, named as a roster names them: canonical `m<N>`
@@ -2628,6 +2662,7 @@ impl Log {
             rooting: None,
             stubbed: None,
             stub_bytes: 0,
+            writing: None,
         })
     }
 
@@ -2643,6 +2678,7 @@ impl Log {
         projected.budgets = self.budgets;
         projected.stored_at = self.stored_at;
         projected.enforce_seats = self.enforce_seats;
+        projected.writing = self.writing_afresh();
         projected.head.clone_from(&self.head);
         // A rooted log's projection keeps the stubs in the heads' past, and the dropped heads
         // among them stay heads ([`rooted`]).
@@ -2914,6 +2950,7 @@ impl Log {
             parents,
             authored_ms,
             body,
+            statement: None,
         }
     }
 
@@ -3606,6 +3643,18 @@ impl Log {
                 batch.put_bytes,
             ),
         };
+        // A log at format 2 stops its keyed records short of its keyed budget by a checkpoint
+        // share of each seat ([`budgets::Authoring::keyed_refusal`]); no store of a running
+        // build reads format 2, so no running build asks it.
+        if self.stored_at.admits_two()
+            && let Some(why) = batch.keyed_refusal(
+                less(self.counts.keyed, batch.keyed),
+                self.budgets.keyed,
+                self.membership_ref().members().len(),
+            )
+        {
+            return Err(Error::of_kind(crate::ErrorKind::MembershipCapacity, why));
+        }
         let bytes = self.held_bytes.saturating_add(self.stub_bytes);
         match batch.refusal(less(bytes, batch.bytes), signed, author) {
             Some(why) => Err(Error::of_kind(crate::ErrorKind::MembershipCapacity, why)),

@@ -534,12 +534,16 @@ fn shells() -> Vec<Vec<&'static str>> {
     out
 }
 
-fn block(tool: Tool) -> String {
-    let name = match tool {
-        Tool::Tippy => "targo-tippy",
-        Tool::Targo | Tool::Cargo | Tool::CargoCompat => "targo",
+/// The block the shim `tool` runs under carries ([`shim_block`]), made once per shim: it is
+/// spelled from constants alone.
+fn block(tool: Tool) -> &'static str {
+    static TARGO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static TIPPY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let (name, made) = match tool {
+        Tool::Tippy => ("targo-tippy", &TIPPY),
+        Tool::Targo | Tool::Cargo | Tool::CargoCompat => ("targo", &TARGO),
     };
-    shim_block(name).unwrap()
+    made.get_or_init(|| shim_block(name).unwrap())
 }
 
 #[cfg(unix)]
@@ -571,6 +575,10 @@ fn sh(
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", home)
         .env("PWD", cwd)
+        // A root the caller set stands, so the block asks `xcode-select` and `xcrun` nothing:
+        // no placement word reads the SDK root, whose lookup
+        // `the_shim_gives_a_building_verb_the_sdk_root_and_keeps_the_callers` judges.
+        .env("SDKROOT", "/caller-set-sdk-root")
         .current_dir(cwd);
     for (k, v) in env {
         cmd.env(k, v);
@@ -2263,6 +2271,17 @@ fn a_placed_member_build_resolves_the_unit_graph_plain_targo_does() {
         features.dedup();
         features
     };
+    // The graph is a function of the words alone here (one workspace, home and environment),
+    // so the halves that place a call with the same words are judged by one resolution of them.
+    let resolved = std::cell::RefCell::new(HashMap::<Vec<String>, String>::new());
+    let graph = |args: &[String]| -> String {
+        if let Some(known) = resolved.borrow().get(args) {
+            return known.clone();
+        }
+        let got = graph(args);
+        resolved.borrow_mut().insert(args.to_vec(), got.clone());
+        got
+    };
     let env = HashMap::new();
     for verb in ["test", "bench", "build"] {
         let typed = strings(&["--unverified", verb, "-p", "narrow"]);
@@ -3055,7 +3074,7 @@ fn the_targo_shim_carries_the_block_and_reads_as_before() {
     let env = crate::shim_env::ShimEnv::admit(&["A=1".to_owned()]).unwrap();
     let body = crate::platform::sh_shim_content_routed(targo, &env, None);
     assert_eq!(
-        body.contains(&block(Tool::Targo)),
+        body.contains(block(Tool::Targo)),
         cfg!(target_os = "macos"),
         "{body}"
     );
@@ -3065,7 +3084,7 @@ fn the_targo_shim_carries_the_block_and_reads_as_before() {
         None,
     );
     assert_eq!(
-        lint.contains(&block(Tool::Tippy)),
+        lint.contains(block(Tool::Tippy)),
         cfg!(target_os = "macos"),
         "{lint}"
     );

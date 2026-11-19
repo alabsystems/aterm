@@ -4,6 +4,47 @@
 use super::*;
 
 #[test]
+fn retained_transport_pass_cannot_use_startup_or_omit_original_physical_stages() {
+    const STARTUP: &str =
+        "PASS retained SDK startup, physical attachment and actual configuration response";
+    const TRANSPORT: &str =
+        "PASS retained Native transport replacement, E1 image custody and premature App denial";
+    assert!(
+        RetainedStages::default()
+            .observe(STARTUP, false, false)
+            .unwrap()
+    );
+    assert!(
+        RetainedStages::default()
+            .observe(STARTUP, true, false)
+            .is_err()
+    );
+    assert!(
+        RetainedStages::default()
+            .observe(TRANSPORT, false, false)
+            .is_err()
+    );
+    let reports = [
+        "Retained qualification: phase=native-transport-original-file",
+        "Retained qualification: phase=exec-with-original-image-custody",
+        "Retained qualification: phase=after-frontend-exec",
+        "Retained qualification: phase=native-transport-kernel-rights-verified",
+    ];
+    for missing in 0..=reports.len() {
+        let mut actual = RetainedStages::default();
+        for (index, report) in reports.iter().enumerate() {
+            if index != missing {
+                assert!(!actual.observe(report, true, false).unwrap());
+            }
+        }
+        assert_eq!(
+            actual.observe(TRANSPORT, true, false).is_ok(),
+            missing == reports.len()
+        );
+    }
+}
+
+#[test]
 fn published_task_passes_the_host_private_reader_without_replacement() {
     use std::os::unix::fs::PermissionsExt as _;
 

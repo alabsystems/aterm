@@ -227,7 +227,9 @@ pub(crate) fn team_requirement(team: &str) -> io::Result<String> {
 
 /// Serve the broker on `opts.socket` until the process ends: on macOS as root, admitting aterm's
 /// code, and adopting a signed update of `opts.source` (it then exits 0 for launchd to start the
-/// new image, as it does when its own image is replaced).
+/// new image, as it does when its own image is replaced). Beside the LAN it does `duties`
+/// ([`crate::Duties`]): `aterm lan serve` hands it Spotlight's exclusion of the console
+/// account's own new home folders ([`crate::scope`]).
 ///
 /// It counts its connections, its full checks, its name resolutions and their CPU time into
 /// [`aterm_uds::lan::COUNTS_NAME`] beside the socket ([`crate::counts`]): on a running Mac,
@@ -237,11 +239,11 @@ pub(crate) fn team_requirement(team: &str) -> io::Result<String> {
 /// Not root (outside a test binary), off macOS, the socket's folder or the socket that cannot be
 /// made, or the admission requirement that cannot be read. Failures are reported through the
 /// broker's log, kept bounded by what its start kept (`kept`, from [`keep_log`]).
-pub fn serve(opts: Opts, _kept: aterm_uds::job_log::Kept) -> io::Result<()> {
-    serve_inner(opts).inspect_err(|error| log(format_args!("serve: {error}")))
+pub fn serve(opts: Opts, duties: crate::Duties, _kept: aterm_uds::job_log::Kept) -> io::Result<()> {
+    serve_inner(opts, duties).inspect_err(|error| log(format_args!("serve: {error}")))
 }
 
-fn serve_inner(opts: Opts) -> io::Result<()> {
+fn serve_inner(opts: Opts, duties: crate::Duties) -> io::Result<()> {
     if aterm_uds::test_binary::scratch_root().is_none() && aterm_uds::peer::our_uid() != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -280,6 +282,8 @@ fn serve_inner(opts: Opts) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     crate::adopt::watch(opts.source, admission.updates)?;
+    let server = server.serving(duties);
+    crate::scope::held_at_exit(&server.shared.scope);
     server.run()
 }
 
@@ -321,6 +325,9 @@ pub(crate) struct Shared {
     /// What this server counts of its connections ([`crate::counts`]). Only a served socket's
     /// accept loop writes them to a file; the direct path's are counted and read by nobody.
     pub(crate) counts: Counts,
+    /// Spotlight's exclusion of the console account's new home folders, and its one lock
+    /// ([`crate::scope`]): none until [`Server::serving`] is handed it.
+    pub(crate) scope: crate::scope::Scope,
     /// What runs once the first admitted peer says this protocol's hello
     /// ([`Self::after_first_hello`]); taken when it runs.
     first_hello: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -348,6 +355,7 @@ impl Shared {
             clock: Instant::now,
             live: AtomicUsize::new(0),
             counts: Counts::new(),
+            scope: crate::scope::Scope::none(),
             first_hello: Mutex::new(None),
             #[cfg(any(test, debug_assertions))]
             seam: aterm_uds::lan::seam(),
@@ -481,6 +489,20 @@ impl Server {
             }),
             sink: Sink::beside(socket),
         })
+    }
+
+    /// This server doing `duties` beside the LAN ([`crate::scope`]). It is handed them before it
+    /// serves, while nothing else holds what its connections share.
+    pub(crate) fn serving(mut self, duties: crate::Duties) -> Self {
+        let alone = Arc::get_mut(&mut self.shared);
+        debug_assert!(
+            alone.is_some(),
+            "a server is handed its duties before it serves"
+        );
+        if let Some(shared) = alone {
+            shared.scope = crate::scope::Scope::of(duties);
+        }
+        self
     }
 
     /// Accept one connection and count it: the connection to serve (`None` for one told the
@@ -676,6 +698,7 @@ fn served(
         return Count::TrailingBytes;
     }
     shared.counts.add(match &request {
+        Request::ScopeHome => Count::ScopeHome,
         Request::Connect { .. } => Count::Connect,
         Request::Udp { .. } => Count::Udp,
         Request::Resolve { .. } => Count::Resolve,
@@ -772,6 +795,10 @@ fn answer(
     spent: &mut dyn FnMut(),
 ) -> Result<(), Failure> {
     match request {
+        // Its own frame answers it whichever way, and its own line, which names no path, logs it.
+        Request::ScopeHome => {
+            crate::scope::serve(&shared.scope, stream, shared.log).map_err(|e| failure(&e))
+        }
         Request::Connect {
             target,
             port,

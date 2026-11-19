@@ -419,7 +419,7 @@ pub struct End {
     pub closed: bool,
     /// When the newest entry's row was written (wall ms).
     pub at_ms: Option<u64>,
-    /// A notice's wall once its turn is closed (`transcript_wall`).
+    /// A notice's wall once its turn is closed (`transcript_wall`, as the policy answers it).
     wall: Option<WallKind>,
     /// The classes a notice confirms (`confirms`), one bit each.
     classes: u8,
@@ -456,7 +456,7 @@ impl End {
         self.last == EndClass::Notice && self.classes & bit(wall_confirm::class(screen)) != 0
     }
 
-    /// The wall a closed turn's notice is (the harness's `transcript_wall`).
+    /// The wall a closed turn's notice is (the harness's `transcript_wall`, as its policy answers it: `turn_end::answered_wall`).
     #[must_use]
     pub fn wall(&self) -> Option<WallKind> {
         if self.closed && self.last == EndClass::Notice {
@@ -551,9 +551,9 @@ pub struct NoticeRead {
     pub status: Option<u16>,
     /// Which of the account's limits it was written for (`quotaLimits.rateLimitType`).
     pub limit: Option<String>,
-    /// The wall it is once its turn is closed (`transcript_wall`).
+    /// The wall it is once its turn is closed (`transcript_wall`), as the policy answers it (`turn_end::answered_wall`).
     pub wall: Option<WallKind>,
-    /// Whether it confirms a screen wall of each class, in the order of a usage limit, a full context, the lost login, an API error and the memory wall.
+    /// Whether it confirms a screen wall of each class, in the order of a usage limit, a full context, the lost login, an API error and the memory wall: the class `confirms` reads, and that of the wall the policy answers it as.
     pub confirms: [bool; 5],
     /// Which limit it names (`limit_named`: by its words, else by its `rateLimitType`).
     pub named: Option<WallKind>,
@@ -566,7 +566,13 @@ pub fn notice_read(line: &str) -> Option<NoticeRead> {
     notice_of_value(&transcript::step_notice(line).ok()?)
 }
 
-/// [`NoticeRead`] of a row as a projection read it.
+/// [`NoticeRead`] of a row as a projection read it. Its wall is the one the policy answers
+/// (`turn_end::answered_wall`, plan package UB-05), as the tab publishes it: a login notice whose
+/// words name a blocked path (`Please run /login · API Error: 403 Forbidden`, typed
+/// `authentication_failed`) is the API's outage, and confirms the screen's API error, so the
+/// session log neither retracts the `wall:api-error` the tab published nor amends its turn to a
+/// lost login. It still confirms a login wall too, which the harness's own `confirm_wall` judges
+/// on the reader's raw kind before it answers it.
 fn notice_of_value(v: &Value) -> Option<NoticeRead> {
     let Some(Row::Entry(entry @ Entry::Notice { .. })) = wall_confirm::row_of(v) else {
         return None;
@@ -578,8 +584,8 @@ fn notice_of_value(v: &Value) -> Option<NoticeRead> {
         at: None,
         prompted: false,
     };
-    let wall = wall_confirm::transcript_wall(&end);
-    let confirms = CLASSES.map(|k| wall_confirm::confirms(k, &end));
+    let raw = wall_confirm::transcript_wall(&end);
+    let mut confirms = CLASSES.map(|k| wall_confirm::confirms(k, &end));
     let Entry::Notice {
         text,
         error,
@@ -590,6 +596,12 @@ fn notice_of_value(v: &Value) -> Option<NoticeRead> {
     else {
         return None;
     };
+    let wall = raw.map(|k| crate::supervise::policy::turn_end::answered_wall(k, &text));
+    if let Some(answered) = wall.filter(|&w| Some(w) != raw) {
+        for (k, c) in CLASSES.iter().zip(confirms.iter_mut()) {
+            *c |= wall_confirm::class(*k) == wall_confirm::class(answered);
+        }
+    }
     let named = wall_confirm::limit_named(&text, limit.as_deref());
     Some(NoticeRead {
         text,

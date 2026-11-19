@@ -1741,6 +1741,60 @@ fn a_policy_edit_reaches_live_sessions_and_reopens_the_deadline() {
 }
 
 #[test]
+fn codex_adoption_audit_runs_with_tab_status_disabled() {
+    let mut app = crate::App::headless_for_test();
+    app.config.tab_status = Some(false);
+    app.reconfigure_session_status();
+    let ctx = app.pool.get(0).expect("pooled terminal").ctx.clone();
+    let now = Instant::now();
+    assert!(app.observe_session_statuses(now).is_empty());
+    assert!(app.session_status.status(0).is_none());
+    assert_eq!(
+        app.observe_codex_packages(now),
+        None,
+        "a shell needs no audit timer"
+    );
+
+    // The initial census already saw this terminal. A new claim must arm it through
+    // the same metadata event as the control connection, even with the classifier off.
+    let source = crate::self_claim::stand_in::running();
+    crate::session_timeline::claim_supervisor_as(
+        &ctx,
+        &format!("codex-alab@{}", source.pid),
+        Some(41),
+        None,
+        Some(source),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    let before = Instant::now();
+    app.on_meta_changed(0);
+    let after = Instant::now();
+    let cadence = crate::codex_rollout_tap::REST_FAR;
+    let first = app
+        .observe_codex_packages(before)
+        .expect("new claim armed immediately");
+    assert!((before + cadence..=after + cadence).contains(&first));
+    assert_eq!(app.observe_codex_packages(first), Some(first + cadence));
+    assert!(app.observe_session_statuses(first).is_empty());
+    assert!(app.session_status.status(0).is_none());
+
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    ));
+    app.on_meta_changed(0);
+    assert_eq!(
+        app.observe_codex_packages(first),
+        None,
+        "release retires the timer"
+    );
+}
+
+#[test]
 fn turning_tab_status_off_stops_classifying_and_retires_the_records() {
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);

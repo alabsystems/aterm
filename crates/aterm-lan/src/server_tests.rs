@@ -143,6 +143,7 @@ fn the_broker_keeps_the_log_its_plist_names_and_serves_on_what_it_kept() {
             source: scratch.path().join("aterm.app"),
             socket: file.join("broker.sock"),
         },
+        crate::Duties::none(),
         kept,
     );
     assert!(refused.is_err(), "the socket's folder is a file");

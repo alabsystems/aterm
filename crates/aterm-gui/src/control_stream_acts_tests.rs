@@ -523,7 +523,7 @@ fn model_and_upgrade_records_are_kept_in_the_current_state_record() {
     let epoch = stream.open(ONE).epoch;
     let upgrade_word = |rig: &Rig| {
         let now_s = aterm_time::unix_millis().unwrap_or(0) / 1000;
-        let awake_s = super::super::awake_now() / 1000;
+        let awake_s = aterm_uds::process::awake_ms().unwrap_or(0) / 1000;
         let status = timeline(rig, ONE, |timeline| timeline.upgrade_column(now_s, awake_s));
         let row = survey(rig, ONE, "upgrade");
         assert_eq!(

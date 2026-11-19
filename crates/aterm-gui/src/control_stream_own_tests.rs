@@ -154,7 +154,15 @@ fn hand_is_sent_when_it_changes_at_most_every_100_ms_and_always_the_latest() {
     rig.service.clock.store(1_100, Ordering::Release);
     let sent = client.own();
     assert_eq!(hand_of(&sent), (latest, Composer::Draft, true));
-    assert_eq!(sent.seq, opened.sent + 3, "numbered after the opening pair");
+    assert_eq!(
+        sent.seq,
+        client.opening_end() + 1,
+        "numbered after the opening records"
+    );
+    assert_eq!(
+        client.opening_end(),
+        opened.sent + client.opening.len() as u64
+    );
     two_beats(&mut client, &mut seq);
     assert!(
         client.heard.is_empty(),
@@ -229,7 +237,7 @@ fn a_restart_or_policy_change_reaches_an_open_stream_as_a_record() {
     assert_eq!(
         (restart.seq, restart.body),
         (
-            opened.sent + 3,
+            client.opening_end() + 1,
             Body::Restart {
                 cause: "stall".to_string(),
                 account: None,
@@ -311,14 +319,15 @@ fn a_restart_or_policy_change_reaches_an_open_stream_as_a_record() {
     assert!(client.heard.is_empty(), "{:?}", client.heard);
     assert_eq!(
         rig.state(ONE).sent,
-        opened.sent + 7,
-        "two opening records, three restarts and two policies"
+        opened.sent + client.opening.len() as u64 + 5,
+        "the opening records, three restarts and two policies"
     );
 }
 
 /// A NEW STREAM HEARS THE CURRENT `hand` AND A `policy`, AND NO RECORD AGAIN (D8): a reopened
 /// stream of the same epoch answers `in` where the last left it and goes on from there with the
-/// hand as it is now and a `policy`; nothing the closed stream was sent comes again, and a
+/// hand as it is now and a `policy` (no `want`: a `relaunch` grant does not admit the
+/// conversation records, HX-15h); nothing the closed stream was sent comes again, and a
 /// `restart` row or a policy move written while no stream was open is owed to none. A new
 /// epoch starts `in` at 0 and keeps `acked`.
 #[test]
@@ -331,9 +340,11 @@ fn a_new_stream_hears_the_current_hand_and_policy_and_no_resent_record() {
     let first_id = first.id();
     let opened = first.open(ONE);
     assert_eq!(
-        (opened.sent, first.opening[0].seq, first.opening[1].seq),
-        (0, 1, 2)
+        (opened.sent, first.opening[0].seq, first.opening_end()),
+        (0, 1, 2),
+        "hand, policy"
     );
+    assert!(!first.wanted(), "a grant without `state`");
     record_restart(ctx, Cause::Asked);
     assert_eq!(first.own().seq, 3);
     crate::harness_policy_verb::record_policy_move(ctx, 4);
@@ -365,7 +376,7 @@ fn a_new_stream_hears_the_current_hand_and_policy_and_no_resent_record() {
         (opened.epoch.as_str(), 1, 4),
         "`in` where the closed stream left it"
     );
-    assert_eq!((again.opening[0].seq, again.opening[1].seq), (5, 6));
+    assert_eq!((again.opening[0].seq, again.opening_end()), (5, 6));
     assert_eq!(
         hand_of(&again.opening[0]),
         (keys, Composer::Empty, true),
@@ -397,7 +408,7 @@ fn a_new_stream_hears_the_current_hand_and_policy_and_no_resent_record() {
     let mut later = rig.claimant(ONE, "relaunch");
     let fresh = later.open(ONE);
     assert_eq!((fresh.acked, fresh.sent), (3, 0));
-    assert_eq!((later.opening[0].seq, later.opening[1].seq), (1, 2));
+    assert_eq!((later.opening[0].seq, later.opening_end()), (1, 2));
     assert_eq!(
         later.record(4, Body::Took { of: 6 }),
         (4, Some("refused:in".to_string()))
@@ -479,8 +490,8 @@ fn a_stream_reopened_before_the_last_closed_hears_nothing_owed_to_the_last() {
     );
     assert_eq!(
         rig.state(ONE).sent,
-        reopened.sent + 2,
-        "the opening pair only"
+        reopened.sent + second.opening.len() as u64,
+        "the opening records only"
     );
 
     // The busy lane goes on: its `claim` record is refused, and the stream it served closes

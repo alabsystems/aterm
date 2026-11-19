@@ -373,7 +373,7 @@ fn harness_causes(log: &Log, run: Node, pgid: i32, read: u64, now_ms: u64) -> Ca
             (Op::Open | Op::Amend, Kind::Turn) => {
                 if r.op == Op::Open {
                     opens.push((r.node, r.t, r.par == Some(run)));
-                } else if r.f.get(Key::TurnBy).is_some() {
+                } else if r.f.get_word(Key::TurnBy) == Some("harness") {
                     harness.push(r.node);
                 }
                 if let Some(cause) = r.f.get(Key::Cause) {
@@ -582,6 +582,9 @@ impl SessionLog {
             StepEvent::Interrupt => {
                 self.transcript_event(source, TxEvent::Interrupt, pos, state, now)
             }
+            // The claim's stream feeds the kind: its records are the steps, and the transcript's
+            // row of the same call opens none (D29).
+            StepEvent::ToolUse { subagent, .. } if self.stream_down.step(subagent) => {}
             StepEvent::ToolUse {
                 id: call,
                 tool,
@@ -599,7 +602,15 @@ impl SessionLog {
                 }
             }
             StepEvent::ToolResult { id: call, error } => {
-                if let Some(call) = id(&call) {
+                // A result closes a step the transcript opened before the stream fed its kind;
+                // under the stand-down one for a call it never opened is the stream's, and
+                // nothing of it is the transcript's to count lost.
+                let held = |log: &Self, call: ShortId| {
+                    log.agent.as_ref().is_some_and(|a| a.tracker.tx_holds(call))
+                };
+                if let Some(call) = id(&call).filter(|call| {
+                    !(self.stream_down.tool || self.stream_down.subagent) || held(self, *call)
+                }) {
                     self.transcript_event(
                         source,
                         TxEvent::ToolResult { id: call, error },

@@ -1108,7 +1108,10 @@ fn an_interrupt_while_the_run_is_measured_ends_its_claim() {
         let _ = std::io::Read::read_to_string(&mut o, &mut out);
     }
     assert_eq!(status.code(), Some(3), "{status} {out}");
-    names(&out, &["stopped by SIGTERM: ", "before its first look"]);
+    names(
+        &out,
+        &["stopped by SIGTERM: ", "before any look found it short"],
+    );
     let left = left_in(dir.path());
     assert!(left.is_empty(), "left {left:?}");
 }

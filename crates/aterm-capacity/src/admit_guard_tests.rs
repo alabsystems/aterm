@@ -75,14 +75,16 @@ fn guarded_poll_keeps_queue_order_and_only_transfers_a_successful_guard() {
         Waiter::enter_since(&ledger, &machine, Need::new("guarded").cores(2), since).unwrap();
     let order = waiter.record().order();
     let mut calls = 0;
-    let (polled, guard) = waiter.poll_until_guarded(&machine, &|| false, &mut || {
-        calls += 1;
-        assert!(
-            matches!(ledger.try_turn().unwrap(), Err(_)),
-            "same admission turn remains held"
-        );
-        Ok(None::<Guard>)
-    });
+    let (polled, guard) = waiter
+        .poll_until_guarded(&machine, &|| false, &mut || {
+            calls += 1;
+            assert!(
+                ledger.try_turn().unwrap().is_err(),
+                "same admission turn remains held"
+            );
+            Ok(None::<Guard>)
+        })
+        .expect("nothing stops this look");
     assert_eq!(calls, 1);
     assert!(guard.is_none());
     let waiter = match polled {
@@ -94,8 +96,9 @@ fn guarded_poll_keeps_queue_order_and_only_transfers_a_successful_guard() {
     };
     assert_eq!(waiter.record().order(), order);
     assert!(waiter.record().held.is_none());
-    let (polled, guard) =
-        waiter.poll_until_guarded(&machine, &|| false, &mut || Ok(Some(Guard(drops.clone()))));
+    let (polled, guard) = waiter
+        .poll_until_guarded(&machine, &|| false, &mut || Ok(Some(Guard(drops.clone()))))
+        .expect("nothing stops this look");
     let claim = match polled {
         Polled::Admitted(c) => c,
         other => panic!("{other:?}"),
@@ -123,29 +126,33 @@ fn no_room_error_and_cancellation_never_leave_a_guard_or_grant() {
         other => panic!("{other:?}"),
     };
     let waiter = Waiter::enter(&ledger, &machine, Need::new("blocked").cores(1)).unwrap();
-    let (polled, guard) =
-        waiter.poll_until_guarded(&machine, &|| false, &mut || -> io::Result<Option<Guard>> {
+    let (polled, guard) = waiter
+        .poll_until_guarded(&machine, &|| false, &mut || -> io::Result<Option<Guard>> {
             panic!("no callback when resources do not fit")
-        });
+        })
+        .expect("nothing stops this look");
     assert!(matches!(&polled, Polled::Waiting(_, _)));
     assert!(guard.is_none());
     drop((polled, claim));
     let waiter = Waiter::enter(&ledger, &machine, Need::new("error").cores(1)).unwrap();
-    let (polled, guard) =
-        waiter.poll_until_guarded(&machine, &|| false, &mut || -> io::Result<Option<Guard>> {
+    let (polled, guard) = waiter
+        .poll_until_guarded(&machine, &|| false, &mut || -> io::Result<Option<Guard>> {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
-        });
+        })
+        .expect("nothing stops this look");
     assert!(matches!(polled, Polled::Gone(e) if e.kind() == io::ErrorKind::PermissionDenied));
     assert!(guard.is_none());
     let stopped = Cell::new(false);
     let drops = Rc::new(Cell::new(0));
     let waiter = Waiter::enter(&ledger, &machine, Need::new("cancel after lock").cores(1)).unwrap();
-    let (polled, guard) = waiter.poll_until_guarded(&machine, &|| stopped.get(), &mut || {
+    let polled = waiter.poll_until_guarded(&machine, &|| stopped.get(), &mut || {
         stopped.set(true);
         Ok(Some(Guard(drops.clone())))
     });
-    assert!(matches!(polled, Polled::Gone(e) if e.kind() == io::ErrorKind::Interrupted));
-    assert!(guard.is_none());
+    assert!(
+        matches!(polled, Err(PollStopped { short: None })),
+        "a stop is reported as one, not as a ledger failure"
+    );
     assert_eq!(drops.get(), 1);
     assert!(ledger.list().unwrap().is_empty());
 }
@@ -230,10 +237,11 @@ fn old_holders_bound_all_grants_and_alone_but_verified_nested_work_can_finish() 
     drop(claim);
     machine.held.holders[0] = Held::unmeasured(None, 14);
     let waiter = Waiter::enter(&ledger, &machine, need()).unwrap();
-    let (polled, guard) =
-        waiter.poll_until_guarded(&machine, &|| false, &mut || -> io::Result<Option<Guard>> {
+    let (polled, guard) = waiter
+        .poll_until_guarded(&machine, &|| false, &mut || -> io::Result<Option<Guard>> {
             panic!("unknown held old slot cannot admit")
-        });
+        })
+        .expect("nothing stops this look");
     assert!(matches!(&polled, Polled::Waiting(_, _)));
     assert!(guard.is_none());
 }
@@ -244,10 +252,12 @@ fn grant_publication_failure_drops_the_acquired_guard() {
     let waiter = Waiter::enter(&ledger, &machine, Need::new("lost waiter").cores(1)).unwrap();
     let path = waiter.laid.path().to_path_buf();
     let drops = Rc::new(Cell::new(0));
-    let (polled, guard) = waiter.poll_until_guarded(&machine, &|| false, &mut || {
-        std::fs::remove_file(&path)?;
-        Ok(Some(Guard(drops.clone())))
-    });
+    let (polled, guard) = waiter
+        .poll_until_guarded(&machine, &|| false, &mut || {
+            std::fs::remove_file(&path)?;
+            Ok(Some(Guard(drops.clone())))
+        })
+        .expect("nothing stops this look");
     assert!(!matches!(&polled, Polled::Admitted(_)));
     assert!(guard.is_none());
     assert_eq!(drops.get(), 1);

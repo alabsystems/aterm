@@ -5,6 +5,7 @@
 
 use crate::field::{BoundedText, BoundedToken, Fields, Key, Val};
 use crate::fold::NodeFields;
+use crate::harness_stamp::HarnessStamp;
 use crate::log::{Amend, Close, Log, Mark, Open};
 use crate::rec::Stamp;
 use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, ShortId, Src, lookup};
@@ -344,6 +345,70 @@ pub enum EdgeOutcome {
     Nothing,
 }
 
+/// THE SCREEN STEPS A CLAIM'S RECORD STREAM FEEDS (HX-15i1, D29), per reader: the prompt
+/// parser's approval boxes once the stream applied an `ask` under a claim holding `approvals`,
+/// the question parser's dialogs under one holding `questions`, and the wall readers' walls once
+/// it applied a `wall` under one holding `walls` ([`TurnTracker::set_stream_steps`]). While a
+/// kind stands down, neither a screen verdict nor a program's claimed box opens a step of it:
+/// the stream's own `ask` and `wall` steps are that kind's one writer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamSteps {
+    /// Approval boxes (the prompt parser).
+    pub approvals: bool,
+    /// Question dialogs (the question parser).
+    pub questions: bool,
+    /// Walls (the wall readers).
+    pub walls: bool,
+}
+
+impl StreamSteps {
+    /// Whether the stream feeds the steps of `what`, so the screen opens none.
+    #[must_use]
+    pub const fn feeds(self, what: ScreenStep) -> bool {
+        match what {
+            ScreenStep::Approval(_) => self.approvals,
+            ScreenStep::Question => self.questions,
+            ScreenStep::Wall(_) => self.walls,
+            ScreenStep::Stall | ScreenStep::Survey => false,
+        }
+    }
+
+    /// The kinds `self` names and `other` does not.
+    const fn without(self, other: Self) -> Self {
+        Self {
+            approvals: self.approvals && !other.approvals,
+            questions: self.questions && !other.questions,
+            walls: self.walls && !other.walls,
+        }
+    }
+
+    /// The kinds either names.
+    const fn or(self, other: Self) -> Self {
+        Self {
+            approvals: self.approvals || other.approvals,
+            questions: self.questions || other.questions,
+            walls: self.walls || other.walls,
+        }
+    }
+
+    /// Whether it names no kind.
+    const fn none(self) -> bool {
+        !self.approvals && !self.questions && !self.walls
+    }
+}
+
+/// A program's claimed box the stream stood down for ([`TurnTracker::claim_box`]), while its
+/// report stands: what its reader takes again once the stream stops feeding its kind
+/// ([`TurnTracker::retake`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WithheldBox {
+    boxed: ClaimedBox,
+    /// The report's began (`None`: a carried claim's, which nothing dated).
+    began: Option<u64>,
+    /// The turn it stood in (`None`: the run): a box whose turn ended left with it.
+    turn: Option<Node>,
+}
+
 /// A step the screen holds open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScreenStep {
@@ -567,6 +632,9 @@ pub struct LastClose {
     pub ctl: bool,
     /// Whether the transcript closed it (its vendor turn's end, or a newer vendor turn superseding it): [`TurnTracker::transcript`].
     pub tx: bool,
+    /// Whether the harness's record stream closed it (its end, or a new turn superseding it):
+    /// [`TurnTracker::stream_turn`].
+    pub stream: bool,
 }
 
 /// What the tracker holds, for a conformance projection or a debugger.
@@ -679,6 +747,17 @@ struct VendorInterrupt {
     source: Option<TxMark>,
     bound: Option<(Node, Src)>,
     valid: bool,
+}
+
+/// The vendor turn the open turn `t` names (its `vref=`), if it names one.
+fn open_vref(log: &Log, t: Node) -> Option<ShortId> {
+    log.state()
+        .turn()
+        .filter(|o| o.node == t)
+        .and_then(|o| match o.f.get(Key::Vref) {
+            Some(Val::Id(id)) => Some(*id),
+            _ => None,
+        })
 }
 
 fn carry_one<'a>(fields: &[(&str, &'a str)], key: &str) -> Option<&'a str> {
@@ -857,6 +936,43 @@ impl VendorInterrupt {
     }
 }
 
+/// A harness's `turn` record, as its stream applied it ([`TurnTracker::stream_turn`]): no wire
+/// type, so every platform builds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamTurn<'a> {
+    /// `started`: the harness's turn `turn` began, opened by `by` (a `turn_by=` word, written
+    /// where it is one), a peer's tab in `peer` (written as `as=` where it fits).
+    Started {
+        /// The harness's count of turns in its conversation.
+        turn: u64,
+        /// Who opened it.
+        by: Option<&'a str>,
+        /// The peer tab that opened it, for `by` = `peer`.
+        peer: Option<&'a str>,
+    },
+    /// The harness's turn `turn` ended `out`.
+    Ended {
+        /// The harness's count.
+        turn: u64,
+        /// How.
+        out: TurnOut,
+    },
+}
+
+/// THE STREAM'S HOLD ON A RUN'S TURNS ([`TurnTracker::stream_turn`]): the claim holder whose
+/// records fed them (the stamp's `holder=`), the newest turn number those records named, and the
+/// open turn they hold under it (none once it closed, whoever closed it). The harness counts the
+/// turns of its conversation, so a record of a number at or below the newest it named, other
+/// than a repeat of the turn it holds open, is one it sent before (its resend queue after a
+/// lapse, a conversation re-sent for `want`): it writes nothing. Another holder's records start
+/// over: the turn the old one held is no one's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamHold {
+    holder: ShortId,
+    number: u64,
+    node: Option<Node>,
+}
+
 /// The turn tracker of one agent run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnTracker {
@@ -900,6 +1016,33 @@ pub struct TurnTracker {
     /// The screen verdict opened a turn on this run in this process (a carry starts it unset): its
     /// turns are the screen's, and the program's claim stands aside ([`TurnTracker::claim_edge`]).
     screen_turns: bool,
+    /// THE STREAM FEEDS TURNS (HX-15h, D29): the live claim's record stream applied a `turn`
+    /// record in this epoch ([`TurnTracker::stream_turn`], [`TurnTracker::set_stream_turns`]).
+    /// While it is set only the stream opens or closes a turn: a screen verdict opens none and
+    /// arms no rest, a program's claim stands aside, and the transcript opens, closes and
+    /// supersedes none (it still names the stream's turn with its `vref=` and metrics). Steps stay
+    /// the screen's and hang under the stream's turn. Never carried: a successor's stream feeds
+    /// nothing until its first `turn` record.
+    stream_turns: bool,
+    /// THE STREAM FEEDS THE RUN'S BOXES AND WALLS (HX-15i1, D29), per reader
+    /// ([`TurnTracker::set_stream_steps`]): no screen verdict and no claimed box opens a step of
+    /// a kind it feeds. Never carried, as [`Self::stream_turns`] is not.
+    stream_steps: StreamSteps,
+    /// THE KINDS THE STREAM GAVE BACK (HX-15i1): those it stopped feeding since the host last
+    /// settled the published word ([`TurnTracker::set_stream_steps`]), whose readers take the box
+    /// or wall still shown at that settle ([`TurnTracker::retake`]). Never carried.
+    regained: StreamSteps,
+    /// The published word's detail as it moved to [`Self::word`] (a wall's reset), which a
+    /// step its reader takes again carries ([`TurnTracker::retake`]). Never carried.
+    word_detail: Option<String>,
+    /// A program's claimed box the stream stood down for, while its report stands
+    /// ([`WithheldBox`]). Never carried.
+    withheld: Option<WithheldBox>,
+    /// The stream's hold on this run's turns ([`StreamHold`]): whose records fed them, the newest
+    /// number they named, and the open turn held under it. Kept past a close by another source,
+    /// so a record the harness sends again (its resend queue, a conversation re-sent for `want`)
+    /// writes nothing; carried across a seamless update with the turn.
+    stream_hold: Option<StreamHold>,
     /// The turns a partial transcript opened where none ran (fix E1) that no claim's beginning
     /// has taken and no claim's rest closed yet, oldest first, each with its open's wall time: at
     /// most [`UNTAKEN_MAX`], and never carried: a successor feeds no beginning from before its
@@ -957,6 +1100,20 @@ impl TurnTracker {
             opens: 0,
             closes: 0,
             screen_turns: false,
+            stream_turns: false,
+            stream_steps: StreamSteps {
+                approvals: false,
+                questions: false,
+                walls: false,
+            },
+            regained: StreamSteps {
+                approvals: false,
+                questions: false,
+                walls: false,
+            },
+            word_detail: None,
+            withheld: None,
+            stream_hold: None,
             untaken: Vec::new(),
             claim_span: false,
         }
@@ -998,6 +1155,7 @@ impl TurnTracker {
             return self.wake_at();
         }
         self.word = v;
+        self.word_detail = detail.map(str::to_string);
         self.settle = None;
         self.tx.refuted = None;
         match v {
@@ -1131,6 +1289,7 @@ impl TurnTracker {
             .is_some_and(|pending| pending.bound.is_none())
             || edge == ClaimEdge::Rested && self.interrupted != Interruption::None;
         if self.screen_turns
+            || self.stream_turns
             || (self.tx.state == Some(TxState::On)
                 && (!self.tx.stopped || at.wall_ms <= self.tx.read_ms)
                 && !pending_claim)
@@ -1173,7 +1332,7 @@ impl TurnTracker {
         let raw_end = at.wall_ms;
         let at = tx_close_at(log, turn, at);
         let close = Close::new(Out::Turn(out), Src::Engine, Conf::Claim);
-        self.close_turn_with(log, close, out, (None, false, false), at);
+        self.close_turn_with(log, close, out, (None, false, false, false), at);
         self.claim_end = raw_interval
             .filter(|span| span.continuous && span.begin < raw_end)
             .map(|_| raw_end);
@@ -1211,7 +1370,13 @@ impl TurnTracker {
             self.claim_end = None;
             let close = Close::new(Out::Turn(TurnOut::Unknown), Src::Engine, Conf::Claim);
             let at = tx_close_at(log, t, at);
-            self.close_turn_with(log, close, TurnOut::Unknown, (None, false, false), at);
+            self.close_turn_with(
+                log,
+                close,
+                TurnOut::Unknown,
+                (None, false, false, false),
+                at,
+            );
         }
         // A partial transcript's turn no beginning took holds this span, running or closed.
         if self.turn.is_none_or(|t| self.untaken_at(t, at)) && self.take_untaken(at).is_some() {
@@ -1447,34 +1612,50 @@ impl TurnTracker {
             }
             self.close_claim(log, false, at);
         }
-        if let Some(boxed) = report.boxed {
-            let what = boxed.step();
-            let mut f = Fields::new();
-            if let ScreenStep::Approval(b) = what {
-                let _ = f.set(Key::Box, Val::Word(b.word()));
-            }
-            let under_turn = self.turn.is_some();
-            let parent = self.turn.unwrap_or(self.run);
-            let at = no_earlier(at, log.open_entry(parent).map_or(0, |e| e.t));
-            let open = Open::new(what.kind(), Src::Engine, Conf::Claim)
-                .under(parent)
-                .fields(f);
-            if let Ok(node) = log.open(open, at) {
-                self.claim = Some(ClaimHeld {
-                    held: Held {
-                        node,
-                        what,
-                        under_turn,
-                        detail: None,
-                        opened: Some(at),
-                    },
-                    boxed,
-                    began: Some(report.began),
-                });
-                self.opened_decision(node, at);
-            }
+        // The stream feeds this kind of box: the claim opens none, and the box is withheld for
+        // its reader to take again once the stream stops feeding it (HX-15i1). Any other report
+        // is the withheld box's leave.
+        let steps = self.stream_steps;
+        let fed = |b: &ClaimedBox| steps.feeds(b.step());
+        self.withheld = report.boxed.filter(fed).map(|boxed| WithheldBox {
+            boxed,
+            began: Some(report.began),
+            turn: self.turn,
+        });
+        if let Some(boxed) = report.boxed.filter(|b| !fed(b)) {
+            self.open_claim(log, boxed, Some(report.began), at);
         }
         self.wake_at()
+    }
+
+    /// Open the claimed box `boxed` of report `began` under the open turn, else the run, at
+    /// `src=engine conf=claim` ([`Self::claim_box`]).
+    fn open_claim(&mut self, log: &mut Log, boxed: ClaimedBox, began: Option<u64>, at: Stamp) {
+        let what = boxed.step();
+        let mut f = Fields::new();
+        if let ScreenStep::Approval(b) = what {
+            let _ = f.set(Key::Box, Val::Word(b.word()));
+        }
+        let under_turn = self.turn.is_some();
+        let parent = self.turn.unwrap_or(self.run);
+        let at = no_earlier(at, log.open_entry(parent).map_or(0, |e| e.t));
+        let open = Open::new(what.kind(), Src::Engine, Conf::Claim)
+            .under(parent)
+            .fields(f);
+        if let Ok(node) = log.open(open, at) {
+            self.claim = Some(ClaimHeld {
+                held: Held {
+                    node,
+                    what,
+                    under_turn,
+                    detail: None,
+                    opened: Some(at),
+                },
+                boxed,
+                began,
+            });
+            self.opened_decision(node, at);
+        }
     }
 
     /// The claimed box's leave at `at`: its close, attributed as a screen step's
@@ -1532,6 +1713,302 @@ impl TurnTracker {
             self.interrupted = Interruption::Screen;
             self.interrupt_fresh = true;
         }
+    }
+
+    /// THE STREAM'S TURN (HX-15h, D29, D30): a `turn` record the live claim's record stream
+    /// applied, written as a harness claim under `stamp` (`holder= hseq= src=harness conf=claim
+    /// by=<the tab>`). From the first, the stream feeds this run's turns ([`Self::stream_turns`]):
+    /// no screen verdict, program claim or transcript opens or closes one.
+    ///
+    /// A `started` with no turn open opens one under the run (`turn_by=<who>`, a peer's tab in
+    /// `as=`), no earlier than the run's open or the newest closed turn's close; a vendor prompt
+    /// the transcript read just before it, with no turn to name, names it. One that finds a turn
+    /// the stream does not hold (the screen's, a claim's, a partial transcript's, another
+    /// holder's) takes it: an amend stamped the same way names it the stream's, and no second turn
+    /// opens (at most one is open). A `started` of the turn the stream holds repeats it and writes
+    /// nothing; one of a newer number supersedes it (`out=superseded`) and opens its own.
+    ///
+    /// An end closes the turn the stream holds under its number (`out=done|error|interrupted|
+    /// wall`), and an open turn the stream does not hold where its number is newer than any this
+    /// holder named (a stream that begins mid-turn); an end of another number than the held
+    /// turn's, or with no turn open, writes nothing.
+    ///
+    /// A record of a number at or below the newest this holder named, other than a repeat of the
+    /// held turn, is history ([`StreamHold`]): it writes nothing, whether another source closed
+    /// that turn in between or the harness sends its conversation again.
+    ///
+    /// Returns whether the record stands: `false` only where the log refused its row (a closed
+    /// run or log, a row with no room for the stamp).
+    pub fn stream_turn(
+        &mut self,
+        log: &mut Log,
+        edge: StreamTurn<'_>,
+        stamp: &HarnessStamp,
+        at: Stamp,
+    ) -> bool {
+        self.resync(log);
+        if !log.is_open(self.run) {
+            return false;
+        }
+        self.stream_turns = true;
+        self.settle = None;
+        let holder = stamp.holder;
+        let hold = self.stream_hold.filter(|h| h.holder == holder);
+        let named = hold.map(|h| h.number);
+        let held = hold
+            .and_then(|h| h.node)
+            .filter(|node| Some(*node) == self.turn);
+        let hold_as = |number: u64, node: Option<Node>| {
+            Some(StreamHold {
+                holder,
+                number,
+                node,
+            })
+        };
+        match edge {
+            StreamTurn::Started { turn, by, peer } => {
+                if held.is_some() && named == Some(turn) {
+                    return true;
+                }
+                if named.is_some_and(|n| turn <= n) {
+                    return true;
+                }
+                let mut f = Fields::new();
+                if let Some(by) = by.and_then(|by| lookup(crate::vocab::TURN_BY_WORDS, by)) {
+                    let _ = f.set(Key::TurnBy, Val::Word(by));
+                }
+                if let Some(peer) = peer.and_then(|p| BoundedText::new(Key::As, p)) {
+                    let _ = f.set(Key::As, Val::Text(peer));
+                }
+                if let Some(t) = self.turn {
+                    if held == Some(t) {
+                        let Ok(close) = stamp.close(Out::Turn(TurnOut::Superseded), Fields::new())
+                        else {
+                            return false;
+                        };
+                        self.stream_close(log, t, close, TurnOut::Superseded, at);
+                    } else {
+                        let Ok(amend) = stamp.amend(Kind::Turn, f) else {
+                            return false;
+                        };
+                        let at = no_earlier(at, log.open_entry(t).map_or(0, |e| e.t));
+                        if log.amend(t, amend, at).is_err() {
+                            return false;
+                        }
+                        self.untaken.retain(|&(n, _)| n != t);
+                        self.stream_hold = hold_as(turn, Some(t));
+                        return true;
+                    }
+                }
+                let Ok(open) = stamp.open(Kind::Turn, f) else {
+                    return false;
+                };
+                let run_t = log.open_entry(self.run).map_or(0, |e| e.t);
+                let floor = run_t.max(log.state().last[1].as_ref().map_or(0, |c| c.t));
+                let at = no_earlier(at, floor);
+                let Ok(node) = log.open(open.under(self.run), at) else {
+                    return false;
+                };
+                self.turn = Some(node);
+                self.interrupted = Interruption::None;
+                self.claim_interval = None;
+                self.claim_end = None;
+                self.interrupt_fresh = false;
+                self.pending_ledger = None;
+                self.stream_hold = hold_as(turn, Some(node));
+                self.adopt_unmapped(log, node, at);
+                true
+            }
+            StreamTurn::Ended { turn, out } => {
+                let newest = named.map_or(turn, |n| n.max(turn));
+                let Some(t) = self.turn else {
+                    self.stream_hold = hold_as(newest, None);
+                    return true;
+                };
+                match held {
+                    // An end of another turn than the one the stream holds open.
+                    Some(_) if named != Some(turn) => return true,
+                    Some(_) => {}
+                    // A turn the stream does not hold, and a number it already named: history.
+                    None if named.is_some_and(|n| turn <= n) => return true,
+                    None => {}
+                }
+                let Ok(close) = stamp.close(Out::Turn(out), Fields::new()) else {
+                    return false;
+                };
+                self.stream_close(log, t, close, out, at);
+                self.stream_hold = hold_as(newest, None);
+                true
+            }
+        }
+    }
+
+    /// THE VENDOR TURN A PROMPT LEFT UNNAMED names the turn just opened at `at`: a prompt read
+    /// while no turn ran, within [`ATTRIBUTION_MS`] of it and not ended, as a screen's turn
+    /// adopts one ([`Self::ensure_turn_as`]).
+    fn adopt_unmapped(&mut self, log: &mut Log, node: Node, at: Stamp) {
+        if let Some(v) = self
+            .tx
+            .cur
+            .filter(|v| v.end_ms.is_none() && v.node.is_none())
+            && v.at_ms > 0
+            && v.at_ms.abs_diff(at.wall_ms) <= ATTRIBUTION_MS
+            && let Some(conf) = self.tx.state.and_then(TxState::conf)
+        {
+            Self::amend_vref(log, node, v.vref, conf, at);
+            self.tx.cur = Some(VTurn {
+                node: Some(node),
+                ..v
+            });
+        }
+    }
+
+    /// The stream closes the open turn `t` (its end, or a new turn's supersede) with `close`, no
+    /// earlier than the newest row the transcript dated in it. A step the screen still shows
+    /// outlives the turn: it opens again on the run, continuing (`cont=`) the one the close ended,
+    /// as a wall's does at the settle, so its need stands while the screen shows it (the screen's
+    /// next word that does not hold it closes it). A survey only ever stands in a turn and ends
+    /// with it.
+    fn stream_close(&mut self, log: &mut Log, t: Node, close: Close, out: TurnOut, at: Stamp) {
+        let at = tx_close_at(log, t, at);
+        let shown = self
+            .step
+            .as_ref()
+            .filter(|h| h.under_turn && h.what != ScreenStep::Survey)
+            .map(|h| (h.node, h.what, h.detail.clone()));
+        self.close_turn_with(log, close, out, (None, false, false, true), at);
+        if let Some((node, what, detail)) = shown {
+            self.ensure_step(log, what, detail, Some(node), at);
+        }
+    }
+
+    /// Whether the stream feeds this run's turns ([`Self::stream_turn`]).
+    #[must_use]
+    pub const fn stream_turns(&self) -> bool {
+        self.stream_turns
+    }
+
+    /// THE STAND-DOWN FOR `turn`, as the host keeps it per claim and epoch: `on` while the live
+    /// claim's stream feeds turns (a new run's tracker is told at its open), off once it no longer
+    /// does. A turn the stream left open stays open, and the screen's rest closes it: one the
+    /// screen already reads at rest (idle, a prose question, the survey, or a wall the
+    /// transcript's judge has not refuted) arms its settle at `at`, as the verdict would have.
+    pub fn set_stream_turns(&mut self, on: bool, at: Stamp) {
+        let was = std::mem::replace(&mut self.stream_turns, on);
+        if on {
+            self.settle = None;
+            return;
+        }
+        let cause = match self.word {
+            Verdict::Wall(k) if self.tx.refuted.is_none() => Some(SettleCause::Wall(Some(k))),
+            Verdict::Walled if self.tx.refuted.is_none() => Some(SettleCause::Wall(None)),
+            w => rest_cause(w),
+        };
+        if was
+            && self.turn.is_some()
+            && let Some(cause) = cause
+        {
+            self.arm(cause, at);
+        }
+    }
+
+    /// THE STAND-DOWN FOR `ask` AND `wall` (HX-15i1, D29), as the host keeps it per claim and
+    /// epoch: which of the screen's approval, question and wall steps the live claim's stream
+    /// feeds now (a new run's tracker is told at its open). From then neither a screen verdict
+    /// nor a program's claimed box opens a step of a kind the stream feeds. A step of such a kind
+    /// the tracker still holds as the stand-down begins is no longer followed by its reader: it
+    /// closes there `out=passed`, attributed as the screen's next word would close it (a claimed
+    /// box as its claim's end would), before the stream's own step opens, so no kind keeps two
+    /// writers and no box two steps (a claimed box is withheld, as one reported during the
+    /// stand-down is).
+    ///
+    /// A kind the stream stops feeding is given back to its reader: at the host's next settle of
+    /// the published word, the box or wall still shown opens its step again ([`Self::retake`]).
+    pub fn set_stream_steps(&mut self, log: &mut Log, steps: StreamSteps, at: Stamp) {
+        self.resync(log);
+        let before = self.stream_steps;
+        self.stream_steps = steps;
+        self.regained = self.regained.or(before.without(steps)).without(steps);
+        if self.step.as_ref().is_some_and(|h| steps.feeds(h.what)) {
+            self.close_step(log, StepOut::Passed, at);
+        }
+        if let Some(c) = self.claim.as_ref().filter(|c| steps.feeds(c.held.what)) {
+            let withheld = WithheldBox {
+                boxed: c.boxed,
+                began: c.began,
+                turn: c.held.under_turn.then_some(self.turn).flatten(),
+            };
+            self.close_claim(log, false, at);
+            self.withheld = Some(withheld);
+        }
+    }
+
+    /// Whether a kind the stream gave back waits on [`Self::retake`].
+    #[must_use]
+    pub const fn retake_due(&self) -> bool {
+        !self.regained.none()
+    }
+
+    /// THE READERS THE STREAM GAVE BACK TAKE WHAT IS STILL SHOWN (HX-15i1, D29), at the host's
+    /// settle of the published word after [`Self::set_stream_steps`] stopped the stream feeding a
+    /// kind: where that word still shows a box or wall of such a kind and no step holds it (a
+    /// word that moved opened it in [`Self::observe`]), its step opens as `observe` opens it (a
+    /// wall with the word's detail); and a program's claimed box withheld while the stream fed its
+    /// kind, still reported in the turn it stood in, opens its step as [`Self::claim_box`]
+    /// opens it. Then the kinds are taken. Whether a step opened.
+    pub fn retake(&mut self, log: &mut Log, at: Stamp) -> bool {
+        let regained = std::mem::take(&mut self.regained);
+        if regained.none() {
+            return false;
+        }
+        self.resync(log);
+        if !log.is_open(self.run) {
+            return false;
+        }
+        let steps = self.stream_steps;
+        let given = |what: ScreenStep| regained.feeds(what) && !steps.feeds(what);
+        let shown = match self.word {
+            Verdict::Prompt(b) if b.is_question() => Some(ScreenStep::Question),
+            Verdict::Prompt(b) => Some(ScreenStep::Approval(b)),
+            Verdict::Wall(k) => Some(ScreenStep::Wall(Some(k))),
+            Verdict::Walled => Some(ScreenStep::Wall(None)),
+            _ => None,
+        };
+        let mut opened = false;
+        if self.step.is_none()
+            && let Some(what) = shown.filter(|what| given(*what))
+        {
+            // As `observe` opens it: a wall carries the word's detail, a box none.
+            let detail = matches!(what, ScreenStep::Wall(_))
+                .then(|| self.word_detail.clone())
+                .flatten();
+            self.ensure_step(log, what, detail, None, at);
+            opened |= self.step.is_some();
+        }
+        if !self.screen_turns
+            && self.claim.is_none()
+            && let Some(w) = self
+                .withheld
+                .filter(|w| given(w.boxed.step()) && w.turn == self.turn)
+        {
+            self.withheld = None;
+            self.open_claim(log, w.boxed, w.began, at);
+            opened |= self.claim.is_some();
+        }
+        opened
+    }
+
+    /// The screen steps the stream feeds ([`Self::set_stream_steps`]).
+    #[must_use]
+    pub const fn stream_steps(&self) -> StreamSteps {
+        self.stream_steps
+    }
+
+    /// Whether the transcript join holds a step of call `id` (open, or closed by its turn and
+    /// owed a result): a result for one it does not hold would be counted lost.
+    #[must_use]
+    pub fn tx_holds(&self, id: ShortId) -> bool {
+        self.tx.tools.iter().any(|(v, ..)| *v == id)
     }
 
     /// Input from `by` reached the session: a turn opening within [`ATTRIBUTION_MS`] is attributed to it.
@@ -1773,6 +2250,16 @@ impl TurnTracker {
             }
         }
         self.tx.carry_into(&mut s);
+        if let Some(h) = self.stream_hold {
+            s.push_str(&format!(
+                " stream_holder={} stream_no={}",
+                h.holder.as_str(),
+                h.number
+            ));
+            if h.node.is_some() && h.node == self.turn {
+                s.push_str(" stream_own=1");
+            }
+        }
         if let Some(c) = &self.claim {
             s.push_str(&format!(
                 " claim={} claim_under={} claim_what={}",
@@ -1957,6 +2444,20 @@ impl TurnTracker {
         if !proof_unique && interrupted.confirmed() {
             interrupted = Interruption::Unknown;
         }
+        // The stream's hold crosses with the turn (a successor's stream does not feed the turns
+        // until its first `turn` record, but what its harness sends again is history there too).
+        let stream_hold = match (carry_one(&kv, "stream_holder"), carry_one(&kv, "stream_no")) {
+            (Some(holder), Some(number)) => {
+                ShortId::new(holder)
+                    .zip(parse_u64(number))
+                    .map(|(holder, number)| StreamHold {
+                        holder,
+                        number,
+                        node: turn.filter(|_| carry_one(&kv, "stream_own") == Some("1")),
+                    })
+            }
+            _ => None,
+        };
         Some(TurnTracker {
             run,
             proof_unique,
@@ -1978,12 +2479,24 @@ impl TurnTracker {
             opens: 0,
             closes: 0,
             screen_turns: false,
+            stream_turns: false,
+            stream_steps: StreamSteps::default(),
+            regained: StreamSteps::default(),
+            word_detail: None,
+            withheld: None,
+            stream_hold,
             untaken: Vec::new(),
             claim_span: false,
         })
     }
 
     fn resync(&mut self, log: &Log) {
+        // A turn the stream held closed, whoever closed it: its number stays named.
+        if let Some(hold) = self.stream_hold.as_mut()
+            && hold.node.is_some_and(|t| !log.is_open(t))
+        {
+            hold.node = None;
+        }
         if self.turn.is_some_and(|t| !log.is_open(t)) {
             self.turn = None;
             self.settle = None;
@@ -2105,6 +2618,10 @@ impl TurnTracker {
     }
 
     fn arm(&mut self, cause: SettleCause, at: Stamp) {
+        // The stream feeds the turns: no rest closes one.
+        if self.stream_turns {
+            return;
+        }
         let due_mono = at.mono_ms.saturating_add(SETTLE_MS);
         debug_assert!(settle_due(at.mono_ms, due_mono) && !settle_due(at.mono_ms, due_mono - 1));
         self.settle = Some(Settle {
@@ -2146,6 +2663,10 @@ impl TurnTracker {
     }
 
     fn ensure_turn(&mut self, log: &mut Log, conf: Conf, at: Stamp) {
+        // The stream feeds the turns: the screen opens none.
+        if self.stream_turns {
+            return;
+        }
         // The screen owns the steps where it opens turns: a claimed box leaves now.
         if self.claim.is_some() {
             self.close_claim(log, false, at);
@@ -2253,6 +2774,10 @@ impl TurnTracker {
         if self.step.as_ref().is_some_and(|h| h.what == what) {
             return;
         }
+        // The stream feeds this kind of step: its reader opens none (HX-15i1).
+        if self.stream_steps.feeds(what) {
+            return;
+        }
         let under_turn = self.turn.is_some();
         let parent = self.turn.unwrap_or(self.run);
         let mut f = Fields::new();
@@ -2353,7 +2878,7 @@ impl TurnTracker {
         at: Stamp,
     ) {
         let close = Close::new(Out::Turn(out), Src::Screen, conf);
-        self.close_turn_with(log, close, out, (settled_ms, ctl, false), at);
+        self.close_turn_with(log, close, out, (settled_ms, ctl, false, false), at);
     }
 
     fn close_turn_with(
@@ -2361,10 +2886,10 @@ impl TurnTracker {
         log: &mut Log,
         close: Close,
         out: TurnOut,
-        how: (Option<u64>, bool, bool),
+        how: (Option<u64>, bool, bool, bool),
         at: Stamp,
     ) {
-        let (settled_ms, ctl, tx) = how;
+        let (settled_ms, ctl, tx, stream) = how;
         let Some(turn) = self.turn.take() else {
             return;
         };
@@ -2396,6 +2921,7 @@ impl TurnTracker {
                 settled_ms,
                 ctl,
                 tx,
+                stream,
             });
         }
     }
@@ -3295,8 +3821,9 @@ impl TurnTracker {
     }
 
     /// THE CLAIM'S CLOSED TURN A LATE PROMPT NAMES: of the run's closed turns the program's claim
-    /// opened (`src=engine conf=claim`) and no vendor turn names yet, the one opened nearest the
-    /// prompt's row at `tp`, within [`ATTRIBUTION_MS`] and not before the run's open (`run_t`).
+    /// or a harness's stream opened (`src=engine|harness conf=claim`) and no vendor turn names
+    /// yet, the one opened nearest the prompt's row at `tp`, within [`ATTRIBUTION_MS`] and not
+    /// before the run's open (`run_t`).
     /// A transcript first read after its claims' turns closed (a self-claim proven late, a tap
     /// that stopped and reads again) names each of them as the newest closed turn is named,
     /// rather than opening a second turn for a span a claim's turn holds.
@@ -3313,7 +3840,7 @@ impl TurnTracker {
                 r.op == Op::Open
                     && r.k == Kind::Turn
                     && r.par == Some(self.run)
-                    && (r.src, r.conf) == (Src::Engine, Conf::Claim)
+                    && matches!((r.src, r.conf), (Src::Engine | Src::Harness, Conf::Claim))
                     && r.t >= run_t
                     && r.t.abs_diff(tp) <= ATTRIBUTION_MS
                     && !log.is_open(r.node)
@@ -3360,6 +3887,15 @@ impl TurnTracker {
             (Some(l), Some(c)) if c.1.abs_diff(tp) < l.1.abs_diff(tp) => Some(c),
             (l, c) => l.or(c),
         };
+        // The stream feeds the turns: the prompt names a turn as the screen's path below does
+        // (the closed one it came late for, else the open one opened within the window that
+        // names no vendor turn yet), and opens, closes and supersedes none. A prompt read before
+        // the stream's `started` stays unmapped, and that turn's open names it
+        // ([`Self::adopt_unmapped`]).
+        if self.stream_turns {
+            self.tx_prompt_streamed(log, (vref, conf, row), late);
+            return;
+        }
         if let Some(t) = self.turn {
             let opened = log.open_entry(t).map_or(0, |e| e.t);
             let held =
@@ -3396,7 +3932,13 @@ impl TurnTracker {
             let at = tx_close_at(log, t, rebase(prev_end.unwrap_or(tp), now));
             let close =
                 Close::new(Out::Turn(TurnOut::Superseded), Src::Transcript, conf).by(Actor::Vendor);
-            self.close_turn_with(log, close, TurnOut::Superseded, (None, false, true), at);
+            self.close_turn_with(
+                log,
+                close,
+                TurnOut::Superseded,
+                (None, false, true, false),
+                at,
+            );
         } else if let Some((node, _)) = late {
             Self::amend_vref(log, node, vref, conf, row);
             self.tx.cur = Some(mapped(node));
@@ -3427,6 +3969,54 @@ impl TurnTracker {
             }
             None => self.tx.cur = None,
         }
+    }
+
+    /// [`Self::tx_prompt`] while the stream feeds the turns: the vendor turn `vref` read at `row`
+    /// names the closed turn `late` came for where it opened nearer the prompt than the open turn,
+    /// else the open turn where it opened within [`ATTRIBUTION_MS`] of the prompt and names no
+    /// vendor turn yet (or this one), else nothing: the turn the stream opens next adopts it.
+    fn tx_prompt_streamed(
+        &mut self,
+        log: &mut Log,
+        (vref, conf, row): (ShortId, Conf, Stamp),
+        late: Option<(Node, u64)>,
+    ) {
+        let tp = row.wall_ms;
+        let mapped = |node: Node| VTurn {
+            vref,
+            node: Some(node),
+            end_ms: None,
+            at_ms: tp,
+        };
+        let open = self.turn.map(|t| {
+            let opened = log.open_entry(t).map_or(0, |e| e.t);
+            (t, opened.abs_diff(tp), open_vref(log, t))
+        });
+        if let Some((t, _, Some(held))) = open
+            && held == vref
+        {
+            self.tx.cur = Some(mapped(t));
+            return;
+        }
+        let near = open.map_or(u64::MAX, |(_, near, _)| near);
+        if let Some((node, _)) = late.filter(|(_, o)| o.abs_diff(tp) < near) {
+            Self::amend_vref(log, node, vref, conf, row);
+            self.tx.cur = Some(mapped(node));
+            return;
+        }
+        if let Some((t, near, None)) = open
+            && near <= ATTRIBUTION_MS
+        {
+            Self::amend_vref(log, t, vref, conf, row);
+            self.tx.cur = Some(mapped(t));
+            return;
+        }
+        self.tx.cur = Some(VTurn {
+            vref,
+            node: None,
+            end_ms: None,
+            at_ms: tp,
+        });
     }
 
     fn tx_tool(
@@ -3599,7 +4189,11 @@ impl TurnTracker {
         let open = Some(node) == self.turn && log.is_open(node);
         let screen_held = self.step.as_ref().is_some_and(|h| h.under_turn);
         // A partial source ends only the turn it opened (fix E1); the screen's settles it.
-        if open && !screen_held && (state == TxState::On || tx_owns(log, node)) {
+        if open
+            && !screen_held
+            && !self.stream_turns
+            && (state == TxState::On || tx_owns(log, node))
+        {
             let (out, oconf) = match self.settle.map(|s| s.cause) {
                 Some(c) => match settle_out(c, self.interrupted.confirmed()) {
                     (o, Conf::Heuristic) => (o, Conf::Heuristic),
@@ -3616,7 +4210,7 @@ impl TurnTracker {
             };
             at = tx_close_at(log, node, row);
             let close = Close::new(Out::Turn(out), Src::Transcript, oconf).by(Actor::Vendor);
-            self.close_turn_with(log, close, out, (None, false, true), at);
+            self.close_turn_with(log, close, out, (None, false, true, false), at);
         }
         // A measured source may close the screen's turn, but a different vendor
         // identity cannot replace that turn's metrics. Its raw facts remain above.
@@ -3730,7 +4324,8 @@ impl TurnTracker {
     }
 
     fn tx_end_wall(&mut self, log: &mut Log, kind: WallKind, state: TxState, now: Stamp) {
-        if state != TxState::On {
+        // The stream said how its turn ended: the transcript rewrites no outcome.
+        if state != TxState::On || self.stream_turns {
             return;
         }
         let Some(node) = self

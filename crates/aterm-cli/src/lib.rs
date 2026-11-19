@@ -216,6 +216,9 @@ pub enum Verb {
     /// `aterm file` — the lab's shared files: tables every member reads from a local snapshot
     /// (docs/DESIGN-shared-files-2026-11-11.md §3).
     File,
+    /// `aterm goals` — Product Planning's verb: project goals and project trackers, kept in the
+    /// `lab/tracker` tables (docs/DESIGN-lab-tracker-2026-11-14.md §1).
+    Goals,
     /// `aterm email` — read configured mail accounts without opening a window.
     Email,
     /// `aterm harness` — Claude Code harness read views, accounts roster, and live upgrade.
@@ -263,6 +266,7 @@ impl Verb {
         Verb::Members,
         Verb::Db,
         Verb::File,
+        Verb::Goals,
         Verb::Email,
         Verb::Harness,
         Verb::Keeper,
@@ -301,6 +305,7 @@ impl Verb {
             Verb::Members => "members",
             Verb::Db => "db",
             Verb::File => "file",
+            Verb::Goals => "goals",
             Verb::Email => "email",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
@@ -343,6 +348,7 @@ impl Verb {
             | Verb::Members
             | Verb::Db
             | Verb::File
+            | Verb::Goals
             | Verb::Email
             | Verb::Harness
             | Verb::Keeper
@@ -383,6 +389,7 @@ impl Verb {
             Verb::Members => "aterm members <cmd>",
             Verb::Db => "aterm db <cmd> --dir <database>",
             Verb::File => "aterm file <cmd> [<name>] [--json]",
+            Verb::Goals => "aterm goals <cmd> <args>",
             Verb::Email => "aterm email <cmd>",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
@@ -512,8 +519,15 @@ impl Verb {
                 "The lab's shared files (ai/accounts, ai/links,",
                 "lab/machines): tables read from this machine's",
                 "snapshot, each answer with its state (ls | cat |",
-                "path | status | get | rows | watch | history |",
-                "refresh). Unix only.",
+                "path | status | get | rows | watch | history).",
+                "Windows reads retained files. Unix also syncs.",
+            ],
+            Verb::Goals => &[
+                "Product Planning: the lab's project goals and",
+                "project trackers. Take a package, note a row,",
+                "mark a package done, record a measurement",
+                "(claim | note | done | measure); each record says",
+                "who, why and on what evidence. Unix only.",
             ],
             Verb::Email => &[
                 "Read mail without a window (accounts | folders |",

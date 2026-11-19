@@ -121,7 +121,7 @@ fn a_chosen_display_spelling_survives_a_reload() {
     let mut chosen = full();
     chosen.nick = nick("blue heron");
     let reloaded = MachineName::from_toml(&chosen.to_toml().unwrap()).unwrap();
-    assert_eq!(reloaded.title(), "m8 blue heron");
+    assert_eq!(reloaded.title(), "m8 Blue Heron");
 }
 
 #[test]

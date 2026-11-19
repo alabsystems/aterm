@@ -271,6 +271,13 @@ struct Mock {
     /// For the next `await idle` waits, one each: how long until its screen holds still, the
     /// wait latching then or timing out at its step, whichever comes first.
     idle_after: VecDeque<Duration>,
+    /// How long from the run's start ([`Mock::run_on`]) each `await idle` holds still its whole
+    /// [`SETTLE_CAP`], as [`paced`] has it ([`Mock::paced_until`]).
+    paced_for: Option<Duration>,
+    /// Where the run's clock ends [`Mock::paced_for`]: until then each `await idle` past
+    /// [`Mock::idle_after`] holds still its whole [`SETTLE_CAP`] or to this instant, whichever is
+    /// sooner, and from then on each is answered as it is unpaced.
+    paced_until: Option<Instant>,
     cursor_col: Option<usize>,
     attention: Option<String>,
     attention_replies: VecDeque<CtlReply>,
@@ -1139,6 +1146,8 @@ impl Mock {
             pinned: None,
             title_refused: false,
             idle_after: VecDeque::new(),
+            paced_for: None,
+            paced_until: None,
             stalls: 0,
             idle_skips_busy: false,
             by_index: BTreeMap::new(),
@@ -3172,14 +3181,21 @@ impl Mock {
                 run_nap(self.waits.as_deref(), Duration::from_millis(asked));
                 Ok(timeout())
             }
-            "await" if tail.first() == Some(&"idle") && !self.idle_after.is_empty() => {
+            "await"
+                if tail.first() == Some(&"idle")
+                    && (!self.idle_after.is_empty() || self.paced_left().is_some()) =>
+            {
                 let asked = tail
                     .iter()
                     .position(|a| *a == "timeout")
                     .and_then(|i| tail.get(i + 1))
                     .and_then(|ms| ms.parse::<u64>().ok())
                     .map_or(Duration::ZERO, Duration::from_millis);
-                let still = self.idle_after.pop_front().unwrap_or_default();
+                let still = self
+                    .idle_after
+                    .pop_front()
+                    .or_else(|| self.paced_left())
+                    .unwrap_or_default();
                 run_nap(self.waits.as_deref(), still.min(asked));
                 Ok(if still <= asked {
                     ok("OK idle\n")
@@ -4683,8 +4699,15 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
     use aterm_phase::muse::fixtures as u;
     use aterm_phase::prompt::fixtures::screen;
     let end = screen(u::END_OF_TURN_1_4_10);
-    let run_pinned = |rows: &[String], titles: &[Option<&str>], pinned: Option<&str>| {
+    // A run `pace`d ([`paced_to_the_hold_end`]) stands each short settle still its whole
+    // SETTLE_CAP, as a held reply is read, until just before the hold ends, and then reads at each
+    // round trip: a hold of TITLE_HOLD is some forty reads and a few round trips, its end read to
+    // a few round trips.
+    let run_paced = |rows: &[String], titles: &[Option<&str>], pinned: Option<&str>, pace: bool| {
         let mut m = Mock::new(vec![rows.to_vec()]);
+        if pace {
+            m = paced_to_the_hold_end(m);
+        }
         m.titles = titles.iter().map(|t| t.map(str::to_string)).collect();
         m.pinned = pinned.map(str::to_string);
         let clock = virtual_clock();
@@ -4697,6 +4720,9 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
         drop(s);
         let unread = m.titles.len();
         (t, m.requests, took, unread)
+    };
+    let run_pinned = |rows: &[String], titles: &[Option<&str>], pinned: Option<&str>| {
+        run_paced(rows, titles, pinned, false)
     };
     let run = |rows: &[String], titles: &[Option<&str>]| {
         let (t, requests, took, _) = run_pinned(rows, titles, None);
@@ -4738,7 +4764,7 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
     let (t, requests, _) = run(&claude, &[Some("◐ proj")]);
     assert_eq!(t.phase, Phase::Idle);
     assert_eq!(reads(&requests), 0, "{requests:#?}");
-    let (t, requests, took) = run(&end, &[Some("⠙ proj")]);
+    let (t, requests, took, _) = run_paced(&end, &[Some("⠙ proj")], None, true);
     assert_eq!(
         (t.phase, &t.screen.rows, t.timed_out),
         (Phase::Idle, &end, false)
@@ -4805,6 +4831,16 @@ fn title_run_paced(screens: Vec<Vec<String>>, titles: &[&str]) -> TitleRun {
 /// reply is read about every 1.5 s, as one a program keeps drawing is.
 fn paced(mut m: Mock) -> Mock {
     m.idle_after = std::iter::repeat_n(SETTLE_CAP, 400).collect();
+    m
+}
+
+/// `m` [`paced`] until ten round trips ([`ROUND_TRIP`]) before a [`TITLE_HOLD`] from the run's
+/// start ends ([`Mock::paced_for`]), and read at each round trip from then on, as the unpaced mock
+/// is: the hold's end is read to a few round trips, so a hold that ends 10 ms early ends on a read
+/// before TITLE_HOLD, for some forty settles and a few round trips, not a read each round trip of
+/// the whole hold.
+fn paced_to_the_hold_end(mut m: Mock) -> Mock {
+    m.paced_for = Some(TITLE_HOLD - 10 * ROUND_TRIP);
     m
 }
 
@@ -4909,7 +4945,10 @@ fn a_title_hold_holds_a_question_and_notes_its_hang() {
     assert_eq!((r.turn.phase, &r.turn.screen.rows), (Phase::Idle, &end));
     assert_eq!(title_reads(&r.requests), 1, "{:#?}", r.requests);
     assert!(r.took < Duration::from_secs(1), "{:?}", r.took);
-    let r = title_run(vec![end.clone()], &["⠙ proj"], false);
+    let r = title_run_on(
+        paced_to_the_hold_end(title_mock(vec![end.clone()], &["⠙ proj"], false)),
+        None,
+    );
     assert_eq!((r.turn.phase, r.turn.timed_out), (Phase::Idle, false));
     assert!(r.took >= TITLE_HOLD, "{:?}", r.took);
     assert_eq!(r.noted.len(), 1, "{:#?}", r.noted);
@@ -5049,8 +5088,13 @@ fn a_report_sent_with_the_rows_holds_a_status_line_reply_under_a_glyphless_title
         "state=done:app=claude-code",
         "state=done:app=claude-code",
     ];
-    let reported = |frames: Vec<Vec<String>>, reports: &[&str]| {
+    // The hold is run `pace`d to its end ([`paced_to_the_hold_end`]): its reads some forty and a
+    // few round trips, not one per round trip, its end read to a few round trips.
+    let reported = |frames: Vec<Vec<String>>, reports: &[&str], pace: bool| {
         let mut m = snapshot_mock(frames, &["Claude Code"]);
+        if pace {
+            m = paced_to_the_hold_end(m);
+        }
         m.screen_reports = reports
             .iter()
             .enumerate()
@@ -5058,7 +5102,7 @@ fn a_report_sent_with_the_rows_holds_a_status_line_reply_under_a_glyphless_title
             .collect();
         title_run_on(m, None)
     };
-    let r = reported(frames.clone(), &reports);
+    let r = reported(frames.clone(), &reports, false);
     assert_eq!(
         (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
         (Phase::Idle, &done, false),
@@ -5069,7 +5113,11 @@ fn a_report_sent_with_the_rows_holds_a_status_line_reply_under_a_glyphless_title
     assert_eq!(title_reads(&r.requests), 0, "{:#?}", r.requests);
     assert!(r.noted.is_empty(), "{:#?}", r.noted);
     let answered = screen(STATUSLINE_MIDREPLY_ANSWERED_2_1_323);
-    let r = reported(vec![answered.clone()], &["state=working:app=claude-code"]);
+    let r = reported(
+        vec![answered.clone()],
+        &["state=working:app=claude-code"],
+        true,
+    );
     assert_eq!(
         (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
         (Phase::Idle, &answered, false),
@@ -6488,6 +6536,17 @@ impl Mock {
         self.waits = Some(Arc::clone(clock));
         self.hang_at = steps.then(|| Instant::now() + aterm_spec::wait::MUST_HAPPEN);
         self.round_trip = if steps { ROUND_TRIP } else { Duration::ZERO };
+        self.paced_until = self.paced_for.map(|span| clock.mono() + span);
+    }
+
+    /// How long the next `await idle`'s screen holds still before [`Mock::paced_until`]: its
+    /// whole [`SETTLE_CAP`] or what is left to that instant, and none once the run's clock is
+    /// there.
+    fn paced_left(&self) -> Option<Duration> {
+        let left = self
+            .paced_until?
+            .saturating_duration_since(run_now(self.waits.as_deref()));
+        (!left.is_zero()).then(|| left.min(SETTLE_CAP))
     }
 }
 fn memory_tape(m: &mut Mock) -> (MemoryTape, TapedCtl<'_, Mock>) {

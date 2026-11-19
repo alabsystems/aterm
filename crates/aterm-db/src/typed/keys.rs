@@ -812,6 +812,40 @@ pub fn archived_pk(operation: &[u8; 32]) -> String {
     h8("ar", b"aterm/alab/archived/1\0", &[operation])
 }
 
+/// An account event's row (SF-47, `alab::registry::ACCOUNT_EVENT`): a digest of its subject
+/// (an `ac-` account, or an `ad-` login where the event names no account), the source word, the
+/// cause word, the status it moved to (empty for a note) and `discriminator`, so a re-import of
+/// one sheet cell names the same row whatever else the sheet's tab says. An event that cannot
+/// collapse (a person's or an agent's note) passes what makes it one write, its operation or
+/// time; an import passes nothing.
+///
+/// # Errors
+/// `subject` is neither an account key nor an address key.
+pub fn account_event_pk(
+    subject: &str,
+    source: &str,
+    cause: &str,
+    to: &str,
+    discriminator: &[u8],
+) -> Result<String> {
+    if !(is_digest_pk(subject, "ac") || is_digest_pk(subject, "ad")) {
+        return Err(Error::new(
+            "an account event names an account or a login address",
+        ));
+    }
+    Ok(h8(
+        "ae",
+        b"aterm/alab/account-event/1\0",
+        &[
+            subject.as_bytes(),
+            source.as_bytes(),
+            cause.as_bytes(),
+            to.as_bytes(),
+            discriminator,
+        ],
+    ))
+}
+
 /// A carried history entry's row (`alab::history`), keyed by the Mac that carried it and the
 /// operation it restates: two Macs carrying one operation write two rows, so no row is a
 /// register of two candidates that a later restatement would have to carry together.

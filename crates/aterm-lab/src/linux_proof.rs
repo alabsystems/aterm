@@ -507,8 +507,21 @@ pub fn test_verdict(name: &str, out: &Out) -> Row {
         name: name.to_string(),
         verdict,
         secs: out.secs,
-        detail,
+        detail: with_stall_tail(out, detail),
     }
+}
+
+/// Keep the interrupted test's partial line and the watchdog's snapshot even when an
+/// earlier binary failed or cargo wrote a diagnostic of its own.
+pub(super) fn with_stall_tail(out: &Out, mut detail: String) -> String {
+    if out.code == Some(124) {
+        let tail = out.tail(5);
+        if !detail.ends_with(&tail) {
+            detail.push('\n');
+            detail.push_str(&tail);
+        }
+    }
+    detail
 }
 
 /// How the x86_64 cell's uds, pty and libc tests run: one at a time.
@@ -529,21 +542,32 @@ pub fn no_run<'a>(args: &[&'a str]) -> Vec<&'a str> {
     built
 }
 
-/// A test row's run, `cargo(args)` being its cargo argv: built first ([`no_run`]) with no hang
-/// detector, since a cold build on a loaded host is slow, not hung, then run under the row's
-/// 30-minute one, which only this names. A failed build is the row's output; the seconds are both
-/// steps'.
+/// Build the row first ([`no_run`]), then supervise its cargo command from the guest's native
+/// architecture, including when the tests themselves run under Rosetta.
 #[must_use]
 pub fn test_run(up: &Up, cargo: impl Fn(&[&str]) -> Vec<String>, args: &[&str]) -> Out {
-    const TEST_ROW_HANG_SECS: u32 = 1800;
     let built = up
         .guest
         .shell_streamed(&up.home, &cargo(&no_run(args)), "  | ");
     if !built.ok() {
         return built;
     }
-    let mut argv = hang_detector(TEST_ROW_HANG_SECS);
+    let mut argv = vec![
+        "cargo".into(),
+        "run".into(),
+        "--quiet".into(),
+        "--locked".into(),
+        "--manifest-path".into(),
+        format!("{}/Cargo.toml", linux::repo()),
+        "-p".into(),
+        "aterm-uds".into(),
+        "--example".into(),
+        "row_watch".into(),
+        "--".into(),
+    ];
     argv.extend(cargo(args));
+    let env = up.cargo_env(Arch::Aarch64, &format!("{}/target", up.lane_dir()), false);
+    let argv = guest::with_env(&env, &argv);
     let mut out = up.guest.shell_streamed(&up.home, &argv, "  | ");
     out.secs += built.secs;
     out

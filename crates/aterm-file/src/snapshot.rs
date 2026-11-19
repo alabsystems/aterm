@@ -16,7 +16,7 @@
 use crate::Name;
 use aterm_digest::Sha256;
 use aterm_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io};
 
 /// The format word of a snapshot.
 pub const FORMAT: &str = "aterm-file-snap/1";
@@ -245,13 +245,12 @@ impl Snapshot {
     /// the two members and one without.
     #[must_use]
     pub fn content(&self) -> [u8; 32] {
-        let lines: Vec<String> = self.rows.iter().map(row_line).collect();
-        self.content_of(lines.iter().map(String::as_str))
+        self.content_of(self.rows.iter().map(row_line))
     }
 
     /// [`Self::content`] from each row's line ([`row_line`]), in row order: a rendering that
     /// keeps its rows' lines ([`crate::Rendered`]) digests them without rendering a row again.
-    pub(crate) fn content_of<'a>(&self, lines: impl Iterator<Item = &'a str>) -> [u8; 32] {
+    pub(crate) fn content_of(&self, lines: impl Iterator<Item = impl AsRef<str>>) -> [u8; 32] {
         let mut sha = Sha256::new();
         sha.update(b"aterm/file/snapshot-content/1\0");
         sha.update(self.name.to_string().as_bytes());
@@ -267,7 +266,7 @@ impl Snapshot {
             sha.update([0]);
         }
         for line in lines {
-            sha.update(line.as_bytes());
+            sha.update(line.as_ref().as_bytes());
             sha.update(b"\n");
         }
         sha.finalize()
@@ -307,7 +306,7 @@ impl Snapshot {
         let mut text = Value::Object(header).to_string();
         text.push('\n');
         for line in lines {
-            text.push_str(line);
+            text.push_str(line.as_ref());
             text.push('\n');
         }
         let digest = aterm_codec::hex::encode_lower(&Sha256::digest(text.as_bytes()));
@@ -422,20 +421,63 @@ impl Snapshot {
     pub fn face(&self) -> String {
         let widths = column_widths(&self.columns, &self.rows);
         let kept = face_columns(&self.columns, &widths, self.rows.len());
-        let lines: Vec<String> = self
-            .rows
-            .iter()
-            .map(|row| face_line(&self.columns, &kept, row))
-            .collect();
-        self.face_of(&kept, lines.iter().map(String::as_str))
+        self.face_of(
+            &kept,
+            self.rows
+                .iter()
+                .map(|row| face_line(&self.columns, &kept, row)),
+        )
     }
 
-    /// [`Self::face`] of the columns `kept` from each row's face line ([`face_line`]).
-    pub(crate) fn face_of<'a>(
-        &self,
-        kept: &[usize],
-        lines: impl Iterator<Item = &'a str>,
-    ) -> String {
+    /// Every row and column in display spelling, including columns omitted from the editor.
+    ///
+    /// # Errors
+    /// A sparse snapshot can expand beyond the 128 MiB file limit when written as a rectangle.
+    pub fn full_tsv(&self) -> io::Result<String> {
+        self.full_tsv_with_stamp("")
+    }
+
+    /// A complete editable TSV bound to the baseline and this snapshot's content.
+    pub(crate) fn export_tsv(&self, stamp: &str) -> io::Result<String> {
+        if self
+            .columns
+            .len()
+            .saturating_mul(self.rows.len().saturating_add(1))
+            > crate::MAX_EXPORT_CELLS
+        {
+            return Err(io::Error::other(
+                "the editable TSV exceeds the 4,194,304-cell import limit",
+            ));
+        }
+        self.full_tsv_with_stamp(stamp)
+    }
+
+    fn full_tsv_with_stamp(&self, stamp: &str) -> io::Result<String> {
+        let too_large = || io::Error::other("the complete TSV exceeds the 128 MiB file limit");
+        let separators = self.columns.len().max(1) as u64;
+        if separators.saturating_mul(self.rows.len() as u64 + 1) > MAX_BYTES {
+            return Err(too_large());
+        }
+        let all: Vec<_> = (0..self.columns.len()).collect();
+        let mut text = self.face_header(&all);
+        if text.len() as u64 > MAX_BYTES {
+            return Err(too_large());
+        }
+        // The revision cell ends the header, including when an earlier column name
+        // contains a quoted newline. Append its stamp before writing the first record.
+        text.insert_str(text.len() - 1, stamp);
+        for row in &self.rows {
+            let line = face_line(&self.columns, &all, row);
+            if (text.len() as u64) + (line.len() as u64) + 1 > MAX_BYTES + stamp.len() as u64 {
+                return Err(too_large());
+            }
+            text.push_str(&line);
+            text.push('\n');
+        }
+        Ok(text)
+    }
+
+    fn face_header(&self, kept: &[usize]) -> String {
         let mut text = String::new();
         for (i, at) in kept.iter().enumerate() {
             if i > 0 {
@@ -444,8 +486,18 @@ impl Snapshot {
             push_cell(&mut text, &self.columns[*at].header(self.rev));
         }
         text.push('\n');
+        text
+    }
+
+    /// [`Self::face`] of the columns `kept` from each row's face line ([`face_line`]).
+    pub(crate) fn face_of(
+        &self,
+        kept: &[usize],
+        lines: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> String {
+        let mut text = self.face_header(kept);
         for line in lines {
-            text.push_str(line);
+            text.push_str(line.as_ref());
             text.push('\n');
         }
         text
@@ -503,27 +555,35 @@ pub(crate) fn column_widths(columns: &[Column], rows: &[Row]) -> Vec<u64> {
 /// is counted at its widest, the key's at the largest revision.
 #[must_use]
 pub fn face_columns(columns: &[Column], widths: &[u64], rows: usize) -> Vec<usize> {
-    let header = |at: usize| cell_width(&columns[at].header(u64::MAX));
-    let size = |kept: &[usize]| -> u64 {
-        let k = kept.len() as u64;
-        let line_ends = k.saturating_sub(1) + 1;
-        let header: u64 = kept.iter().map(|at| header(*at)).sum::<u64>() + line_ends;
-        let body: u64 = kept.iter().map(|at| widths[*at]).sum::<u64>() + rows as u64 * line_ends;
-        header + body
+    // With at least one column, each column contributes one tab or line end per record.
+    // Charge that and the header once so dropping thousands of columns stays linear after
+    // sorting. Most faces fit in full and need no sort.
+    let records = rows as u128 + 1;
+    let cost = |at: usize| {
+        u128::from(cell_width(&columns[at].header(u64::MAX))) + u128::from(widths[at]) + records
     };
-    let mut kept: Vec<usize> = (0..columns.len()).collect();
-    let mut widest: Vec<usize> = (0..columns.len())
+    let mut count = columns.len();
+    let mut bytes: u128 = (0..count).map(cost).sum();
+    let fits = |count: usize, bytes: u128| {
+        count <= crate::MAX_FACE_COLUMNS && bytes <= u128::from(crate::MAX_FACE_BYTES)
+    };
+    if fits(count, bytes) {
+        return (0..count).collect();
+    }
+    let mut widest: Vec<_> = (0..count)
         .filter(|at| columns[*at].source != Source::Pk)
         .collect();
-    // The widest last, the later of two as wide after the earlier.
-    widest.sort_by_key(|at| (widths[*at], *at));
-    while size(&kept) > crate::MAX_FACE_BYTES || kept.len() > crate::MAX_FACE_COLUMNS {
-        let Some(drop) = widest.pop() else {
+    widest.sort_unstable_by_key(|at| (widths[*at], *at));
+    let mut kept = vec![true; count];
+    for at in widest.into_iter().rev() {
+        kept[at] = false;
+        count -= 1;
+        bytes -= cost(at);
+        if fits(count, bytes) {
             break;
-        };
-        kept.retain(|at| *at != drop);
+        }
     }
-    kept
+    (0..columns.len()).filter(|at| kept[*at]).collect()
 }
 
 /// One row's face line over the columns `kept` of `columns`, its line end left out.

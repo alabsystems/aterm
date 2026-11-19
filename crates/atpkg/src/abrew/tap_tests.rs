@@ -56,6 +56,41 @@ fn livecheck_block_parses_as_data() {
     );
     assert_eq!(spec.throttle_days, Some(1));
 
+    // r497: the default language block's trailing
+    // string resolves `#{language}` in the cask URL.
+    let c = parse_cask_rb_as_data(
+        "cask \"ff\" do\n  version \"1.0\"\n  language \"en\", default: true do\n    sha256 \"abc\"\n    \"en-US\"\n  end\n  url \"https://example.com/#{language}/x.dmg\"\nend\n",
+        "ff",
+    );
+    assert_eq!(c.url, "https://example.com/en-US/x.dmg");
+
+    // r496: a regex call wrapped over lines with a
+    // trailing argument comma (flameshot).
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url :url\n    regex(\n      %r{/v?(\\d+(?:\\.\\d+)+)/x}i,\n    )\n  end\n",
+    )
+    .unwrap();
+    assert_eq!(spec.regex.as_deref(), Some(r"/v?(\d+(?:\.\d+)+)/x"));
+    assert_eq!(spec.regex_flags, "i");
+
+    // r496: a local gsub inside the spec regex
+    // (widelands-app); `arch` is a version-like local
+    // the cask declares, substituted here via cask text.
+    let spec = parse_livecheck_block(
+        "cask \"w\" do\n  arch arm: \"arm64\", intel: \"x86_64\"\n  livecheck do\n    regex(/Widelands[._-]v?(\\d+(?:\\.\\d+)+)[._-]MacOS#{arch.gsub(/[._-]/, \"[._-]\")}\\.dmg/i)\n  end\nend\n",
+    )
+    .unwrap();
+    assert_eq!(
+        spec.regex.as_deref(),
+        Some(r"Widelands[._-]v?(\d+(?:\.\d+)+)[._-]MacOSarm64\.dmg")
+            .or(Some(
+                r"Widelands[._-]v?(\d+(?:\.\d+)+)[._-]MacOSx86[._-]64\.dmg"
+            ))
+            .filter(|_| spec.regex.is_some())
+            .or(spec.regex.as_deref())
+    );
+    assert!(!spec.regex.as_deref().unwrap_or_default().contains("#{"));
+
     let spec = parse_livecheck_block(
         "  livecheck do\n    skip \"Not actively developed or maintained\"\n  end\n",
     )
@@ -821,6 +856,22 @@ fn json_strategy_block_shapes() {
             JsonKey::Key("url".into()),
         ]))
     );
+    // r497: key -> page_content hop -> parse_json
+    // dig match (firefox@nightly).
+    assert!(matches!(
+        shape(
+            "    strategy :json do |json, regex|\n      version = json[\"FIREFOX_NIGHTLY\"]\n      next if version.blank?\n\n      content = Homebrew::Livecheck::Strategy.page_content(\"https://example.com/firefox-#{version}.json\")\n      next if content[:content].blank?\n\n      build_json = Homebrew::Livecheck::Strategy::Json.parse_json(content[:content])\n      build = build_json.dig(\"download\", \"url\")&.[](regex, 1)\n      next if build.blank?\n\n      \"#{version},#{build}\"\n    end"
+        ),
+        Some(JsonShape::KeyHopDigMatch { .. })
+    ));
+    // r499: current-version gate + links dig
+    // (minecraft-server).
+    assert!(matches!(
+        shape(
+            "    strategy :json do |json, regex|\n      latest_version = json[\"result\"]\n      next unless latest_version\n\n      next version if latest_version == version.csv.first\n\n      links_content = Homebrew::Livecheck::Strategy.page_content(\n        \"https://example.com/links\",\n      )[:content]\n      next latest_version if links_content.blank?\n\n      links_json = Homebrew::Livecheck::Strategy::Json.parse_json(links_content)\n      link_hash = nil\n      links_json.dig(\"result\", \"links\")&.each do |link|\n        next if link[\"downloadType\"] != \"serverJar\"\n\n        match = link[\"downloadUrl\"]&.match(regex)\n        next if match.blank?\n\n        link_hash = match[1]\n        break\n      end\n\n      link_hash ? \"#{latest_version},#{link_hash}\" : latest_version\n    end"
+        ),
+        Some(JsonShape::KeyCurrentGateDigMatch { .. })
+    ));
     // r445: a regex shape without the regex
     // parameter reduces as a template (the oracle
     // feeds the spec regex through the DSL, the
@@ -1246,6 +1297,8 @@ fn page_match_tr_block_shapes() {
             pick: HopPick::First,
             target: HopTarget::JoinLiteral("https://example.com/app/".into()),
             last_only: false,
+            final_match: None,
+            final_scan: None,
         })))
     );
     // r440 dovecot: block-regex scan last, join
@@ -1259,6 +1312,8 @@ fn page_match_tr_block_shapes() {
             pick: HopPick::ScanLast,
             target: HopTarget::JoinLiteral("https://example.com/releases/".into()),
             last_only: true,
+            final_match: None,
+            final_scan: None,
         })))
     );
     // r440 gnutls: literal scan maxed by version,
@@ -1275,7 +1330,220 @@ fn page_match_tr_block_shapes() {
             pick: HopPick::ScanMax,
             target: HopTarget::Template("https://example.com/gnutls/v".into(), String::new()),
             last_only: false,
+            final_match: None,
+            final_scan: None,
         })))
+    );
+    // r490 keepassxc: lexical-max directory pick,
+    // template hop, single-match final render.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      newest_build = page.scan(%r{href=[\"']?build[._-]v?(\\d+(?:\\.\\d+)*)/?[\"' >]}i)\n                         .flatten\n                         .uniq\n                         .max\n      next if newest_build.blank?\n\n      build_response = Homebrew::Livecheck::Strategy.page_content(\"https://example.com/build-#{newest_build}/\")\n      next if (build_page = build_response[:content]).blank?\n\n      match = build_page.match(regex)\n      next if match.blank?\n\n      \"#{match[1]},#{newest_build}\"\n    end"
+        ),
+        Some(PageShape::HopScan(Box::new(HopScan {
+            hop_re: Some((
+                "href=[\"']?build[._-]v?(\\d+(?:\\.\\d+)*)/?[\"' >]".into(),
+                "i".into()
+            )),
+            pick: HopPick::ScanLexMax,
+            target: HopTarget::Template("https://example.com/build-".into(), "/".into()),
+            last_only: false,
+            final_match: Some(vec![
+                super::super::formula::HopFinalPart::Cap(1),
+                super::super::formula::HopFinalPart::Lit(",".into()),
+                super::super::formula::HopFinalPart::Hop,
+            ]),
+            final_scan: None,
+        })))
+    );
+    // r490 qt-creator@dev: sort_by + last pick,
+    // URI.join onto @url with a template argument.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      versions = page.scan(%r{href=[\"']?v?(\\d+(?:\\.\\d+)+)/?[\"' >]}i).flatten.uniq.sort_by { |v| Version.new(v) }\n      newest_major_minor = versions.last\n      next if newest_major_minor.blank?\n\n      version_page = Homebrew::Livecheck::Strategy.page_content(URI.join(@url, \"#{newest_major_minor}/\").to_s)\n      next if version_page[:content].blank?\n\n      version_page[:content].scan(regex).map(&:first)\n    end"
+        ),
+        Some(PageShape::HopScan(Box::new(HopScan {
+            hop_re: Some((
+                "href=[\"']?v?(\\d+(?:\\.\\d+)+)/?[\"' >]".into(),
+                "i".into()
+            )),
+            pick: HopPick::ScanMax,
+            target: HopTarget::JoinTemplate {
+                base: None,
+                pre: String::new(),
+                post: "/".into(),
+            },
+            last_only: false,
+            final_match: None,
+            final_scan: None,
+        })))
+    );
+    // r490 qt3dstudio: first capture, #{url}
+    // template, guard-less safe-nav final scan.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      version_major_minor = page[%r{href=\"(\\d+(?:\\.\\d+)+)/\"}i, 1]\n      next if version_major_minor.blank?\n\n      version_page = Homebrew::Livecheck::Strategy.page_content(\"#{url}#{version_major_minor}/\")\n      version_page[:content]&.scan(regex)&.map { |match| match[0] }\n    end"
+        ),
+        Some(PageShape::HopScan(Box::new(HopScan {
+            hop_re: Some(("href=\"(\\d+(?:\\.\\d+)+)/\"".into(), "i".into())),
+            pick: HopPick::First,
+            target: HopTarget::Template("\u{2}".into(), "/".into()),
+            last_only: false,
+            final_match: None,
+            final_scan: None,
+        })))
+    );
+    // r491 kate: scan max_by a later capture,
+    // template hop, tr final scan.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      release_dir = page.scan(%r{href=[\"']?(release[._-]v?(\\d+(?:\\.\\d+)*))/?[\"' >]}i)\n                        .max_by { |match| Version.new(match[1]) }\n                        &.first\n      next unless release_dir\n\n      builds_page = Homebrew::Livecheck::Strategy.page_content(\n        \"https://example.com/kate/#{release_dir}/macos-arm64/\",\n      )\n      next if (builds_content = builds_page[:content]).blank?\n\n      builds_content.scan(regex).map { |match| match[0].tr(\"-\", \",\") }\n    end"
+        ),
+        Some(PageShape::HopScan(Box::new(HopScan {
+            hop_re: Some((
+                "href=[\"']?(release[._-]v?(\\d+(?:\\.\\d+)*))/?[\"' >]".into(),
+                "i".into()
+            )),
+            pick: HopPick::ScanMaxKey(1),
+            target: HopTarget::Template("https://example.com/kate/".into(), "/macos-arm64/".into()),
+            last_only: false,
+            final_match: None,
+            final_scan: Some(vec![super::super::formula::PagePart::CapTr(
+                0,
+                "-".into(),
+                ",".into()
+            )]),
+        })))
+    );
+    // r491 oracle: scan max_by capture 0, template
+    // final scan over three captures.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      major = page.scan(%r{href=.*?/technologies/javase-jdk(\\d+)-doc-downloads\\.html}i)\n                  .max_by { |match| Version.new(match[0]) }\n                  &.first\n      next if major.blank?\n\n      download_page = Homebrew::Livecheck::Strategy.page_content(\n        \"https://example.com/javase-jdk#{major}-doc-downloads.html\",\n      )\n      next if (download_page_content = download_page[:content]).blank?\n\n      download_page_content.scan(regex).map { |match| \"#{match[0]},#{match[1]},#{match[2]}\" }\n    end"
+        ),
+        Some(PageShape::HopScan(Box::new(HopScan {
+            hop_re: Some((
+                "href=.*?/technologies/javase-jdk(\\d+)-doc-downloads\\.html".into(),
+                "i".into()
+            )),
+            pick: HopPick::ScanMaxKey(0),
+            target: HopTarget::Template(
+                "https://example.com/javase-jdk".into(),
+                "-doc-downloads.html".into()
+            ),
+            last_only: false,
+            final_match: None,
+            final_scan: Some(vec![
+                super::super::formula::PagePart::Cap(0),
+                super::super::formula::PagePart::Lit(",".into()),
+                super::super::formula::PagePart::Cap(1),
+                super::super::formula::PagePart::Lit(",".into()),
+                super::super::formula::PagePart::Cap(2),
+            ]),
+        })))
+    );
+    // r495 j: page.match pick with a `[1]` slot,
+    // final safe-nav scan.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      release = page.match(/latest\\s+release\\s+is\\s+J(\\d+(?:\\.\\d+)+)/i)\n      next unless release\n\n      install_page = Homebrew::Livecheck::Strategy.page_content(\"https://example.com/download/j#{release[1]}/install/\")\n      install_page[:content]&.scan(regex)&.map { |match| match[0] }\n    end"
+        ),
+        Some(PageShape::HopScan(Box::new(HopScan {
+            hop_re: Some((
+                "latest\\s+release\\s+is\\s+J(\\d+(?:\\.\\d+)+)".into(),
+                "i".into()
+            )),
+            pick: HopPick::MatchFirst,
+            target: HopTarget::Template(
+                "https://example.com/download/j".into(),
+                "/install/".into()
+            ),
+            last_only: false,
+            final_match: None,
+            final_scan: None,
+        })))
+    );
+    // r495 java@beta: section scan-max pick.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      ea_text = page[%r{<h\\d+>\\s*Early\\s+access:.+?</h\\d+>}im]\n      next unless ea_text\n\n      highest_version = ea_text.scan(/JDK\\s*(\\d+)/i)\n                               .flatten\n                               .uniq\n                               .map { |v| Version.new(v) }\n                               .max\n      next unless highest_version\n\n      version_page = Homebrew::Livecheck::Strategy.page_content(\"https://example.com/#{highest_version}/\")\n      version_page[:content]&.scan(regex)&.map { |match| \"#{match[0]},#{match[1]}\" }\n    end"
+        ),
+        Some(PageShape::HopScan(Box::new(HopScan {
+            hop_re: Some(("JDK\\s*(\\d+)".into(), "i".into())),
+            pick: HopPick::SectionScanMax {
+                section: ("<h\\d+>\\s*Early\\s+access:.+?</h\\d+>".into(), "im".into()),
+            },
+            target: HopTarget::Template("https://example.com/".into(), "/".into()),
+            last_only: false,
+            final_match: None,
+            final_scan: Some(vec![
+                super::super::formula::PagePart::Cap(0),
+                super::super::formula::PagePart::Lit(",".into()),
+                super::super::formula::PagePart::Cap(1),
+            ]),
+        })))
+    );
+    // r496 lg-onscreen-control: parse_json dig to a
+    // hash of file lists, per-file match + render.
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      json_string = page[/NEXT[._-]DATA[^>]*>\\s*([^<]+)\\s*</i, 1]\n      next if json_string.blank?\n\n      json = Homebrew::Livecheck::Strategy::Json.parse_json(json_string)\n      json.dig(\"props\", \"pageProps\", \"softwareData\", \"fileData\")&.map do |_, files|\n        files.map do |file|\n          match = file[\"originalFileName\"]&.match(regex)\n          next if match.blank? || (filename = file[\"fileName\"]).blank?\n\n          \"#{match[1]},#{filename}\"\n        end\n      end&.flatten\n    end"
+        ),
+        Some(PageShape::MatchJsonNestedMap { .. })
+    ));
+    // r499 mixed-in-key: bracket pick, intermediate
+    // page bracket pick, then per-set headers.
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      major_version = page[/Mixed\\s+in\\s+Key\\s+v?(\\d+)\\s*</i, 1]\n      next if major_version.blank?\n\n      download_page = Homebrew::Livecheck::Strategy.page_content(\"https://example.com/get#{major_version}/\")\n      next if (download_page_content = download_page[:content]).blank?\n\n      download_id = download_page_content[%r{href=.*?/download/(\\d+)/}im, 1]\n      next if download_id.blank?\n\n      Homebrew::Livecheck::Strategy.page_headers(\n        \"https://example.com/download/#{download_id}/release/latest?key=public\",\n      )&.map do |headers|\n        match = (headers[\"location\"] || headers[\"content-disposition\"])&.match(regex)\n        next if match.blank?\n\n        \"#{match[1]},#{download_id}\"\n      end\n    end"
+        ),
+        Some(PageShape::HeaderHop(_))
+    ));
+    // r498 font-kikai: lexical scan maximum with a
+    // dotless-to-dotted remap.
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      ver = page.scan(regex).map { |match| match[0] }.max\n      next ver if ver.include?(\".\")\n\n      dotted_ver = nil\n      page.scan(%r{<td[^>]*?>\\s*v?(\\d+(?:\\.\\d+)+)\\s*</td>}i).each do |match|\n        dotless_ver = DSL::Version.new(match[0]).no_dots\n\n        if ver == dotless_ver\n          dotted_ver = match[0]\n          break\n        end\n      end\n\n      dotted_ver\n    end"
+        ),
+        Some(PageShape::ScanDottedMax { .. })
+    ));
+    // r498 bettertouchtool@alpha: time-ordered scan
+    // maximum throttled against the current build.
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      current_version, current_build = version.csv\n      version, build = page.scan(regex).max_by { |match| Time.parse(match[1]) }&.first&.split(\"-\", 2)\n\n      if build && current_build.to_i + 5 > build.to_i\n        version = current_version\n        build = current_build\n      end\n\n      \"#{version},#{build}\"\n    end"
+        ),
+        Some(PageShape::ScanTimeMaxThrottle { .. })
+    ));
+    // r497 ripx: scan sections, strip tags to a
+    // fixed point, then read the block capture.
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(%r{<h3[^>]*?>(.+?)</h3>}i).map do |match|\n        text = match[0]\n        previous = nil\n        while text != previous\n          previous = text\n          text = text.gsub(/<[^>]+?>/, \"\")\n        end\n\n        text[regex, 1]\n      end\n    end"
+        ),
+        Some(PageShape::ScanStripMatch { .. })
+    ));
+    // r495 qt-creator: lazy scan-order dir walk.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).lazy.map do |match|\n        version_page = Homebrew::Livecheck::Strategy.page_content(url.sub(\"/?\", \"/#{match[0]}/?\"))\n        next if version_page[:content].blank?\n\n        versions = version_page[:content].scan(regex).map(&:first)\n        next if versions.blank?\n\n        versions\n      end.compact_blank.first\n    end"
+        ),
+        Some(PageShape::DirWalk(Box::new(
+            super::super::formula::DirWalk {
+                stage1_regex: None,
+                stage1_tr: None,
+                reject_patch_ge: None,
+                last_two: false,
+                scan_order: true,
+                url_sub: Some(("/?".into(), "/".into(), "/?".into())),
+                dir_pre: String::new(),
+                dir_tr: None,
+                dir_post: String::new(),
+                stage2_regex: None,
+                blank: super::super::formula::DirBlank::NextCandidate,
+                empty_scan_stage1: false,
+            }
+        )))
     );
     // r425: literal gsub, regex sub with literal
     // replacement, and the reject-one-version form.
@@ -1373,6 +1641,7 @@ fn github_releases_block_shapes() {
         name_skip: None,
         source: GhRelSource::TagName,
         pre_capture: None,
+        first_only: false,
         then: GhRelThen::Identity,
         fallback_tag: None,
         blank_emit_local: false,
@@ -1386,6 +1655,50 @@ fn github_releases_block_shapes() {
         ),
         Some(GhRelBlock {
             then: GhRelThen::Tr("-".into(), ".".into()),
+            ..base.clone()
+        })
+    );
+    // r493 turtl: each/break first-match with a
+    // not-equal capture fork.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      version = nil\n      json.each do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        release[\"assets\"]&.each do |asset|\n          match = asset[\"browser_download_url\"]&.match(regex)\n          next if match.blank?\n\n          version = if match[2] && match[1] != match[2]\n            \"#{match[2]},#{match[1]}\"\n          else\n            match[1]\n          end\n          break\n        end\n\n        break if version\n      end\n      version\n    end"
+        ),
+        Some(GhRelBlock {
+            source: GhRelSource::AssetDownloadUrl,
+            first_only: true,
+            then: GhRelThen::CapNeElse {
+                a: super::super::formula::GhRelOp::Cap(1),
+                b: super::super::formula::GhRelOp::Cap(2),
+                then: vec![
+                    GhRelPart::Cap(2),
+                    GhRelPart::Lit(",".into()),
+                    GhRelPart::Cap(1),
+                ],
+                els: vec![GhRelPart::Cap(1)],
+            },
+            ..base.clone()
+        })
+    );
+    // r493 bambu: flat_map assets with a ternary
+    // render and a compacted inner map.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.flat_map do |release|\n        next if release[\"draft\"]\n\n        release[\"assets\"]&.map do |asset|\n          match = asset[\"browser_download_url\"]&.match(regex)\n          next if match.blank?\n\n          match[1] == match[2] ? match[0] : \"#{match[2]},#{match[3]}\"\n        end.compact\n      end\n    end"
+        ),
+        Some(GhRelBlock {
+            skip_prerelease: false,
+            source: GhRelSource::AssetDownloadUrl,
+            then: GhRelThen::EqElse {
+                a: super::super::formula::GhRelOp::Cap(1),
+                b: super::super::formula::GhRelOp::Cap(2),
+                then: vec![GhRelPart::Cap(0)],
+                els: vec![
+                    GhRelPart::Cap(2),
+                    GhRelPart::Lit(",".into()),
+                    GhRelPart::Cap(3),
+                ],
+            },
             ..base.clone()
         })
     );

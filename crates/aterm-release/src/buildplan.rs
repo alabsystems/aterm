@@ -3,6 +3,7 @@
 
 //! The release's one build (`artifact.rs` keeps what it makes).
 // STOCK EXCEPTION: the compat slice builds with `RUSTUP_TOOLCHAIN` naming the candidate's trust.lock `[stock] toolchain` ([`Stock`], `trust_lock::stock_toolchain`), because Trust has no x86_64-apple-darwin std in the aarch64 sysroot (`targo --unverified check --target x86_64-apple-darwin -p aterm` fails with E0463).
+use aterm_types::world::{Config, Layout};
 use aterm_uds::spawnfd::{Command, command};
 use std::ffi::OsString;
 use std::fs::File;
@@ -145,11 +146,12 @@ pub fn x86_64_probe_asset_name(version: &str) -> String {
 pub fn x86_64_probe_transcript(version: &str, report: &str) -> String {
     let mut text = format!(
         "# aterm {version}: the universal binary's x86_64 slice, RUN under Rosetta by the\n\
-         # release cut before it shipped: `arch -x86_64 aterm --diagnose` (cleared\n\
-         # environment, a private scratch HOME, SHELL={X86_64_PROBE_SHELL}), whose updater\n\
-         # pin and app version were checked against the release's, then one headless\n\
-         # session driven over the control socket: `{SLICE_TURN_TEXT}` typed, `x86_64`\n\
-         # answered on the screen. The report follows verbatim.\n\
+         # release cut before it shipped: `arch -x86_64 aterm --diagnose` (in a private\n\
+         # scratch world: its own environment and HOME, every automatic lane off,\n\
+         # SHELL={X86_64_PROBE_SHELL}), whose updater pin and app version were checked\n\
+         # against the release's, then one headless session driven in the same world\n\
+         # over the control socket: `{SLICE_TURN_TEXT}` typed, `x86_64` answered on the\n\
+         # screen. The report follows verbatim.\n\
          # docs/DESIGN-intel-just-works-2026-09-14.md section 3.1\n\n"
     );
     text.push_str(report);
@@ -1873,9 +1875,8 @@ fn finish_build(
 
     let scratch = private_slice_scratch()?;
     let probed = (|| {
-        let report = x86_64_slice_runs(&shipped, &scratch.join("home"), &mut |command| {
-            command.output()
-        })?;
+        let world = slice_world(&scratch)?;
+        let report = x86_64_slice_runs(&shipped, &world, &mut |command| command.output())?;
         let label = "x86_64 slice under Rosetta";
         crate::postlink::identity_report(&identity, &report)?;
         if let Some(expected) = &plan.expected_update_pin_sha256 {
@@ -1886,7 +1887,7 @@ fn finish_build(
             &shipped,
             SliceArch::X86_64,
             Renderer::Cpu,
-            &scratch,
+            &world,
             &mut |command| command.spawn(),
             &mut |command| command.output(),
             SLICE_SOCKET_WAIT,
@@ -3943,28 +3944,24 @@ pub(crate) enum Renderer {
     Gpu,
 }
 
-fn hermetic_env(command: &mut Command, home: &Path) {
-    command
-        .env_clear()
-        .env("PATH", RELEASE_SYSTEM_PATH)
-        .env("HOME", home);
+/// A command that starts `arch(1)` in the slice probe's `world` ([`Layout::command`]): its
+/// environment cleared, then the world's whole one ([`Layout::live_env`]: of the cutter's own, only
+/// the marks of a verify run or trust-lane check it runs under), its working folder the world's
+/// HOME.
+fn in_slice_world(world: &Layout) -> Result<Command, String> {
+    world
+        .command("/usr/bin/arch")
+        .map_err(|refusal| format!("start the slice probe in its scratch world: {refusal}"))
 }
 
 fn x86_64_slice_runs(
     universal: &Path,
-    home: &Path,
+    world: &Layout,
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
 ) -> Result<String, String> {
     crate::gates::rosetta_runs(run)?;
-    std::fs::create_dir_all(home).map_err(|error| format!("create {}: {error}", home.display()))?;
-    let mut probe = command("/usr/bin/arch");
-    probe
-        .arg("-x86_64")
-        .arg(universal)
-        .arg("--diagnose")
-        .current_dir("/");
-    hermetic_env(&mut probe, home);
-    probe.env("SHELL", X86_64_PROBE_SHELL);
+    let mut probe = in_slice_world(&world.clone().with_shell(X86_64_PROBE_SHELL))?;
+    probe.arg("-x86_64").arg(universal).arg("--diagnose");
     let out =
         run(&mut probe).map_err(|error| format!("run the x86_64 slice under Rosetta: {error}"))?;
     if !out.status.success() {
@@ -3988,12 +3985,28 @@ pub(crate) fn private_slice_scratch() -> Result<PathBuf, String> {
         .map_err(|error| format!("create private slice probe directory: {error}"))
 }
 
-/// A slice of `universal` DRIVES A SESSION.
+/// The scratch world a slice's probes start its release image in, laid out and made in the empty
+/// `scratch` ([`Layout::under`], [`Layout::make`]): every lane off ([`Config::OFF`]). The probes
+/// of one slice share it: `--diagnose`, then the session turn.
+pub(crate) fn slice_world(scratch: &Path) -> Result<Layout, String> {
+    let world = Layout::under(scratch).map_err(|refusal| {
+        format!(
+            "lay out the slice probe's scratch world in {}: {refusal}",
+            scratch.display()
+        )
+    })?;
+    world
+        .make(&Config::OFF)
+        .map_err(|error| format!("make the slice probe's scratch world: {error}"))?;
+    Ok(world)
+}
+
+/// A slice of `universal` DRIVES A SESSION, started in `world`.
 pub(crate) fn slice_drives_a_session(
     universal: &Path,
     slice: SliceArch,
     renderer: Renderer,
-    scratch: &Path,
+    world: &Layout,
     spawn: &mut dyn FnMut(&mut Command) -> std::io::Result<aterm_uds::spawnfd::Child>,
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
     socket_wait: std::time::Duration,
@@ -4006,30 +4019,9 @@ pub(crate) fn slice_drives_a_session(
         }
     }
     let name = slice.uname();
-    let home = scratch.join("home");
-    let config = scratch.join("cfg");
-    let runtime = scratch.join("run");
-    for dir in [&home, &config.join("aterm"), &runtime] {
-        std::fs::create_dir_all(dir)
-            .map_err(|error| format!("create {}: {error}", dir.display()))?;
-    }
-    let toml = config.join("aterm").join("aterm.toml");
-    crate::durable::write_fresh(
-        &toml,
-        "[update]\nenabled = false\n[packages]\nenabled = false\n",
-    )
-    .map_err(|error| format!("write {}: {error}", toml.display()))?;
-    let sock = scratch.join("a.sock");
-    let hermetic = |command: &mut Command| {
-        hermetic_env(command, &home);
-        command
-            .env("SHELL", "/bin/sh")
-            .env("XDG_CONFIG_HOME", &config)
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .current_dir(&home);
-    };
+    let sock = world.control_sock();
 
-    let mut instance = command("/usr/bin/arch");
+    let mut instance = in_slice_world(world)?;
     instance
         .arg(slice.arch_flag())
         .arg(universal)
@@ -4044,12 +4036,11 @@ pub(crate) fn slice_drives_a_session(
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
         .stderr(aterm_uds::spawnfd::Stdio::null());
-    hermetic(&mut instance);
     let _lifeline =
-        aterm_uds::lifeline::Lifeline::arm(&mut instance, scratch).map_err(|error| {
+        aterm_uds::lifeline::Lifeline::arm(&mut instance, &world.root).map_err(|error| {
             format!(
                 "arm the {name} slice's lifeline in {}: {error}",
-                scratch.display()
+                world.root.display()
             )
         })?;
     let mut instance =
@@ -4075,7 +4066,7 @@ pub(crate) fn slice_drives_a_session(
     }
 
     let ctl = |args: &[&str]| {
-        let mut command = command("/usr/bin/arch");
+        let mut command = in_slice_world(world)?;
         command
             .arg(slice.arch_flag())
             .arg(universal)
@@ -4083,13 +4074,12 @@ pub(crate) fn slice_drives_a_session(
             .arg("--sock")
             .arg(&sock)
             .args(args);
-        hermetic(&mut command);
-        command
+        Ok::<_, String>(command)
     };
     let settle = format!("settle=match:^{name}$");
     let mut turn_args = vec!["turn", settle.as_str(), "timeout=30000"];
     turn_args.extend(SLICE_TURN_TEXT.split(' '));
-    let out = run(&mut ctl(&turn_args)).map_err(|error| {
+    let out = run(&mut ctl(&turn_args)?).map_err(|error| {
         format!(
             "drive the {name} slice's session {}: {error}",
             slice.under()
@@ -4099,7 +4089,7 @@ pub(crate) fn slice_drives_a_session(
     if renderer == Renderer::Cpu {
         return Ok(());
     }
-    let image = run(&mut ctl(&["image", "--bytes"]))
+    let image = run(&mut ctl(&["image", "--bytes"])?)
         .map_err(|error| format!("capture the {name} slice's first frame: {error}"))?;
     if !image.status.success() {
         return Err(format!(
@@ -4109,7 +4099,7 @@ pub(crate) fn slice_drives_a_session(
             String::from_utf8_lossy(&image.stderr).trim()
         ));
     }
-    let metrics = run(&mut ctl(&["metrics"]))
+    let metrics = run(&mut ctl(&["metrics"])?)
         .map_err(|error| format!("read the {name} slice's metrics: {error}"))?;
     gpu_verdict(&metrics, slice)
 }
@@ -4143,15 +4133,17 @@ fn gpu_verdict(out: &std::process::Output, slice: SliceArch) -> Result<(), Strin
 /// The drive's refusal, naming what the turn saw.
 pub(crate) fn signed_slice_drives_a_session(app: &Path) -> Result<(), String> {
     let scratch = private_slice_scratch()?;
-    let driven = slice_drives_a_session(
-        &app.join("Contents/MacOS/aterm"),
-        SliceArch::Arm64,
-        Renderer::Gpu,
-        &scratch,
-        &mut |command| command.spawn(),
-        &mut |command| command.output(),
-        SLICE_SOCKET_WAIT,
-    );
+    let driven = slice_world(&scratch).and_then(|world| {
+        slice_drives_a_session(
+            &app.join("Contents/MacOS/aterm"),
+            SliceArch::Arm64,
+            Renderer::Gpu,
+            &world,
+            &mut |command| command.spawn(),
+            &mut |command| command.output(),
+            SLICE_SOCKET_WAIT,
+        )
+    });
     let _ = std::fs::remove_dir_all(&scratch);
     driven
 }

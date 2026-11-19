@@ -34,7 +34,8 @@ mod frontend_control;
 pub use frontend_control::{ControllerWithdrawal, FrontendController, FrontendMember};
 #[cfg(unix)]
 pub use owned_launch::{
-    OwnedService, OwnedServiceFailure, PreparedServiceAttachment, ServiceFrontend, ServiceIdentity,
+    OwnedService, OwnedServiceFailure, PreparedServiceAttachment, PreparedServicePacket,
+    ServiceFrontend, ServiceIdentity, ServicePacketKind,
 };
 #[cfg(unix)]
 #[path = "codex_source_owned_environment.rs"]
@@ -44,6 +45,8 @@ pub use owned_environment::OwnedLaunchEnvironment;
 
 #[path = "codex_source_restart.rs"]
 mod restart;
+#[cfg(unix)]
+pub use restart::FrontendExecReservation;
 pub use restart::RestartReservation;
 pub use restart::SourceExecReservation;
 #[cfg(all(unix, any(test, debug_assertions)))]
@@ -260,6 +263,10 @@ impl Drop for InitialSourcePermit {
 
 enum LaunchBinding {
     Consumer,
+    /// Only independent frontend control may enter this native constructor.
+    /// A UI replacement never acquires a credential/Source actor from its token.
+    #[cfg(unix)]
+    Frontend,
     #[cfg(unix)]
     Native(Arc<owned_launch::Binding>),
 }
@@ -268,12 +275,16 @@ impl LaunchBinding {
         match self {
             Self::Consumer => Ok(()),
             #[cfg(unix)]
+            Self::Frontend => Ok(()),
+            #[cfg(unix)]
             Self::Native(binding) => binding.entry(),
         }
     }
     fn revoked(&self) -> bool {
         match self {
             Self::Consumer => false,
+            #[cfg(unix)]
+            Self::Frontend => false,
             #[cfg(unix)]
             Self::Native(binding) => binding.revoked(),
         }
@@ -1011,6 +1022,27 @@ impl Registry {
         }
     }
 
+    /// Observe only this exact native-issued UI constructor role. It carries
+    /// no credential reader or permission to create another backend service.
+    ///
+    /// # Errors
+    /// The original peer/constructor binding is stale or metadata is busy.
+    #[cfg(unix)]
+    pub fn frontend_exec_peer(&self, peer: &Peer) -> Result<bool, Error> {
+        if !peer.current() {
+            return Err(Error::Stale);
+        }
+        let state = lock(&self.state)?;
+        let Some(token) = &peer.launch else {
+            return Ok(false);
+        };
+        let launch = state.launches.get(token).ok_or(Error::Stale)?;
+        if launch.process.as_ref() != Some(&peer.process) || launch.sid != peer.caller.sid {
+            return Err(Error::Stale);
+        }
+        Ok(matches!(&launch.binding, LaunchBinding::Frontend))
+    }
+
     /// Native-issued IDs retain a process epoch and monotone ordinal. Only the
     /// active set is bounded; retired IDs can never reopen a source registration.
     pub fn open_member(
@@ -1037,6 +1069,15 @@ impl Registry {
         let mut state = lock(&self.state)?;
         if !connection.is_live() || !peer.current() {
             return Err(Error::Stale);
+        }
+        #[cfg(unix)]
+        if peer
+            .launch
+            .as_ref()
+            .and_then(|token| state.launches.get(token))
+            .is_some_and(|launch| matches!(launch.binding, LaunchBinding::Frontend))
+        {
+            return Err(Error::Denied);
         }
         restart::advance_exec_actor(&mut state, peer)?;
         if !state.actors.contains_key(&key) {

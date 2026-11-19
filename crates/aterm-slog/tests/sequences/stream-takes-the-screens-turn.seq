@@ -1,0 +1,15 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h: a `started` that finds a turn the screen opened takes it: one amend in the stream's
+# stamp names who opened it, and no second turn opens. From then the screen's rest, held far past
+# the settle, closes nothing; the stream's end closes it.
+see busy
+expect open t1 turn par=r1 src=screen conf=strong @0
+at 500 stream started 1 by=ctl
+expect amend t1 turn src=harness conf=claim by=t0000000001 holder=claude-code-alab@4242 hseq=1 turn_by=ctl @500
+expect turn=t1
+at 600 see idle
+expect wake=none
+at 3000 expect turn=t1
+at 4000 stream ended 1 interrupted
+expect close t1 turn out=interrupted src=harness conf=claim hseq=2 @4000
+expect turn=none

@@ -25,8 +25,8 @@ use atpkg_publish::triple::Triple;
 use super::fixture::{
     CPU_ARM64, CPU_X86_64, DORMANT_LEDGER, EM_AARCH64, FakeTools, MINTED_LEDGER, SEAL_COMMIT,
     SEAL_DRIVER, SEAL_TRIPLE, checkout as fixture_checkout, client_verifies, elf, fat, git, macho,
-    put, put_exe, ran, scratch, seal_fixture, seed_mint, set_mode, toolchain as fixture_toolchain,
-    trust_repo, version_text,
+    put, put_exe, ran, scratch, seal_fixture_for, seal_image, seed_mint, set_mode,
+    toolchain as fixture_toolchain, trust_repo, version_text,
 };
 
 #[path = "bundle_mc_toolchain.rs"]
@@ -56,6 +56,10 @@ struct World {
 /// seal (closure beside it, a rustc hard link and copied genuine aliases) and a clean source
 /// checkout.
 fn world(label: &str) -> World {
+    world_for(label, SEAL_TRIPLE)
+}
+
+fn world_for(label: &str, triple: &str) -> World {
     let tmp = scratch(label);
     let root = std::fs::canonicalize(tmp.path()).expect("root");
     let home = root.join("home");
@@ -71,13 +75,13 @@ fn world(label: &str) -> World {
         &keys.index_toml(41, &[("trust", "trust")], &[("trust", 1)]),
     );
     trust_repo(&home.join("trust"), DORMANT_LEDGER, &ctx, &host);
-    let (seal, private) = seal_fixture(&root);
+    let (seal, private) = seal_fixture_for(&root, triple);
     std::fs::hard_link(seal.join("bin/trustc"), seal.join("bin/rustc")).expect("rustc");
-    put_exe(&seal.join("bin/trustdoc"), &native("trustdoc"));
+    put_exe(&seal.join("bin/trustdoc"), &seal_image(triple, "trustdoc"));
     for tool in TRUST_EXPOSES {
         let bin = seal.join("bin").join(tool);
         if !bin.exists() {
-            put_exe(&bin, &native(tool));
+            put_exe(&bin, &seal_image(triple, tool));
         }
     }
     for (canonical, alias) in [("targo", "cargo"), ("trustdoc", "rustdoc")] {
@@ -668,6 +672,235 @@ fn the_full_bundle_gate_refuses_every_alias_tampered_after_relocation() {
             "{alias}: {err}"
         );
         assert!(err.to_string().contains(alias), "{err}");
+    }
+}
+
+#[test]
+fn a_trust_bundle_refuses_partial_or_aliased_miri_components() {
+    let w = world("bundle-miri-invalid");
+    let req = w.request();
+    let t = tools();
+    let pair = ["targo-miri", "trust-miri"];
+    for name in pair {
+        let path = w.seal.join("bin").join(name);
+        put_exe(&path, &native(name));
+        let Err(err) = bundle::admit(&w.ctx, &req, &t) else {
+            panic!("admitted incomplete Miri component with {name} alone");
+        };
+        assert!(
+            err.to_string()
+                .contains("requires both bin/targo-miri and bin/trust-miri")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    let frontend = w.seal.join("bin/targo-miri");
+    let interpreter = w.seal.join("bin/trust-miri");
+    put_exe(&frontend, &native("frontend"));
+    std::os::unix::fs::symlink("targo-miri", &interpreter).unwrap();
+    let Err(err) = bundle::admit(&w.ctx, &req, &t) else {
+        panic!("admitted a symlink as interpreter");
+    };
+    assert!(
+        err.to_string()
+            .contains("bin/trust-miri must be a regular executable")
+    );
+    std::fs::remove_file(&interpreter).unwrap();
+    std::fs::hard_link(&frontend, &interpreter).unwrap();
+    let Err(err) = bundle::admit(&w.ctx, &req, &t) else {
+        panic!("admitted two names for the same Miri frontend");
+    };
+    assert!(err.to_string().contains("distinct executables"));
+}
+
+#[test]
+fn a_trust_bundle_preserves_the_admitted_optional_miri_pair() {
+    let w = world("bundle-miri-pair");
+    let req = w.request();
+    let t = tools();
+    let pair = ["targo-miri", "trust-miri"];
+    for (admitted, changed) in [(false, &pair[..]), (true, &pair[..]), (true, &pair[..1])] {
+        if admitted {
+            for name in pair {
+                put_exe(&w.seal.join("bin").join(name), &native(name));
+            }
+        }
+        let relocated = bundle::admit(&w.ctx, &req, &t)
+            .unwrap()
+            .stage()
+            .and_then(bundle::Staged::mutate)
+            .and_then(bundle::Mutated::relocate)
+            .unwrap();
+        let stage = std::fs::read_dir(&req.out)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|path| path.join("root/bin").is_dir())
+            .unwrap();
+        for name in changed {
+            let path = stage.join("root/bin").join(name);
+            if admitted {
+                std::fs::remove_file(path).unwrap();
+            } else {
+                put_exe(&path, &native(name));
+            }
+        }
+        let Err(err) = relocated.gate() else {
+            panic!("accepted changed Miri presence after relocation");
+        };
+        let cause = if changed.len() == pair.len() {
+            "changed the presence of the admitted Trust Miri pair"
+        } else {
+            "requires both bin/targo-miri and bin/trust-miri"
+        };
+        assert!(err.to_string().contains(cause), "{err}");
+    }
+    let out = bundle::pack_bundle_with(&w.ctx, &req, &t).expect("pack both distinct Miri tools");
+    let shipped = w.extract(&out.asset);
+    for name in pair {
+        assert_eq!(
+            std::fs::read(shipped.join("bin").join(name)).unwrap(),
+            native(name)
+        );
+    }
+}
+
+const DARWIN_HOST_LINKER: &str = "lib/rustlib/aarch64-apple-darwin/bin/rust-lld";
+
+#[test]
+fn darwin_trust_pack_preserves_the_admitted_worker_runtime_and_strips_other_tools() {
+    let triple = "aarch64-apple-darwin";
+    let w = world_for("bundle-darwin-worker", triple);
+    let mut req = w.request();
+    req.triple = Some(Triple::parse(triple).unwrap());
+    let mut t = tools();
+    t.default_version = Some(version_text(SEAL_COMMIT, triple));
+    t.resign_by_name = true;
+    let extension = "lib/rustlib/aarch64-apple-darwin/lib/worker-runtime.o";
+    for name in ["bin/rust-lld", "bin/dsymutil", extension] {
+        put_exe(&w.seal.join(name), &seal_image(triple, name));
+    }
+    std::fs::create_dir_all(w.seal.join(DARWIN_HOST_LINKER).parent().unwrap()).unwrap();
+    std::fs::copy(w.seal.join("bin/rust-lld"), w.seal.join(DARWIN_HOST_LINKER)).unwrap();
+    std::fs::hard_link(w.seal.join(extension), w.seal.join("bin/runtime-alias")).unwrap();
+    let out = bundle::pack_bundle_with(&w.ctx, &req, &t).expect("Darwin package");
+    let shipped = w.extract(&out.asset);
+    for path in [
+        "bin/trustc",
+        "bin/rustc",
+        "bin/targo",
+        "bin/cargo",
+        "bin/rust-lld",
+        DARWIN_HOST_LINKER,
+        "bin/dsymutil",
+        "lib/librustc_driver-fixture.dylib",
+        extension,
+        "bin/runtime-alias",
+    ] {
+        assert_eq!(
+            std::fs::read(w.seal.join(path)).unwrap(),
+            std::fs::read(shipped.join(path)).unwrap(),
+            "{path}"
+        );
+    }
+    assert_ne!(
+        ino(&shipped.join("bin/rust-lld")),
+        ino(&shipped.join(DARWIN_HOST_LINKER))
+    );
+    assert_ne!(
+        std::fs::read(w.seal.join("bin/tippy")).unwrap(),
+        std::fs::read(shipped.join("bin/tippy")).unwrap()
+    );
+}
+
+#[test]
+fn darwin_trust_admits_legacy_without_lld_and_refuses_incomplete_or_divergent_linker_pairs() {
+    let triple = "aarch64-apple-darwin";
+    let w = world_for("bundle-darwin-linkers", triple);
+    let mut req = w.request();
+    req.triple = Some(Triple::parse(triple).unwrap());
+    let mut t = tools();
+    t.default_version = Some(version_text(SEAL_COMMIT, triple));
+    let out = bundle::pack_bundle_with(&w.ctx, &req, &t).expect("legacy seal without LLD");
+    let shipped = w.extract(&out.asset);
+    assert!(!shipped.join("bin/rust-lld").exists() && !shipped.join(DARWIN_HOST_LINKER).exists());
+
+    let root = w.seal.join("bin/rust-lld");
+    let host = w.seal.join(DARWIN_HOST_LINKER);
+    let refuse = || {
+        let Err(error) = bundle::admit(&w.ctx, &req, &t) else {
+            panic!("inconsistent linker pair admitted");
+        };
+        assert!(error.to_string().contains(DARWIN_HOST_LINKER), "{error}");
+    };
+    let image = seal_image(triple, "linker");
+    put_exe(&host, &image);
+    refuse();
+    std::fs::remove_file(&host).unwrap();
+    put_exe(&root, &image);
+    refuse();
+    std::fs::hard_link(&root, &host).unwrap();
+    refuse();
+    std::fs::remove_file(&host).unwrap();
+    put_exe(&host, &seal_image(triple, "differ"));
+    refuse();
+    put_exe(&host, &image);
+    set_mode(&host, 0o711);
+    refuse();
+}
+
+#[test]
+fn darwin_trust_refuses_a_changed_worker_input_after_relocation_even_without_strip() {
+    let triple = "aarch64-apple-darwin";
+    let w = world_for("bundle-darwin-worker-changed", triple);
+    let mut req = w.request();
+    req.triple = Some(Triple::parse(triple).unwrap());
+    req.strip = false;
+    let mut t = tools();
+    t.default_version = Some(version_text(SEAL_COMMIT, triple));
+    let helper = "bin/dsymutil";
+    put_exe(&w.seal.join(helper), &seal_image(triple, "debug helper"));
+    for rel in ["bin/rust-lld", DARWIN_HOST_LINKER] {
+        put_exe(&w.seal.join(rel), &seal_image(triple, "linker"));
+    }
+    for (damage, rel) in [
+        ("bytes", "bin/trustc"),
+        ("bytes", DARWIN_HOST_LINKER),
+        ("mode", DARWIN_HOST_LINKER),
+        ("hardlink", DARWIN_HOST_LINKER),
+        ("mode", helper),
+        ("symlink", helper),
+    ] {
+        let relocated = bundle::admit(&w.ctx, &req, &t)
+            .unwrap()
+            .stage()
+            .unwrap()
+            .mutate()
+            .unwrap()
+            .relocate()
+            .unwrap();
+        let stage = std::fs::read_dir(&req.out)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.join("root").is_dir())
+            .unwrap();
+        let path = stage.join("root").join(rel);
+        match damage {
+            "mode" => set_mode(&path, 0o644),
+            "hardlink" => {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::hard_link(stage.join("root/bin/rust-lld"), &path).unwrap();
+            }
+            "symlink" => {
+                std::fs::remove_file(&path).unwrap();
+                std::os::unix::fs::symlink(w.seal.join(helper), &path).unwrap();
+            }
+            _ => {
+                put_exe(&path, &seal_image(triple, "changed after relocation"));
+            }
+        }
+        let Err(error) = relocated.gate() else {
+            panic!("{damage} change to {rel} passed");
+        };
+        assert!(error.to_string().contains(rel), "{error}");
     }
 }
 

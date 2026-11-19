@@ -40,31 +40,42 @@ pub(super) fn replaced() -> bool {
 /// The job's entry, from the front door.
 pub(super) fn run() -> ExitCode {
     PROGRAM.get_or_init(ProgramWatch::current);
-    take_stop_signals();
-    aterm_gui::install_session_log();
-    if let Some(why) = aterm_cli::macos_doctor::lasting_scope_refusal() {
-        aterm_log::info!("setup resume: not this account's run to resume: {why}");
-        return ExitCode::SUCCESS;
+    run_with_stop_waiter(take_stop_signals, || {
+        aterm_gui::install_session_log();
+        if let Some(why) = aterm_cli::macos_doctor::lasting_scope_refusal() {
+            aterm_log::info!("setup resume: not this account's run to resume: {why}");
+            return ExitCode::SUCCESS;
+        }
+        resume_with(&mut Live::default())
+    })
+}
+
+/// A run is admitted only once the thread that records an orderly stop has started.
+fn run_with_stop_waiter(
+    install: impl FnOnce() -> bool,
+    resume: impl FnOnce() -> ExitCode,
+) -> ExitCode {
+    if !install() {
+        // Logging is not installed yet. Launchd keeps this job's stderr.
+        let _ = aterm_uds::stdout::stderr_line(format_args!(
+            "setup resume: could not start the stop-signal waiter. Launchd will retry the login job."
+        ));
+        return ExitCode::FAILURE;
     }
-    resume_with(&mut Live::default())
+    resume()
 }
 
 /// A logout's SIGTERM (launchd ends a login's agents so), a `kickstart -k`, a SIGHUP or a SIGINT
 /// ends the job as a quit ends a window: the stages its pass runs now are noted as cut off by no
 /// crash ([`stopped_by`]), so the next pass gives their begins back rather than parking one a
 /// second logout cut off.
-fn take_stop_signals() {
-    let taken = aterm_uds::process::take_stop_signals("setup-resume-stop", |signal| {
+fn take_stop_signals() -> bool {
+    aterm_uds::process::take_stop_signals("setup-resume-stop", |signal| {
         std::process::exit(stopped_by(
             signal,
             aterm_cli::macos_doctor::note_setup_interrupted,
         ));
-    });
-    if !taken {
-        aterm_log::warn!(
-            "setup resume: no thread takes a logout's signal; a stage it cuts off counts as a stop"
-        );
-    }
+    })
 }
 
 /// The job's end on `signal`: the stages this process runs are noted by `note` first, then the

@@ -978,20 +978,6 @@ impl EffectsPipeline {
         }
     }
 
-    /// Test seam: draw the rainbow's ribbon body in a shape no built-in theme picks (the
-    /// underline body when `tall` is false, the tall body held flat when `flat` is true), until
-    /// the next [`Self::set_cursor_glow`]. The `rainbow` theme is the tall body, its band behind
-    /// the words and its rail under them; the other bodies stay engine data the replays judge.
-    #[cfg(any(test, debug_assertions))]
-    #[inline]
-    pub const fn set_ribbon_shape(&mut self, tall: bool, flat: bool) {
-        if let Some(request) = self.glow_request.as_mut() {
-            request.spelling.ribbon_tall = tall;
-            request.spelling.ribbon_flat = flat;
-        }
-        self.resolve_glow();
-    }
-
     /// Set only the glow's trail colour.
     #[inline]
     pub fn set_cursor_glow_color(&mut self, color: &str) -> bool {

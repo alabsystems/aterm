@@ -12,16 +12,10 @@ pub struct Fingerprints {
     pub lines: Vec<(String, u64)>,
 }
 
-/// FNV-1a 64-bit hash, stable across builds: `aterm_hash::fnv1a_64`, spelled out because this
-/// crate depends on nothing. `fnv_is_aterm_hashs_fold` holds it to that.
+/// FNV-1a 64-bit hash of `text`'s bytes, stable across builds ([`aterm_hash::fnv1a_64`]).
 #[must_use]
 pub fn fnv(text: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
+    aterm_hash::fnv1a_64(text.as_bytes())
 }
 
 /// The fingerprints of `reply`'s value lines (record and sentence lines).

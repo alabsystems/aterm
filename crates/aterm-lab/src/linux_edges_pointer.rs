@@ -28,13 +28,19 @@ struct Node {
     floating_nodes: Vec<Node>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Placement {
+    Ready((i32, i32)),
+    Pending(String),
+}
+
 /// Sway's `rect` excludes its titlebar; `window_rect` locates the client inside it.
 /// The lane uses scale one, and aterm's xdg window geometry is its complete surface.
 pub(super) fn client_origin(
     tree: &str,
     pid: u32,
     geometry: NativeGeometry,
-) -> Result<(i32, i32), String> {
+) -> Result<Placement, String> {
     let root: Node =
         aterm_json::from_str(tree).map_err(|error| format!("Sway's tree is unread: {error}"))?;
     let mut pending = vec![&root];
@@ -52,36 +58,50 @@ pub(super) fn client_origin(
         }
         found = Some(node);
     }
-    let node = found.ok_or_else(|| format!("Sway shows no aterm client for pid {pid}"))?;
+    let Some(node) = found else {
+        return Ok(Placement::Pending(format!("no Sway client for pid {pid}")));
+    };
     let rect = node.rect.as_ref().ok_or("Sway's client has no rect")?;
     let window = node
         .window_rect
         .as_ref()
         .ok_or("Sway's client has no window_rect")?;
-    if node.visible != Some(true)
-        || geometry.scale != 1.0
-        || rect.width <= 0
-        || rect.height <= 0
+    let visible = node.visible.ok_or("Sway's client has no visibility")?;
+    if geometry.scale != 1.0
+        || rect.width < 0
+        || rect.height < 0
         || window.x < 0
         || window.y < 0
-        || window.width != geometry.width
-        || window.height != geometry.height
+        || window.width < 0
+        || window.height < 0
         || i64::from(window.x) + i64::from(window.width) > i64::from(rect.width)
         || i64::from(window.y) + i64::from(window.height) > i64::from(rect.height)
     {
         return Err(format!(
-            "Sway's visible client does not match the scale-one {}x{} surface of pid {pid}",
-            geometry.width, geometry.height
+            "invalid Sway geometry for pid {pid}: rect {}x{}, window {}x{}+{}+{}, scale {}",
+            rect.width,
+            rect.height,
+            window.width,
+            window.height,
+            window.x,
+            window.y,
+            geometry.scale
         ));
     }
-    Ok((
+    if !visible || (window.width, window.height) != (geometry.width, geometry.height) {
+        return Ok(Placement::Pending(format!(
+            "pid {pid}: Sway visible={visible} window {}x{}, GUI surface {}x{}",
+            window.width, window.height, geometry.width, geometry.height
+        )));
+    }
+    Ok(Placement::Ready((
         rect.x
             .checked_add(window.x)
             .ok_or("Sway client x overflow")?,
         rect.y
             .checked_add(window.y)
             .ok_or("Sway client y overflow")?,
-    ))
+    )))
 }
 
 /// A terminal cell centre from an immutable dims reply, without moving a pointer.
@@ -399,6 +419,15 @@ impl Progress {
             owners: pids.iter().map(|&pid| (pid, None, None)).collect(),
             generation: 0,
         }
+    }
+
+    /// Refresh the process samples after querying the owners. Their replies do not
+    /// count as independent work done while waiting for a configure to take effect.
+    pub(super) fn after_probe(&mut self, read: impl FnMut(u32) -> Reading) -> Result<(), String> {
+        let generation = self.generation;
+        self.observe(read)?;
+        self.generation = generation;
+        Ok(())
     }
 
     pub(super) fn observe(

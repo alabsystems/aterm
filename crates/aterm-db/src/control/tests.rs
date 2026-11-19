@@ -320,6 +320,63 @@ fn a_dial_its_peer_closes_before_answering_for_contention_is_busy() {
     ));
 }
 
+/// A COMMONS EXCHANGE COUNTS ITS STREAM'S BYTES AS ITS PROGRESS, ON BOTH SIDES: the deadline
+/// over each side of one loopback round saw its stream move, so a test's hang detector
+/// ([`crate::network::Patience::HANG`]) cuts a round only once it stops moving. Each side's
+/// exchange runs, and drops its deadline, on its own thread ([`crate::network::LAST_MOVES`]).
+/// NEGATIVE CONTROLS, observed: the initiator's exchange handed its stream uncounted
+/// (`channel.transport.stream()` in `Endpoint::exchange`'s initiating arm) leaves its deadline at
+/// no move, `` the initiator's deadline counted Some(0) moves, the responder's Some(40) ``; the
+/// responder's (its answering arm), `` the initiator's deadline counted Some(40) moves, the
+/// responder's Some(0) ``.
+#[test]
+fn a_commons_exchange_counts_its_stream_bytes_as_progress() {
+    let lab = Lab::new();
+    let (responder, initiator) = (lab.endpoint(0), lab.endpoint(1));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let moved = || crate::network::LAST_MOVES.with(std::cell::Cell::take);
+    let (initiated, responded) = thread::scope(|scope| {
+        let responded = scope.spawn(|| {
+            moved();
+            responder
+                .exchange(
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
+                    Side::Responder,
+                    &mut Repair::default(),
+                )
+                .unwrap();
+            moved()
+        });
+        moved();
+        initiator
+            .exchange(
+                Connection::connect(address, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN)
+                    .unwrap(),
+                Side::Initiator,
+                &mut Repair::default(),
+            )
+            .unwrap();
+        (moved(), responded.join().unwrap())
+    });
+    assert!(
+        [initiated, responded]
+            .iter()
+            .all(|moves| moves.is_some_and(|moves| moves > 0)),
+        "the initiator's deadline counted {initiated:?} moves, the responder's {responded:?}"
+    );
+}
+
 #[test]
 fn a_session_builds_the_same_endpoint_without_reopening_its_locked_journal() {
     use crate::table::{Session, tests::Lab};
@@ -1775,6 +1832,7 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
         body: Body::Name {
             name: "orphan-waiting".to_owned(),
         },
+        statement: None,
     }
     .sign(&w1, inc1)
     .unwrap();

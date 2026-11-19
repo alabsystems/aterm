@@ -957,7 +957,8 @@ fn a_cut_block_whose_span_straddles_the_cut_paints_its_last_row() {
         ),
         "one paragraph: {block:?}"
     );
-    let (text, inline) = crate::native_app::bounded_markdown_block_paint(&document, 0, block);
+    let (text, inline) =
+        crate::native_app::bounded_markdown_block_paint(&document, 0, block, 900.0);
     assert!(
         text.ends_with('…') && text.len() <= 128 * 1024,
         "the block was cut"
@@ -978,8 +979,13 @@ fn a_cut_block_whose_span_straddles_the_cut_paints_its_last_row() {
     let max_columns = 80;
     let rows = crate::native_markdown::wrap_reader_text(&text, max_columns, 0, 131_072, false);
     let spec = MarkdownBlockSpec {
+        focused_link: None,
         text: text.clone(),
         kind: MarkdownBlockKind::Paragraph,
+        quote_depth: 0,
+        quote_above: 0,
+        quote_below: 0,
+        gap_after: 0.0,
         dense: false,
         selectable: true,
         action: None,
@@ -990,23 +996,18 @@ fn a_cut_block_whose_span_straddles_the_cut_paints_its_last_row() {
         estimated_height: 48.0,
         inline,
     };
-    let base = StyledBase {
-        x: 0.0,
-        y: 0.0,
-        bottom: 1_000.0,
-        line_h: 18.0,
-        size: native_type_px(TypeStep::Body),
-        face: crate::widget::TextFace::Ui,
-        weight: crate::widget::TextWeight::Regular,
-        color: [0, 0, 0],
-    };
+    let frame = markdown_frame(&spec, 800.0).unwrap();
+    let rect = LogicalRect::new(
+        0.0,
+        0.0,
+        frame.inset_left + frame.inset_right + (max_columns as f32 + 0.25) * frame.advance(),
+        frame.height(1),
+    );
     let mut prims = Vec::new();
-    paint_styled_markdown_rows(
+    paint_markdown_block(
         &mut prims,
+        rect,
         &spec,
-        &base,
-        max_columns,
-        1,
         crate::settings::Roles::from_theme(aterm_render::Theme::default()),
     );
     let painted: String = prims
@@ -1041,8 +1042,13 @@ fn a_markdown_paragraph_paints_its_inline_spans() {
         UiTree::new(UiNode::new(
             "markdown/block/0",
             UiContent::MarkdownBlock(MarkdownBlockSpec {
+                focused_link: None,
                 text: text.clone(),
                 kind: MarkdownBlockKind::Paragraph,
+                quote_depth: 0,
+                quote_above: 0,
+                quote_below: 0,
+                gap_after: 0.0,
                 dense: false,
                 selectable: true,
                 action: None,
@@ -3575,16 +3581,25 @@ fn a_block_the_reader_cuts_keeps_its_panel_open_at_the_cut() {
         .map(|line| format!("let line_{line} = {line};"))
         .collect::<Vec<_>>()
         .join("\n");
-    for kind in [
-        MarkdownBlockKind::Code {
-            language: Some("rust".to_string()),
-        },
-        MarkdownBlockKind::Table,
-        MarkdownBlockKind::Quote,
+    for (kind, quote_depth) in [
+        (
+            MarkdownBlockKind::Code {
+                language: Some("rust".to_string()),
+            },
+            0,
+        ),
+        (MarkdownBlockKind::Table, 0),
+        (MarkdownBlockKind::Paragraph, 1),
+        (MarkdownBlockKind::Table, 2),
     ] {
         let spec = |visual_row: usize| MarkdownBlockSpec {
+            focused_link: None,
             text: text.clone(),
             kind: kind.clone(),
+            quote_depth,
+            quote_above: 0,
+            quote_below: 0,
+            gap_after: 0.0,
             dense: false,
             selectable: true,
             action: None,
@@ -3595,7 +3610,7 @@ fn a_block_the_reader_cuts_keeps_its_panel_open_at_the_cut() {
             total_visual_rows: 12,
             inline: Vec::new(),
         };
-        let frame = markdown_frame(&spec(0)).expect("a block with text");
+        let frame = markdown_frame(&spec(0), 320.0).expect("a block with text");
         // (first row shown, rows shown, the block's rectangle): whole, ended at the
         // preview's last whole row, scrolled into and shown to its end.
         for (row, rows, open_top, open_bottom) in [
@@ -3655,6 +3670,75 @@ fn a_block_the_reader_cuts_keeps_its_panel_open_at_the_cut() {
 }
 
 #[test]
+fn deeply_quoted_lists_and_rules_leave_room_for_their_content() {
+    use crate::widget::DrawPrim;
+
+    let roles = crate::settings::Roles::from_theme(aterm_render::Theme::default());
+    let rect = LogicalRect::new(10.0, 40.0, 120.0, 54.0);
+    let mut spec = MarkdownBlockSpec {
+        text: "one two three four five six seven eight".to_string(),
+        kind: MarkdownBlockKind::ListItem {
+            depth: 12,
+            ordinal: Some(7),
+        },
+        quote_depth: 30,
+        quote_above: 0,
+        quote_below: 0,
+        gap_after: 0.0,
+        dense: false,
+        selectable: true,
+        action: None,
+        focused_link: None,
+        selected: false,
+        source: 0..60,
+        estimated_height: rect.height,
+        visual_row: 0,
+        total_visual_rows: 6,
+        inline: Vec::new(),
+    };
+    let frame = markdown_frame(&spec, rect.width).unwrap();
+    assert!(frame.text_width(rect.width) >= rect.width * 0.39);
+    let mut prims = Vec::new();
+    paint_markdown_block(&mut prims, rect, &spec, roles);
+    let rails: Vec<_> = prims
+        .iter()
+        .filter_map(|p| match p {
+            DrawPrim::Panel { x, w, .. } if *w <= 3.0 => Some((*x, x + w)),
+            _ => None,
+        })
+        .collect();
+    assert!(rails.len() >= 2);
+    assert!(rails.windows(2).all(|pair| pair[0].1 < pair[1].0));
+    let last_rail = rails.last().unwrap().1;
+    assert!(prims.iter().any(|p| matches!(p, DrawPrim::Text { s, x, .. }
+        if s == "7." && *x > last_rail && *x < rect.x + frame.inset_left)));
+
+    spec.visual_row = 1;
+    prims.clear();
+    paint_markdown_block(&mut prims, rect, &spec, roles);
+    assert!(
+        !prims
+            .iter()
+            .any(|p| matches!(p, DrawPrim::Text { s, .. } if s == "7."))
+    );
+
+    spec.kind = MarkdownBlockKind::Rule;
+    prims.clear();
+    paint_markdown_block(&mut prims, rect, &spec, roles);
+    assert!(
+        prims
+            .iter()
+            .any(|p| matches!(p, DrawPrim::Stroke { x, w, .. }
+        if *x > last_rail && (x + w - rect.right()).abs() < 0.01))
+    );
+    assert!(
+        prims
+            .iter()
+            .all(|p| !matches!(p, DrawPrim::ClipPush { .. } | DrawPrim::ClipPop))
+    );
+}
+
+#[test]
 fn a_cjk_block_wraps_inside_the_readers_column() {
     const NO_ROW_START: [char; 6] = ['。', '、', '」', 'ー', 'ァ', 'ょ'];
     let text = "設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。\
@@ -3678,8 +3762,13 @@ fn a_cjk_block_wraps_inside_the_readers_column() {
                     ] {
                         let context = format!("{scale}\u{d7} {width}pt {kind:?}");
                         let spec = MarkdownBlockSpec {
+                            focused_link: None,
                             text: text.to_string(),
                             kind: kind.clone(),
+                            quote_depth: 0,
+                            quote_above: 0,
+                            quote_below: 0,
+                            gap_after: 0.0,
                             dense: false,
                             selectable: true,
                             action: None,

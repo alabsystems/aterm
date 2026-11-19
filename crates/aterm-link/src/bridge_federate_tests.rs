@@ -2657,8 +2657,8 @@ fn a_reply_from_where_a_rotation_moved_the_asked_node_is_no_stray() {
     let other = node_of(&key_of(59));
     let keys = keys_for(55, None);
     let (_lane, mut a, _served) = attached(&ma, "ta000000000", keys.path());
-    a.note_asked(5, &peer_was);
-    a.note_asked(6, &mine_was);
+    a.note_asked(5, &peer_was, None);
+    a.note_asked(6, &mine_was, None);
     for rotated in [true, false] {
         let case = format!("rotated={rotated}");
         Handoff {

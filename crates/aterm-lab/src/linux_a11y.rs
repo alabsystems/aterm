@@ -395,7 +395,7 @@ impl Cell<'_> {
             verdict,
             secs: out.secs,
             detail: if verdict == Verdict::Pass || out.text.contains(MEASURE_RESULT) {
-                detail
+                proof::with_stall_tail(&out, detail)
             } else {
                 format!("{detail}\n{}", out.tail(5))
             },

@@ -154,7 +154,7 @@ fn a_hung_sweep_still_publishes_cpu_memory_swap_disk_and_net_and_names_the_sweep
     fn hung(
         _: aterm_sysprobe::SweepOpts,
         _: &mut aterm_sysprobe::coalitions::CoalitionIds,
-    ) -> Option<aterm_sysprobe::Sweep> {
+    ) -> Option<(aterm_sysprobe::Sweep, Option<aterm_sysprobe::kproc::Table>)> {
         aterm_sysprobe::lane::mark("proc_pid_rusage", Some(4321));
         ENTERED.fetch_add(1, Ordering::SeqCst);
         GATE.pass();
@@ -196,7 +196,7 @@ fn a_hung_sweep_still_publishes_cpu_memory_swap_disk_and_net_and_names_the_sweep
     // The negative control: the kernel's sweep answers.
     static ANSWERED: LazyLock<Shared> = LazyLock::new(workers);
     let mut host = probe_over(
-        || reader_with(aterm_sysprobe::processes_keeping, MUST_HAPPEN),
+        || reader_with(aterm_sysprobe::processes_keeping_table, MUST_HAPPEN),
         &ANSWERED,
     );
     let (held, state) = ANSWERED.fresh(Duration::ZERO, true);
@@ -219,7 +219,7 @@ fn a_stalled_sweep_is_asked_once_however_many_pulls_follow() {
     fn hung(
         _: aterm_sysprobe::SweepOpts,
         _: &mut aterm_sysprobe::coalitions::CoalitionIds,
-    ) -> Option<aterm_sysprobe::Sweep> {
+    ) -> Option<(aterm_sysprobe::Sweep, Option<aterm_sysprobe::kproc::Table>)> {
         ENTERED.fetch_add(1, Ordering::SeqCst);
         aterm_sysprobe::lane::mark("proc_listallpids", None);
         GATE.pass();
@@ -254,14 +254,14 @@ fn a_sweep_that_hangs_after_a_good_sample_keeps_as_of_moving_and_reports_since()
     fn later(
         opts: aterm_sysprobe::SweepOpts,
         ids: &mut aterm_sysprobe::coalitions::CoalitionIds,
-    ) -> Option<aterm_sysprobe::Sweep> {
+    ) -> Option<(aterm_sysprobe::Sweep, Option<aterm_sysprobe::kproc::Table>)> {
         if HANG.load(Ordering::SeqCst) {
             aterm_sysprobe::lane::mark("proc_listallpids", None);
             ENTERED.fetch_add(1, Ordering::SeqCst);
             GATE.pass();
             return None;
         }
-        aterm_sysprobe::processes_keeping(opts, ids)
+        aterm_sysprobe::processes_keeping_table(opts, ids)
     }
     let req = Request {
         self_pid: std::process::id(),
@@ -312,8 +312,8 @@ fn a_held_ownership_proof_keeps_machine_readings_fresh_and_names_its_phase_and_p
     fn sweep(
         _: aterm_sysprobe::SweepOpts,
         _: &mut aterm_sysprobe::coalitions::CoalitionIds,
-    ) -> Option<aterm_sysprobe::Sweep> {
-        Some(aterm_sysprobe::Sweep {
+    ) -> Option<(aterm_sysprobe::Sweep, Option<aterm_sysprobe::kproc::Table>)> {
+        let sweep = aterm_sysprobe::Sweep {
             procs: vec![aterm_sysprobe::ProcessReading {
                 pid: 4321,
                 ppid: std::process::id(),
@@ -323,7 +323,8 @@ fn a_held_ownership_proof_keeps_machine_readings_fresh_and_names_its_phase_and_p
                 ..aterm_sysprobe::ProcessReading::default()
             }],
             truncated: false,
-        })
+        };
+        Some((sweep, None))
     }
     fn shell(identity: aterm_pty::ShellIdentity) -> Option<bool> {
         ENTERED.fetch_add(1, Ordering::SeqCst);
@@ -396,12 +397,12 @@ fn a_resting_reading_asks_its_sweep_for_no_scheduling() {
     fn sweep(
         opts: aterm_sysprobe::SweepOpts,
         ids: &mut aterm_sysprobe::coalitions::CoalitionIds,
-    ) -> Option<aterm_sysprobe::Sweep> {
+    ) -> Option<(aterm_sysprobe::Sweep, Option<aterm_sysprobe::kproc::Table>)> {
         ASKED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(opts.scheduling);
-        aterm_sysprobe::processes_keeping(opts, ids)
+        aterm_sysprobe::processes_keeping_table(opts, ids)
     }
     let mut reader = reader_with(sweep, MUST_HAPPEN);
     let rest = Request {

@@ -116,7 +116,7 @@ fn a_bound_registry_name_precedes_legacy_books_and_roster_without_making_a_local
     )
     .expect("uses the bound row");
     assert_eq!(origin, Origin::Registry);
-    assert_eq!(name.title(), "m86 MissBunny");
+    assert_eq!(name.title(), "m86 Miss Bunny");
     assert_eq!(
         (name.class, name.since, name.rev),
         (Class::Seeded, IMPLIED_SINCE, 0)
@@ -337,6 +337,80 @@ fn a_number_rename_keeps_a_row_nickname_no_read_followed_yet() {
     assert_eq!(renamed.title(), "m87 Heron");
 }
 
+#[test]
+fn a_nickname_with_the_same_display_keeps_the_file_and_reconciles_the_row() {
+    let root = state();
+    let saved = chosen(&root);
+    let nick = Nickname::parse("miss bunny").unwrap();
+    let (set, asked) = registry::with_door(registry::Written::Unchanged, || {
+        set_nick(
+            root.path(),
+            &NickTo::Word(nick.clone()),
+            ByKind::Person,
+            unread,
+            NOW + 1,
+            false,
+        )
+    });
+    let set = set.expect("the chosen display is already held");
+    assert!(!set.changed);
+    assert_eq!(set.name, saved);
+    assert_eq!(set.queued, None);
+    assert_eq!(asked, cells(&["nickname=Miss Bunny"]));
+
+    let to = NameTo {
+        num: num(87),
+        nick: Some(nick),
+    };
+    let (renamed, asked) = registry::with_door(queued(), || {
+        set_name(
+            root.path(),
+            &to,
+            no_labels,
+            ByKind::Person,
+            unread,
+            NOW + 2,
+            false,
+        )
+    });
+    let renamed = renamed.expect("changes only the number").name;
+    assert_eq!(renamed.nick, saved.nick);
+    assert_eq!(renamed.rev, saved.rev + 1);
+    assert_eq!(asked, cells(&["label=m87"]));
+}
+
+#[test]
+fn choosing_an_automatic_nickname_with_the_number_preserves_its_stored_spelling() {
+    let root = state();
+    chosen(&root);
+    let saved = file::replace(root.path(), |name| {
+        name.nick_class = NickClass::Auto;
+        Ok(())
+    })
+    .unwrap();
+    let to = NameTo {
+        num: num(86),
+        nick: Some(Nickname::parse("miss bunny").unwrap()),
+    };
+    let (set, asked) = registry::with_door(queued(), || {
+        set_name(
+            root.path(),
+            &to,
+            no_labels,
+            ByKind::Person,
+            unread,
+            NOW + 1,
+            false,
+        )
+    });
+    let set = set.expect("an explicit choice");
+    assert!(set.changed);
+    assert_eq!(set.name.nick_class, NickClass::Chosen);
+    assert_eq!(set.name.nick, saved.nick);
+    assert_eq!(set.name.rev, saved.rev + 1);
+    assert_eq!(asked, cells(&["nickname=Miss Bunny"]));
+}
+
 /// A rename to the nickname the row was given, which no read followed yet, asks for nothing the
 /// name does not hold once it follows: the file takes the row's change and the rename says so.
 #[test]
@@ -431,7 +505,7 @@ fn a_row_holding_this_macs_own_nickname_renames_nothing() {
 fn a_name_that_never_looked_follows_a_chosen_row_only_once_it_moves() {
     for (class, first) in [
         (NickClass::Chosen, "unnumbered Bunny"),
-        (NickClass::Auto, "unnumbered MissBunny"),
+        (NickClass::Auto, "unnumbered Miss Bunny"),
     ] {
         let root = state();
         let mut kept = MachineName::unnumbered(Nickname::parse("Bunny").expect("a nickname"), NOW);
@@ -462,7 +536,7 @@ fn a_row_with_no_chosen_nickname_renames_nothing() {
     assert_eq!((emptied.title(), emptied.rev), (mirror.title(), mirror.rev));
     assert_eq!(seen(&emptied), Some(None));
     renick(&root, "Otter", None, NOW + 2);
-    assert_eq!(follow(&root, Some("MissBunny")).title(), "m86 MissBunny");
+    assert_eq!(follow(&root, Some("MissBunny")).title(), "m86 Miss Bunny");
 }
 
 /// No row of this Mac's (no lab, a name kept elsewhere) leaves the file as it is.
@@ -592,7 +666,7 @@ fn an_owner_write_of_the_row_label_renumbers_this_mac() {
     let root = state();
     let before = chosen(&root);
     let name = renumber(&root, Some("m87"), NOW + 1).expect("the row renumbers the Mac");
-    assert_eq!(name.title(), "m87 MissBunny");
+    assert_eq!(name.title(), "m87 Miss Bunny");
     assert_eq!(
         (name.class, name.rev),
         (Class::Chosen, before.rev + 1),
@@ -676,7 +750,7 @@ fn a_followed_number_is_saved_only_under_the_sources_admission() {
     let name = follow(NOW + 2)
         .expect("an admitted source")
         .expect("the row renumbers the Mac");
-    assert_eq!(name.title(), "m87 MissBunny");
+    assert_eq!(name.title(), "m87 Miss Bunny");
     assert_eq!(file::read(root.path()).expect("reads"), Some(name));
 }
 
@@ -691,14 +765,14 @@ fn an_owner_number_replaces_a_seeded_one_and_makes_its_own_chosen() {
     let name = renumber(&root, Some("m87"), NOW + 1).expect("renumbered");
     assert_eq!(
         (name.title(), name.class),
-        ("m87 MissBunny".to_owned(), Class::Chosen)
+        ("m87 Miss Bunny".to_owned(), Class::Chosen)
     );
     let root = state();
     mirrored(&root);
     let name = renumber(&root, Some("m86"), NOW + 1).expect("the seeded number becomes chosen");
     assert_eq!(
         (name.title(), name.class),
-        ("m86 MissBunny".to_owned(), Class::Chosen)
+        ("m86 Miss Bunny".to_owned(), Class::Chosen)
     );
     assert_eq!(
         renumber(&root, Some("m86"), NOW + 2),
@@ -726,7 +800,7 @@ fn a_pending_or_untakeable_label_renumbers_nothing() {
     );
     assert_eq!(
         renumber(&root, Some("m87"), NOW + 3).map(|name| name.title()),
-        Some("m87 MissBunny".to_owned())
+        Some("m87 Miss Bunny".to_owned())
     );
 }
 
@@ -750,10 +824,10 @@ fn a_renumber_here_queues_its_number_to_the_row() {
     assert_eq!(asked, cells(&["label=m88"]));
     assert!(set.renumbered);
     assert_eq!(queued_id(set.queued.as_ref()), Some("wi-1"));
-    assert_eq!(set.name.title(), "m88 MissBunny");
+    assert_eq!(set.name.title(), "m88 Miss Bunny");
     let (set, asked) = renamed_with(&root, "m89", queued(), true, NOW + 2);
     let set = set.expect("a preview");
-    assert_eq!(set.name.title(), "m89 MissBunny");
+    assert_eq!(set.name.title(), "m89 Miss Bunny");
     assert!(asked.is_empty(), "a dry run queues nothing");
     assert_eq!(set.queued, None);
     let to = NickTo::Word(Nickname::parse("Otter").expect("a nickname"));
@@ -831,7 +905,7 @@ fn a_dry_run_is_refused_as_its_real_run_would_be() {
     );
     assert_eq!(file::read(root.path()).expect("reads"), Some(before));
     let (set, _) = renamed_with(&root, "m88", queued(), true, NOW + 2);
-    assert_eq!(set.expect("a preview").name.title(), "m88 MissBunny");
+    assert_eq!(set.expect("a preview").name.title(), "m88 Miss Bunny");
 }
 
 /// A rename's write that gives way, whole, to another writer's value of the row leaves the row's
@@ -840,7 +914,7 @@ fn a_dry_run_is_refused_as_its_real_run_would_be() {
 ///
 /// NEGATIVE CONTROL, observed: with the queued rename leaving the file's `row` as the base saw
 /// it (`Saw(MissBunny)`), the row's MissBunny reads as seen and the Mac keeps the nickname the
-/// row never took: `left: "m12 Otter" right: "m12 MissBunny"`.
+/// row never took: `left: "m12 Otter" right: "m12 Miss Bunny"`.
 #[test]
 fn a_rename_that_gave_way_follows_the_rows_nickname() {
     let root = state();
@@ -865,7 +939,7 @@ fn a_rename_that_gave_way_follows_the_rows_nickname() {
     assert_eq!(set.expect("a rename").name.title(), "m12 Otter");
     assert_eq!(asked, cells(&["label=m12", "nickname=Otter"]));
     let name = follow(&root, Some("MissBunny"));
-    assert_eq!(name.title(), "m12 MissBunny");
+    assert_eq!(name.title(), "m12 Miss Bunny");
     assert_eq!(follow(&root, Some("MissBunny")), name);
 }
 
@@ -900,7 +974,7 @@ fn a_number_asked_for_again_is_queued_over_an_unfollowed_row_number() {
     let set = set.expect("a rename to the number held");
     assert_eq!(asked, cells(&["label=m86"]));
     assert!(set.renumbered && !set.changed);
-    assert_eq!(set.name.title(), "m86 MissBunny");
+    assert_eq!(set.name.title(), "m86 Miss Bunny");
     let (_, asked) = registry::with_door(queued(), || {
         registry::with_label(Some("m86"), false, || {
             set_name(
@@ -944,7 +1018,7 @@ fn a_number_asked_for_again_is_queued_over_an_unfollowed_row_number() {
     });
     assert_eq!(
         undone.expect("a nickname undo").name.title(),
-        "m86 MissBunny"
+        "m86 Miss Bunny"
     );
     assert_eq!(
         asked,
@@ -977,7 +1051,7 @@ fn an_owner_revert_to_the_number_a_rename_here_replaced_is_followed() {
     let root = state();
     chosen(&root);
     let (set, _) = renamed_with(&root, "m88", queued(), false, NOW + 1);
-    assert_eq!(set.expect("a renumber here").name.title(), "m88 MissBunny");
+    assert_eq!(set.expect("a renumber here").name.title(), "m88 Miss Bunny");
     assert_eq!(
         renumber(&root, Some("m88"), NOW + 2),
         None,
@@ -985,7 +1059,7 @@ fn an_owner_revert_to_the_number_a_rename_here_replaced_is_followed() {
     );
     assert_eq!(
         renumber(&root, Some("m86"), NOW + 3).map(|name| name.title()),
-        Some("m86 MissBunny".to_owned())
+        Some("m86 Miss Bunny".to_owned())
     );
 }
 
@@ -1009,7 +1083,7 @@ fn a_label_the_vault_gives_another_mac_is_refused_and_judged_again() {
     assert_eq!(file::read(root.path()).expect("reads"), Some(before));
     assert_eq!(
         renumber(&root, Some("m87"), NOW + 2).map(|name| name.title()),
-        Some("m87 MissBunny".to_owned())
+        Some("m87 Miss Bunny".to_owned())
     );
 }
 
@@ -1041,7 +1115,7 @@ fn an_undo_of_a_followed_number_queues_the_number_it_restores() {
         })
     });
     let undone = undone.expect("an undo").name;
-    assert_eq!(undone.title(), "m86 MissBunny");
+    assert_eq!(undone.title(), "m86 Miss Bunny");
     assert_eq!(asked, cells(&["label=m86"]));
     assert_eq!(
         renumber_with(&root, Some("m87"), true, no_labels, NOW + 3).expect("reads"),
@@ -1181,11 +1255,11 @@ fn a_name_made_while_the_registry_was_unread_takes_its_rows_name_whoever_wrote_i
 }
 
 /// A WORD-VALUED `fleet-name` MADE THE NICKNAME WHILE THE REGISTRY WAS UNREAD GIVES WAY TO THE
-/// ROW'S: `unnumbered otter`, its nickname chosen, would keep `otter` on a first look of
+/// ROW'S: `unnumbered Otter`, its nickname chosen, would keep `otter` on a first look of
 /// [`follow_registry`] and take no number from a row it does not name, so the first read that
 /// finds the row takes both (`m86 Badger`, still chosen, the row seen), and a follow of the same
 /// row then moves nothing. A row with no nickname leaves the noun the name has.
-/// NEGATIVE CONTROL: as above, with no [`settled`] the name stays `unnumbered otter`.
+/// NEGATIVE CONTROL: as above, with no [`settled`] the name stays `unnumbered Otter`.
 #[test]
 fn a_chosen_nickname_made_while_the_registry_was_unread_gives_way_to_the_rows() {
     let root = state();
@@ -1200,7 +1274,7 @@ fn a_chosen_nickname_made_while_the_registry_was_unread_gives_way_to_the_rows() 
     .expect("made while unread");
     assert_eq!(
         (made.title().as_str(), made.nick_class, origin),
-        ("unnumbered otter", NickClass::Chosen, Origin::Evidence)
+        ("unnumbered Otter", NickClass::Chosen, Origin::Evidence)
     );
     let (name, origin) = ensure_from(
         root.path(),
@@ -1606,7 +1680,7 @@ fn a_chosen_number_and_nickname_are_one_change_with_the_prior_claim_kept() {
     )
     .expect("renames");
     assert!(set.changed);
-    assert_eq!(set.name.title(), "m86 MissBunny");
+    assert_eq!(set.name.title(), "m86 Miss Bunny");
     assert_eq!(set.name.class, Class::Chosen);
     assert_eq!(set.name.nick_class, NickClass::Chosen);
     assert_eq!(set.name.rev, before.rev + 1);
@@ -1620,9 +1694,13 @@ fn a_chosen_number_and_nickname_are_one_change_with_the_prior_claim_kept() {
         Some(set.name.clone())
     );
 
+    let same = NameTo {
+        num: to.num,
+        nick: Some(Nickname::parse("miss bunny").expect("the same displayed words")),
+    };
     let again = set_name(
         root.path(),
-        &to,
+        &same,
         no_labels,
         ByKind::Agent,
         unread,
@@ -2140,7 +2218,7 @@ fn choosing_the_held_seeded_number_never_weakens_its_claim_against_a_rival() {
     )
     .expect("only the nickname changes");
     assert!(nick.changed);
-    assert_eq!(nick.name.title(), "m7 MissBunny");
+    assert_eq!(nick.name.title(), "m7 Miss Bunny");
     assert_eq!(
         (nick.name.class, nick.name.since, nick.name.act),
         (same.name.class, same.name.since, same.name.act)
@@ -2180,7 +2258,7 @@ fn an_upgraded_machine_keeps_its_older_name_pending_migration() {
     assert_eq!(origin, Origin::Evidence);
     assert_eq!(
         name.title(),
-        "m12 studio",
+        "m12 Studio",
         "the roster's NAME, the fleet name's word"
     );
     assert_eq!(name.nick_class, NickClass::Chosen);
@@ -2338,7 +2416,9 @@ fn a_nickname_in_view_is_one_in_any_case() {
 fn a_nickname_change_is_chosen_raises_rev_and_keeps_the_claim() {
     let heron = || Nickname::parse("heron").expect("a nickname");
     let held = MachineName::unnumbered(heron(), NOW);
-    let chosen = renicked(&held, heron()).expect("a drawn noun chosen is a change");
+    let chosen = renicked(&held, Nickname::parse("HERON").unwrap())
+        .expect("a drawn noun chosen is a change");
+    assert_eq!(chosen.nick, held.nick);
     assert_eq!(
         (chosen.nick_class, chosen.rev),
         (NickClass::Chosen, 1),
@@ -2346,8 +2426,10 @@ fn a_nickname_change_is_chosen_raises_rev_and_keeps_the_claim() {
     );
     assert_eq!(renicked(&chosen, heron()), None, "chosen already");
     let seeded = MachineName { rev: 4, ..chosen };
-    let respelled = renicked(&seeded, Nickname::parse("Heron").expect("a nickname"))
-        .expect("another spelling is another nickname");
+    assert_eq!(renicked(&seeded, Nickname::parse("Heron").unwrap()), None);
+    let respelled = renicked(&seeded, Nickname::parse("He Ron").unwrap())
+        .expect("different displayed word boundaries rename the machine");
+    assert_eq!(respelled.display_nick(), "He Ron");
     assert_eq!(respelled.rev, 5, "a seeded file's change raises rev");
     assert_eq!(
         (

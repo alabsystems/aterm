@@ -157,6 +157,7 @@ fn measure_initial_live_claim_projection() {
                 black_box(&raw),
                 operations.iter(),
                 &index,
+                None,
             ))
         };
         for explicit in [false, true] {
@@ -219,7 +220,7 @@ fn measure_carried_claim_layout() {
             native.push(op);
         }
         let raw = cells(&native.iter().collect::<Vec<_>>());
-        let proof = snapshot(&MACHINE, &raw, native.iter(), &native_index).unwrap();
+        let proof = snapshot(&MACHINE, &raw, native.iter(), &native_index, None).unwrap();
         let mut combined_index = Index::new(8);
         let combined = vec![carried_operation(
             240,
@@ -253,6 +254,7 @@ fn measure_carried_claim_layout() {
                 black_box(cells),
                 operations.iter(),
                 index,
+                None,
             ))
         };
         let expected = run(0);
@@ -266,7 +268,7 @@ fn measure_carried_claim_layout() {
                 assert_eq!(read.rows[&pk].fields, expected.rows[&pk].fields);
             }
             assert_eq!(
-                snapshot(&MACHINE, cells, operations.iter(), index).unwrap(),
+                snapshot(&MACHINE, cells, operations.iter(), index, None).unwrap(),
                 proof
             );
         }
@@ -550,6 +552,7 @@ fn reviving_a_retired_row_does_not_reclaim_an_observed_incumbents_label() {
         &cells(&[&a, &retired, &b]),
         [&a, &retired, &b].into_iter(),
         &index,
+        None,
     );
     assert_eq!(before.rows[b_pk].get("label"), Some(&json!("m7")));
     assert!(!before.rows[a_pk].live());
@@ -559,6 +562,7 @@ fn reviving_a_retired_row_does_not_reclaim_an_observed_incumbents_label() {
         &cells(&[&a, &b, &revived]),
         [&a, &retired, &b, &revived].into_iter(),
         &index,
+        None,
     );
     assert!(after.rows[a_pk].live());
     assert_eq!(
@@ -569,11 +573,11 @@ fn reviving_a_retired_row_does_not_reclaim_an_observed_incumbents_label() {
     let raw = cells(&[&a, &b, &revived]);
     let operations = [&a, &retired, &b, &revived];
     let normalized = interpreted_cells(&MACHINE, &raw, operations.into_iter(), &index);
-    let evidence = snapshot(&MACHINE, &normalized, operations.into_iter(), &index).unwrap();
+    let evidence = snapshot(&MACHINE, &normalized, operations.into_iter(), &index, None).unwrap();
     let mut next = Index::new(8);
     let carried = carried_operation(100, &normalized, Some(&evidence), &mut next);
     let copied = cells(&[&carried]);
-    let read = project(&MACHINE, &copied, [&carried].into_iter(), &next);
+    let read = project(&MACHINE, &copied, [&carried].into_iter(), &next, None);
     assert_eq!(read.rows[b_pk].get("label"), Some(&json!("m7")));
     assert_eq!(read.rows[a_pk].get("label"), after.rows[a_pk].get("label"));
     let unproven = carried_operation(101, &normalized, None, &mut next);
@@ -582,13 +586,14 @@ fn reviving_a_retired_row_does_not_reclaim_an_observed_incumbents_label() {
         &cells(&[&carried, &unproven]),
         [&carried, &unproven].into_iter(),
         &next,
+        None,
     );
     assert_eq!(hydrated.rows[b_pk].get("label"), Some(&json!("m7")));
     assert_eq!(
         hydrated.rows[a_pk].get("label"),
         after.rows[a_pk].get("label")
     );
-    let evidence = snapshot(&MACHINE, &copied, [&carried].into_iter(), &next).unwrap();
+    let evidence = snapshot(&MACHINE, &copied, [&carried].into_iter(), &next, None).unwrap();
     let mut last = Index::new(8);
     let recarried = carried_operation(200, &copied, Some(&evidence), &mut last);
     let read = project(
@@ -596,6 +601,7 @@ fn reviving_a_retired_row_does_not_reclaim_an_observed_incumbents_label() {
         &cells(&[&recarried]),
         [&recarried].into_iter(),
         &last,
+        None,
     );
     assert_eq!(read.rows[b_pk].get("label"), Some(&json!("m7")));
     assert_eq!(read.rows[a_pk].get("label"), after.rows[a_pk].get("label"));
@@ -614,6 +620,7 @@ fn a_live_reassertion_preserves_tenure_and_a_concurrent_edit_stays_conflicted() 
         &cells(&[&a, &b, &live]),
         [&a, &b, &live].into_iter(),
         &index,
+        None,
     );
     assert_eq!(read.rows[a_pk].get("label"), Some(&json!("m7")));
     let retired = operation(50, a_pk, "row", "retired", &[5], &mut index);
@@ -625,6 +632,7 @@ fn a_live_reassertion_preserves_tenure_and_a_concurrent_edit_stays_conflicted() 
         &raw,
         [&a, &b, &live, &retired, &revived, &edited].into_iter(),
         &index,
+        None,
     );
     assert!(read.rows[a_pk].fields["label"].conflicted());
     assert_eq!(read.rows[a_pk].get("label"), None);
@@ -638,14 +646,14 @@ fn a_partial_carry_cannot_pair_an_old_claim_with_a_new_activity_period() {
     let mut source = Index::new(8);
     let a = operation(10, a_pk, "label", "m7", &[], &mut source);
     let initial = cells(&[&a]);
-    let first_proof = snapshot(&MACHINE, &initial, [&a].into_iter(), &source).unwrap();
+    let first_proof = snapshot(&MACHINE, &initial, [&a].into_iter(), &source, None).unwrap();
     let retired = operation(50, a_pk, "row", "retired", &[10], &mut source);
     let b = operation(20, b_pk, "label", "m7", &[50], &mut source);
     let revived = operation(5, a_pk, "row", "live", &[20], &mut source);
     let raw = cells(&[&a, &b, &revived]);
     let operations = [&a, &retired, &b, &revived];
     let normalized = interpreted_cells(&MACHINE, &raw, operations.into_iter(), &source);
-    let proof = snapshot(&MACHINE, &normalized, operations.into_iter(), &source).unwrap();
+    let proof = snapshot(&MACHINE, &normalized, operations.into_iter(), &source, None).unwrap();
     let mut target = Index::new(8);
     let old = carried_operation(100, &initial, Some(&first_proof), &mut target);
     let mut partial = normalized.into_owned();
@@ -656,6 +664,7 @@ fn a_partial_carry_cannot_pair_an_old_claim_with_a_new_activity_period() {
         &cells(&[&old, &rest]),
         [&old, &rest].into_iter(),
         &target,
+        None,
     );
     assert_ne!(read.rows[a_pk].get("label"), Some(&json!("m7")));
     assert_eq!(read.rows[b_pk].get("label"), Some(&json!("m7")));
@@ -670,14 +679,14 @@ fn an_expired_claim_cannot_block_a_sole_unproven_claimant() {
         let mut source = Index::new(8);
         let a = operation(10, a_pk, column, value, &[], &mut source);
         let initial = cells(&[&a]);
-        let initial_proof = snapshot(&MACHINE, &initial, [&a].into_iter(), &source).unwrap();
+        let initial_proof = snapshot(&MACHINE, &initial, [&a].into_iter(), &source, None).unwrap();
         let retired = operation(50, a_pk, "row", "retired", &[10], &mut source);
         let revived = operation(5, a_pk, "row", "live", &[50], &mut source);
         let operations = [&a, &retired, &revived];
         let raw = cells(&[&a, &revived]);
         let mut partial =
             interpreted_cells(&MACHINE, &raw, operations.into_iter(), &source).into_owned();
-        let proof = snapshot(&MACHINE, &partial, operations.into_iter(), &source).unwrap();
+        let proof = snapshot(&MACHINE, &partial, operations.into_iter(), &source, None).unwrap();
         partial.remove(&(MACHINE.name.into(), format!("{a_pk}.{column}")));
         let b = operation(20, b_pk, column, value, &[], &mut source);
         let c = operation(21, c_pk, column, value, &[], &mut source);
@@ -690,11 +699,12 @@ fn an_expired_claim_cannot_block_a_sole_unproven_claimant() {
             &cells(&[&unknown]),
             [&unknown].into_iter(),
             &target,
+            None,
         );
         assert_eq!(alone.rows[b_pk].get(column), Some(&json!(value)));
         let operations = [&old, &rest, &unknown];
         let combined = cells(&operations);
-        let read = project(&MACHINE, &combined, operations.into_iter(), &target);
+        let read = project(&MACHINE, &combined, operations.into_iter(), &target, None);
         assert_eq!(
             read.rows[a_pk].get(column),
             None,
@@ -706,13 +716,14 @@ fn an_expired_claim_cannot_block_a_sole_unproven_claimant() {
             Some(&json!(value)),
             "a proved-empty contender cannot block the sole remaining claim"
         );
-        let proof = snapshot(&MACHINE, &combined, operations.into_iter(), &target).unwrap();
+        let proof = snapshot(&MACHINE, &combined, operations.into_iter(), &target, None).unwrap();
         let recarried = carried_operation(103, &combined, Some(&proof), &mut target);
         let read = project(
             &MACHINE,
             &cells(&[&recarried]),
             [&recarried].into_iter(),
             &target,
+            None,
         );
         assert_eq!(read.rows[a_pk].get(column), None);
         assert_eq!(read.rows[b_pk].get(column), Some(&json!(value)));
@@ -723,6 +734,7 @@ fn an_expired_claim_cannot_block_a_sole_unproven_claimant() {
             &cells(&operations),
             operations.into_iter(),
             &target,
+            None,
         );
         for pk in [a_pk, b_pk, c_pk] {
             assert_eq!(
@@ -745,7 +757,14 @@ fn one_native_reactivation_can_restore_multiple_previously_carried_rows() {
     second.key = format!("{}.row", pks[1]);
     retired.changes.push(second);
     let raw = cells(&[&a, &c, &retired]);
-    let proof = snapshot(&MACHINE, &raw, [&a, &c, &retired].into_iter(), &source).unwrap();
+    let proof = snapshot(
+        &MACHINE,
+        &raw,
+        [&a, &c, &retired].into_iter(),
+        &source,
+        None,
+    )
+    .unwrap();
     let mut target = Index::new(8);
     let carried = carried_operation(100, &raw, Some(&proof), &mut target);
     let mut revived = operation(5, pks[0], "row", "live", &[100], &mut target);
@@ -756,8 +775,8 @@ fn one_native_reactivation_can_restore_multiple_previously_carried_rows() {
     raw.extend(cells(&[&revived]));
     let operations = [&carried, &revived];
     let normalized = interpreted_cells(&MACHINE, &raw, operations.into_iter(), &target);
-    let proof = snapshot(&MACHINE, &normalized, operations.into_iter(), &target).unwrap();
-    let read = project(&MACHINE, &raw, operations.into_iter(), &target);
+    let proof = snapshot(&MACHINE, &normalized, operations.into_iter(), &target, None).unwrap();
+    let read = project(&MACHINE, &raw, operations.into_iter(), &target, None);
     for (pk, label) in pks.into_iter().zip(["m7", "m8"]) {
         assert_eq!(read.rows[pk].get("label"), Some(&json!(label)));
         let coordinate = (MACHINE.name.into(), format!("{pk}.label"));
@@ -804,6 +823,8 @@ fn the_importer_adopts_the_canonical_node_holder() {
         awaiting: crate::typed::Awaiting::NONE,
         refused: Vec::new(),
         refusals: Vec::new(),
+        state: crate::typed::state::State::default(),
+        claims_floor: None,
         cells_from: None,
     };
     let macs = [KnownMac {
@@ -845,7 +866,7 @@ fn the_importer_adopts_the_canonical_node_holder() {
 fn a_partial_import_keeps_the_order_of_a_claim_the_source_already_renamed() {
     let mut source = Index::new(8);
     let a = operation(30, "mc-0000000000000002", "label", "m7", &[], &mut source);
-    let initial = snapshot(&MACHINE, &cells(&[&a]), [&a].into_iter(), &source).unwrap();
+    let initial = snapshot(&MACHINE, &cells(&[&a]), [&a].into_iter(), &source, None).unwrap();
     let b = operation(10, "mc-0000000000000001", "label", "m7", &[30], &mut source);
     let away = operation(
         50,
@@ -856,7 +877,14 @@ fn a_partial_import_keeps_the_order_of_a_claim_the_source_already_renamed() {
         &mut source,
     );
     let current = cells(&[&away, &b]);
-    let evidence = snapshot(&MACHINE, &current, [&a, &b, &away].into_iter(), &source).unwrap();
+    let evidence = snapshot(
+        &MACHINE,
+        &current,
+        [&a, &b, &away].into_iter(),
+        &source,
+        None,
+    )
+    .unwrap();
     let mut target = Index::new(8);
     let first = carried_operation(100, &cells(&[&a]), Some(&initial), &mut target);
     // The renamed row has not arrived yet. Reads keep held records rather than waiting.
@@ -866,6 +894,7 @@ fn a_partial_import_keeps_the_order_of_a_claim_the_source_already_renamed() {
         &cells(&[&first, &second]),
         [&first, &second].into_iter(),
         &target,
+        None,
     );
     assert_eq!(
         partial.rows["mc-0000000000000002"].get("label"),
@@ -886,6 +915,8 @@ fn a_partial_import_keeps_the_order_of_a_claim_the_source_already_renamed() {
         awaiting: crate::typed::Awaiting::NONE,
         refused: Vec::new(),
         refusals: Vec::new(),
+        state: crate::typed::state::State::default(),
+        claims_floor: None,
         cells_from: None,
     };
     let empty = crate::typed::owned::OwnedRead::default();
@@ -896,10 +927,23 @@ fn a_partial_import_keeps_the_order_of_a_claim_the_source_already_renamed() {
             .unwrap()
             .starts_with("m7-")
     );
-    let evidence = snapshot(&MACHINE, &held, [&first, &second].into_iter(), &target).unwrap();
+    let evidence = snapshot(
+        &MACHINE,
+        &held,
+        [&first, &second].into_iter(),
+        &target,
+        None,
+    )
+    .unwrap();
     let mut next = Index::new(8);
     let copied = carried_operation(110, &held, Some(&evidence), &mut next);
-    let again = project(&MACHINE, &cells(&[&copied]), [&copied].into_iter(), &next);
+    let again = project(
+        &MACHINE,
+        &cells(&[&copied]),
+        [&copied].into_iter(),
+        &next,
+        None,
+    );
     assert_eq!(
         again.rows["mc-0000000000000002"].get("label"),
         Some(&json!("m7")),
@@ -922,7 +966,7 @@ fn a_causally_later_claim_cannot_create_a_three_way_comparator_cycle() {
         [&c, &a, &b],
         [&c, &b, &a],
     ] {
-        let read = project(&MACHINE, &raw, operations.into_iter(), &causal);
+        let read = project(&MACHINE, &raw, operations.into_iter(), &causal, None);
         assert_eq!(
             read.rows["mc-0000000000000003"].get("label"),
             Some(&json!("m7"))
@@ -961,6 +1005,7 @@ fn repeating_a_number_preserves_tenure_but_leaving_and_returning_does_not() {
         &cells(&[&repeat, &b]),
         [&a, &b, &repeat].into_iter(),
         &causal,
+        None,
     );
     assert_eq!(
         first.rows["mc-0000000000000001"].get("label"),
@@ -973,6 +1018,7 @@ fn repeating_a_number_preserves_tenure_but_leaving_and_returning_does_not() {
         &cells(&[&back, &b]),
         [&a, &b, &repeat, &away, &back].into_iter(),
         &causal,
+        None,
     );
     assert_eq!(
         returned.rows["mc-0000000000000002"].get("label"),
@@ -1000,7 +1046,7 @@ fn a_losing_node_claim_is_withheld_without_fabricating_a_principal() {
         &mut causal,
     );
     let raw = cells(&[&a, &b]);
-    let read = project(&MACHINE, &raw, [&a, &b].into_iter(), &causal);
+    let read = project(&MACHINE, &raw, [&a, &b].into_iter(), &causal, None);
     assert_eq!(
         read.rows["mc-0000000000000001"].get("node"),
         Some(&json!("0123456789abcdef"))
@@ -1010,7 +1056,7 @@ fn a_losing_node_claim_is_withheld_without_fabricating_a_principal() {
         read.rows["mc-0000000000000002"].fields["node"].value(),
         Some(&json!("0123456789abcdef"))
     );
-    let unknown = project(&MACHINE, &raw, [&a, &b].into_iter(), &Index::new(0));
+    let unknown = project(&MACHINE, &raw, [&a, &b].into_iter(), &Index::new(0), None);
     assert!(
         unknown.rows.values().all(|row| row.get("node").is_none()),
         "missing ancestry must not invent concurrency"
@@ -1024,7 +1070,7 @@ fn exporting_a_clash_label_and_saving_unchanged_preserves_the_signed_claim() {
     let a = operation(10, "mc-0000000000000001", "label", "m7", &[], &mut causal);
     let b = operation(20, "mc-0000000000000002", "label", "m7", &[], &mut causal);
     let raw = cells(&[&a, &b]);
-    let read = project(&MACHINE, &raw, [&a, &b].into_iter(), &causal);
+    let read = project(&MACHINE, &raw, [&a, &b].into_iter(), &causal, None);
     let bare = super::super::grid::Where::parse("label=m7").unwrap();
     assert_eq!(
         read.rows
@@ -1089,7 +1135,7 @@ fn long_same_value_histories_keep_the_first_tenure_without_recursive_ancestry() 
         previous = Some(id);
     }
     let last = operations.last().unwrap();
-    let provenance = snapshot(&MACHINE, &cells(&[last]), operations.iter(), &causal).unwrap();
+    let provenance = snapshot(&MACHINE, &cells(&[last]), operations.iter(), &causal, None).unwrap();
     let encoded = &provenance[&(MACHINE.name.into(), "mc-0000000000000001.label".into())][&last.id];
     let Provenance::Known(starts) = Provenance::decode(encoded).unwrap() else {
         panic!("native history is known")
@@ -1109,7 +1155,7 @@ fn restoring_a_withdrawn_claim_has_the_same_tenure_before_and_after_a_roll() {
     let a = operation(10, a_pk, "label", "m7", &[], &mut source);
     let b = operation(20, b_pk, "label", "m7", &[], &mut source);
     let original = cells(&[&a, &b]);
-    let evidence = snapshot(&MACHINE, &original, [&a, &b].into_iter(), &source).unwrap();
+    let evidence = snapshot(&MACHINE, &original, [&a, &b].into_iter(), &source, None).unwrap();
 
     let withdrawn = operation(50, a_pk, "label", "m8", &[10, 20], &mut source);
     let mut restored = operation(5, a_pk, "label", "m7", &[50], &mut source);
@@ -1122,6 +1168,7 @@ fn restoring_a_withdrawn_claim_has_the_same_tenure_before_and_after_a_roll() {
         &cells(&[&restored, &b]),
         [&a, &b, &withdrawn, &restored].into_iter(),
         &source,
+        None,
     );
     assert_eq!(native.rows[b_pk].get("label"), Some(&json!("m7")));
 
@@ -1145,6 +1192,7 @@ fn restoring_a_withdrawn_claim_has_the_same_tenure_before_and_after_a_roll() {
         &final_cells,
         [&carried, &withdrawn, &restored].into_iter(),
         &destination,
+        None,
     );
     for pk in [a_pk, b_pk] {
         assert_eq!(
@@ -1160,7 +1208,14 @@ fn restoring_a_withdrawn_claim_has_the_same_tenure_before_and_after_a_roll() {
         a.changes[0].value.clone().unwrap(),
         "the restored typed value keeps its import and automatic metadata"
     );
-    let evidence = snapshot(&MACHINE, &normalized, operations.into_iter(), &destination).unwrap();
+    let evidence = snapshot(
+        &MACHINE,
+        &normalized,
+        operations.into_iter(),
+        &destination,
+        None,
+    )
+    .unwrap();
     let mut next = Index::new(4);
     let carried_again = carried_operation(200, &normalized, Some(&evidence), &mut next);
     let after = project(
@@ -1168,6 +1223,7 @@ fn restoring_a_withdrawn_claim_has_the_same_tenure_before_and_after_a_roll() {
         &cells(&[&carried_again]),
         [&carried_again].into_iter(),
         &next,
+        None,
     );
     for pk in [a_pk, b_pk] {
         assert_eq!(after.rows[pk].get("label"), native.rows[pk].get("label"));
@@ -1191,7 +1247,7 @@ fn restoring_conflicted_or_opaque_claims_preserves_their_unresolved_evidence() {
         let interpreted = restored_cells(&MACHINE, &raw, [&restored].into_iter());
         assert!(matches!(interpreted, std::borrow::Cow::Borrowed(_)));
         assert_eq!(*interpreted, raw);
-        let projected = project(&MACHINE, &raw, [&restored].into_iter(), &destination);
+        let projected = project(&MACHINE, &raw, [&restored].into_iter(), &destination, None);
         let row = &projected.rows[pk];
         if opaque {
             assert!(row.raw.contains("label"));
@@ -1221,7 +1277,7 @@ fn a_new_claim_after_a_carry_does_not_outrank_its_observed_incumbent() {
         &mut source_index,
     );
     let raw = cells(&[&a, &b]);
-    let provenance = snapshot(&MACHINE, &raw, [&a, &b].into_iter(), &source_index).unwrap();
+    let provenance = snapshot(&MACHINE, &raw, [&a, &b].into_iter(), &source_index, None).unwrap();
     let mut target_index = Index::new(8);
     let mut rolled = operation(
         100,
@@ -1274,6 +1330,7 @@ fn a_new_claim_after_a_carry_does_not_outrank_its_observed_incumbent() {
         &cells(&[&rolled, &late]),
         [&rolled, &late].into_iter(),
         &target_index,
+        None,
     );
     assert_eq!(
         after.rows["mc-0000000000000001"].get("label"),
@@ -1338,10 +1395,16 @@ fn a_claim_written_after_a_lifecycle_carried_with_no_proof_keeps_its_tenure() {
         assert!(clash.starts_with("m9-"), "{clash}");
         assert_eq!(read.rows[x].get("node"), None);
     };
-    elected(&project(&MACHINE, &raw, operations.into_iter(), &index));
+    elected(&project(
+        &MACHINE,
+        &raw,
+        operations.into_iter(),
+        &index,
+        None,
+    ));
 
     let normalized = interpreted_cells(&MACHINE, &raw, operations.into_iter(), &index);
-    let evidence = snapshot(&MACHINE, &normalized, operations.into_iter(), &index).unwrap();
+    let evidence = snapshot(&MACHINE, &normalized, operations.into_iter(), &index, None).unwrap();
     assert_eq!(
         evidence[&lifecycle][&[60; 32]],
         Value::Null,
@@ -1354,12 +1417,13 @@ fn a_claim_written_after_a_lifecycle_carried_with_no_proof_keeps_its_tenure() {
         &cells(&[&rerolled]),
         [&rerolled].into_iter(),
         &next,
+        None,
     ));
 
     let contradicted =
         CarriedClaims::from([(lifecycle, BTreeMap::from([([60; 32], Value::Bool(false))]))]);
     let (raw, ops, index) = rolled(Some(&contradicted));
-    let read = project(&MACHINE, &raw, ops.iter(), &index);
+    let read = project(&MACHINE, &raw, ops.iter(), &index, None);
     for pk in [x, y] {
         assert_eq!(read.rows[pk].get("label"), None, "{pk}");
         assert_eq!(read.rows[pk].get("node"), None, "{pk}");

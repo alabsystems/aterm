@@ -173,6 +173,14 @@ impl Reports {
         changed
     }
 
+    /// The release `actor`'s kept report names: a time-signed report this store verified under
+    /// that member's roster binding and still keeps ([`Self::set_roster`] drops one signed
+    /// [`super::RECENT`] ago). `None` where it keeps none of `actor`.
+    #[must_use]
+    pub fn reported(&self, actor: &Actor) -> Option<Version> {
+        self.kept.get(actor).map(|(report, _)| report.version)
+    }
+
     /// Whether this store has a roster: a member of its trust to keep a report of. Without one
     /// it keeps, offers and wants nothing, and an answer it gave a peer's offer would say it
     /// wants none of reports it takes once its roster is set.

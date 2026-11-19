@@ -1965,6 +1965,29 @@ pub const VERBS: &[VerbSpec] = &[
          link the lab refused) a `proc.lab-link` one.",
     )
     .input(Input::NONE),
+    va(
+        "hosted",
+        Write,
+        Status,
+        App,
+        OwnerOnly,
+        "hosted <start|end> kind=<word> [exit=<n>]: post a run; the reply names its session",
+        "— Owner-only. A run (a `verify land` landing, any other `verify` pass) posts its start \
+         and its end to the aterm that hosts it: `OK hosted=<sid|-> worker=<sid|->`. aterm \
+         places the posting process itself, by its chain of parents: `hosted` is the session \
+         whose program is that process or an ancestor of it, by the ID `aterm ctl @self` \
+         addresses (a legacy `s-` session as a minted one), and `-` for a process in no session \
+         (a LaunchAgent, a bare ssh), whose run belongs to its computer. The request names no \
+         session and no word of it moves the answer (`ERR usage:` for any other word, and for a \
+         `kind` that is not one lower-case word of at most 32 letters, digits and `-`). A run a \
+         program worker's session hosts (`verify land --tab`) while its task is open is \
+         credited to the session that started the worker: `hosted` is that session and \
+         `worker` the worker's own. That session is the one aterm placed the spawn's request \
+         in when it opened the worker, where the task record's `from` names it too; a spawn \
+         whose `from=` names any other session credits nobody, and the run is the worker \
+         session's own. `exit=<n>` is an end's exit code. Each post is one line of aterm.log.",
+    )
+    .input(Input::NONE),
     v(
         "messages",
         Read,

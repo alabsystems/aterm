@@ -55,6 +55,7 @@ impl Chains {
             parents,
             authored_ms: 1_000,
             body,
+            statement: None,
         }
         .sign(&by.seed(), by.incarnation())
         .unwrap();

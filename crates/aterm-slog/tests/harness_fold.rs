@@ -152,6 +152,33 @@ fn a_harness_phase_is_not_displaced_by_a_shell_status_mark() {
     );
 }
 
+/// HX-15e: a state aterm's harness watchdog wrote as `mark agent src=aterm` (`unknown` for a
+/// harness whose beats stopped, `stopped` for a claimant the kernel stopped) stands when the
+/// shell next marks its status, as the harness's own would have. NEGATIVE CONTROL: its `-`
+/// gives way to the shell's phase.
+#[test]
+fn a_watchdog_phase_is_not_displaced_by_a_shell_status_mark() {
+    let mut log = Log::new(0);
+    let (run, _) = session(&mut log);
+    agent_mark(&mut log, run, Src::Harness, Conf::Claim, "busy", 10);
+    agent_mark(&mut log, run, Src::Aterm, Conf::Strong, "unknown", 20);
+    shell_status(&mut log, 30);
+    let phase = &log.state().phase;
+    assert_eq!(
+        (phase.word, phase.src, phase.conf),
+        ("unknown", Src::Aterm, Conf::Strong),
+        "aterm's reading of the harness stands against the shell's status"
+    );
+
+    agent_mark(&mut log, run, Src::Aterm, Conf::Strong, "-", 40);
+    shell_status(&mut log, 50);
+    assert_eq!(
+        log.state().phase.src,
+        Src::Status,
+        "CONTROL: aterm's `-` gives way to the shell's"
+    );
+}
+
 /// A need the session's own harness raised (a box it wrote as a step, a question it marked) is
 /// OBSERVED though the stream writes it `conf=claim`: `brief`'s session line names it, no
 /// `claim need` line does, and its word is one `link notify --on need:` takes. NEGATIVE

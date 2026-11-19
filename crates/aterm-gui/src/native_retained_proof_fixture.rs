@@ -6,7 +6,7 @@ use super::*;
 
 pub(super) fn install(
     ctx: &mut crate::SessionCtx,
-    launch: &SourceProofLaunch,
+    launch: &Arc<SourceProofLaunch>,
 ) -> Result<(), String> {
     use crate::native_session_policy::{FixtureImages, FixturePolicy};
     use aterm_agent::harness::{contract, native_act::Constructor};
@@ -33,7 +33,8 @@ pub(super) fn install(
         },
         &[Constructor::PrivateRestart],
     )
-    .map_err(str::to_owned)?;
+    .map_err(str::to_owned)?
+    .with_retained_proof(Arc::clone(launch));
     ctx.install_fixture_policy(policy)
         .map_err(|_| "retained proof policy already registered".to_owned())
 }

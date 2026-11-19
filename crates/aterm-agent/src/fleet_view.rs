@@ -21,8 +21,12 @@
 //! says its log is in a later records format than 1, a member whose build does not read that
 //! format ([`FormatFloor`]), this Mac's own row where its own build does not: the row the
 //! node's view says is this Mac's, or, in the command, which reads no view, the seat that
-//! bound this Mac's own node key. No Mac holds such a mark yet
-//! (`aterm_secrets::commons::hearing::READS_FORMAT` names no release), so that arm names no one.
+//! bound this Mac's own node key. So does a Mac with no mark whose vault's source refused its
+//! records pull for a later format than its build reads
+//! (`aterm_secrets::client::told_later_format`, the source's unsigned word, which moves this
+//! display and nothing else). No Mac holds such a mark and no source states such a format yet
+//! (`aterm_secrets::commons::hearing::READS_FORMAT` names no release), so that arm names no
+//! one.
 //!
 //! **No Commons machine uuid column yet:** nothing on this Mac maps a node id to its registry
 //! row without reading Commons' tables; `aterm db computers` is the registry's join (§4.12).
@@ -47,7 +51,8 @@ pub const RECORD_FENCE: (u64, u64) = (0, 154);
 /// (`docs/DESIGN-vault-log-2026-11-14.md` step 3: a Mac below the fence "stays on a consistent
 /// prefix and shows `needs update`"). Read off this Mac's own format mark, which is stored only
 /// on a record a seat signed (`aterm_secrets::membership_log::follow`): a peer's word that the
-/// vault moved names no one here.
+/// vault moved names no other member here, and names this Mac's own row alone where it is its
+/// vault source's refusal of this Mac's records pull ([`format_floor`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FormatFloor {
     /// Format 1, which every build reads: no member needs an update for it.
@@ -57,8 +62,10 @@ pub enum FormatFloor {
     /// reads as an earlier release needs an update, this Mac's own row included.
     From((u64, u64)),
     /// A later format that no release this build knows of reads, so this Mac's own build does
-    /// not (a Mac taken back to an older aterm after it followed its vault): its own row needs
-    /// an update, and it cannot say which other builds do. Its own row is the one the node's
+    /// not (a Mac taken back to an older aterm after it followed its vault, or a Mac with no
+    /// mark whose vault's source refused it for a later format, which is that source's
+    /// unsigned word and moves this display alone): its own row needs an update, and it cannot
+    /// say which other builds do. Its own row is the one the node's
     /// view says is this Mac's, and the seat that bound this Mac's own node key
     /// ([`Facts::own`]): `aterm fleet` composes with no view, so the key alone names it there.
     Unread,
@@ -907,7 +914,10 @@ fn own_node_key(state: &Path, format: FormatFloor) -> Option<[u8; 32]> {
 }
 
 /// What reads the records format this Mac's log is in ([`FormatFloor::of`]), by its format
-/// mark alone: its records file is not opened. A mark that does not read claims nothing.
+/// mark: its records file is not opened. A mark that does not read claims nothing. A Mac with
+/// no mark whose vault's source refused its last records pass for a later format than its
+/// build reads (`aterm_secrets::client::told_later_format`) reads [`FormatFloor::Unread`]: its
+/// own row needs an update.
 fn format_floor(paths: Option<&aterm_secrets::client::Paths>) -> FormatFloor {
     let Some(paths) = paths else {
         return FormatFloor::Every;
@@ -917,11 +927,21 @@ fn format_floor(paths: Option<&aterm_secrets::client::Paths>) -> FormatFloor {
     if mutant(Mutant::MarkUnread) {
         return FormatFloor::Every;
     }
-    FormatFloor::of(
-        aterm_secrets::client::records_marked_format(paths).ok(),
+    let marked = aterm_secrets::client::records_marked_format(paths).ok();
+    let floor = FormatFloor::of(
+        marked,
         aterm_secrets::commons::hearing::READS_FORMAT
             .map(|release| (u64::from(release.0), u64::from(release.1))),
-    )
+    );
+    // A Mac with no mark whose vault's source refused it for a later format than its build
+    // reads: the source's unsigned word, which moves this display and nothing else.
+    if floor == FormatFloor::Every
+        && marked == Some(aterm_secrets::crossing::FORMAT_ONE)
+        && aterm_secrets::client::told_later_format(paths)
+    {
+        return FormatFloor::Unread;
+    }
+    floor
 }
 
 fn held_records(paths: Option<&aterm_secrets::client::Paths>) -> Option<(u64, bool)> {

@@ -358,7 +358,7 @@ pub(super) const NO_HOST: &str = "no restart in place (no host)";
 pub(super) const RELAUNCH_OFF: &str = "no restart in place (relaunch is off)";
 
 /// Whether the `tries`-th deferred restart attempt is journaled.
-const fn restart_note_due(tries: u32) -> bool {
+pub(super) const fn restart_note_due(tries: u32) -> bool {
     tries < 4 || tries.is_multiple_of(6)
 }
 
@@ -1742,6 +1742,12 @@ impl<C: Ctl> Session<'_, C> {
         let worked = worked.filter(|_| !reader.housekeeping(&screen.rows));
         self.read_left_answer(&mut reading, screen, check);
         self.confirm_wall(&mut reading, screen, opts, check);
+        // A login wall whose words name a blocked path is the API's outage from here on, as
+        // Cloudflare's page is (plan package UB-05, `turn_end::answered_wall`): its track, its
+        // memory, the witness and the reach it asks for are the retry's, never a login's.
+        if let Some(w) = reading.wall.as_mut() {
+            w.kind = super::super::policy::turn_end::answered_wall(w.kind, &w.message);
+        }
         if check == Check::Decide
             && reading.wall.is_none()
             && match reading.program {

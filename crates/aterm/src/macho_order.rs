@@ -29,12 +29,16 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// A scratch world's words (`aterm_types::world`), mounted from that crate's own file: the
-/// `aterm-order-ld` wrapper links no crate, so it compiles them from source, and the images the
+/// A scratch world's layout (`aterm_types::world`), mounted from that crate's own file: the
+/// `aterm-order-ld` wrapper links no crate, so it compiles it from source, and the images the
 /// probe measures start in the world every other release aterm under a fresh HOME takes
 /// ([`probe_world`]).
-#[path = "../../aterm-types/src/world_words.rs"]
-mod world_words;
+#[expect(
+    dead_code,
+    reason = "the probe takes only some of the layout; aterm-types owns the rest"
+)]
+#[path = "../../aterm-types/src/world_layout.rs"]
+mod world_layout;
 
 const MH_MAGIC_64: u32 = 0xfeed_facf;
 const FAT_MAGIC: u32 = 0xcafe_babe;
@@ -1309,11 +1313,12 @@ pub(crate) struct ProbeWorld {
 }
 
 /// The [`ProbeWorld`] laid out under `root`, which the probe removes when its image ends; `None`
-/// where the platform keeps no state under a HOME (Windows), so no marker could name it.
+/// where the host is no platform a world is laid out for (`world_layout::Platform::HOST`), so no
+/// marker could name its state folder.
 #[must_use]
 pub(crate) fn probe_world(root: &Path) -> Option<ProbeWorld> {
     let home = root.join("home");
-    let state = world_words::state_home(&home)?;
+    let state = world_layout::state_home(&home)?;
     let config_home = root.join("cfg");
     let config_dir = config_home.join("aterm");
     let run_dir = root.join("run");
@@ -1328,14 +1333,14 @@ pub(crate) fn probe_world(root: &Path) -> Option<ProbeWorld> {
         ("XDG_CONFIG_HOME", config_home.into_os_string()),
         ("XDG_RUNTIME_DIR", run_dir.clone().into_os_string()),
         ("HISTFILE", "/dev/null".into()),
-        (world_words::MARKER, state.into_os_string()),
+        (world_layout::MARKER, state.into_os_string()),
     ];
     let files = vec![
         (home.join(".profile"), prompt.to_owned()),
         (shrc, prompt.to_owned()),
         (
             config_dir.join("aterm.toml"),
-            format!("{PROBE_ROOT_KEYS}{}", world_words::LANES_OFF),
+            format!("{PROBE_ROOT_KEYS}{}", world_layout::LANES_OFF),
         ),
     ];
     let dirs = vec![home.clone(), config_dir, run_dir];

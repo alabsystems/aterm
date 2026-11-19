@@ -216,7 +216,7 @@ fn the_reader_offers_the_fleet_tables_its_policy_refusal_its_off_and_its_absence
     };
     assert_eq!(
         aterm_db::fleet::command::sources_line(&folder.tables().value.sources),
-        "registry=never journal=never network=never fleet_read=never",
+        "registry=never journal=never network=never fleet_read=never own=never",
         "CONTROL: nothing is offered before a read"
     );
 
@@ -224,19 +224,19 @@ fn the_reader_offers_the_fleet_tables_its_policy_refusal_its_off_and_its_absence
     assert_eq!(
         offered(),
         format!(
-            "registry=held({HELD_POLICY}) journal=held({HELD_POLICY}) network=never fleet_read=never"
+            "registry=held({HELD_POLICY}) journal=held({HELD_POLICY}) network=never fleet_read=never own=never"
         )
     );
     write("[alab]\nroster = false\n");
     assert_eq!(
         offered(),
-        "registry=off journal=off network=never fleet_read=never"
+        "registry=off journal=off network=never fleet_read=never own=never"
     );
     // The policy allows the lab and this home holds none: there is no registry to read.
     write("[alab]\nroster = true\n");
     assert_eq!(
         offered(),
-        "registry=off journal=off network=never fleet_read=never"
+        "registry=off journal=off network=never fleet_read=never own=never"
     );
 }
 
@@ -540,7 +540,9 @@ fn a_registry_that_cannot_be_read_does_not_hide_the_journal() {
     let sources = folder.tables().value.sources;
     assert_eq!(
         aterm_db::fleet::command::sources_line(&sources),
-        format!("registry=held({HELD_UNREADABLE}) journal=live network=never fleet_read=never")
+        format!(
+            "registry=held({HELD_UNREADABLE}) journal=live network=never fleet_read=never own=never"
+        )
     );
 
     // A projection that binds the peer to m13 is read, then the registry cannot be read.

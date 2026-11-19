@@ -147,6 +147,9 @@ pub(crate) struct NeedFacts {
     pub(crate) told: ToldNeeds,
     /// This machine's Grok Build sign-in, for a Grok session on a sign-in wall alone.
     pub(crate) grok_signin: Option<GrokSignin>,
+    /// aterm's harness watchdog ended the tab's harness and nothing has claimed the tab since
+    /// ([`crate::session_timeline::SessionMeta::unsupervised`]).
+    pub(crate) unsupervised: Option<crate::session_timeline::Unsupervised>,
 }
 
 impl NeedFacts {
@@ -818,6 +821,7 @@ pub(crate) fn of(facts: &NeedFacts) -> Verdict {
         stall_need(facts),
         task_need(facts),
         wall_need.clone(),
+        unsupervised_need(facts),
         ask,
         boxed,
     ];
@@ -836,6 +840,25 @@ pub(crate) fn of(facts: &NeedFacts) -> Verdict {
         held: facts.hold,
         recheck_unix,
     }
+}
+
+/// The tab's harness was ended by aterm's watchdog: nothing supervises it until it is
+/// relaunched.
+fn unsupervised_need(facts: &NeedFacts) -> Option<Need> {
+    let ended = facts.unsupervised.as_ref()?;
+    Some(Need {
+        word: NeedWord::Unsupervised,
+        key: ended.at_us,
+        what: fold_clip(
+            &format!(
+                "unsupervised: aterm ended its harness {}; relaunch it",
+                ended.holder
+            ),
+            REMEDY_TEXT_MAX,
+        ),
+        harness: None,
+        report: None,
+    })
 }
 
 fn stall_need(facts: &NeedFacts) -> Option<Need> {

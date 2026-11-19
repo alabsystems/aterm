@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_uds::host::upstream::ReferenceTool;
 
-use crate::artifact::bottle::BottleRequest;
+use crate::artifact::bottle::{BottleRequest, agit};
 use crate::error::{Error, Result};
 use crate::programs::{BottleOrigin, Shape};
 use crate::triple::Triple;
@@ -59,25 +59,40 @@ fn parse(bytes: &[u8]) -> Result<aterm_toml::Value> {
     aterm_toml::from_str(text).map_err(|e| Error::refused(format!("reference manifest: {e}")))
 }
 
-fn recipe(doc: &aterm_toml::Value) -> Option<&'static ReferenceTool> {
+#[derive(Clone, Copy)]
+enum Product {
+    Reference(&'static ReferenceTool),
+    Agit,
+}
+
+impl Product {
+    fn controls(self) -> &'static [&'static str] {
+        match self {
+            Self::Reference(_) => &CONTROLS,
+            Self::Agit => agit::CONTROLS,
+        }
+    }
+}
+
+fn product(doc: &aterm_toml::Value) -> Option<Product> {
     let program = doc.get("program")?.as_str()?;
-    let def = crate::programs::get(program)?;
-    match def.shape {
-        Shape::Bottle(crate::programs::BottleDef {
-            origin: BottleOrigin::Reference(recipe),
-            ..
-        }) => Some(recipe),
+    let Shape::Bottle(bottle) = crate::programs::get(program)?.shape else {
+        return None;
+    };
+    match bottle.origin {
+        BottleOrigin::Reference(recipe) => Some(Product::Reference(recipe)),
+        BottleOrigin::Agit => Some(Product::Agit),
         _ => None,
     }
 }
 
-pub(crate) fn is_reference(bytes: &[u8]) -> Result<bool> {
-    Ok(recipe(&parse(bytes)?).is_some())
+pub(crate) fn requires_native_receipts(bytes: &[u8]) -> Result<bool> {
+    Ok(product(&parse(bytes)?).is_some())
 }
 
 /// Additional, validated evidence files carried by a source-derived release.
 pub(crate) fn receipt_names(bytes: &[u8]) -> Result<Vec<String>> {
-    if !is_reference(bytes)? {
+    if !requires_native_receipts(bytes)? {
         return Ok(vec![]);
     }
     let parsed: atpkg::PkgManifest = aterm_toml::from_str(
@@ -121,7 +136,44 @@ pub(crate) fn write(
     artifact: &atpkg::Artifact,
     native_controls: Option<usize>,
 ) -> Result<()> {
-    if native_controls.is_some_and(|n| n != CONTROLS.len()) {
+    let cohort = super::witness(recipe, super::artifact(recipe, request.triple)?);
+    store(
+        manifest,
+        bytes,
+        artifact,
+        cohort,
+        &CONTROLS,
+        native_controls,
+    )
+}
+
+pub(in crate::artifact::bottle) fn write_agit(
+    origin: &agit::BuildOrigin,
+    manifest: &Path,
+    bytes: &[u8],
+    artifact: &atpkg::Artifact,
+) -> Result<()> {
+    let cohort = aterm_json::to_value(origin)
+        .map_err(|e| Error::refused(format!("agit source record: {e}")))?;
+    store(
+        manifest,
+        bytes,
+        artifact,
+        cohort,
+        agit::CONTROLS,
+        Some(agit::CONTROLS.len()),
+    )
+}
+
+fn store(
+    manifest: &Path,
+    bytes: &[u8],
+    artifact: &atpkg::Artifact,
+    source_cohort: aterm_json::Value,
+    controls: &[&str],
+    native_controls: Option<usize>,
+) -> Result<()> {
+    if native_controls.is_some_and(|n| n != controls.len()) {
         return Err(Error::refused(
             "reference native control count differs from its receipt contract",
         ));
@@ -141,7 +193,7 @@ pub(crate) fn write(
         native_translation: native_controls.map(|_| "native".into()),
         control_count: native_controls.unwrap_or(0),
         controls: if native_controls.is_some() {
-            CONTROLS.iter().map(|s| (*s).to_owned()).collect()
+            controls.iter().map(|s| (*s).to_owned()).collect()
         } else {
             vec![]
         },
@@ -154,7 +206,7 @@ pub(crate) fn write(
         archive_sha256: artifact.sha256.clone(),
         archive_size: artifact.size,
         tree_root: artifact.tree_root.clone(),
-        source_cohort: super::witness(recipe, super::artifact(recipe, request.triple)?),
+        source_cohort,
     };
     let path = sidecar(manifest, &artifact.asset)?;
     crate::lane::report::write_atomic_bytes(
@@ -216,15 +268,22 @@ fn composition(prior: &str, bytes: &[u8], target: &str) -> Result<()> {
 /// The checked exact bytes are retained by the signer, rather than fetched/read again.
 pub(crate) fn require(manifest: &Path, bytes: &[u8]) -> Result<Option<Permit>> {
     let doc = parse(bytes)?;
-    let Some(recipe) = recipe(&doc) else {
+    let Some(product) = product(&doc) else {
         return Ok(None);
     };
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::refused(format!("reference manifest UTF-8: {e}")))?;
     let parsed: atpkg::PkgManifest = aterm_toml::from_str(text)
         .map_err(|e| Error::refused(format!("reference manifest: {e}")))?;
-    if parsed.version != recipe.version
-        || parsed.exposes != [recipe.name]
+    let settings_match = match product {
+        Product::Reference(recipe) => {
+            parsed.version == recipe.version && parsed.exposes == [recipe.name]
+        }
+        Product::Agit => parsed.exposes == ["agit"] && parsed.harness.is_none(),
+    };
+    let controls = product.controls();
+    let mut agit_origin = None;
+    if !settings_match
         || !parsed.requires.is_empty()
         || !parsed.shim_env.is_empty()
         || parsed.artifacts.is_empty()
@@ -245,14 +304,31 @@ pub(crate) fn require(manifest: &Path, bytes: &[u8]) -> Result<Option<Permit>> {
         let receipt: Receipt = aterm_json::from_slice(&data)
             .map_err(|e| Error::refused(format!("native reference receipt: {e}")))?;
         let target = Triple::parse(&artifact.target)?;
+        let cohort_matches = match product {
+            Product::Reference(recipe) => {
+                receipt.source_cohort == super::witness(recipe, super::artifact(recipe, target)?)
+            }
+            Product::Agit => {
+                crate::artifact::bottle::bottle_row("agit", target)?;
+                let origin: agit::BuildOrigin =
+                    aterm_json::from_value(receipt.source_cohort.clone())
+                        .map_err(|e| Error::refused(format!("agit receipt source record: {e}")))?;
+                origin.check(&parsed.version)?;
+                // Reject unrecognized fields and mixtures of fork revisions across platform rows.
+                let canonical = aterm_json::to_value(&origin)
+                    .map_err(|e| Error::refused(format!("agit receipt source record: {e}")))?;
+                receipt.source_cohort == canonical
+                    && agit_origin.get_or_insert_with(|| origin.clone()) == &origin
+            }
+        };
         if receipt.schema != 1
             || receipt.evidence != "operator-native-runtime-observation"
             || receipt.status != "native-pass"
             || receipt.native_host.as_deref() != Some(artifact.target.as_str())
             || receipt.native_translation.as_deref() != Some("native")
             || receipt.control_count != receipt.controls.len()
-            || receipt.control_count != CONTROLS.len()
-            || !CONTROLS.iter().all(|name| {
+            || receipt.control_count != controls.len()
+            || !controls.iter().all(|name| {
                 receipt
                     .controls
                     .iter()
@@ -265,7 +341,7 @@ pub(crate) fn require(manifest: &Path, bytes: &[u8]) -> Result<Option<Permit>> {
             || receipt.archive_sha256 != artifact.sha256
             || receipt.archive_size != artifact.size
             || receipt.tree_root != artifact.tree_root
-            || receipt.source_cohort != super::witness(recipe, super::artifact(recipe, target)?)
+            || !cohort_matches
             || atpkg::tree::sha256_bytes(receipt.qualified_manifest.as_bytes())
                 != receipt.manifest_sha256
         {
@@ -340,7 +416,7 @@ pub(crate) fn snapshot(
     bytes: &[u8],
     files: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
-    if !is_reference(bytes)? {
+    if !requires_native_receipts(bytes)? {
         return Ok(files.to_vec());
     }
     let directory = prepared_manifest
@@ -370,6 +446,21 @@ pub(crate) fn snapshot(
     .map_err(|e| Error::refused(format!("reference manifest: {e}")))?;
     for artifact in &parsed.artifacts {
         let destination = sidecar(prepared_manifest, &artifact.asset)?;
+        // A merged agit pack uploads the newly packed asset and carries the previously
+        // qualified local archives. Freeze every row before the ready manifest goes out.
+        let archive = directory.join(&artifact.asset);
+        if parsed.program == "agit" && !frozen.contains(&archive) {
+            copy_snapshot(
+                &original_manifest.with_file_name(&artifact.asset),
+                &archive,
+                aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND,
+            )?;
+            let before_manifest = frozen
+                .iter()
+                .position(|p| p == prepared_manifest)
+                .ok_or_else(|| Error::refused("agit snapshot lost its ready manifest"))?;
+            frozen.insert(before_manifest, archive);
+        }
         if !destination.exists() {
             copy_snapshot(
                 &sidecar(original_manifest, &artifact.asset)?,

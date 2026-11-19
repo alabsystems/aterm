@@ -1427,7 +1427,7 @@ belong in `aterm secrets`; database records carry references to them.
         name: "file",
         tagline: None,
         body: Some(
-            r#"file — the lab's shared files (`aterm file`, Unix only).
+            r#"file — the lab's shared files (`aterm file`).
 
 A shared file is a table every member of the lab reads: `ai/accounts` (the accounts at AI
 providers), `ai/links` (which machine prefers which account, in what order) and
@@ -1435,15 +1435,27 @@ providers), `ai/links` (which machine prefers which account, in what order) and
 `~/.aterm/files`, so a read is a read of a local file: it answers whatever the replicated
 store behind it is doing, and it never opens that store.
 
+Windows reads previously recorded files under `%USERPROFILE%\.aterm\files`. Run
+`aterm file help` there for the offline commands. Unix also supports refreshing,
+importing and publishing through the local Commons writer.
+
   aterm file ls                          every shared file here, with its state
   aterm file cat <name> [--published]    the table as TSV, this machine's queued writes over
                                          it (--published: the snapshot alone); state on stderr
-  aterm file path <name>                 where the TSV is
+  aterm file path <name>                 the editable published TSV
+  aterm file path <name> --local         a maintained <leaf>.local.tsv including
+                                         queued writes and held conflicts; sync status on stderr
+  aterm file export <name>               the complete published table as an editable TSV
+  aterm file import <name> <file>        preview changes to an exported TSV
+  aterm file import <name> <file> --apply
+                                         submit the changed cells using the export's baseline
   aterm file schema <name>               each column's type, whether it may be empty, and
                                          the file its cells name rows of; the key
   aterm file status [<name>]             state, why, revision, rows, inert, face
   aterm file get <name> <row> [<column>] one row or one cell
   aterm file rows <name> [--where col=val]... [--join <ref column>]
+  aterm file search <name> <text> [--where col=val]... [--join <ref column>]
+                                         match a key or displayed cell, ignoring case
   aterm file watch <name> [--timeout <seconds>] [--changes <n>]
   aterm file history <name> [--limit <n>]
   aterm file refresh [<name>]            project the store to the snapshot now
@@ -1461,9 +1473,11 @@ store behind it is doing, and it never opens that store.
   aterm file commit <name>               write what the TSV's changed cells say
   aterm file restore <name>              write the TSV again from the snapshot
 
-Every verb takes `--json`.
+Use `--json` for structured results. Export writes TSV.
 
 WRITES
+  Add `--queue-only` to a write to return after it is accepted locally. The next
+  publishing pass attempts it. Use this flag with `import --apply` to queue a TSV offline.
   A write is queued on this machine first and published by its writer: it answers
   `published <operation>`, `queued <id>: <why>` (published later, whatever the store is doing
   now) or `held <id>: <why>` (exit 4: the cell changed since this machine read it). A held write
@@ -1514,6 +1528,69 @@ Addresses are shown in full here, as they are in the files under `~/.aterm/files
 this user can read. No password, token or other secret is ever in a shared file.
 
 Exit 0 ok, 2 usage, 3 problems (nothing queued or recorded), 4 conflict.
+"#,
+        ),
+    },
+    Topic {
+        name: "goals",
+        tagline: None,
+        body: Some(
+            r#"goals — Product Planning: project goals and project trackers (`aterm goals`, Unix only).
+
+Product Planning is one product with two parts: project goals (what the lab measures, and each
+measurement) and project trackers (packages of work, who holds each one, what was said about
+it and on what evidence). Its rows are kept in the `lab/tracker` tables, which every member of
+the lab holds a copy of. Every record says who made it (the session and program aterm reads
+from the process tree), why, and on what evidence.
+
+Not live yet: no build registers `lab/tracker`. Until this build does, each command below
+refuses with "Product Planning is not live in this build" and writes nothing.
+
+  aterm goals claim <package> [--reason <line>] [--evidence <piece>]...
+                                         take a ready package: its state becomes `running`
+                                         and its row says who holds it
+  aterm goals note <id> <text> [--on <table>] [--reason <line>] [--evidence <piece>]...
+                                         append a note about a row to the `note` log
+  aterm goals done <package> --evidence <piece>... [--reason <line>]
+                                         mark a running package done; it must cite evidence
+  aterm goals measure <metric> <value> [--source <command>] [--commit <hash>]
+                      [--class <word>] [--reason <line>] [--evidence <piece>]...
+                                         append one sample of a metric to the `measure` log
+
+Every command takes `--json`, and `--by <word>` to name who says they ran it. `--` ends the
+flags: each word after it is the command's own, as a note's text that starts with `--` is.
+
+CLAIM AND DONE
+  `claim` and `done` change a package's row. Each is one write through the `lab/packages`
+  shared file's outbox, and answers one of three ways:
+    published <operation>                 the table holds the write
+    queued (not claimed yet) <id>: <why>  the write waits in this machine's outbox and a later
+                                          pass publishes it; the package is not claimed until
+                                          then (`done` answers `queued (not done yet)`)
+    held <id>: <why>                      exit 4: the package changed since this machine read
+                                          it (another agent claimed it first, for one); nothing
+                                          was overwritten
+  `aterm file resolve lab/packages <id> theirs` drops a held write.
+
+NOTE AND MEASURE
+  A note and a measurement are this machine's own log entries: each is appended at once under
+  its writer lock, never queued, and answers `published <key>`.
+  `note` is about a package unless `--on` names another of the tracker's tables: group, goal,
+  metric, lane, repo, package, change, decision, ruling, stop, competition, project, plan,
+  request, release or view. The note keeps the evidence it cites.
+  `measure` records the value as a decimal, the command that measured it (`--source`), the
+  commit (`--commit`), the machine class (`--class`) and this machine.
+
+REASON AND EVIDENCE
+  `--reason <line>` is the one-line why the record keeps. `--evidence <piece>` is repeated, up
+  to 16 times; each piece is one of
+    commit:<repo>@<commit>
+    path:<repo>:<path>
+    measure:<metric>=<value>
+    note:<text>
+    an `https://` URL
+
+Exit 0 published or queued, 2 usage, 3 the write cannot be made here now, 4 held.
 "#,
         ),
     },
@@ -3029,8 +3106,9 @@ const fn verb_line(v: crate::Verb) -> &'static str {
         crate::Verb::Db => {
             "encrypted embedded application databases, replicated directly on the LAN"
         }
-        crate::Verb::File => {
-            "the lab's shared files: tables read from this machine's snapshot (Unix)"
+        crate::Verb::File => "the lab's shared files, read from this machine's snapshots",
+        crate::Verb::Goals => {
+            "Product Planning: claim, note and finish packages, record measurements (Unix)"
         }
         crate::Verb::Email => "read mail without a window, as JSON Lines",
         crate::Verb::Harness => {

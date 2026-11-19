@@ -1687,14 +1687,13 @@ fn a_requests_why_text_is_appended_host_text_and_reads_back() {
     assert!(!wire.contains("why_text"), "CONTROL: {wire}");
 }
 
-/// A HARNESS'S REFUSAL OF AN ATERM RECORD (HX-15c) is the `refused` mark, the last kind, appended
-/// after `desc`, local: `in=`, the last key, appended after `hseq=`, is the number of aterm's
+/// A HARNESS'S REFUSAL OF AN ATERM RECORD (HX-15c) is the `refused` mark, appended after `desc`,
+/// local: `in=`, the last key, appended after `hseq=`, is the number of aterm's
 /// record it answers, a wire fact; the harness's words ride in `text=`, host tier, never in the
 /// closed `why=`. It reads back whole. NEGATIVE CONTROL: the wire encode keeps `in=` and drops
 /// the text.
 #[test]
 fn a_stream_refusal_is_the_appended_refused_mark_and_in_its_appended_key() {
-    assert_eq!(Kind::ALL.last(), Some(&Kind::Refused), "the last kind");
     let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
     assert_eq!(kind_at(Kind::Refused), kind_at(Kind::Desc).map(|i| i + 1));
     assert_eq!(Kind::Refused.word(), "refused");
@@ -1734,6 +1733,64 @@ fn a_stream_refusal_is_the_appended_refused_mark_and_in_its_appended_key() {
     assert!(
         wire.contains(" in=2 ") && !wire.contains("text="),
         "CONTROL: {wire}"
+    );
+}
+
+/// A HARNESS'S `msg` AND `diff` (HX-15h, D31) are the marks `msg` and `diff`, appended in that
+/// order after `refused` (`diff` is the last kind), each a mark and no node. Their bodies are the
+/// tab's Out ring's, never the log's: a row carries the record's `hseq=`, its `fp=` digest (40
+/// hex characters, a log ID at its bound) and the stream's stamps, and reads back whole. A
+/// harness's `turn` record names its opener in `turn_by=`, whose words now hold the five a record
+/// names, `peer` last. NEGATIVE CONTROL: an `fp=` one character over the ID bound is no ID, and
+/// a `turn_by=` word outside the five is refused.
+#[test]
+fn msg_and_diff_are_the_appended_marks_and_turn_by_holds_the_records_openers() {
+    assert_eq!(Kind::ALL.last(), Some(&Kind::Diff), "the last kind");
+    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
+    assert_eq!(kind_at(Kind::Msg), kind_at(Kind::Refused).map(|i| i + 1));
+    assert_eq!(kind_at(Kind::Diff), kind_at(Kind::Msg).map(|i| i + 1));
+    for (kind, word) in [(Kind::Msg, "msg"), (Kind::Diff, "diff")] {
+        assert_eq!(kind.word(), word);
+        assert!(kind.is_mark() && kind.node_level().is_none(), "{word}");
+        assert_eq!(Kind::from_word(word), kind);
+    }
+    let fp = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(fp.len(), 40);
+    let f = Fields::new()
+        .u(Key::Hseq, 9)
+        .and_then(|f| f.id(Key::Fp, fp))
+        .and_then(|f| f.id(Key::Holder, "claude-code-alab@4242"))
+        .expect("fields");
+    let msg = Rec {
+        src: Src::Harness,
+        conf: Conf::Claim,
+        ..rec(Op::Mark, Node::SESSION, Kind::Msg, f)
+    };
+    let host = encode(&msg, Tier::Host).expect("fits");
+    assert!(
+        host.contains(" mark - msg ")
+            && host.contains(" hseq=9 ")
+            && host.contains(&format!(" fp={fp} "))
+            && host.contains(" src=harness conf=claim"),
+        "{host}"
+    );
+    let read = decode(&host).expect("decodes");
+    assert_eq!((read.k, read.f.clone()), (Kind::Msg, msg.f.clone()));
+    assert!(
+        Fields::new().id(Key::Fp, &format!("{fp}8")).is_err(),
+        "CONTROL: 41 characters are no ID"
+    );
+    assert_eq!(
+        TURN_BY_WORDS,
+        &["harness", "person", "ctl", "agent", "peer"],
+        "appended: `harness` keeps its place"
+    );
+    for word in TURN_BY_WORDS {
+        assert!(Fields::new().word(Key::TurnBy, word).is_ok(), "{word}");
+    }
+    assert!(
+        Fields::new().word(Key::TurnBy, "vendor").is_err(),
+        "CONTROL: a word outside the five"
     );
 }
 
@@ -1946,14 +2003,16 @@ fn turn_by_is_appended_wire_and_an_older_reader_skips_it() {
         (Key::TurnBy.word(), Key::TurnBy.tier(), Key::TurnBy.cap()),
         ("turn_by", Tier::Wire, Cap::Word(TURN_BY_WORDS))
     );
-    assert_eq!(TURN_BY_WORDS, ["harness"]);
+    // `harness` from a vendor's row (gap 25); the other four from a harness's `turn` record
+    // (HX-15h), which names who opened its turn.
+    assert_eq!(TURN_BY_WORDS, ["harness", "person", "ctl", "agent", "peer"]);
     let key_at = |key: Key| FIELDS.iter().position(|(k, ..)| *k == key);
     assert_eq!(
         key_at(Key::TurnBy).map(|i| i + 1),
         key_at(Key::Window),
         "appended: every earlier key keeps its index, the tab mark's keys after it"
     );
-    for actor in ["human", "ctl", "vendor", "-"] {
+    for actor in ["human", "vendor", "aterm", "-"] {
         assert!(
             Fields::new().word(Key::TurnBy, actor).is_err(),
             "{actor}: turn_by is a role a vendor's row names, never an actor"

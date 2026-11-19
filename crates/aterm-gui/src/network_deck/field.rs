@@ -325,6 +325,7 @@ fn activity_of(mac: &FleetMac) -> Option<Activity> {
         NeedWord::Frozen,
         NeedWord::Stopped,
         NeedWord::Memory,
+        NeedWord::Unsupervised,
     ]) {
         return Some(Activity::Stuck);
     }

@@ -49,7 +49,8 @@ aterm-alloc = { workspace = true }
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # The one `mdutil -s` parser (`aterm_vitals::spotlight::volumes`), which the Spotlight scope's
 # indexing read (`macos_setup::spotlight_scope::indexing`) shares with System State. A pure model:
-# no clock, no platform, no dependencies.
+# no clock and no platform reads; its dependencies, aterm-process-facts and aterm-hash (with
+# astream-wire beneath it), read neither.
 aterm-vitals = { workspace = true }
 # FNV-1a/64 for `RowsFence::hash_rows`: server and clients must compute one hash; and
 # for `state_notify::name`'s key of a state home, which a poster and a listener must agree on.
@@ -69,9 +70,16 @@ aterm-spec-anchor = { workspace = true }
 # Not on wasm, which has none of those folders.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 aterm-uds = { workspace = true }
+# The mount table as `getfsstat(MNT_NOWAIT)` reads it (`aterm_sysprobe::volumes::table`), so
+# Spotlight's reading of a home never reads a folder another filesystem is mounted on
+# (`macos_setup::spotlight_scope`). aterm-uds already links it: no crate joins the graph.
+aterm-sysprobe = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
+# The scratch world's laws (`world_layout_tests.rs`) read each `aterm.toml` they render as one
+# TOML document, as aterm's own reader does.
+aterm-toml = { workspace = true }
 aterm-heap-count = { path = "../aterm-heap-count" }
 # The machine-number models `machine_name::model_tests` holds `settle`, `choose` and `check` to.
 aterm-models-swarm = { workspace = true }

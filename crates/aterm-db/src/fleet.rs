@@ -146,6 +146,9 @@ impl<T: Clone> Reading<T> {
 /// the journal ([`Folder::install_lab_reader`]), and the fold thread ([`folder`]).
 type Starter = Box<dyn Fn() + Send + Sync>;
 
+/// What reads this Mac's own reading and its time, unix ms ([`Folder::install_own_reader`]).
+pub type OwnReader = Box<dyn Fn() -> Option<(read::Own, u64)> + Send + Sync>;
+
 /// The fleet tables' inputs and their published fold.
 pub struct Folder {
     inputs: Mutex<Inputs>,
@@ -158,6 +161,8 @@ pub struct Folder {
     /// Some reader has asked for the tables.
     asked: AtomicBool,
     lab_reader: OnceLock<Starter>,
+    /// What reads this Mac's own reading, each fold ([`Self::install_own_reader`]).
+    own_reader: OnceLock<OwnReader>,
     /// What starts this folder's fold thread, on the first ask ([`folder`] sets it; a folder
     /// without one is folded by its holder, [`Self::fold_now`]).
     fold_thread: OnceLock<Starter>,
@@ -184,6 +189,7 @@ impl Folder {
             wake: Condvar::new(),
             asked: AtomicBool::new(false),
             lab_reader: OnceLock::new(),
+            own_reader: OnceLock::new(),
             fold_thread: OnceLock::new(),
             folding: AtomicBool::new(false),
         }
@@ -317,6 +323,16 @@ impl Folder {
         installed
     }
 
+    /// Install what reads this Mac's own reading, made in process from its deck's vitals
+    /// ([`read::Own`]), from which this Mac's column, pairs, verdicts and load are drawn. Each
+    /// fold reads it first ([`Self::fold_now`]), and a fold names the instant the reading it
+    /// drew stops being drawn, so this Mac's column lapses only where its deck stopped reading,
+    /// whatever else moves the fold: no reader pushes it, and none is asked for it while
+    /// nothing folds. A fixture's inputs are never replaced. The first install wins.
+    pub fn install_own_reader(&self, read: OwnReader) -> bool {
+        self.own_reader.set(read).is_ok()
+    }
+
     /// The tables and their revision, without waiting: `None` while a fold is being swapped in,
     /// which is no new value, so the caller keeps the `Arc` it has. The first ask starts the
     /// registry and journal reader where one is installed, and this folder's fold thread where
@@ -346,11 +362,22 @@ impl Folder {
     /// tables differ. Returns the next instant the rows change by themselves.
     pub fn fold_now(&self, now_ms: u64) -> Option<u64> {
         *self.dirty.lock().unwrap_or_else(PoisonError::into_inner) = false;
-        let inputs = self
-            .inputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        // This Mac's own reading, read before the inputs are locked.
+        let own = self
+            .own_reader
+            .get()
+            .filter(|_| !self.fixed.load(Ordering::Acquire))
+            .and_then(|read| read());
+        let inputs = {
+            let mut inputs = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((own, at_ms)) = own {
+                inputs.own = Source::Live {
+                    value: Arc::new(own),
+                    at_ms,
+                };
+            }
+            inputs.clone()
+        };
         let folded = fold::fold(&inputs, now_ms);
         self.tables.publish(folded.tables);
         folded.next_change_ms

@@ -78,6 +78,12 @@ fn this_build() -> Vec<u8> {
 
 fn from_app() -> Fake {
     let mut sys = Fake::root();
+    as_app(&mut sys);
+    sys
+}
+
+/// `sys` running from this build's bundle ([`SOURCE`]).
+fn as_app(sys: &mut Fake) {
     sys.born(std::process::id(), 123);
     sys.running_app = Some(PathBuf::from(SOURCE));
     sys.file(SOURCE_EXE, &this_build())
@@ -104,7 +110,18 @@ fn from_app() -> Fake {
             },
         );
     }
-    sys
+}
+
+/// `sys` running from this build's bundle, with this build's broker installed and launchd
+/// running it: a root LAN broker of this build serves
+/// ([`crate::init_spotlight::broker_serves`]).
+pub(crate) fn serving(sys: &mut Fake) {
+    as_app(sys);
+    install_on(sys);
+    sys.on(
+        PRINT,
+        Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
+    );
 }
 
 /// As root the bundle is cloned into the root-only staging folder, sealed, swapped in, and
@@ -718,11 +735,16 @@ fn job_changes(sys: &Fake) -> Vec<String> {
 /// A broker's files in place, this build's.
 fn installed() -> Fake {
     let sys = from_app();
+    install_on(&sys);
+    sys
+}
+
+/// This build's broker's files, written on `sys`.
+fn install_on(sys: &Fake) {
     sys.file(lan::IMAGE_EXECUTABLE, &this_build()).file(
         lan::PLIST_PATH,
         install::plist_text(Path::new(SOURCE)).as_bytes(),
     );
-    sys
 }
 
 /// A hang detector, never a budget: far past any bound, a stop ends a retry loop that has none.
@@ -1190,4 +1212,114 @@ fn a_broker_root_could_not_install_is_recorded_until_an_apply_succeeds() {
     LanBroker::default().apply(&sys, &ctx).unwrap();
     assert!(sys.written(LAN_BROKER).is_none());
     assert!(!refused(&sys, Owed::LanBroker));
+}
+
+/// A broker of this build that serves (its plist and image current, launchd running its job)
+/// and would take every folder owed takes Spotlight's scope of a home setup's password never
+/// scoped off the automatic ask: it excludes them with no password. Here the receipt names every
+/// folder beyond the home's top level, so the home's own top-level folders are all that is
+/// owed; a home with none of the scope excluded still owes ~/Library's and the data volume's
+/// folders, which the broker never takes, so the password is asked with the broker serving. A
+/// broker launchd does not run, one whose plist this build does not write, and one that would refuse
+/// the home (a sticky home) leave the ask to the password, and so does one that already left
+/// the home's folders as they are (this account's record of them), which `sync.spotlight` then
+/// reads as no work of its own for a day, and asks the broker again after it while the password
+/// stays owed.
+/// NEGATIVE CONTROLS: an automatic reading that does not read the broker asks the password on
+/// the served Mac too; a reading that leaves out the record asks the broker for them again; an
+/// automatic reading that drops a record past its day owes the password nothing.
+#[test]
+fn a_serving_broker_of_this_build_takes_spotlight_off_the_automatic_ask() {
+    use aterm_types::macos_setup::spotlight_scope::{self, Leave};
+    let folder = |uid: u32, mode: u32| crate::port::Stat {
+        uid,
+        gid: 0,
+        mode,
+        dir: true,
+        symlink: false,
+        len: 0,
+    };
+    let never_scoped = |print: Ran| {
+        let mut sys = installed();
+        sys.euid = 501;
+        crate::init_spotlight::tests::home(&sys);
+        sys.stat_of("/", folder(0, 0o755))
+            .stat_of("/Users", folder(0, 0o755))
+            .stat_of("/Users//alice", folder(501, 0o750));
+        sys.logged_in(&crate::items::defaults::tests::user("alice", 501))
+            .stat_of(
+                "/dev/console",
+                crate::port::Stat {
+                    uid: 501,
+                    gid: 0,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            )
+            .on(
+                "/usr/bin/mdutil -s /System/Volumes/Data",
+                Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"),
+            )
+            .on(PRINT, print);
+        sys
+    };
+    let account = |print: Ran| {
+        let sys = never_scoped(print);
+        sys.file(
+            crate::init_spotlight::SCOPE_RECEIPT,
+            crate::init_spotlight::tests::BEYOND_THE_HOME,
+        );
+        sys
+    };
+    let running = || Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n");
+    let never = never_scoped(running());
+    assert!(crate::init_spotlight::broker_serves(&never));
+    assert!(crate::init_spotlight::automatic_scope_owed(&never));
+    let served = account(running());
+    assert!(crate::init_spotlight::broker_serves(&served));
+    assert!(!crate::init_spotlight::automatic_scope_owed(&served));
+    assert!(
+        crate::init_spotlight::scope_owed(&served),
+        "still work, the broker's"
+    );
+
+    let stopped = account(Ran::exit(113, "Could not find service"));
+    assert!(!crate::init_spotlight::broker_serves(&stopped));
+    assert!(crate::init_spotlight::automatic_scope_owed(&stopped));
+
+    let elsewhere = account(running());
+    elsewhere.file(lan::PLIST_PATH, b"<plist>another build's</plist>\n");
+    assert!(!crate::init_spotlight::broker_serves(&elsewhere));
+    assert!(crate::init_spotlight::automatic_scope_owed(&elsewhere));
+
+    let sticky = account(running());
+    sticky.stat_of("/Users//alice", folder(501, 0o1750));
+    assert!(crate::init_spotlight::broker_serves(&sticky));
+    assert!(crate::init_spotlight::automatic_scope_owed(&sticky));
+
+    let Some(Ok(owed)) = crate::init_spotlight::broker_reading(&served) else {
+        panic!("the served home is the broker's to exclude");
+    };
+    assert!(!owed.is_empty());
+    let mut left = account(running());
+    let state = PathBuf::from("/Users//alice/Library/Application Support/aterm/state");
+    left.account_state = Some(state.clone());
+    let record = state.join(spotlight_scope::BROKER_LEFT);
+    left.file(
+        &record.to_string_lossy(),
+        spotlight_scope::broker_left_text(&owed, left.now).as_bytes(),
+    );
+    assert!(crate::init_spotlight::broker_serves(&left));
+    assert_eq!(
+        crate::init_spotlight::broker_reading(&left),
+        Some(Err(Leave::Stands(spotlight_scope::LEFT.to_owned())))
+    );
+    assert!(crate::init_spotlight::automatic_scope_owed(&left));
+    // A day on, `sync.spotlight` asks the broker again, and the password stays owed until the
+    // broker's exclusion removes the record.
+    left.advance(spotlight_scope::LEFT_KEPT.as_secs());
+    assert_eq!(crate::init_spotlight::broker_reading(&left), Some(Ok(owed)));
+    assert!(crate::init_spotlight::automatic_scope_owed(&left));
 }

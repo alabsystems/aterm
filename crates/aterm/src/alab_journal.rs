@@ -23,13 +23,14 @@
 //! states the facts of the credential its sign-in runs on (plan package SF-34, decision SF-D3:
 //! kind, where kept, issued, ends, refreshed, last used, state; `login_token::read`), never its
 //! value: to learn them the harness's readers parse, in memory and scrubbed, each Codex row's
-//! `auth.json` (and its refresh journal's refusal of the refresh token it holds) and each Claude
-//! Code row's `.credentials.json` where it is in a file, and keep only words and times. The vault
-//! is not read for it: a Claude Code row is on its token as the upkeep's last reading says
-//! (`tokens_here.json`), the reading its launch takes, its token's mint and last use are this
-//! Mac's value-free table's (`tokens.json`, `tokens-check.json`), and its refusal here the
-//! value-free file beside the vault state; the values stay in the vault, each CLI's login file and
-//! the keychain.
+//! `auth.json` (and its refresh journal's refusal of the refresh token it holds), each Claude
+//! Code row's `.credentials.json` where it is in a file, each Grok Build row's `auth.json`, each
+//! Kimi Code row's credential file (and the refusal its refresh records beside it) and each agy
+//! row's grant, and keep only words and times. The vault is not read for it: a Claude Code row
+//! is on its token as the upkeep's last reading says (`tokens_here.json`), the reading its launch
+//! takes, its token's mint and last use are this Mac's value-free table's (`tokens.json`,
+//! `tokens-check.json`), and its refusal here the value-free file beside the vault state; the
+//! values stay in the vault, each CLI's login file and the keychain.
 
 use aterm_agent::harness::{
     accounts::{self, Cli, Roster, Row},
@@ -341,8 +342,9 @@ fn on_token_now(config: &Path, home: Option<&Path>) -> OnToken {
 /// token (`Store::read_tokens_here`, no vault read), through the harness's value-free rows
 /// (`journal::login_rows`), each with the facts of the credential its sign-in runs on
 /// (`login_token::read`: Claude Code's from its token facts, `SetupTokens::read`, and its
-/// credential file where it is in one; Codex's from its `auth.json`), each word checked again
-/// into the journal's types ([`login`]); a row outside the journal's words is left out. Each
+/// credential file where it is in one; Codex's and Grok Build's from their `auth.json`, Kimi
+/// Code's from its credential file, agy's from its grant), each word checked again into the
+/// journal's types ([`login`]); a row outside the journal's words is left out. Each
 /// says why this Mac holds it as the lab does: `linked` where a preference of this Mac's names
 /// it, else `fill` (run here with no preference naming it, or an account the lab does not know);
 /// the flusher's book says the reason of a `place` row over either. A CLI with no roster holds

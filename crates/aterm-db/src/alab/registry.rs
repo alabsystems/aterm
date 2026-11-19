@@ -1225,8 +1225,9 @@ phone_collection!(
     Ty::Secret
 );
 
-/// The account statuses, safest first for a conflict.
-pub const ACCOUNT_STATUS: &[&str] = &["pending", "active", "paused", "broken", "banned"];
+/// The account statuses (`account_status::STATUS`): version 3 appends `suspended` and
+/// `cancelled`.
+pub const ACCOUNT_STATUS: &[&str] = super::account_status::STATUS;
 /// The services an account can run.
 pub const SERVICES: &[&str] = &[
     "claude-code",
@@ -1253,9 +1254,13 @@ crate::att_collection!(
     /// account's slug takes, only an owner's verb writes, so the default `<cli>-<6 hex>` label the
     /// importer and an older observer stored names nothing, at whatever version they wrote it;
     /// and two live accounts of one realm under one label are a finding.
+    ///
+    /// Version 3 (SF-47) appends the holds `suspended` and `cancelled` to `status`, and its
+    /// conflicts prefer the most final hold (`account_status::SAFEST_FIRST`); an account's
+    /// `account-event` rows say what moved it.
     pub ACCOUNT = Collection {
         name: "account",
-        version: 2,
+        version: 3,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "ac",
@@ -1282,7 +1287,7 @@ crate::att_collection!(
             )
             .null(),
             Column::new("status", Ty::Enum(ACCOUNT_STATUS))
-                .on_conflict(OnConflict::Prefer(&["banned", "broken", "paused", "pending", "active"]))
+                .on_conflict(OnConflict::Prefer(super::account_status::SAFEST_FIRST))
                 .writer(Writer::Birth),
             // The handle the owner names the account by, which its slug takes after the provider
             // word (`alab::account_names`); empty, the slug's handle derives from the address. A
@@ -1461,6 +1466,60 @@ crate::att_collection!(
         unique: &[],
         max_row: 0,
         authority: None,
+    }
+);
+
+crate::att_collection!(
+    /// What happened to an account (SF-47): one row per change of its status or note, born whole
+    /// in one record and never edited (every content cell a fixed Birth cell). It names the
+    /// account, or the login where no account is keyed, by key alone (`Ty::Key`), so an event
+    /// never holds its account's retirement up; the source that said it and a closed cause word
+    /// (`account_status::SOURCES`, `CAUSES`), never a vendor's text; the status it moved from and
+    /// to; and `what`, a person's, an agent's or a vendor message's words, under the note guard.
+    /// Keyed by `keys::account_event_pk` from its subject, source, cause and new status, so a
+    /// re-import of one sheet cell names the same row.
+    pub ACCOUNT_EVENT = Collection {
+        name: "account-event",
+        version: 1,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "ae",
+        derive: Derive::BirthSha256,
+        columns: &[
+            Column::new("account", Ty::Key).null().writer(Writer::Birth).fixed(),
+            Column::new("login", Ty::Key).null().writer(Writer::Birth).fixed(),
+            Column::new("provider", Ty::Ref("provider"))
+                .null()
+                .writer(Writer::Birth)
+                .fixed(),
+            // The registry head the writer read when it judged the move.
+            Column::new("after", Ty::Digest).null().writer(Writer::Birth).fixed(),
+            Column::new("happened", Ty::Time).null().writer(Writer::Birth).fixed(),
+            Column::new("recorded", Ty::Time).null().writer(Writer::Birth).fixed(),
+            Column::new("from", Ty::Enum(ACCOUNT_STATUS))
+                .null()
+                .writer(Writer::Birth)
+                .fixed(),
+            Column::new("to", Ty::Enum(ACCOUNT_STATUS))
+                .null()
+                .writer(Writer::Birth)
+                .fixed(),
+            Column::new("cause", Ty::Enum(super::account_status::CAUSES))
+                .writer(Writer::Birth)
+                .fixed(),
+            Column::new("source", Ty::Enum(super::account_status::SOURCES))
+                .writer(Writer::Birth)
+                .fixed(),
+            Column::new("what", Ty::Text(512)).null().writer(Writer::Birth).fixed(),
+            Column::new("by", Ty::Key).null().writer(Writer::Birth).fixed(),
+            Column::new("src", Ty::SrcRef).null().writer(Writer::Birth).fixed(),
+            // The operation digest of the write the event explains, where it is another record's.
+            Column::new("op", Ty::Digest).null().writer(Writer::Birth).fixed(),
+            row().writer(Writer::Birth),
+        ],
+        unique: &[],
+        max_row: 0,
+        authority: Some(1),
     }
 );
 
@@ -1682,7 +1741,7 @@ crate::att_collection!(
 );
 
 /// Every collection of the registry, besides the reserved `schema` collection.
-pub const COLLECTIONS: [&Collection; 16] = [
+pub const COLLECTIONS: [&Collection; 17] = [
     &PROVIDER,
     &CLI,
     &PLAN,
@@ -1695,6 +1754,7 @@ pub const COLLECTIONS: [&Collection; 16] = [
     &ACCOUNT_OBS,
     &SEALED_PHONE,
     &ACCOUNT,
+    &ACCOUNT_EVENT,
     &SUBACCOUNT,
     &AUTH_ROUTE,
     &PREFERENCE,
@@ -1725,6 +1785,15 @@ pub const FACES: &[Faced] = &[
         Face::Owner,
         &[
             "label", "provider", "login", "status", "plan", "services", "renews",
+        ],
+    ),
+    face(
+        "account-event",
+        ("Account events", "Account event"),
+        Face::Owner,
+        &[
+            "account", "login", "provider", "from", "to", "cause", "source", "happened",
+            "recorded", "what",
         ],
     ),
     face(
@@ -1874,7 +1943,7 @@ pub const ROLE_2: &str = "registry.2";
 
 /// The second generation's collections: the first's, the rows a roll carries archived, its cover
 /// rows and the history it carries.
-pub const COLLECTIONS_2: [&Collection; 19] = [
+pub const COLLECTIONS_2: [&Collection; 20] = [
     &PROVIDER,
     &CLI,
     &PLAN,
@@ -1887,6 +1956,7 @@ pub const COLLECTIONS_2: [&Collection; 19] = [
     &ACCOUNT_OBS,
     &SEALED_PHONE,
     &ACCOUNT,
+    &ACCOUNT_EVENT,
     &SUBACCOUNT,
     &AUTH_ROUTE,
     &PREFERENCE,
@@ -1898,7 +1968,7 @@ pub const COLLECTIONS_2: [&Collection; 19] = [
 
 /// The third generation's collections: the second's, with `address`, `mailbox` and `phone` at
 /// version 3, each secret column naming a secret-store entry and a phone number ordinary data.
-pub const COLLECTIONS_3: [&Collection; 19] = [
+pub const COLLECTIONS_3: [&Collection; 20] = [
     &PROVIDER,
     &CLI,
     &PLAN,
@@ -1911,6 +1981,7 @@ pub const COLLECTIONS_3: [&Collection; 19] = [
     &ACCOUNT_OBS,
     &PHONE,
     &ACCOUNT,
+    &ACCOUNT_EVENT,
     &SUBACCOUNT,
     &AUTH_ROUTE,
     &PREFERENCE,
@@ -1922,7 +1993,7 @@ pub const COLLECTIONS_3: [&Collection; 19] = [
 
 /// The fourth generation's collections: the third's, with `machine` and `mailbox` at version 4,
 /// `nickname_aliases`, `hosts` and `receives_domains` each a text set (LT-15B).
-pub const COLLECTIONS_4: [&Collection; 19] = [
+pub const COLLECTIONS_4: [&Collection; 20] = [
     &PROVIDER,
     &CLI,
     &PLAN,
@@ -1935,6 +2006,7 @@ pub const COLLECTIONS_4: [&Collection; 19] = [
     &ACCOUNT_OBS,
     &PHONE,
     &ACCOUNT,
+    &ACCOUNT_EVENT,
     &SUBACCOUNT,
     &AUTH_ROUTE,
     &PREFERENCE,

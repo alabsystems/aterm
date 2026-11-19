@@ -10,6 +10,10 @@ const TRUST: Trust = Trust {
     genesis: [13; 32],
 };
 const NOW: u64 = 400 * DAY_MS;
+/// The floor a member that reports [`RELAYS`] clears: the release the relay tests below sign,
+/// so they judge the relay and a report's age, not where a deployed fence such as
+/// [`CHECKPOINTS`] stands.
+const RELAYED: Floor = in_place(Some(RELAYS));
 
 fn member(n: u8) -> (Binding, [u8; 32]) {
     enrolled(n, TRUST.network, TRUST.authority)
@@ -605,7 +609,7 @@ fn a_report_relayed_by_another_member_counts_once_its_signature_checks() {
     let mut at_c = store(&c, &roster);
     let mut ledger = Ledger::new(TRUST);
     ledger.know_local(&c);
-    assert_eq!(ledger.holding_below([&a], NOW, CHECKPOINTS), unheard);
+    assert_eq!(ledger.holding_below([&a], NOW, RELAYED), unheard);
     assert!(take(&mut at_b, &wire, NOW));
     let (mut b_mark, mut c_mark) = (Mark::default(), Mark::default());
     let sent = round(
@@ -625,7 +629,7 @@ fn a_report_relayed_by_another_member_counts_once_its_signature_checks() {
     assert_eq!(sent, [4 + 6 + 24, 4 + 4 + 1 + 2, 4 + 4 + 2 + 136]);
     assert_eq!(kept(&at_c), [wire]);
     assert!(hear(&mut ledger, &at_c, NOW));
-    assert!(ledger.holding_below([&a], NOW, CHECKPOINTS).is_empty());
+    assert!(ledger.holding_below([&a], NOW, RELAYED).is_empty());
     assert_eq!(
         ledger.entry(&a.actor()),
         Some(&Entry {
@@ -700,7 +704,7 @@ fn a_report_relayed_by_another_member_counts_once_its_signature_checks() {
     let mut ledger = Ledger::new(TRUST);
     ledger.know_local(&c);
     assert!(!hear(&mut ledger, &reader, NOW));
-    assert_eq!(ledger.holding_below([&a], NOW, CHECKPOINTS), unheard);
+    assert_eq!(ledger.holding_below([&a], NOW, RELAYED), unheard);
 }
 
 /// Rule 1: a time-signed report is 136 bytes that verify only as its signer wrote them and only
@@ -841,9 +845,9 @@ fn a_relayed_report_signed_seven_days_ago_counts_for_nothing_and_a_kept_one_stop
     let then = signed_ms + RECENT;
     assert!(take(&mut reports, &fresh, NOW));
     assert!(hear(&mut ledger, &reports, NOW));
-    assert!(ledger.holding_below([&a], then - 1, CHECKPOINTS).is_empty());
+    assert!(ledger.holding_below([&a], then - 1, RELAYED).is_empty());
     assert_eq!(
-        ledger.holding_below([&a], then, CHECKPOINTS),
+        ledger.holding_below([&a], then, RELAYED),
         vec![(a.actor(), Hold::Unheard)]
     );
     let offer = |reports: &Reports, now_ms| {
@@ -907,11 +911,11 @@ fn a_relayed_report_signed_more_than_ten_minutes_ahead_is_refused_and_one_within
     );
     assert!(
         ledger
-            .holding_below([&a], NOW + RECENT - 1, CHECKPOINTS)
+            .holding_below([&a], NOW + RECENT - 1, RELAYED)
             .is_empty()
     );
     assert_eq!(
-        ledger.holding_below([&a], NOW + RECENT, CHECKPOINTS),
+        ledger.holding_below([&a], NOW + RECENT, RELAYED),
         vec![(a.actor(), Hold::Unheard)]
     );
     assert!(ledger.record(a.actor(), NOW, Said::Version(LIFTED)));
@@ -1007,7 +1011,7 @@ fn a_relayed_report_stamped_within_ten_minutes_after_a_round_does_not_replace_wh
     let mut ledger = Ledger::new(TRUST);
     ledger.record(actor, heard_ms, Said::Version(older));
     let held = vec![(actor, Hold::Older(Some(older)))];
-    assert_eq!(ledger.holding_below([&a], heard_ms, CHECKPOINTS), held);
+    assert_eq!(ledger.holding_below([&a], heard_ms, RELAYED), held);
     assert!(!ledger.relay(&early, heard_ms + MINUTE));
     assert_eq!(
         ledger.entry(&actor),
@@ -1017,10 +1021,7 @@ fn a_relayed_report_stamped_within_ten_minutes_after_a_round_does_not_replace_wh
             said_ms: heard_ms,
         })
     );
-    assert_eq!(
-        ledger.holding_below([&a], heard_ms + MINUTE, CHECKPOINTS),
-        held
-    );
+    assert_eq!(ledger.holding_below([&a], heard_ms + MINUTE, RELAYED), held);
     assert!(!ledger.writes_no_secret_file(&a, heard_ms + MINUTE));
 
     // Stamped exactly ten minutes after the round it still does not; a millisecond more does.

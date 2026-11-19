@@ -19837,6 +19837,86 @@ fn cloudflares_block_page_tells_the_host_no_lost_login() {
     }
 }
 
+/// A STATUS-ALONE 403 WHOSE GOAL WAS CLEARED UNDER IT IS NO LOST LOGIN (plan package UB-05): a
+/// `/goal` session at `Please run /login · API Error: 403 Forbidden` is cleared `(authentication
+/// failed)` under it, as Claude Code 2.1.323 types every 401 and 403, and the screen's reader joins
+/// that echo to the 403's row. With the accounts on, and the transcript's informational goal row
+/// after the 403's notice (as m2's measured 2.1.323 transcript writes it), the point tells the
+/// host no lost login (`LoginSeen::Lost`, a strike), asks nothing at a login wall
+/// (`account:wall:auth`, the host's `LostLogin`) and tells no login's end
+/// (`account:login-ended`): it is the blocked path the 403 alone is, whatever the goal names.
+/// CONTROL: a revoked token's 403 under the same echo is the login lost, told as such.
+/// NEGATIVE CONTROLS (2026-11-18, each restored with cp from a backup plus touch, confirmed with
+/// cmp): with aterm-phase's `wall.rs` as this branch had it before (each printed status's body
+/// read to the end of the text, the bare credential nouns), the 403 under its `stage 3` echo is
+/// told `LoginSeen::Lost`; with only the echo's cut and the body's bound taken out, the goal that
+/// names the OAuth token is told `LoginSeen::Lost`.
+#[test]
+fn a_status_alone_403_whose_goal_was_cleared_tells_the_host_no_lost_login() {
+    use crate::supervise::policy::turn_end::LoginSeen;
+    let edge_tail = include_str!("fixtures/claude-2.1.323-transcript-cloudflare-403.jsonl");
+    let page = "Attention Required! | Cloudflare";
+    let cleared = |goal: &str| {
+        format!(
+            "⏺ Goal cleared after an unrecoverable error (authentication failed): \"{goal}\". \
+             Run /goal again to continue."
+        )
+    };
+    let screen_of = |body: &str, goal: &str| {
+        let error = format!("  ⎿  Please run /login · API Error: 403 {body}");
+        let echo = cleared(goal);
+        let mut v = rows(&["⏺ Carrying on.", error.as_str(), "", echo.as_str(), ""]);
+        v.extend(composer("  ? for shortcuts"));
+        v
+    };
+    let run = |body: &str, goal: &str| {
+        let host = AccountHost::scripted(&[None], &[]);
+        *host.tail.lock().unwrap() = Some(edge_tail.replace(page, body));
+        let opts = account_opts(&host);
+        let shown = screen_of(body, goal);
+        let mut m = Mock::new(vec![shown.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(ACCOUNT_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        let point = s.turn_of(Screen {
+            rows: shown,
+            seq: 102,
+            cursor_col: 2,
+            ..Screen::default()
+        });
+        let action = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        let facts = host.login_facts.lock().unwrap().clone();
+        drop(s);
+        (facts, host.said("account:"), action)
+    };
+    assert!(
+        edge_tail.contains(page) && edge_tail.contains("\"subtype\":\"informational\""),
+        "PRECONDITION: the measured transcript's 403 notice and its goal row"
+    );
+    for goal in [
+        "stage 3",
+        "rotate the OAuth token",
+        "fix the token expired banner",
+    ] {
+        let (facts, asked, action) = run("Forbidden", goal);
+        assert!(
+            !facts.contains(&LoginSeen::Lost),
+            "{goal}: no lost login seen: {facts:?}"
+        );
+        assert!(
+            !asked
+                .iter()
+                .any(|s| s == "account:wall:auth" || s == "account:login-ended"),
+            "{goal}: no lost login told: {asked:?}"
+        );
+        assert_ne!(action.rule_id(), Some(RULE_LOGIN), "{goal}: {action:?}");
+    }
+    let (facts, _, _) = run("OAuth token has been revoked.", "stage 3");
+    assert_eq!(facts, [LoginSeen::Lost], "CONTROL: the revoked token's 403");
+}
+
 /// EACH POINT A TURN WORKED TO TELLS ITS LOGIN SERVED, THOUGH NO LIVE READ OF THE TURN RAN: a
 /// cruise break's turn read only under a background wait or a carried transcript is no live
 /// read ([`Session::took`]), and its point, decided with the turn's work

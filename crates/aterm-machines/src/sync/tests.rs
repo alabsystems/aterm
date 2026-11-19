@@ -4,6 +4,7 @@
 //! The converge pass over inert ports, with private native Git read-back controls.
 
 use super::*;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -174,6 +175,12 @@ pub(crate) struct Inert {
     awake_retired: Mutex<Vec<String>>,
     /// What retiring old `aterm caffeine` login jobs answers ([`Ports::retire_awake_old_jobs`]).
     retire_awake_done: Mutex<Result<String, String>>,
+    /// `sync.spotlight`'s reading ([`Ports::spotlight`]): no home at the console by default, so
+    /// the other kinds' tests count none of it.
+    spotlight: Mutex<Option<Result<BTreeSet<PathBuf>, spotlight_scope::Leave>>>,
+    /// What each ask of the root LAN broker answers, in turn ([`Ports::exclude_spotlight`]); one
+    /// that excluded the folders with none left makes the reading scoped.
+    spotlight_passes: Mutex<Vec<spotlight_scope::Pass>>,
     /// What a renewal of the broker ends in ([`Ports::renew_broker`]).
     renewed: Mutex<Result<String, String>>,
     peers: Mutex<PeersRead>,
@@ -304,6 +311,8 @@ impl Inert {
             retire_awake_done: Mutex::new(Ok(
                 "retired old `aterm caffeine` login item: com.aterm.aterm.caffeine".to_owned(),
             )),
+            spotlight: Mutex::new(None),
+            spotlight_passes: Mutex::new(Vec::new()),
             renewed: Mutex::new(Ok("renewed".to_owned())),
             peers: Mutex::new(PeersRead::Joined("in vault alab".to_owned())),
             peer_looks: Mutex::new(Vec::new()),
@@ -696,6 +705,24 @@ impl Ports for Inert {
     fn awake_retired_jobs(&self) -> Vec<String> {
         self.read(&self.awake_retired).unwrap()
     }
+    fn spotlight(&self) -> Option<Result<BTreeSet<PathBuf>, spotlight_scope::Leave>> {
+        self.spotlight.lock().unwrap().clone()
+    }
+
+    fn exclude_spotlight(&self) -> spotlight_scope::Pass {
+        self.applied("spotlight");
+        let mut passes = self.spotlight_passes.lock().unwrap();
+        let pass = if passes.is_empty() {
+            spotlight_scope::Pass::Nothing
+        } else {
+            passes.remove(0)
+        };
+        if matches!(pass, spotlight_scope::Pass::Done(_)) {
+            *self.spotlight.lock().unwrap() = Some(Ok(BTreeSet::new()));
+        }
+        pass
+    }
+
     fn retire_awake_old_jobs(&self) -> Result<String, String> {
         self.applied("awake-retire");
         let done = self.retire_awake_done.lock().unwrap().clone();
@@ -3415,8 +3442,9 @@ fn sync_identity_applies_before_fleet_and_accounts_and_skips_personal_vaults() {
 
 /// `[swarm] enabled = false` turns every converge sync item `NotApplicable` across every trigger,
 /// reading none of the individual sync ports (aterm's own stale vault server's read apart,
-/// [`Ports::stale_vault_server`]) and applying nothing; an invalid `[swarm]` section fails every
-/// sync row rather than defaulting on.
+/// [`Ports::stale_vault_server`], and `sync.spotlight`, which is no swarm participation) and
+/// applying nothing; an invalid `[swarm]` section fails every sync row rather than defaulting
+/// on.
 /// NEGATIVE CONTROL: on the same ports with `[swarm] enabled = true`, the due sync items read
 /// their ports and apply changes.
 #[test]
@@ -6252,5 +6280,132 @@ pub(crate) mod owed_clone {
                 reading()
             );
         }
+    }
+}
+
+/// `sync.spotlight` runs after `sync.refresh`, among the pass's repositories, as a Relay row
+/// with no vault behind it, and asks the root LAN broker for the home's folders it would take.
+/// An exclusion that leaves none owed is a change and a complete pass. A broker that was busy,
+/// took a first batch, or did not serve though its reading said it would is unfinished work the
+/// clock's next try takes, never a wait for input that parks the pass; so is a definite answer
+/// that it left the folders as they are, which the next try reads kept (not applicable); a
+/// failed edit fails the row.
+/// NEGATIVE CONTROL: an unserved broker standing aside for an input (`StoodAside::Inputs`)
+/// parks the pass, so no clock retries it.
+#[test]
+fn the_spotlight_row_asks_the_broker_after_the_refresh_and_retries_a_transient_answer() {
+    let indexed = || Some(Ok([PathBuf::from("/Users//alice/trust")].into()));
+    let pass_with = |pass: spotlight_scope::Pass| {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.spotlight.lock().unwrap() = indexed();
+        ports.spotlight_passes.lock().unwrap().push(pass);
+        let ran = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        (ran, ports.applies())
+    };
+
+    let (done, applies) = pass_with(spotlight_scope::Pass::Done(1));
+    let at = |id: &str| done.rows.iter().position(|row| row.id == id).unwrap();
+    assert!(at(REFRESH) < at(SPOTLIGHT), "{:?}", done.rows);
+    let spotlight = row(&done.rows, SPOTLIGHT);
+    assert_eq!(spotlight.outcome, Outcome::Changed, "{spotlight:?}");
+    assert_eq!(spotlight.class, Some(Class::Relay));
+    assert_eq!(spotlight.from.as_deref(), Some("indexed: trust"));
+    assert_eq!(
+        applies.iter().filter(|kind| **kind == "spotlight").count(),
+        1
+    );
+    assert!(done.complete(), "{done:?}");
+
+    for pass in [
+        spotlight_scope::Pass::Busy,
+        spotlight_scope::Pass::More(64),
+        spotlight_scope::Pass::Unavailable("the LAN broker is restarting".into()),
+        spotlight_scope::Pass::Left("the receipt is full".into()),
+    ] {
+        let (waiting, _) = pass_with(pass.clone());
+        let spotlight = row(&waiting.rows, SPOTLIGHT);
+        assert!(
+            matches!(spotlight.stood_aside, Some(StoodAside::Waiting(_))),
+            "{pass:?}: {spotlight:?}"
+        );
+        assert!(!waiting.complete(), "{pass:?}");
+        assert!(
+            !waiting.waits_for_input(),
+            "{pass:?}: the next try takes it"
+        );
+    }
+
+    let (failed, _) = pass_with(spotlight_scope::Pass::Failed("the edit failed".into()));
+    let spotlight = row(&failed.rows, SPOTLIGHT);
+    assert_eq!(spotlight.outcome, Outcome::Failed, "{spotlight:?}");
+    assert!(!failed.waits_for_input());
+
+    // No home at the console: nothing to ask.
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&pass.rows, SPOTLIGHT).outcome, Outcome::NotApplicable);
+    assert!(!ports.applies().contains(&"spotlight"));
+}
+
+/// A reading that keeps the broker from acting (no broker of this build serves, a rule refuses
+/// the home, its share of the receipt is full) is no work of `sync.spotlight`'s: the row reads
+/// `NotApplicable` with the reading's words and asks nothing, and the pass completes, so the
+/// clock's recheck reads it again. So does a reading of this Mac that did not answer, an
+/// indexing state `mdutil` reports unknown among them: one that lasts is never tried every five
+/// minutes for good, and never parks the pass.
+/// NEGATIVE CONTROLS: the earlier reading, a cause that stands as a stand-aside for input,
+/// parks the pass: `complete()` is false and `waits_for_input()` true; an unread reading
+/// deferred leaves the pass unfinished, which the clock retries.
+#[test]
+fn a_spotlight_reading_that_leaves_the_folders_as_they_are_parks_no_pass() {
+    let pass_with = |reading: spotlight_scope::Leave| {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.spotlight.lock().unwrap() = Some(Err(reading));
+        let ran = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        (ran, ports.applies())
+    };
+    for reading in [
+        spotlight_scope::Leave::Stands("no LAN broker of this build serves this Mac".into()),
+        spotlight_scope::Leave::Refused("this account's home is not a folder of its own".into()),
+        spotlight_scope::Leave::Unread("Spotlight's indexing state could not be read".into()),
+    ] {
+        let (pass, applies) = pass_with(reading.clone());
+        let spotlight = row(&pass.rows, SPOTLIGHT);
+        assert_eq!(spotlight.outcome, Outcome::NotApplicable, "{spotlight:?}");
+        assert_eq!(spotlight.why.as_deref(), Some(reading.why()));
+        assert!(!applies.contains(&"spotlight"));
+        assert!(pass.complete(), "{reading:?}: {pass:?}");
+        assert!(!pass.waits_for_input(), "{reading:?}: {pass:?}");
+    }
+}
+
+/// `[swarm] enabled = false` leaves `sync.spotlight` on: the exclusion of this home's folders is
+/// this Mac's own upkeep with its root LAN broker, which the window and every automatic run of
+/// `aterm init` leave to this row, so a home the broker would take is still asked for.
+/// NEGATIVE CONTROL: the swarm switch read for every kind marks the row `NotApplicable` and asks
+/// no broker.
+#[test]
+fn the_spotlight_row_runs_with_the_swarm_off() {
+    for swarm in [Ok(false), Err("aterm.toml: invalid [swarm]".to_owned())] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.swarm.lock().unwrap() = swarm.clone();
+        *ports.spotlight.lock().unwrap() = Some(Ok([PathBuf::from("/Users//alice/trust")].into()));
+        ports
+            .spotlight_passes
+            .lock()
+            .unwrap()
+            .push(spotlight_scope::Pass::Done(1));
+        let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+        let spotlight = row(&pass.rows, SPOTLIGHT);
+        assert_eq!(
+            spotlight.outcome,
+            Outcome::Changed,
+            "{swarm:?}: {spotlight:?}"
+        );
+        assert!(ports.applies().contains(&"spotlight"), "{swarm:?}");
     }
 }

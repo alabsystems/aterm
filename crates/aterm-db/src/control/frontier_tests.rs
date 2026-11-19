@@ -112,6 +112,7 @@ fn chain(
                 body: Body::Name {
                     name: format!("chain-{member}-{sequence}"),
                 },
+                statement: None,
             }
             .sign(&[member as u8 + 31; 32], [member as u8 + 3; 16])
             .unwrap();
@@ -208,7 +209,7 @@ fn frontier_refuses_missing_reflected_and_incompatible_identity_before_evidence(
                     proof,
                     Side::Initiator,
                     &mut repair,
-                    Instant::now() + EXCHANGE,
+                    EXCHANGE.horizon(Instant::now()),
                     Protocol::Frontier(wire)
                 )
                 .is_err()
@@ -444,10 +445,12 @@ fn frontier_native_tls_repairs_marked_history_and_preserves_its_mark_in_either_d
     }
 }
 
-/// A frontier responder whose custody's format mark names a later format writes nothing, not even
-/// its metadata: the `ACX4`/`AFR4` bound states format 1 alone, and the haves and evidence that
-/// follow it are read without loading the records file, so the mark is read where the bound is
-/// made (`own_bound`), as the crossed mark is.
+/// A frontier responder whose custody's format mark names a later format, on a build that does
+/// not read that format (every build, while `hearing::READS_FORMAT` names no release), writes
+/// nothing, not even its metadata: it states no bound rather than format 1 beside records of a
+/// later one. The haves and evidence that follow the metadata are read without loading the
+/// records file, so the mark is read where the bound is made (`own_bound`), as the crossed mark
+/// is.
 ///
 /// NEGATIVE CONTROL: with `own_bound` reading the crossed mark alone (as first built), the
 /// responder wrote its metadata stating format 1 before anything refused
@@ -481,7 +484,7 @@ fn vault_fence_a_frontier_responder_past_format_one_writes_nothing() {
                     Some(&proof_of(&fixture.endpoints[0])),
                     Side::Responder,
                     &mut repair,
-                    Instant::now() + EXCHANGE,
+                    EXCHANGE.horizon(Instant::now()),
                     Protocol::Frontier(wire)
                 )
                 .is_err()
@@ -566,7 +569,7 @@ fn frontier_full_stores_hold_refused_records_until_capacity_changes() {
                 });
                 let mut repair = Repair::default();
                 let result = fixture.endpoints[0].exchange(
-                    Connection::connect(address, Scope::Loopback, EXCHANGE).unwrap(),
+                    Connection::connect(address, Scope::Loopback, EXCHANGE.window).unwrap(),
                     Side::Initiator,
                     &mut repair,
                 );
@@ -862,13 +865,13 @@ fn frontier_native_tls_resumes_after_a_durable_receipt_is_lost() {
             )
             .unwrap()
             .into_parts();
-            tcp.set_read_timeout(Some(EXCHANGE)).unwrap();
-            tcp.set_write_timeout(Some(EXCHANGE)).unwrap();
+            tcp.set_read_timeout(Some(EXCHANGE.window)).unwrap();
+            tcp.set_write_timeout(Some(EXCHANGE.window)).unwrap();
             let mut channel = fleet::test_server_handshake_database_v5_as(
                 tcp,
                 &FleetSecret::new(&[51; 32]).unwrap(),
                 Some(&fixture.endpoints[1].identity),
-                EXCHANGE,
+                EXCHANGE.window,
             )
             .unwrap();
             assert_eq!(
@@ -885,23 +888,23 @@ fn frontier_native_tls_resumes_after_a_durable_receipt_is_lost() {
                 channel.peer.as_ref(),
                 Side::Responder,
                 &mut repair,
-                Instant::now() + EXCHANGE,
+                EXCHANGE.horizon(Instant::now()),
                 Protocol::Frontier(Wire::Delta),
             );
             assert!(cut.failed);
             assert!(report.is_ok());
             assert!(repair.membership_error().is_some());
         });
-        let (tcp, _) = Connection::connect(address, Scope::Loopback, EXCHANGE)
+        let (tcp, _) = Connection::connect(address, Scope::Loopback, EXCHANGE.window)
             .unwrap()
             .into_parts();
-        tcp.set_read_timeout(Some(EXCHANGE)).unwrap();
-        tcp.set_write_timeout(Some(EXCHANGE)).unwrap();
+        tcp.set_read_timeout(Some(EXCHANGE.window)).unwrap();
+        tcp.set_write_timeout(Some(EXCHANGE.window)).unwrap();
         let mut channel = fleet::test_client_handshake_database_v5_as(
             tcp,
             &FleetSecret::new(&[51; 32]).unwrap(),
             Some(&fixture.endpoints[0].identity),
-            EXCHANGE,
+            EXCHANGE.window,
         )
         .unwrap();
         assert_eq!(
@@ -914,7 +917,7 @@ fn frontier_native_tls_resumes_after_a_durable_receipt_is_lost() {
             channel.peer.as_ref(),
             Side::Initiator,
             &mut repair,
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             Protocol::Frontier(Wire::Delta),
         );
         assert!(report.is_ok());
@@ -1039,7 +1042,7 @@ fn frontier_rejects_oversized_evidence_before_reading_its_records() {
                     Some(&proof),
                     Side::Responder,
                     &mut repair,
-                    Instant::now() + EXCHANGE,
+                    EXCHANGE.horizon(Instant::now()),
                     Protocol::Frontier(wire)
                 )
                 .is_err()
@@ -1111,7 +1114,7 @@ fn frontier_rejects_a_different_real_genesis_even_when_root_metadata_matches() {
                     Some(&proof),
                     Side::Responder,
                     &mut repair,
-                    Instant::now() + EXCHANGE,
+                    EXCHANGE.horizon(Instant::now()),
                     Protocol::Frontier(wire)
                 )
                 .is_err()
@@ -1185,7 +1188,7 @@ fn frontier_rechecks_capacity_after_waiting_for_peer_admission() {
                     Some(&proof),
                     Side::Responder,
                     &mut repair,
-                    Instant::now() + EXCHANGE,
+                    EXCHANGE.horizon(Instant::now()),
                     Protocol::Frontier(wire),
                 )
             },
@@ -1240,7 +1243,7 @@ fn frontier_native_tls_repairs_history_past_the_legacy_count() {
             )
         });
         let client_result = fixture.endpoints[0].exchange(
-            Connection::connect(address, Scope::Loopback, EXCHANGE).unwrap(),
+            Connection::connect(address, Scope::Loopback, EXCHANGE.window).unwrap(),
             Side::Initiator,
             &mut repair,
         );
@@ -1386,7 +1389,7 @@ fn counted_session(
                 Some(&proof_of(peer)),
                 side,
                 &mut repair,
-                Instant::now() + EXCHANGE,
+                EXCHANGE.horizon(Instant::now()),
                 Protocol::Frontier(Wire::Delta),
             );
             ((result, repair), stream.written)
@@ -1467,6 +1470,7 @@ fn a_mac_admitted_at_record_ten_thousand_pushes_only_what_its_peer_lacks() {
                     entrant: entrant(&lab, 1),
                     evidence: aterm_secrets::membership_log::Evidence::Phrase,
                 },
+                statement: None,
             }
             .sign(&[31; 32], [3; 16])
             .unwrap(),
@@ -1518,7 +1522,7 @@ fn a_mac_admitted_at_record_ten_thousand_pushes_only_what_its_peer_lacks() {
                     Some(&proof_of(&late)),
                     Side::Responder,
                     &mut repair,
-                    Instant::now() + EXCHANGE,
+                    EXCHANGE.horizon(Instant::now()),
                     Protocol::Frontier(Wire::Delta),
                 )
                 .is_err()
@@ -1555,6 +1559,7 @@ fn a_push_reads_its_custody_only_for_what_its_witness_leaves() {
             entrant: entrant(&lab, 1),
             evidence: aterm_secrets::membership_log::Evidence::Phrase,
         },
+        statement: None,
     }
     .sign(&[31; 32], [3; 16])
     .unwrap();
@@ -1619,7 +1624,7 @@ fn push_one(lab: &Lab, receiver: &Endpoint, record: &Record) -> Repair {
         Some(&proof_of(&lab.endpoint(1))),
         Side::Responder,
         &mut repair,
-        Instant::now() + EXCHANGE,
+        EXCHANGE.horizon(Instant::now()),
         Protocol::Frontier(Wire::Delta),
     );
     repair
@@ -1654,6 +1659,7 @@ fn an_unseated_signers_push_is_refused_and_its_peer_is_not_authenticated() {
                 entrant: entrant(&lab, 1),
                 evidence: aterm_secrets::membership_log::Evidence::Phrase,
             },
+            statement: None,
         }
         .sign(&seed, incarnation)
         .unwrap()
@@ -1857,7 +1863,7 @@ fn a_released_atdb4_mac_and_this_build_meet_on_its_frames() {
             Some(&proof_of(&dialer)),
             Side::Responder,
             &mut repair,
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             Protocol::Frontier(wire),
         );
         (result, repair, Cursor::new(stream.output))
@@ -1893,7 +1899,7 @@ fn a_released_atdb4_mac_and_this_build_meet_on_its_frames() {
             Some(&proof_of(&listener)),
             Side::Initiator,
             &mut Repair::default(),
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             Protocol::Frontier(wire),
         );
         let mut output = Cursor::new(stream.output);
@@ -1938,15 +1944,20 @@ fn released_session(
             )
             .unwrap()
             .into_parts();
-            tcp.set_read_timeout(Some(EXCHANGE)).unwrap();
-            tcp.set_write_timeout(Some(EXCHANGE)).unwrap();
+            tcp.set_read_timeout(Some(EXCHANGE.window)).unwrap();
+            tcp.set_write_timeout(Some(EXCHANGE.window)).unwrap();
             let handshake = if released == Some(1) {
                 fleet::test_server_handshake_database_v4_as
             } else {
                 fleet::test_server_handshake_database_v5_as
             };
-            let mut channel =
-                handshake(tcp, &secret, Some(&fixture.endpoints[1].identity), EXCHANGE).unwrap();
+            let mut channel = handshake(
+                tcp,
+                &secret,
+                Some(&fixture.endpoints[1].identity),
+                EXCHANGE.window,
+            )
+            .unwrap();
             let alpn = channel
                 .transport
                 .stream()
@@ -1959,23 +1970,28 @@ fn released_session(
                 channel.peer.as_ref(),
                 Side::Responder,
                 &mut repair,
-                Instant::now() + EXCHANGE,
+                EXCHANGE.horizon(Instant::now()),
                 Protocol::from_alpn(alpn.as_deref()),
             );
             (alpn, result, repair)
         });
-        let (tcp, _) = Connection::connect(address, Scope::Loopback, EXCHANGE)
+        let (tcp, _) = Connection::connect(address, Scope::Loopback, EXCHANGE.window)
             .unwrap()
             .into_parts();
-        tcp.set_read_timeout(Some(EXCHANGE)).unwrap();
-        tcp.set_write_timeout(Some(EXCHANGE)).unwrap();
+        tcp.set_read_timeout(Some(EXCHANGE.window)).unwrap();
+        tcp.set_write_timeout(Some(EXCHANGE.window)).unwrap();
         let handshake = if released == Some(0) {
             fleet::test_client_handshake_database_v4_as
         } else {
             fleet::test_client_handshake_database_v5_as
         };
-        let mut channel =
-            handshake(tcp, &secret, Some(&fixture.endpoints[0].identity), EXCHANGE).unwrap();
+        let mut channel = handshake(
+            tcp,
+            &secret,
+            Some(&fixture.endpoints[0].identity),
+            EXCHANGE.window,
+        )
+        .unwrap();
         let alpn = channel
             .transport
             .stream()
@@ -1988,7 +2004,7 @@ fn released_session(
             channel.peer.as_ref(),
             Side::Initiator,
             &mut repair,
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             Protocol::from_alpn(alpn.as_deref()),
         );
         [(alpn, result, repair), answered.join().unwrap()]
@@ -2119,7 +2135,7 @@ fn a_full_mac_judges_a_peer_on_the_push_it_has_room_for() {
                 Some(&proof_of(&lab.endpoint(1))),
                 Side::Responder,
                 &mut repair,
-                Instant::now() + EXCHANGE,
+                EXCHANGE.horizon(Instant::now()),
                 Protocol::Frontier(Wire::Delta),
             );
             repair.authenticated_actor()
@@ -2156,7 +2172,7 @@ fn answered(
             Some(&proof_of(peer)),
             side,
             &mut repair,
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             Protocol::Frontier(wire),
         );
         (result, repair)
@@ -2397,7 +2413,7 @@ fn responded<W: Send>(
             Some(&proof_of(peer)),
             side,
             &mut repair,
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             Protocol::Frontier(wire),
         );
         (result, repair)
@@ -2726,7 +2742,7 @@ fn session(
             Some(&proof_of(peer)),
             side,
             &mut repair,
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             protocol,
         );
         (result, repair)
@@ -3469,3 +3485,9 @@ fn an_atdb7_peer_converges_with_this_build_on_atdb7() {
         );
     }
 }
+
+/// The records format on the frontier wires (tracker FL-148E). Unix only, as a format mark's
+/// writers are: a Windows member follows no vault into a later format.
+#[cfg(unix)]
+#[path = "format_tests.rs"]
+mod format_tests;

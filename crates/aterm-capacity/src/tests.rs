@@ -2393,6 +2393,625 @@ fn a_release_queued_while_background_waits_stops_before_grant() {
     }
 }
 
+/// How many of a wait's asks of its stop the sweeps below start the stop at, one sweep each.
+/// The first six are made at fixed points: the ask before the wait enters, then the first
+/// round's at its top, before its look, after the look, after its guard step and the first of
+/// its nap's, which the nap makes before it sleeps. Where an ask after those falls (later in the
+/// nap or in a later round) depends on how long the asks before it took, so the sweeps name no
+/// point for it: each must end the wait as stopped wherever it falls.
+const STOP_ASKS: usize = 12;
+
+/// A wait whose caller's stop first says so at any of its asks, a look's own checks among them
+/// (after the check before the look let it go on), ends as [`Error::Stopped`], never as a ledger
+/// failure, and leaves no wait behind: the stop says so from its `ask`th ask on, for each ask of
+/// the sweep. NEGATIVE CONTROL, by hand: with a look's stop answered as
+/// `Error::Ledger(Interrupted)`, as it was, the sweep failed at its third ask, the look's first
+/// check.
+#[test]
+fn a_caller_stop_first_seen_by_a_looks_own_check_ends_the_wait_as_stopped() {
+    let s = scratch("caller-stop-inside-a-look");
+    let machine = mac48();
+    let holder = admitted(
+        enter(&s, &machine, Need::new("core holder").cores(14)),
+        &machine,
+    );
+    for ask in 1..=STOP_ASKS {
+        let asks = std::cell::Cell::new(0);
+        let stopped = admit_until(
+            &s.ledger,
+            &machine,
+            Need::new("waiting").cores(14),
+            Admit::Wait,
+            Pace {
+                poll: Duration::from_millis(1),
+                ..Pace::default()
+            },
+            &mut |_| {},
+            &|| {
+                asks.set(asks.get() + 1);
+                asks.get() >= ask
+            },
+        );
+        assert!(
+            matches!(stopped, Err(Error::Stopped { signal: None, .. })),
+            "a stop from ask {ask} on ends the wait as stopped: {stopped:?}"
+        );
+        assert_eq!(
+            s.ledger
+                .list()
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.need.what, row.held.is_some()))
+                .collect::<Vec<_>>(),
+            [("core holder".to_owned(), true)],
+            "the stopped wait at ask {ask} left nothing behind"
+        );
+    }
+    drop(holder);
+}
+
+/// `fixed`, but once `armed` its next reading first runs `inside`: in a wait, the reading of the
+/// look after the arming, made after the wait's check before that look and the look's own first
+/// ask, and before its asks after the reading.
+struct InsideTheLook<F: Fn()> {
+    fixed: Fixed,
+    armed: std::cell::Cell<bool>,
+    inside: F,
+}
+
+impl<F: Fn()> InsideTheLook<F> {
+    fn new(inside: F) -> Self {
+        Self {
+            fixed: mac48(),
+            armed: std::cell::Cell::new(false),
+            inside,
+        }
+    }
+}
+
+impl<F: Fn()> crate::Machine for InsideTheLook<F> {
+    fn read(&self, path: Option<&Path>) -> Reading {
+        if self.armed.replace(false) {
+            (self.inside)();
+        }
+        self.fixed.read(path)
+    }
+    fn procs(&self) -> Option<Procs> {
+        self.fixed.procs()
+    }
+    fn waits(&self) -> Vec<aterm_toolchain::waits::Waiting> {
+        self.fixed.waits()
+    }
+}
+
+/// What `ledger` holds, by name, in its order.
+fn queued(ledger: &Ledger) -> Vec<String> {
+    ledger
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.need.what)
+        .collect()
+}
+
+/// A STOP SEEN DURING A LOOK NAMES WHAT THAT LOOK READ (LS-118). A caller's stop that a look
+/// first sees, at its ask after it read the machine and the ledger, ends the wait as
+/// [`Error::Stopped`], never as a ledger failure, and names what that look found it short of,
+/// never a state the wait had already left: B, short by 10 GiB behind A and A2, is stopped in the
+/// look in which A2 ends, which found it short by 5 GiB behind A alone. A stopped look that found
+/// the need fit admits nothing and names what the last look found it short of; one that was the
+/// need's first and found it fit names nothing, and its error says no look found it short, not
+/// that none ran. At the API, a look its stop ended after its guard step names that step's
+/// shortfall ([`Short::ExternalLock`]). NEGATIVE CONTROLS, by hand, each red here: the look
+/// before's shortfall named in place of the stopped look's (`short: last`, as it was), or
+/// preferred to it (`last.or(short)`); the last look's dropped (`short` alone); the guard step's
+/// shortfall dropped at the ask after it; a look blind to the caller's stop (B says a second wait
+/// line, short by 5 GiB, and the look admits C, for the wait's check after it to take back); and
+/// `short: None` said as "before its first look", as it was.
+#[test]
+fn a_stop_seen_during_a_look_ends_the_admission_as_stopped_never_as_a_ledger_failure() {
+    use std::cell::{Cell, RefCell};
+    // Every look that returns short says its line, so a look the stop did not end says one.
+    let pace = Pace {
+        poll: Duration::from_millis(5),
+        line_every: Duration::ZERO,
+    };
+    let m = mac48();
+
+    // B, short by 10 GiB behind A and A2; the caller's stop comes in its second look, in which
+    // A2 ends.
+    let s = scratch("stop-in-look-short");
+    let a = admitted(enter(&s, &m, Need::new("A").mem_gib(25)), &m);
+    let a2 = RefCell::new(Some(admitted(
+        enter(&s, &m, Need::new("A2").mem_gib(5)),
+        &m,
+    )));
+    let stop = Cell::new(false);
+    let lines = RefCell::new(Vec::new());
+    let machine = InsideTheLook::new(|| {
+        a2.borrow_mut().take();
+        stop.set(true);
+    });
+    let ended = admit_until(
+        &s.ledger,
+        &machine,
+        Need::new("B").mem_gib(20),
+        Admit::Wait,
+        pace,
+        &mut |line| {
+            lines.borrow_mut().push(line.to_owned());
+            machine.armed.set(true);
+        },
+        &|| stop.get(),
+    );
+    match &ended {
+        Err(Error::Stopped {
+            signal: None,
+            short: Some(short),
+        }) => {
+            let said = short.to_string();
+            names(&said, &["short by 5 GiB", "\"A\""]);
+            assert!(
+                !said.contains("\"A2\""),
+                "the stopped look found A2 gone: {said}"
+            );
+        }
+        other => panic!(
+            "the caller's stop in B's look ends B as stopped, short of what that look found: \
+             {other:?}"
+        ),
+    }
+    let lines = lines.into_inner();
+    assert_eq!(
+        lines.len(),
+        1,
+        "B said one wait line, at its first look: the look the stop came in ended there, its \
+         shortfall not waited on: {lines:?}"
+    );
+    names(&lines[0], &["B", "short by 10 GiB"]);
+    assert_eq!(queued(&s.ledger), ["A"], "B left the queue");
+
+    // C, short by 10 GiB behind D; the caller's stop comes in its second look, in which D ends,
+    // so that look finds C fit.
+    let fit = scratch("stop-in-look-fit");
+    let d = RefCell::new(Some(admitted(
+        enter(&fit, &m, Need::new("D").mem_gib(30)),
+        &m,
+    )));
+    let stop = Cell::new(false);
+    let machine = InsideTheLook::new(|| {
+        d.borrow_mut().take();
+        stop.set(true);
+    });
+    let (ended, rows) = crate::admission_log::capture(Ledger::at(fit.ledger.dir()), || {
+        admit_until(
+            &fit.ledger,
+            &machine,
+            Need::new("C").mem_gib(20),
+            Admit::Wait,
+            pace,
+            &mut |_| machine.armed.set(true),
+            &|| stop.get(),
+        )
+    });
+    match &ended {
+        Err(Error::Stopped {
+            signal: None,
+            short: Some(short),
+        }) => names(&short.to_string(), &["short by 10 GiB", "\"D\""]),
+        other => panic!(
+            "the caller's stop in C's fitting look ends C as stopped, short of what its look \
+             before found: {other:?}"
+        ),
+    }
+    let looks = |admitted: bool| {
+        rows.iter().any(|r| {
+            r.kind() == "look"
+                && r.get("what").and_then(|w| w.as_str()) == Some("C")
+                && r.flag("admitted") == admitted
+        })
+    };
+    assert!(
+        looks(false),
+        "C's first look, short, was captured: {rows:?}"
+    );
+    assert!(
+        !looks(true),
+        "the look the stop came in admitted nothing: {rows:?}"
+    );
+    assert!(queued(&fit.ledger).is_empty(), "C left the queue");
+
+    // F fits beside A; the caller's stop comes in its first look, armed once F is queued.
+    let stop = Cell::new(false);
+    let machine = InsideTheLook::new(|| stop.set(true));
+    let ended = admit_until(
+        &s.ledger,
+        &machine,
+        Need::new("F").mem_gib(5),
+        Admit::Wait,
+        pace,
+        &mut |_| {},
+        &|| {
+            if !stop.get() && queued(&s.ledger).iter().any(|what| what == "F") {
+                machine.armed.set(true);
+            }
+            stop.get()
+        },
+    );
+    assert!(
+        stop.get() && !machine.armed.get(),
+        "the stop came from F's look's reading"
+    );
+    match &ended {
+        Err(
+            stopped @ Error::Stopped {
+                signal: None,
+                short: None,
+            },
+        ) => {
+            let said = stopped.to_string();
+            names(
+                &said,
+                &["stopped while it waited, before any look found it short"],
+            );
+            assert!(!said.contains("before its first look"), "{said}");
+        }
+        other => panic!("the caller's stop in F's fitting look ends F as stopped: {other:?}"),
+    }
+    assert_eq!(queued(&s.ledger), ["A"], "F left the queue");
+
+    // At the API: E fits beside A, its guard is not to be had, and the stop comes as its guard
+    // step tries.
+    let stop = Cell::new(false);
+    let w = enter(&s, &m, Need::new("E").mem_gib(5));
+    match w.poll_until_guarded(&m, &|| stop.get(), &mut || {
+        stop.set(true);
+        Ok(None::<()>)
+    }) {
+        Err(crate::PollStopped { short: Some(found) }) => {
+            assert_eq!(found.shorts, [Short::ExternalLock]);
+        }
+        other => panic!("a look its stop ended after its guard step: {other:?}"),
+    }
+    assert_eq!(queued(&s.ledger), ["A"], "E left the queue");
+    drop(a);
+}
+
+/// `inner`, but a quiet claim's GPU read is where its caller's stop first says so: the read
+/// sets `reading`, which the caller's stop answers from then on, asks the read's own `stopped`
+/// and keeps its answer in `saw`, and reads nothing.
+struct StopAtTheGpuRead<M> {
+    inner: M,
+    reading: std::cell::Cell<bool>,
+    saw: std::cell::Cell<bool>,
+}
+
+impl<M> StopAtTheGpuRead<M> {
+    const fn new(inner: M) -> Self {
+        Self {
+            inner,
+            reading: std::cell::Cell::new(false),
+            saw: std::cell::Cell::new(false),
+        }
+    }
+}
+
+impl<M: crate::Machine> crate::Machine for StopAtTheGpuRead<M> {
+    fn read(&self, path: Option<&Path>) -> Reading {
+        self.inner.read(path)
+    }
+    fn procs(&self) -> Option<Procs> {
+        self.inner.procs()
+    }
+    fn cpu_point(&self) -> Option<crate::CpuPoint> {
+        self.inner.cpu_point()
+    }
+    fn gpu_busy(&self, stopped: &dyn Fn() -> bool) -> Option<u8> {
+        self.reading.set(true);
+        self.saw.set(stopped());
+        None
+    }
+}
+
+/// The pace of the waits below: a nap of a millisecond.
+const GPU_STOP_PACE: Pace = Pace {
+    poll: Duration::from_millis(1),
+    line_every: Duration::from_secs(60),
+};
+
+/// A stop that only a quiet claim's GPU read saw, in a look that then met the ledger's turn
+/// held (the wait's first look, which returns before its asks after it), ends the wait as
+/// [`Error::Stopped`] short of nothing, as a stop before that look would, and leaves no wait
+/// behind. NEGATIVE CONTROL, by hand: with the wait going on from such a look (`(Ok(polled), _)`
+/// for `(Ok(polled), None)`), it ended as stopped short of the turn the look met after the stop.
+#[test]
+fn a_stop_only_a_looks_gpu_read_saw_ends_a_wait_behind_a_held_turn_as_stopped() {
+    let s = scratch("stop-at-the-gpu-read-turn");
+    let machine = StopAtTheGpuRead::new(mac48());
+    let turn = s.ledger.try_turn().expect("the lock").expect("free");
+    let stopped = admit_until(
+        &s.ledger,
+        &machine,
+        Need::new("quiet behind a held turn").quiet(f64::INFINITY),
+        Admit::Wait,
+        GPU_STOP_PACE,
+        &mut |_| {},
+        &|| machine.reading.get(),
+    );
+    drop(turn);
+    assert!(machine.saw.get(), "the GPU read saw the stop");
+    assert!(
+        matches!(
+            stopped,
+            Err(Error::Stopped {
+                signal: None,
+                short: None
+            })
+        ),
+        "a stop the held turn's look saw at its GPU read ends the wait as stopped, short of \
+         nothing it read: {stopped:?}"
+    );
+    assert!(
+        s.ledger.list().unwrap().is_empty(),
+        "the stopped wait left nothing behind"
+    );
+}
+
+/// A stop that only a measured claim's GPU read saw, in its second look (its first, warming,
+/// reads no GPU), whose CPU counters then go unread (a timing that cannot qualify, which the
+/// look returns before its asks after it), ends the wait as [`Error::Stopped`] short of the
+/// first look's warming, never as that timing, and leaves no wait behind. NEGATIVE CONTROL, by
+/// hand: with the wait going on from such a look (`(Ok(polled), _)` for `(Ok(polled), None)`),
+/// it ended as `Err(Timing(Unavailable))`.
+#[test]
+fn a_stop_only_a_looks_gpu_read_saw_ends_a_measured_wait_as_stopped_not_unqualified() {
+    let s = scratch("stop-at-the-gpu-read-timing");
+    let machine = StopAtTheGpuRead::new(TimingMachine::new(&[(0, 0)]));
+    let stopped = admit_until(
+        &s.ledger,
+        &machine,
+        Need::timing("measured, its counters then unread"),
+        Admit::Wait,
+        GPU_STOP_PACE,
+        &mut |_| {},
+        &|| machine.reading.get(),
+    );
+    assert!(machine.saw.get(), "the second look's GPU read saw the stop");
+    assert_eq!(
+        machine.inner.reads.get(),
+        2,
+        "the stop came in the second look"
+    );
+    match &stopped {
+        Err(Error::Stopped {
+            signal: None,
+            short: Some(short),
+        }) => assert!(
+            short
+                .shorts
+                .iter()
+                .any(|s| matches!(s, Short::Timing(crate::TimingIssue::Warming))),
+            "short of the first look's warming: {short}"
+        ),
+        other => panic!(
+            "a stop the measured look saw at its GPU read ends the wait as stopped: {other:?}"
+        ),
+    }
+    assert!(
+        s.ledger.list().unwrap().is_empty(),
+        "the stopped wait left nothing behind"
+    );
+}
+
+#[cfg(unix)]
+const STOP_INSIDE_A_LOOK: &str = "ATERM_CAPACITY_STOP_INSIDE_A_LOOK";
+
+/// A Release laid, or an interrupt that comes, while a Background wait is between two of its
+/// asks ends that wait as [`Error::Stopped`] (`signal: None` for the Release, the signal for the
+/// interrupt), never as a ledger failure, at whichever ask first sees it: a look's own check
+/// included, where the Release that failed `a_release_queued_while_background_waits_stops_before_grant`
+/// (`Err(Ledger(Kind(Interrupted)))`) was first seen. Each sweep lays the Release, or raises
+/// SIGTERM, from inside the `ask`th ask of the caller's stop, which the wait makes before it
+/// reads the ledger for a Release and after it looked for a caught interrupt. A SIGTERM raised
+/// inside a look whose reading also finds the need fit is seen by that look, which admits
+/// nothing. A dedicated stand-in runs the sweeps: Background work leads its own process group,
+/// and the raised SIGTERM is its own. NEGATIVE CONTROLS, by hand: with a look's stop answered as
+/// `Error::Ledger(Interrupted)`, as it was, the stand-in failed at the Release laid at its third
+/// ask, the look's first check; with that stop answered as `signal: None`, at the SIGTERM raised
+/// at its second ask, which the look's first check was the first to see; with the look asked
+/// the caller's stop alone, blind to the watch, the fitting look admitted the wait, for the
+/// check after it to take back.
+#[cfg(unix)]
+#[test]
+fn a_release_or_interrupt_first_seen_by_a_looks_own_check_ends_a_background_wait_as_stopped() {
+    let Some(dir) = std::env::var_os(STOP_INSIDE_A_LOOK).map(PathBuf::from) else {
+        let s = scratch("stop-inside-a-look");
+        let machine = mac48();
+        let ordinary = admitted(
+            enter(&s, &machine, Need::new("ordinary core holder").cores(14)),
+            &machine,
+        );
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        let child = command
+            .args([
+                "--exact",
+                "tests::a_release_or_interrupt_first_seen_by_a_looks_own_check_ends_a_background_wait_as_stopped",
+                "--nocapture",
+            ])
+            .env(STOP_INSIDE_A_LOOK, s.dir.path())
+            .process_group(0)
+            .spawn()
+            .expect("the dedicated Background stand-in");
+        let mut background = BackgroundWaiter {
+            child,
+            abort: s.dir.path().join("abort"),
+        };
+        let pid = background.child.id();
+        let status = aterm_spec::wait::until_while_working(pid, "the stand-in's sweeps", || {
+            background.child.try_wait().unwrap()
+        });
+        assert!(status.success(), "the sweep stand-in succeeded: {status}");
+        assert!(s.dir.path().join("swept").exists());
+        drop((ordinary, background));
+        return;
+    };
+
+    // SIGTERM at its default action, whatever this test binary was started with: the wait's
+    // watch leaves an ignored one ignored, and the raise below would then be lost.
+    // SAFETY: SIG_DFL is a disposition, no handler of ours; this stand-in runs alone.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+    }
+    let ledger = Ledger::at(dir.join("ledger"));
+    let parent = std::os::unix::process::parent_id();
+    let abort = dir.join("abort");
+    let gone = || abort.exists() || std::os::unix::process::parent_id() != parent;
+    let only_the_holder = |ask: usize| {
+        assert_eq!(
+            ledger
+                .list()
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.need.what, row.held.is_some()))
+                .collect::<Vec<_>>(),
+            [("ordinary core holder".to_owned(), true)],
+            "the stopped Background wait at ask {ask} left nothing behind"
+        );
+    };
+    let wait = |stop: &dyn Fn() -> bool| {
+        admit_until(
+            &ledger,
+            &mac48(),
+            Need::new("waiting background").cores(14),
+            Admit::Preemptible,
+            Pace {
+                poll: Duration::from_millis(1),
+                ..Pace::default()
+            },
+            &mut |_| {},
+            stop,
+        )
+    };
+    for ask in 1..=STOP_ASKS {
+        let asks = std::cell::Cell::new(0);
+        let release = std::cell::RefCell::new(None);
+        let stopped = wait(&|| {
+            asks.set(asks.get() + 1);
+            if asks.get() == ask {
+                let laid = Waiter::enter(
+                    &ledger,
+                    &mac48(),
+                    Need::new("release laid inside a wait")
+                        .rank(crate::Rank::Release)
+                        .cores(14),
+                )
+                .expect("the Release enters");
+                *release.borrow_mut() = Some(laid);
+            }
+            gone()
+        });
+        assert!(
+            matches!(stopped, Err(Error::Stopped { signal: None, .. })),
+            "a Release laid at ask {ask} ends the wait as stopped: {stopped:?}"
+        );
+        drop(release.into_inner().expect("the Release was laid"));
+        only_the_holder(ask);
+    }
+    for ask in 1..=STOP_ASKS {
+        let asks = std::cell::Cell::new(0);
+        let stopped = wait(&|| {
+            asks.set(asks.get() + 1);
+            if asks.get() == ask {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "SIGTERM, no core signal, raised in this isolated stand-in while the \
+                              wait's watch holds its handler, which only notes it"
+                )]
+                // SAFETY: `raise` takes a signal number and touches no memory of ours.
+                let raised = unsafe { libc::raise(libc::SIGTERM) };
+                assert_eq!(raised, 0, "SIGTERM was raised at ask {ask}");
+            }
+            gone()
+        });
+        assert!(
+            matches!(
+                stopped,
+                Err(Error::Stopped {
+                    signal: Some(libc::SIGTERM),
+                    ..
+                })
+            ),
+            "SIGTERM raised at ask {ask} ends the wait as stopped by it: {stopped:?}"
+        );
+        only_the_holder(ask);
+    }
+
+    // SIGTERM raised inside a look whose reading also ends the wait's holder, so the look finds
+    // the need fit: only the wait's watch tells the look of it, at its ask after that reading.
+    let fitting = Ledger::at(dir.join("fitting"));
+    let m = mac48();
+    let holder = std::cell::RefCell::new(Some(admitted(
+        Waiter::enter(&fitting, &m, Need::new("memory holder").mem_gib(30))
+            .expect("the holder enters"),
+        &m,
+    )));
+    let machine = InsideTheLook::new(|| {
+        holder.borrow_mut().take();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "SIGTERM, no core signal, raised in this isolated stand-in while the wait's \
+                      watch holds its handler, which only notes it"
+        )]
+        // SAFETY: `raise` takes a signal number and touches no memory of ours.
+        let raised = unsafe { libc::raise(libc::SIGTERM) };
+        assert_eq!(raised, 0, "SIGTERM was raised in the look");
+    });
+    let (stopped, rows) = crate::admission_log::capture(Ledger::at(dir.join("fitting")), || {
+        admit_until(
+            &fitting,
+            &machine,
+            Need::new("waiting for memory").mem_gib(20),
+            Admit::Preemptible,
+            Pace {
+                poll: Duration::from_millis(1),
+                ..Pace::default()
+            },
+            &mut |_| machine.armed.set(true),
+            &gone,
+        )
+    });
+    match &stopped {
+        Err(Error::Stopped {
+            signal: Some(libc::SIGTERM),
+            short: Some(short),
+        }) => names(&short.to_string(), &["short by 10 GiB"]),
+        other => panic!(
+            "SIGTERM raised in a look that found the need fit ends the wait as stopped by it, \
+             short of what the look before found: {other:?}"
+        ),
+    }
+    let looks = |admitted: bool| {
+        rows.iter().any(|r| {
+            r.kind() == "look"
+                && r.get("what").and_then(|w| w.as_str()) == Some("waiting for memory")
+                && r.flag("admitted") == admitted
+        })
+    };
+    assert!(
+        looks(false),
+        "the wait's first look, short, was captured: {rows:?}"
+    );
+    assert!(
+        !looks(true),
+        "the look SIGTERM came in admitted nothing: {rows:?}"
+    );
+    assert!(
+        fitting.list().unwrap().is_empty(),
+        "the stopped wait left nothing behind"
+    );
+    std::fs::write(dir.join("swept"), "").expect("write the sweep marker");
+}
+
 #[cfg(unix)]
 #[test]
 fn background_standin() {
@@ -4746,9 +5365,16 @@ fn a_stopped_wait_leaves_the_queue_naming_what_it_was_short_of() {
             let _ = ended.send(got.map(|c| c.record().need.what.clone()));
         });
     }
-    let first = heard
-        .recv_timeout(MUST_HAPPEN)
-        .expect("B's first wait line");
+    let first = match heard.recv_timeout(MUST_HAPPEN) {
+        Ok(line) => line,
+        // Its thread dropped the line's sender: B's admission ended before its first line, and
+        // what it returned says why.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "B's admission ended before its first wait line: {:?}",
+            end.recv_timeout(MUST_HAPPEN)
+        ),
+        Err(timeout) => panic!("B's first wait line: {timeout}"),
+    };
     names(&first, &["B", "short by 10 GiB"]);
     assert!(
         s.ledger
@@ -7497,13 +8123,20 @@ fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
             assert_eq!(claim.record().need.what, "verify lint");
         } else {
             stop.store(true, Ordering::SeqCst);
-            assert!(
-                matches!(
-                    joined(waiting, "the stopped wait's end"),
-                    Err(Error::Stopped { .. })
+            match joined(waiting, "the stopped wait's end") {
+                Err(Error::Stopped { signal: None, .. }) => {}
+                // A run halted at its first red signals the test binaries still running, and
+                // this wait takes that signal as its stop: that first red is the run's.
+                Err(Error::Stopped {
+                    signal: Some(signal),
+                    ..
+                }) => panic!(
+                    "the wait told to stop ended by signal {signal}, not by its stop: a signal \
+                     reached this test binary, as a run halted at its first red sends one to \
+                     the test binaries still running; read that first red"
                 ),
-                "stopped"
-            );
+                other => panic!("the wait told to stop ended {other:?}"),
+            }
         }
     }
 }

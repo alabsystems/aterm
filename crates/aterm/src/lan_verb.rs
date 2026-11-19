@@ -2,10 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm lan`, hidden (docs/DESIGN-lan-broker-2026-11-05.md): `serve --source <bundle>`, the
-//! root LAN broker its LaunchDaemon runs; `status`, the broker's hello for `aterm doctor` and
-//! the lab lane; and `fdpass <host> <port> <seconds>`, the `ProxyCommand` of every `ssh` the
-//! machines controller runs, which connects through the broker and passes the connection to
-//! `ssh` ([`aterm_machines::controller::lan_proxy`]).
+//! root LAN broker its LaunchDaemon runs, with Spotlight's exclusion of the console account's
+//! own new home folders as its one duty beside the LAN; `status`, the broker's hello for
+//! `aterm doctor` and the lab lane; and `fdpass <host> <port> <seconds>`, the `ProxyCommand` of
+//! every `ssh` the machines controller runs, which connects through the broker and passes the
+//! connection to `ssh` ([`aterm_machines::controller::lan_proxy`]).
 
 use std::process::ExitCode;
 
@@ -47,7 +48,14 @@ fn serve(source: &str) -> ExitCode {
         source: source.into(),
         socket: aterm_uds::lan::socket_path(),
     };
-    match aterm_lan::serve(opts, kept) {
+    // Beside the LAN, the broker excludes from Spotlight the console account's own new
+    // top-level home folders, working the edit out from what root reads on this Mac.
+    let duties = aterm_lan::Duties {
+        scope: Some(aterm_machines::init_spotlight::broker_duty(
+            std::sync::Arc::new(aterm_machines::port::Live::new()),
+        )),
+    };
+    match aterm_lan::serve(opts, duties, kept) {
         Ok(()) => ExitCode::SUCCESS,
         // The broker reports its failure through the same bounded sink as its live work.
         Err(_) => ExitCode::FAILURE,

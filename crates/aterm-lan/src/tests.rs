@@ -1416,3 +1416,66 @@ fn the_broker_answers_the_spotlight_stores_size_read_only_and_bounded() {
         }]
     );
 }
+
+/// A duty that excludes one folder a request.
+struct OneFolder;
+
+impl aterm_uds::lan::ScopeDuty for OneFolder {
+    fn plan(&self, uid: u32) -> Result<aterm_uds::lan::ScopePlan, aterm_uds::lan::ScopeAnswer> {
+        Ok(aterm_uds::lan::ScopePlan {
+            uid,
+            folders: [std::path::PathBuf::from("/Users//alice/trust")].into(),
+        })
+    }
+
+    fn apply(&self, plan: &aterm_uds::lan::ScopePlan) -> aterm_uds::lan::ScopeAnswer {
+        aterm_uds::lan::ScopeAnswer::Excluded(u32::try_from(plan.folders.len()).unwrap())
+    }
+
+    fn now(&self) -> u64 {
+        0
+    }
+
+    fn sleep(&self, period: Duration) {
+        panic!("a first request waits no pace: {period:?}");
+    }
+}
+
+/// A `ScopeHome` over the real wire reaches the serving broker's duty and its answer comes
+/// back; a broker with no Spotlight duty (the direct path, a test's broker of the LAN alone)
+/// answers that it does not serve the request.
+/// NEGATIVE CONTROL: a `serving` that drops the duty answers the first case unserved.
+#[test]
+fn a_scope_request_is_answered_by_the_duty_and_none_is_unserved() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let socket = root.path().join("run").join("broker.sock");
+    let (started, _starts) = mpsc::channel();
+    let server = Server::bind(
+        &socket,
+        Admission::SameUid,
+        None,
+        Box::new(Fake(Mutex::new(started))),
+        Store::Unserved,
+    )
+    .unwrap()
+    .serving(crate::Duties {
+        scope: Some(std::sync::Arc::new(OneFolder)),
+    });
+    std::thread::spawn(move || {
+        let _ = server.run();
+    });
+    let served = Seam {
+        socket: Some(socket),
+        ..Seam::default()
+    };
+    assert_eq!(
+        seam_here(served, broker::scope_home),
+        aterm_uds::lan::ScopeAnswer::Excluded(1)
+    );
+
+    let (lan_alone, _root, _) = serve(Seam::default());
+    assert!(matches!(
+        seam_here(lan_alone, broker::scope_home),
+        aterm_uds::lan::ScopeAnswer::Unserved(words) if words.contains("no Spotlight duty")
+    ));
+}

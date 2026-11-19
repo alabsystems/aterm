@@ -1107,7 +1107,7 @@ Outside any lab (no jail, no stub):
   codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--expect-rollout bound|partial]
                    [--signed-original [--lose-settle-ack]]
                    [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--restart-only|--window-only
-                    |--capacity-only]
+                    |--capacity-only|--withheld-source-only|--withheld-source-tui-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake
                                  model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --terminals-only:
                                  the background terminals leg alone, about 1 min; --facts-only: the facts leg alone
@@ -1115,6 +1115,10 @@ Outside any lab (no jail, no stub):
                                  the default run; --upgrade-only: one live handoff; add --signed-original with both
                                  package paths to select two distinct installed signed builds in one private store
                                  (use a debug or dev-seams aterm for the private registry);
+                                 --withheld-source-only: the signed noninteractive CLI must fail its turn on a real
+                                 Responses 401 when the session credential is withheld;
+                                 --withheld-source-tui-only: require the signed TUI's original interactive turn to receive that
+                                 401 in a private headless terminal. A startup login gate is inconclusive;
                                  --lose-settle-ack: signed handoff with an explicit private debug fault host;
                                  --raw-upgrade-only: started through the produced primary with its managed entry
                                  absent, automatic crash repair, then a live handoff; --restart-only: an explicit restart

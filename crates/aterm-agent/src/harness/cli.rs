@@ -18142,13 +18142,21 @@ fn renew_one_observed(
             now,
             &mut None,
             policy,
-            |_, logins| {
+            |state, logins| {
                 if host.work_cancelled() {
                     return Err(RenewalFailure::cancelled().to_string());
                 }
                 guard.check(row)?;
                 accounts::admit_workflow(logins, label)?;
                 accounts::note_sign_in_task(logins, label, accounts::SignInAction::Renew, now);
+                // A bot protection the sign-in met is its path's observation, never its login's
+                // (plan package UB-05).
+                if observed
+                    .met()
+                    .is_some_and(|met| met.word.is_bot_protection())
+                {
+                    accounts::note_sign_in_unreached(state, label, now);
+                }
                 Ok(Vec::new())
             },
         );
@@ -21354,7 +21362,7 @@ fn renew_one_for_operation(
             event.workflow = Some(workflow);
             // Only a drive that bound no login is recorded as a sign-in row.
             event.step = (kind == accounts::Kind::SignIn).then_some(accounts::SignInStep::Failed);
-            accounts_observe_signin(store, roster_path, now, err, |raw, _, logins| {
+            accounts_observe_signin(store, roster_path, now, err, |raw, state, logins| {
                 plan.require_publication(host, store)?;
                 plan.require_workflow(raw, logins, label)?;
                 signin_policy_matches(row, raw, own_dir)?;
@@ -21366,11 +21374,13 @@ fn renew_one_for_operation(
                 }
                 // A bot protection's stop is the account's, apart from the row's workflow: only
                 // a login made for the row, or a signed-in `accounts browser` window, ends it
-                // (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3).
+                // (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3). It is its path's
+                // observation, never its login's (plan package UB-05).
                 if matches!(drove.outcome, Outcome::BotCheck(_))
                     && let Some(raw_row) = raw.row(label)
                 {
                     accounts::note_check_stop(logins, raw_row, now);
+                    accounts::note_sign_in_unreached(state, label, now);
                 }
                 plan.require_publication(host, store)?;
                 Ok(vec![event])

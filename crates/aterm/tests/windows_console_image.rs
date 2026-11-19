@@ -61,6 +61,32 @@ fn aterm_is_the_console_image_and_aterm_windowed_the_windowed_one() {
 }
 
 #[test]
+fn the_console_image_lists_shared_files_recorded_in_its_own_profile() {
+    let profile = aterm_tempfile::tempdir().unwrap();
+    let root = aterm_file::Root::for_home(profile.path());
+    let name = aterm_file::Name::parse("lab/machines").unwrap();
+    std::fs::create_dir_all(root.state_dir(&name)).unwrap();
+    std::fs::write(root.state(&name), aterm_file::State::default().encode()).unwrap();
+    let out = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm"))
+        .args(["file", "ls", "--json"])
+        .env("USERPROFILE", profile.path())
+        .env("LOCALAPPDATA", profile.path().join("local"))
+        .env("APPDATA", profile.path().join("roaming"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the offline file reader");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed: aterm_json::Value = aterm_json::from_slice(&out.stdout).unwrap();
+    let files = listed["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["file"].as_str(), Some("lab/machines"));
+}
+
+#[test]
 fn a_window_flag_the_parser_refuses_is_refused_by_the_console_image() {
     for (args, named) in [
         (&["--window", "--font-px", "abc"][..], "--font-px"),

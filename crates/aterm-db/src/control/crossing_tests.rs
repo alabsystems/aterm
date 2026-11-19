@@ -67,8 +67,8 @@ fn a_responder_rechecks_crossing_after_admission_before_its_hello() {
 }
 
 /// A responder whose custody's format mark names a later format, stored before its admission or
-/// after it, writes no hello: no database protocol states that format, so none is spoken, and the
-/// mark is read as the crossed mark is, before any record is loaded.
+/// after it, writes no hello: no legacy database protocol states that format, so none is spoken,
+/// and the mark is read as the crossed mark is, before any record is loaded.
 ///
 /// NEGATIVE CONTROL: with `require_legacy_records` reading the crossed mark alone (as first
 /// built), the responder wrote its hello (`marked before`).
@@ -346,7 +346,7 @@ fn legacy_exchange(
                 Some(&of_mac),
                 peer_side,
                 &mut Repair::default(),
-                Instant::now() + EXCHANGE,
+                EXCHANGE.horizon(Instant::now()),
                 protocol,
             );
         });
@@ -359,7 +359,7 @@ fn legacy_exchange(
             Some(&of_peer),
             side,
             &mut Repair::default(),
-            Instant::now() + EXCHANGE,
+            EXCHANGE.horizon(Instant::now()),
             protocol,
         );
         let Tee { stream, written } = stream;

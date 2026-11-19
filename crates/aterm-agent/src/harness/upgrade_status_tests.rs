@@ -7,7 +7,7 @@ use crate::supervise::ScratchDir;
 use std::path::PathBuf;
 
 const NOW: u64 = 1_790_311_076;
-const TAB: &str = "s-b5cf2faabac5ce5127bd";
+const TAB: &str = "tb5cf2faaba";
 
 #[test]
 fn a_retired_unissued_row_stays_quiet_and_reports_its_hold() {
@@ -4967,7 +4967,7 @@ fn a_release_still_owed_is_shown() {
     );
     assert_eq!(release(&released).as_deref(), Some(""));
     let codex = Row::of(
-        "codex-s-b5cf2faabac5ce5127bd",
+        &format!("codex-{TAB}"),
         &St {
             agent: upgrade::Agent::Codex,
             ..owed.clone()
@@ -9423,14 +9423,14 @@ fn an_unread_record_no_tab_is_known_for_keeps_its_conversations_tab() {
         ..St::default()
     };
     super::super::save_at(&o, "aaa", &pending(TAB), NOW);
-    super::super::save_at(&o, "ccc", &pending("s-two"), NOW);
+    super::super::save_at(&o, "ccc", &pending("tw000000002"), NOW);
     let tabs = [
         LiveTab {
             sid: TAB.to_string(),
             fgpgid: Some(7),
         },
         LiveTab {
-            sid: "s-two".to_string(),
+            sid: "tw000000002".to_string(),
             fgpgid: Some(8),
         },
     ];
@@ -9441,7 +9441,7 @@ fn an_unread_record_no_tab_is_known_for_keeps_its_conversations_tab() {
             sessions
                 .iter()
                 .map(|s| {
-                    let tab = if s == "aaa" { TAB } else { "s-two" };
+                    let tab = if s == "aaa" { TAB } else { "tw000000002" };
                     holder(s, "2.1.281", Some(tab))
                 })
                 .collect(),
@@ -9453,7 +9453,7 @@ fn an_unread_record_no_tab_is_known_for_keeps_its_conversations_tab() {
                 .iter()
                 .filter(|s| *s != "bbb")
                 .map(|s| {
-                    let tab = if s == "aaa" { TAB } else { "s-two" };
+                    let tab = if s == "aaa" { TAB } else { "tw000000002" };
                     holder(s, "2.1.281", Some(tab))
                 })
                 .collect(),
@@ -9469,23 +9469,23 @@ fn an_unread_record_no_tab_is_known_for_keeps_its_conversations_tab() {
     let mut view = View::default();
     assert_eq!(
         keeps(&mut view, &in_two),
-        ["s-two".to_string()],
+        ["tw000000002".to_string()],
         "the tab its conversation's process runs in, alone"
     );
     assert_eq!(view.unreadable(), std::slice::from_ref(&looped), "named");
     assert_eq!(
         keeps(&mut view, &unheld),
-        [TAB.to_string(), "s-two".to_string()],
+        [TAB.to_string(), "tw000000002".to_string()],
         "no process holds it in a tab: every live tab"
     );
     assert_eq!(view.unreadable(), std::slice::from_ref(&looped));
     std::fs::remove_file(&looped).expect("unloop");
     assert!(keeps(&mut view, &in_two).is_empty(), "read whole");
     assert!(view.unreadable().is_empty(), "read whole: none named");
-    super::super::save_at(&o, RECORD_PANICS, &pending("s-closed"), NOW);
+    super::super::save_at(&o, RECORD_PANICS, &pending("tc105ed0000"), NOW);
     assert!(keeps(&mut view, &in_two).is_empty(), "its tab closed");
     assert!(view.unreadable().is_empty(), "its tab closed: none named");
-    super::super::save_at(&o, RECORD_PANICS, &pending("s-two"), NOW);
+    super::super::save_at(&o, RECORD_PANICS, &pending("tw000000002"), NOW);
     let _ = keeps(&mut view, &in_two);
     assert_eq!(view.unreadable().len(), 1);
     view.stand_down(&mut |_| {});

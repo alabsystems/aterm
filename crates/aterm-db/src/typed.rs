@@ -36,6 +36,7 @@ pub use aterm_value_guard as guard;
 pub mod keys;
 pub mod owned;
 pub mod secret;
+pub mod state;
 pub mod values;
 pub mod view;
 pub use view::{Awaiting, Unread, View, refused_words};
@@ -175,8 +176,9 @@ pub enum Named {
 /// its application and the role of its first generation, the collection, and how the value
 /// names the row. A [`Ty::Ref`] names a row of its own table, which every write and read can
 /// judge there; a link's row lives in another table with generations of its own, so no rule of
-/// this table judges it: following it through the family's generations, and reporting one whose
-/// row is missing or retired, is the link check's (TK-07).
+/// this table judges it: following it through the family's generations ([`Link::follows`]), and
+/// reporting one whose row is missing or retired, is the link check's (`alab::link`,
+/// `lab::tracker::checks::links`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
     pub application: &'static str,
@@ -185,6 +187,17 @@ pub struct Link {
     pub role: &'static str,
     pub collection: &'static str,
     pub named: Named,
+}
+
+impl Link {
+    /// Whether `table` is a generation of the family this link names: the family's application,
+    /// and the role of its first generation with or without a later generation's number
+    /// (`registry`, `registry.4`). A link is followed in whichever of them holds the family's
+    /// rows now, its collection taken as that generation declares it.
+    #[must_use]
+    pub fn follows(&self, table: &Table) -> bool {
+        table.application == self.application && table.role.split('.').next() == Some(self.role)
+    }
 }
 
 /// A column's value type (design §3.3). Integers only: a percentage is `pct_x10`.

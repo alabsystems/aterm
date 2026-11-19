@@ -430,6 +430,9 @@ const RETIRED_GEMINI: &str = "gemini";
 /// A Codex TUI's run as its leaf's restore carries it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct CodexRestore {
+    /// Cold admission selected the default login before this relaunch was handed off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub selected_default: bool,
     pub home: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_env: Option<String>,
@@ -541,6 +544,7 @@ impl AgentRestore {
             run: match snap.run {
                 AgentRun::Claude => None,
                 AgentRun::Codex(run) => Some(RunRestore::Codex(CodexRestore {
+                    selected_default: run.selected_default,
                     home: run.home.to_string_lossy().into_owned(),
                     home_env: run.home_env,
                     embedded: true,
@@ -610,6 +614,7 @@ impl AgentRestore {
             (Agent::Codex, Some(RunRestore::Codex(run))) => {
                 let alab = run.alab.and_then(AlabRestore::into_valid_resume)?;
                 AgentRun::Codex(aterm_agent::harness::relaunch::CodexRun {
+                    selected_default: run.selected_default,
                     home: std::path::PathBuf::from(run.home),
                     home_env: run.home_env,
                     self_claimed: Some(alab),
@@ -819,7 +824,6 @@ impl AgentRestore {
         };
         let conversation = self.session.as_deref().filter(|id| is_session_id(id))?;
         let mut routed_alab: Option<AlabRestore> = None;
-        let mut routed_unset = Vec::new();
         let (env, line) = match run {
             None => (
                 [
@@ -832,8 +836,13 @@ impl AgentRestore {
                 aterm_agent::harness::upgrade_drive::resume_command_kept(&self.argv, conversation)?,
             ),
             Some(RunRestore::Codex(CodexRestore {
-                alab: Some(alab), ..
+                alab: Some(alab),
+                selected_default,
+                ..
             })) if alab.is_valid() => {
+                if *selected_default && alab.codex_auth_path.is_none() {
+                    routed_alab = Some(alab.clone());
+                }
                 if let Some(seat) = seat {
                     let ran_env: Vec<(&str, &str)> = alab
                         .codex_home
@@ -854,21 +863,11 @@ impl AgentRestore {
                     )
                     .ok()?
                     {
-                        let mut unset =
-                            aterm_agent::harness::relaunch::pool_args(Cli::Codex, &pick, None, &[])
-                                .ok()?
-                                .unset;
                         let mut candidate = alab.clone();
                         candidate.codex_auth_path = pick.value;
                         if !candidate.is_valid() {
                             return None;
                         }
-                        if candidate.codex_home.as_deref().is_none_or(str::is_empty)
-                            && !unset.contains(&CODEX_HOME_ENV)
-                        {
-                            unset.push(CODEX_HOME_ENV);
-                        }
-                        routed_unset = unset;
                         routed_alab = Some(candidate);
                     }
                 }
@@ -906,7 +905,10 @@ impl AgentRestore {
                 None,
                 None,
                 &env,
-                &routed_unset,
+                &aterm_agent::harness::relaunch::codex_resume_unset(
+                    alab.codex_auth_path.as_deref(),
+                    alab.codex_home.as_deref(),
+                ),
                 Path::new(exe),
                 args,
             )

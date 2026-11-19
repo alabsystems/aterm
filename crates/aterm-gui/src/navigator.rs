@@ -125,6 +125,7 @@ pub(crate) fn word_of(facts: &WordFacts<'_>) -> Word {
                 | NeedWord::Login
                 | NeedWord::Memory
                 | NeedWord::Wall
+                | NeedWord::Unsupervised
                 | NeedWord::Approval
         )
     );

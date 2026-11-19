@@ -56,6 +56,11 @@ libc = { workspace = true }
 aterm-json = { workspace = true }
 # Lexical path comparison shared with policy code; the kernel observations stay here.
 aterm-path = { workspace = true }
+# The workspace's FxHash for the maps the process sweep keeps by pid (`coalitions::CoalitionIds`,
+# the unwaited-reap table): the kernel assigns pids, so pids made to collide need as many live
+# processes, which the process table bounds.
+# Workspace crate; its one dependency, astream-wire, has none and no platform code.
+aterm-hash = { workspace = true }
 
 # The Linux arm's one library: an NVIDIA card's busy figure is NVML's
 # (`libnvidia-ml.so.1`, which the proprietary driver installs), opened at run
@@ -89,8 +94,9 @@ aterm-uds = { workspace = true }
 # dev-only cycle.
 aterm-spec = { workspace = true }
 # The stuck engine's live check (`examples/stuck_live.rs`) hands what the job
-# probe reads to the pure engine, as the host will. Workspace crate, no
-# dependencies.
+# probe reads to the pure engine, as the host will. Workspace crate; its
+# dependencies, aterm-process-facts and aterm-hash (with astream-wire beneath
+# it), read no clock and no platform.
 aterm-vitals = { workspace = true }
 
 # The zombie-write test's stand-in (`src/procs.rs`) finishes its 8 MiB with a

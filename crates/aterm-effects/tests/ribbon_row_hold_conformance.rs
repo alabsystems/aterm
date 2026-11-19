@@ -15,8 +15,6 @@ fn config() -> Config {
         dark_theme: true,
         intensity: 1.0,
         duration: Duration::from_millis(400),
-        ribbon_tall: true,
-        ribbon_flat: false,
         theme_fg: 0x00e6_e6e6,
         theme_bg: 0x001c_1c1c,
         reduced_motion: false,

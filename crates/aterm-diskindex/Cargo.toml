@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-diskindex"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm's whole-volume disk index model: nodes with ids from (volume, inode), the fold rule and the 14,000-node bound, bytes by kind and age, the closed class, fate and proof word lists, the markers that prove build output, and the four laws as checked functions (docs/DESIGN-disk-map-2026-11-18.md §3.2, §6.1). A pure library: the walker that fills it is DC-33."
+
+[dependencies]
+
+[lints]
+workspace = true

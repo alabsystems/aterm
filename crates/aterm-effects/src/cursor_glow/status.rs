@@ -522,7 +522,8 @@ pub struct TrailStatus<'a> {
     pub intensity: f32,
     /// Whether the key seam is open ([`CursorGlow::sound_seam_open`]).
     pub sound_seam: bool,
-    /// Dark-theme ribbon presentation token.
+    /// The ribbon's body: `tall` for the rainbow, whose one body it is, and `none` for a style
+    /// that lays no ribbon.
     pub ribbon_look: &'static str,
     /// Cumulative admission scoreboard.
     pub tally: AdmissionTally,

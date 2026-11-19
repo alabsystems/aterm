@@ -92,12 +92,16 @@ pub(crate) enum PageRead {
 }
 
 impl PageRead {
-    /// What an untouched Number and Nickname field hold: the read's number (empty for a number
-    /// that holds no claim yet) and nickname; `None` before a read with a name lands.
-    fn held_texts(&self) -> Option<(&str, &str)> {
+    /// What this field opens with and whether it is a confirmed, chosen nickname.
+    fn field_text(&self, target: MachineText) -> Option<(&str, bool)> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = target;
         match self {
             #[cfg(target_os = "macos")]
-            Self::Read(read) => Some((read.held.number_text(), read.held.word.as_str())),
+            Self::Read(read) => Some(match target {
+                MachineText::Number => (read.held.number_text(), false),
+                MachineText::Nick => (&read.held.word, read.held.read && read.held.chosen_nick),
+            }),
             Self::Reading | Self::Unsupported(_) | Self::Unread(_) => None,
         }
     }
@@ -133,20 +137,27 @@ impl MachineText {
 pub(super) struct MachineField {
     pub(super) input: crate::native_text_input::TextInputState,
     pub(super) opened: String,
+    chosen_nick: bool,
 }
 
 impl MachineField {
-    fn new(held: &str) -> Self {
+    fn new((held, chosen_nick): (&str, bool)) -> Self {
         Self {
             input: crate::native_text_input::TextInputState::new(held.to_owned()),
             opened: held.to_owned(),
+            chosen_nick,
         }
     }
 
     /// Follow a read that found `fresh`: an untouched field takes it, and a typed one keeps its
     /// text but is judged against `fresh` from now on.
-    fn follow(&mut self, fresh: &str) {
-        let untouched = self.opened == self.input.value();
+    fn follow(&mut self, (fresh, chosen_nick): (&str, bool)) {
+        let untouched = if self.chosen_nick {
+            aterm_types::machine_name::Nickname::displays_as(self.input.value(), &self.opened)
+        } else {
+            self.opened == self.input.value()
+        };
+        self.chosen_nick = chosen_nick;
         fresh.clone_into(&mut self.opened);
         if untouched && self.input.value() != fresh {
             self.input = crate::native_text_input::TextInputState::new(fresh.to_owned());
@@ -198,11 +209,7 @@ impl MachineInputs {
         machine: &MachinePageState,
         target: MachineText,
     ) -> Option<&mut crate::native_text_input::TextInputState> {
-        let (number, nick) = machine.read.held_texts()?;
-        let held = match target {
-            MachineText::Number => number,
-            MachineText::Nick => nick,
-        };
+        let held = machine.read.field_text(target)?;
         Some(
             &mut self
                 .slot_mut(target)
@@ -213,14 +220,12 @@ impl MachineInputs {
 
     /// Follow the read `machine` shows ([`MachineField::follow`]).
     pub(super) fn follow(&mut self, machine: &MachinePageState) {
-        let Some((number, nick)) = machine.read.held_texts() else {
-            return;
-        };
-        if let Some(field) = &mut self.number {
-            field.follow(number);
-        }
-        if let Some(field) = &mut self.nick {
-            field.follow(nick);
+        for target in [MachineText::Number, MachineText::Nick] {
+            if let Some(field) = self.slot_mut(target)
+                && let Some(fresh) = machine.read.field_text(target)
+            {
+                field.follow(fresh);
+            }
         }
     }
 }
@@ -543,7 +548,9 @@ pub(super) mod edit {
             inputs: &MachineInputs,
         ) -> Self {
             let number = field(inputs.number.as_ref(), read.held.number_text());
-            let nick = field(inputs.nick.as_ref(), &read.held.word);
+            let nick = read
+                .held
+                .nickname_field(field(inputs.nick.as_ref(), &read.held.word));
             let line = verdict(&read.snapshot, &read.held, &number, &nick);
             let asked = request(&read.snapshot, &read.held, &number, &nick);
             let (label, action) = match &asked {

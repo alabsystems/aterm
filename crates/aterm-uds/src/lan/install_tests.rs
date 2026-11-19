@@ -1106,3 +1106,44 @@ fn the_source_is_the_bundle_the_executable_sits_in() {
     );
     assert_eq!(source_bundle(Path::new("/Applications/aterm.app")), None);
 }
+
+/// The broker serves this build's requests only from this build's own install: the plist and
+/// the image this build's, and launchd running it. An image still to be adopted runs an earlier
+/// build's broker, which may predate the request, and one the broker keeps over this build a
+/// later build's, whose requests this build cannot know; and `job` is read only where the files
+/// serve.
+/// NEGATIVE CONTROL: accepting an image still to be adopted, or one the broker keeps, counts
+/// another build's broker as serving this one.
+#[test]
+fn only_this_builds_own_running_install_serves_its_requests() {
+    let ours = Reading {
+        image: Part::Current,
+        plist: Part::Current,
+    };
+    assert!(ours.serves_with(|| Some(JobState::Running)));
+    assert!(!ours.serves_with(|| Some(JobState::Idle)));
+    assert!(!ours.serves_with(|| Some(JobState::Unloaded)));
+    assert!(!ours.serves_with(|| None));
+    let adopting = Reading {
+        image: Part::Adopting("ABCDE12345".into()),
+        ..ours.clone()
+    };
+    let kept = Reading {
+        image: Part::Kept {
+            team: "ABCDE12345".into(),
+            image: 9,
+            ours: 8,
+        },
+        ..ours.clone()
+    };
+    let differs = Reading {
+        plist: Part::Differs,
+        ..ours.clone()
+    };
+    for reading in [adopting, kept, differs] {
+        assert!(
+            !reading.serves_with(|| panic!("{reading:?} reads no job")),
+            "{reading:?}"
+        );
+    }
+}

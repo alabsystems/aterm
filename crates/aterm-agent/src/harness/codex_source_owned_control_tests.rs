@@ -176,7 +176,10 @@ fn physical_attachment_receipt_survives_contended_control_metadata() {
         // This is physical custody only; admission remains Busy until unlocked.
         let metadata = control.state.lock().unwrap();
         child.write_all(&nonce).unwrap();
-        assert_eq!(sender.join().unwrap(), Ok(()));
+        assert_eq!(
+            sender.join().unwrap(),
+            Ok(String::from_utf8(nonce.to_vec()).unwrap())
+        );
         assert_eq!(control.bound().err(), Some(Error::Busy));
         drop(metadata);
         control.bound().unwrap();

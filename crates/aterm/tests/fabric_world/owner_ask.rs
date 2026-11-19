@@ -2456,6 +2456,15 @@ fn hosted_stand_in_as(
         || host_log(&a).contains("EVENT idle").then_some(()),
     );
     let pid = launches(&a).first().expect("the native launch").0;
+    // The idle screen can arrive before the host's asynchronous snapshot. Every crash
+    // below needs the host to have recorded this process and its conversation first.
+    let snapshot =
+        format!("harness @{s}: the relaunch snapshot kept names pid {pid} and its conversation");
+    aterm_spec::wait::until_while_working(
+        a.pid(),
+        "the host's snapshot of the running stand-in",
+        || host_log(&a).contains(&snapshot).then_some(()),
+    );
     let args = atpkg::caller_shell::process_args(pid).expect("the stand-in's exec context");
     let observed = aterm_agent::harness::accounts::ProcessLogin::of_exec_env(&args.env)
         .map(|who| who.route == aterm_agent::harness::accounts::AuthRoute::Stored);

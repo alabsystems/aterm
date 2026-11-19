@@ -1077,3 +1077,23 @@ fn the_memo_scans_once_per_revision() {
         .unwrap();
     assert!(!Arc::ptr_eq(&first, &tab));
 }
+
+#[test]
+fn a_rectangular_scan_limits_ragged_tables_in_either_order() {
+    for text in ["a\tb\nc\n", "a\nb\tc\n"] {
+        assert_eq!(
+            Table::scan_rectangular(text, Delimiter::Tab, text.len(), 3).unwrap_err(),
+            TooLarge::Cells
+        );
+        assert_eq!(
+            Table::scan_rectangular(text, Delimiter::Tab, text.len(), 4)
+                .unwrap()
+                .columns(),
+            2
+        );
+        assert_eq!(
+            Table::scan_rectangular(text, Delimiter::Tab, text.len() - 1, 4).unwrap_err(),
+            TooLarge::Bytes(text.len())
+        );
+    }
+}

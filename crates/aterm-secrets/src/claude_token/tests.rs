@@ -76,12 +76,25 @@ struct Lab {
 
 #[cfg(unix)]
 impl Lab {
+    /// The lab [`Self::built`] makes, built once and written into each test's own folder under a
+    /// server of its own ([`LabTemplate`]), so nothing on disk is shared between tests.
     fn new() -> Self {
+        static TEMPLATE: std::sync::OnceLock<LabTemplate> = std::sync::OnceLock::new();
+        let macs = TEMPLATE
+            .get_or_init(|| off_this_thread(Self::built))
+            .start();
+        let m40 = Paths::for_home(&macs.root.path().join("m40"));
+        Self { macs, m40 }
+    }
+
+    /// m22 and m7 holding `[everyone] shared`, m40 let in by m7, and m22 and m7 synced since.
+    fn built() -> LabTemplate {
         let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
         let (m40, _, _) = let_in(&macs, "m40", "m40");
         sync(&macs.m22, None).expect("m22 syncs");
         sync(&macs.m7, None).expect("m7 syncs");
-        Self { macs, m40 }
+        let (m22, m7) = (macs.m22.clone(), macs.m7.clone());
+        LabTemplate::of(macs, &[&m22, &m7, &m40])
     }
 
     fn all(&self) -> [&Paths; 3] {

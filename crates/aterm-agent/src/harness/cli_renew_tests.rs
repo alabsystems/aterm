@@ -4008,6 +4008,125 @@ fn an_unattended_renewal_that_runs_out_leaves_no_provider_running() {
     );
 }
 
+/// A CLOUDFLARE-BLOCKED AUTOMATIC SIGN-IN NEVER STRIKES ITS LOGIN (plan package UB-05; the
+/// design's open question, "does a Cloudflare-blocked automatic sign-in come back as an
+/// `Outcome::Ended` and re-strike every 6 h?"): no. The unattended renewal whose page met
+/// Cloudflare's bot check or its block page ends `Renewal::BotCheck`, never an AI store outcome;
+/// it names the page it met, records a person's renewal task and the account's path observation
+/// (`accounts::Account::unreached`, `accounts::note_sign_in_unreached`), and its login's ledger
+/// is as its evidence left it: no strike, the verdict still the turn the login served, its
+/// binding's end unwritten. Nothing tries it again on any clock
+/// (the 6 h `PERSON_BACKOFF` parks only a stop no bot protection made:
+/// `accounts_sync`'s `try_again` tests), so nothing re-strikes either.
+/// NEGATIVE CONTROLS (2026-11-18, each restored with cp from a backup plus touch, confirmed with
+/// cmp): with the renewal's bot-check transaction also noting the login's end
+/// (`accounts::note_login_end`), the test fails: `a strike was written`; with it writing no path
+/// observation, it fails: `its path is recorded`.
+#[cfg(unix)]
+#[test]
+fn a_cloudflare_blocked_automatic_sign_in_never_strikes_its_login() {
+    for met in ["bot-check claude.ai", "block-page claude.ai"] {
+        let (tmp, env) = renew_env("renew-blocked-strike");
+        let program = tmp.path().join("provider");
+        aterm_tempfile::stand_in(
+            &program,
+            &format!(
+                "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet={met}\\n' > \"$ATERM_OPEN_URL_OUTCOME.part\"\nmv \"$ATERM_OPEN_URL_OUTCOME.part\" \"$ATERM_OPEN_URL_OUTCOME\"\nexit 1\n"
+            ),
+        )
+        .unwrap();
+        let host = NativeRenewal {
+            program,
+            user_home: env.home.clone().unwrap().into_os_string(),
+            within: aterm_spec::wait::MUST_HAPPEN,
+        };
+        let store = env.accounts_store();
+        let roster_path = env.accounts_roster().unwrap();
+        let served_at = env.now - 600;
+        store
+            .transact_logins(env.now, &mut None, |state, logins| {
+                Ok(accounts::observe_served(state, logins, "work-2", served_at))
+            })
+            .unwrap();
+        let ledger = |store: &accounts::Store| {
+            store
+                .load(env.now)
+                .unwrap()
+                .0
+                .accounts
+                .remove("work-2")
+                .map(|account| account.login)
+                .unwrap_or_default()
+        };
+        let before = ledger(&store);
+        assert_eq!(
+            before.verdict().map(|verdict| verdict.said),
+            Some(accounts::Said::Served),
+            "the login served before its renewal: {before:?}"
+        );
+        let roster = Roster::load(&roster_path).unwrap();
+        let row = roster.row("work-2").unwrap();
+        let logins = logins_of(&env);
+        let signin = crate::harness::sign_in_ladder::begun_fixture(
+            store.signin_now().unwrap().unwrap(),
+            Cli::Claude,
+            "work-2",
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = renew_one(
+            &env,
+            &host,
+            &store,
+            &signin,
+            accounts::RenewalPolicy {
+                roster_path: &roster_path,
+                roster: &roster,
+                row,
+                logins: &logins,
+            },
+            row.dir.as_deref(),
+            &RenewBrowser::Remote { opener: None },
+            &mut out,
+            &mut err,
+            &mut None,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(result, Renewal::BotCheck, "{met}: {err}");
+        let after = ledger(&store);
+        assert!(
+            after.struck.is_none(),
+            "{met}: a strike was written: {after:?}"
+        );
+        let unreached = store
+            .load(env.now)
+            .unwrap()
+            .0
+            .accounts
+            .remove("work-2")
+            .and_then(|account| account.unreached);
+        assert_eq!(
+            unreached.map(|obs| obs.at),
+            Some(env.now),
+            "{met}: its path is recorded"
+        );
+        assert_eq!(
+            after
+                .verdict()
+                .map(|verdict| (verdict.login, verdict.obs.at)),
+            Some((accounts::Login::Serves, served_at)),
+            "{met}: {after:?}"
+        );
+        assert!(err.contains("Cloudflare"), "{met}: the page it met: {err}");
+        let binding = logins_of(&env).get("work-2").cloned().unwrap_or_default();
+        assert_eq!(binding.ended_at, None, "{met}: its login's end");
+        assert_eq!(
+            binding.sign_in_task.map(|task| task.action),
+            Some(accounts::SignInAction::Renew),
+            "{met}: a person's renewal"
+        );
+    }
+}
+
 /// AN UNATTENDED RENEWAL THAT MET A CHECK IS HELD AS ONE, A BLOCK PAGE INCLUDED: Cloudflare's
 /// check and its block page each end the renewal as `BotCheck`, which records a task and is
 /// never retried as a failed authentication; a cancellation records nothing, and a browser that

@@ -5,13 +5,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// Why the act restarted its agent: the stall's remedy, or a person's own ask.
+/// Why the act restarted its agent: the stall's remedy, a person's own ask, aterm's harness
+/// watchdog, or aterm's memory ceiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
     /// A published stall stood for the process: the stall's remedy.
     Stall,
     /// Asked with no stall standing.
     Asked,
+    /// aterm's harness watchdog: the claimant gave no sign of life (its record stream missed
+    /// its beats, or its claim's re-exec grace ran out with the claimant still running).
+    Beat,
+    /// aterm's memory ceiling: the agent of a contract 4 claim holding `relaunch` grew past it,
+    /// and the harness was told to restart its child.
+    Memory,
 }
 
 impl Cause {
@@ -21,6 +28,8 @@ impl Cause {
         match self {
             Self::Stall => "stall",
             Self::Asked => "asked",
+            Self::Beat => "beat",
+            Self::Memory => "memory",
         }
     }
 
@@ -30,6 +39,8 @@ impl Cause {
         match word {
             "stall" => Some(Self::Stall),
             "asked" => Some(Self::Asked),
+            "beat" => Some(Self::Beat),
+            "memory" => Some(Self::Memory),
             _ => None,
         }
     }

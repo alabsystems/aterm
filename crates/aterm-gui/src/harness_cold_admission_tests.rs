@@ -17,6 +17,7 @@ fn retained_case(cold: bool) {
         program: "/opt/bin/codex".into(),
         argv: vec!["/opt/bin/codex".into()],
         run: AgentRun::Codex(CodexRun {
+            selected_default: false,
             home: "/tmp/codex-home".into(),
             home_env: None,
             self_claimed: Some(Resume {

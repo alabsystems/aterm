@@ -16,6 +16,10 @@ use aterm_agent::supervise::SupervisorConfig;
 mod retained_service;
 
 #[cfg(unix)]
+#[path = "codex_retained_control.rs"]
+pub(crate) mod retained_control;
+
+#[cfg(unix)]
 pub(crate) use retained_service::StartOwner;
 
 pub(crate) const fn cold_restart_qualified() -> bool {
@@ -80,6 +84,54 @@ pub(crate) struct SessionPolicy {
 }
 
 impl SessionPolicy {
+    #[cfg(unix)]
+    pub(crate) fn retained_request(
+        &self,
+        sources: &std::sync::Arc<aterm_agent::harness::codex_source_registry::Registry>,
+        frontend: aterm_agent::harness::codex_source_registry::ServiceFrontend,
+        master: std::os::fd::BorrowedFd<'_>,
+        operation: &str,
+        action: &retained_control::Action,
+    ) -> Result<aterm_json::Map, aterm_agent::harness::codex_source_registry::Error> {
+        use aterm_agent::harness::codex_source_registry::Error;
+        if !self.retained_constructor_enabled() {
+            return Err(Error::Unsupported);
+        }
+        #[cfg(any(test, debug_assertions))]
+        if self
+            .fixture
+            .as_ref()
+            .and_then(|fixture| fixture.retained_proof.as_ref())
+            .is_some_and(|launch| launch.native_transport_only())
+            && matches!(
+                action,
+                retained_control::Action::UiAck(_)
+                    | retained_control::Action::Promote(_)
+                    | retained_control::Action::SelectionUiAck(_)
+                    | retained_control::Action::SelectionPromote(_)
+            )
+        {
+            return Err(Error::Denied);
+        }
+        let deliveries: Vec<_> = {
+            let services = self.retained.try_lock().map_err(|_| Error::Busy)?;
+            services
+                .iter()
+                .filter(|service| {
+                    service.in_namespace(sources)
+                        && action.service().is_none_or(|id| service.id() == id)
+                })
+                .map(|service| service.delivery())
+                .collect()
+        };
+        for delivery in deliveries {
+            match delivery.request(self, sources, &frontend, master, operation, action) {
+                Err(Error::Denied) if action.service().is_none() => continue,
+                result => return result,
+            }
+        }
+        Err(Error::Denied)
+    }
     #[cfg(all(unix, debug_assertions))]
     pub(crate) fn observe_retained_backends(
         &self,
@@ -179,6 +231,9 @@ impl SessionPolicy {
         // service pair has passed its actual SDK and handover qualification.
         if !self.retained_constructor_enabled() {
             return Err(Error::Unsupported);
+        }
+        if sources.frontend_exec_peer(peer)? {
+            return Err(Error::Denied);
         }
         let selection =
             retained_service::Selection::capture(peer, &settings.arguments, settings.environment)
@@ -567,6 +622,7 @@ pub struct FixturePolicy {
     quota_rotation: bool,
     login_rotation: bool,
     quota_roots: Option<Vec<Vec<u8>>>,
+    retained_proof: Option<Arc<aterm_agent::harness::codex_enrollment::SourceProofLaunch>>,
 }
 
 #[cfg(all(unix, any(test, debug_assertions)))]
@@ -617,7 +673,19 @@ impl FixturePolicy {
             quota_rotation: false,
             login_rotation: false,
             quota_roots: None,
+            retained_proof: None,
         })
+    }
+
+    /// Retain the original authenticated CandidateLease/scope owners for this
+    /// explicit paired proof. Image names or wire build selectors cannot create it.
+    #[must_use]
+    pub fn with_retained_proof(
+        mut self,
+        launch: Arc<aterm_agent::harness::codex_enrollment::SourceProofLaunch>,
+    ) -> Self {
+        self.retained_proof = Some(launch);
+        self
     }
 
     /// An explicit Rust fixture owns this fault directory; installed policy

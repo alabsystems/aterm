@@ -383,6 +383,7 @@ fn each_bounded_kinds_longest_record_takes_its_most_bytes() {
         parents: parents.to_vec(),
         authored_ms: 7,
         body,
+        statement: None,
     };
     let longest = |body: Body| draft(&parents, body).sign(&A.seed(), A.incarnation());
     let node_pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x5a; 32]).unwrap();

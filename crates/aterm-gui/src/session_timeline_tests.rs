@@ -4,6 +4,135 @@
 use super::*;
 
 #[test]
+fn codex_adoption_records_changed_samples_and_retires_stale_foregrounds() {
+    use crate::codex_adoption::{Entry, Reading};
+    use aterm_sysprobe::volumes::FileId;
+    let source = crate::self_claim::Proven {
+        pid: 70,
+        start: "birth".into(),
+    };
+    let mut meta = SessionMeta::default();
+    let (rev, _) = meta.set_supervisor(
+        Some(SupervisorClaim {
+            holder: "codex-alab@70".into(),
+            conn: Some(41),
+            expires_us: Some(200),
+            proven: Some(source.clone()),
+            scoped: None,
+        }),
+        100,
+    );
+    let a = Entry {
+        build: 101,
+        file: FileId { dev: 1, ino: 10 },
+    };
+    let b = Entry {
+        build: 102,
+        file: FileId { dev: 1, ino: 20 },
+    };
+    let mut tl = SessionTimeline::for_test();
+    let clock = |tl: &mut SessionTimeline, wall_ms, mono_ms| {
+        tl.slog_mut()
+            .set_clock(crate::session_log::Clock::reading(move || {
+                aterm_slog::Stamp::new(wall_ms, mono_ms)
+            }));
+    };
+    clock(&mut tl, 5_000, 50);
+    assert_ne!(
+        tl.agent().program_pgid,
+        70,
+        "the presentation classifier has never run"
+    );
+    let samples = [
+        (Some(a), Some(a), "matched"),
+        (Some(a), Some(b), "differs"),
+        (None, Some(b), "unknown"),
+        (Some(b), Some(b), "matched"),
+    ];
+    for (running, selected, expected) in samples {
+        let reading = Reading { running, selected };
+        assert!(tl.observe_codex_adoption(rev, &source, 70, reading));
+        assert!(!tl.observe_codex_adoption(rev, &source, 70, reading));
+        let fields = tl.codex_adoption_fields(&meta, 105, 70).unwrap();
+        assert!(
+            fields.contains(&format!("codex_adoption={expected} ")),
+            "{fields}"
+        );
+    }
+    let rows: Vec<_> = tl
+        .since(None)
+        .filter(|e| e.kind == CODEX_ADOPTION)
+        .collect();
+    assert_eq!(rows.len(), samples.len());
+    assert!(
+        rows[1]
+            .payload
+            .contains("codex_running_build=101 codex_selected_build=102")
+    );
+    assert!(rows[2].payload.contains("codex_running_build=-"));
+    assert!(rows[3].payload.contains("pid=70 start=birth"));
+    clock(&mut tl, 4_900, 120_049);
+    assert!(
+        tl.codex_adoption_fields(&meta, 105, 70)
+            .unwrap()
+            .contains("codex_adoption=matched ")
+    );
+    clock(&mut tl, 4_900, 120_050);
+    assert_eq!(
+        tl.codex_adoption_fields(&meta, 105, 70).unwrap(),
+        "codex_adoption=unknown codex_running_build=- codex_selected_build=- codex_sampled_ms=5000"
+    );
+    clock(&mut tl, 125_000, 51);
+    assert!(
+        tl.codex_adoption_fields(&meta, 105, 70)
+            .unwrap()
+            .contains("codex_adoption=unknown ")
+    );
+    assert!(!tl.observe_codex_adoption(
+        rev,
+        &source,
+        70,
+        Reading {
+            running: Some(b),
+            selected: Some(b)
+        }
+    ));
+    assert_eq!(
+        tl.codex_adoption_fields(&meta, 105, 70).unwrap(),
+        "codex_adoption=matched codex_running_build=102 codex_selected_build=102 codex_sampled_ms=125000"
+    );
+    assert!(
+        tl.codex_adoption_fields(&meta, 201, 70).is_none(),
+        "expired claim"
+    );
+    let reading = Reading {
+        running: Some(b),
+        selected: Some(b),
+    };
+    assert!(!tl.observe_codex_adoption(rev, &source, 71, reading));
+    assert!(
+        tl.codex_adoption_fields(&meta, 106, 71).is_none(),
+        "shell in the foreground"
+    );
+    assert!(
+        tl.codex_adoption_fields(&meta, 106, -1).is_none(),
+        "unreadable foreground"
+    );
+    tl.note_foreground_group(71);
+    tl.note_foreground_group(70);
+    assert!(
+        tl.codex_adoption_fields(&meta, 107, 70).is_none(),
+        "departed and returned"
+    );
+    assert!(tl.observe_codex_adoption(rev, &source, 70, reading));
+    meta.set_supervisor(None, 108);
+    assert!(
+        tl.codex_adoption_fields(&meta, 108, 70).is_none(),
+        "released"
+    );
+}
+
+#[test]
 fn codex_token_observations_keep_the_provider_clock_across_unrelated_updates() {
     let mut tl = SessionTimeline::default();
     tl.note_foreground_group(70);

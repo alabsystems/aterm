@@ -78,6 +78,7 @@ fn selection_case(case: i64) -> bool {
         9 => fresh.tab.push_str("-new"),
         10 => {
             fresh.run = AgentRun::Codex(CodexRun {
+                selected_default: false,
                 home: "/other/codex".into(),
                 home_env: None,
                 self_claimed: None,

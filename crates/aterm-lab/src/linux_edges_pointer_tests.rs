@@ -26,25 +26,33 @@ fn client_placement_comes_from_the_exact_pid_and_excludes_sways_decorations() {
     let geometry = NativeGeometry::parse(DIMS).unwrap();
     let ssd = client(42, 0, 25, 2);
     let csd = client(42, 131, 122, 0);
-    assert_eq!(client_origin(&tree(&ssd), 42, geometry).unwrap(), (2, 25));
+    assert_eq!(
+        client_origin(&tree(&ssd), 42, geometry).unwrap(),
+        Placement::Ready((2, 25))
+    );
     assert_eq!(
         client_origin(&tree(&csd), 42, geometry).unwrap(),
-        (131, 122)
+        Placement::Ready((131, 122))
     );
     let decoy = client(41, 900, 900, 0);
     assert_eq!(
         client_origin(&tree(&format!("{decoy},{csd}")), 42, geometry).unwrap(),
-        (131, 122)
+        Placement::Ready((131, 122))
     );
     // A relayed GUI's app_id survives, but its compositor peer is the proxy.
     let proxied = tree(&client(77, 131, 122, 0));
-    assert!(client_origin(&proxied, 42, geometry).is_err());
-    assert_eq!(client_origin(&proxied, 77, geometry).unwrap(), (131, 122));
+    assert!(matches!(
+        client_origin(&proxied, 42, geometry),
+        Ok(Placement::Pending(_))
+    ));
+    assert_eq!(
+        client_origin(&proxied, 77, geometry).unwrap(),
+        Placement::Ready((131, 122))
+    );
     for bad in [
-        tree(&decoy),
         tree(&format!("{csd},{csd}")),
-        tree(&csd.replace("\"visible\":true", "\"visible\":false")),
-        tree(&csd.replace("\"width\":1014", "\"width\":1013")),
+        tree(&csd.replace("\"visible\":true", "\"ignored\":false")),
+        tree(&ssd.replace("\"width\":1014", "\"width\":1019")),
         tree(&csd.replace("\"pid\":42", "\"pid\":42,\"pid\":41")),
         tree(&csd.replace("\"pid\":42", "\"pid\":42.0")),
         tree(&client(42, i32::MAX, 0, 2)),
@@ -54,6 +62,33 @@ fn client_placement_comes_from_the_exact_pid_and_excludes_sways_decorations() {
     }
     let scaled = NativeGeometry::parse(&DIMS.replace("scale=1.00", "scale=2.00")).unwrap();
     assert!(client_origin(&tree(&csd), 42, scaled).is_err());
+}
+
+#[test]
+fn mapping_and_a_pending_configure_do_not_supply_pointer_coordinates() {
+    let launch = NativeGeometry::parse(DIMS).unwrap();
+    let tiled = NativeGeometry::parse(&DIMS.replace("surface_w=1014", "surface_w=1276")).unwrap();
+    let node = client(42, 0, 25, 2)
+        .replace("1018", "1280")
+        .replace("1014", "1276");
+    let mapped = tree(&node);
+    for (tree, geometry) in [
+        (tree(""), launch),
+        (
+            tree(&node.replace("\"visible\":true", "\"visible\":false")),
+            tiled,
+        ),
+        (mapped.clone(), launch),
+    ] {
+        assert!(matches!(
+            client_origin(&tree, 42, geometry),
+            Ok(Placement::Pending(_))
+        ));
+    }
+    assert_eq!(
+        client_origin(&mapped, 42, tiled).unwrap(),
+        Placement::Ready((2, 25))
+    );
 }
 
 #[test]
@@ -338,4 +373,19 @@ fn native_work_extends_the_existing_window_and_unknown_samples_cannot_close_it()
             .is_err()
         );
     }
+}
+
+#[test]
+fn answering_placement_queries_does_not_extend_the_hang_detector() {
+    let mut work = Progress::new(&[42]);
+    let at = |cpu| move |pid| reading(pid, &sample(pid, 7, cpu));
+    work.after_probe(at(4)).unwrap();
+    assert_eq!(work.observe(at(4)).unwrap(), Some(0));
+    work.after_probe(at(8)).unwrap();
+    assert_eq!(work.observe(at(8)).unwrap(), Some(0));
+    assert_eq!(work.observe(at(9)).unwrap(), Some(1));
+    assert!(
+        work.after_probe(|pid| reading(pid, &sample(pid, 8, 9)))
+            .is_err()
+    );
 }

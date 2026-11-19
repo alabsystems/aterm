@@ -1086,6 +1086,33 @@ pub fn owed_here(
     })
 }
 
+impl Reading {
+    /// Whether the broker serves this build's requests as the files read and launchd runs it,
+    /// with no password: the plist as this build writes it, the image this build's own code
+    /// ([`Part::Current`]), and launchd running the job (`job`, read only where both are so). Any
+    /// other build's image is another build's broker: one still to be adopted
+    /// ([`Part::Adopting`], [`Part::NotAdopted`]) may predate a request this build makes, and one
+    /// the broker keeps over this build ([`Part::Kept`]) is a later build's, whose requests this
+    /// build cannot know, so none of them serves it. A reading that serves still leaves the
+    /// broker's own answer to each request; one that does not is no promise it would refuse. It
+    /// is what an automatic ask reads before it owes setup's password a step the broker does
+    /// (`aterm_machines::root_steps::Owed::Spotlight`).
+    #[must_use]
+    pub fn serves_with(&self, job: impl FnOnce() -> Option<JobState>) -> bool {
+        self.plist == Part::Current
+            && self.image == Part::Current
+            && job() == Some(JobState::Running)
+    }
+}
+
+/// [`Reading::serves_with`] on this machine for this process's [`source_here`], read without
+/// root: `false` with no source and for a file reading that failed, so a step the broker does is
+/// still asked of setup's password where nothing says the broker serves.
+#[must_use]
+pub fn serves_this_build_here(job: impl FnOnce() -> Option<JobState>) -> bool {
+    read_here().is_some_and(|(_, reading)| reading.is_ok_and(|reading| reading.serves_with(job)))
+}
+
 /// Whether this process is a development build on a real Mac: the code the kernel loaded for it
 /// states no team [`Signer`] of [`BUNDLE_ID`] ([`development_at`], read at the path the kernel
 /// records for its image, `proc_pidpath`, against the cdhash it loaded, so a link a build

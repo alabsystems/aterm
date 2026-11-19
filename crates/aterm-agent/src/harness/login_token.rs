@@ -44,16 +44,44 @@
 //!   so no word on record is scoped to it, and it is `unknown`; an OAuth login's word is scoped to
 //!   the tokens its file held when it was read, so it is `unknown` from its CLI's next refresh
 //!   until the harness reads it again (`docs/KNOWN_ISSUES.md`, SF-34).
-//! - **Grok Build, Kimi Code and agy** state none yet (`docs/KNOWN_ISSUES.md`, SF-34).
+//! - **Grok Build, Kimi Code and agy** (SF-34b): an `oauth` login in its `login-file`, the one in
+//!   the row's own login home (its directory, else its store's default login home), read by its
+//!   client's reader (`login_token_stored.rs`: bounded, scrubbed, no value or error text leaving
+//!   it), issued at the renewal that made it and last used at its last served turn, `expired`
+//!   where the file holds no credential any more. A Grok or Kimi file whose own fields name
+//!   another account than the row expects states nothing for the row. No field these readers
+//!   read states when its CLI last refreshed it, so none states a refresh time.
+//!   - Grok Build's `auth.json`: its reader reads only its records' `key`, `user_id` and `email`
+//!     (grok 1.0.77's strings), since no signed-in file was measured, so it reads no end and no
+//!     refresh token from it and states no end. It holds no credential where its records state a
+//!     `key` and none is non-empty; one that states no `key` is held, as the harness counts a
+//!     non-empty file grok has not refused ([`super::grok_signin::login_accepted`]). `refused`
+//!     where this Mac marked grok's refusal of that very login, its `auth.json.refused` at least
+//!     as new as it ([`super::grok_signin::refused`]).
+//!   - Kimi Code's credential file (`credentials/<slot>.json`, the slot of the row's region; of
+//!     a row with none, the file its connector names): its access token's end, `expires_at`, is
+//!     stated where it holds no `refresh_token`; its `expires_in` is that token's lifetime, not
+//!     when the file was written. `refused` where this Mac recorded the issuer's refusal of that
+//!     very grant beside it (`shared_provider::kimi_rejected_snapshot`, whose record names the
+//!     file's bytes or the empty tokens the refusal left them; Unix only).
+//!   - agy's grant (`.gemini/antigravity-cli/antigravity-oauth-token`, Go's `oauth2.Token` in its
+//!     `token`): its access token's end, `expiry` (RFC 3339 in the zone it was made in), is
+//!     stated where it holds no `refresh_token`. Nothing on this Mac records Google's refusal of
+//!     a grant, so it is never `refused`.
 //!
 //! Nothing here holds, prints or logs a value: [`TokenFacts`] is closed words and Unix seconds,
 //! and each reader returns only those. The times are bounded where the journal takes them
 //! (`aterm_db::alab::journal::mine::checked`), so no number can carry a value's bytes either.
 
 use super::accounts::{self, AccountRecords, Cli, Row, Store};
+use super::cli::shared_provider::kimi_credential_path;
 use super::journal::Key;
+use crate::ai::connector::Region;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[path = "login_token_stored.rs"]
+mod stored;
 
 /// What kind of credential a sign-in runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,8 +132,8 @@ impl Kept {
 /// What it is now, as this Mac knows it without its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// Its login serves by the word on record, and it states no end (a grant its CLI renews) or
-    /// one more than 30 days away.
+    /// Its login serves by the word on record, and it states no end (a grant its CLI renews, or
+    /// one whose end nothing here reads) or one more than 30 days away.
     Valid,
     /// Its login serves by the word on record, and the end it states is 30 days or fewer away.
     Expiring,
@@ -143,7 +171,8 @@ pub struct TokenFacts {
     /// When the sign-in that made it, or a setup-token's mint, issued it.
     pub issued_at: Option<u64>,
     /// The end it states itself, where nothing renews it (a setup-token's, an access token's held
-    /// with no refresh token): `None` for a grant its CLI refreshes.
+    /// with no refresh token): `None` for a grant its CLI refreshes, and where nothing here reads
+    /// an end of it.
     pub expires_at: Option<u64>,
     /// When its CLI last refreshed it.
     pub refreshed_at: Option<u64>,
@@ -356,8 +385,10 @@ impl Judged {
 /// The facts of the credential `cli`'s roster row `row` (of the account `key`) signs in with at
 /// `now`, from `judged` (one read of its store `store`, [`Judged::of`]), the store's own login
 /// files and, for Claude Code, its token facts `setup` ([`SetupTokens::read`]), with the clock's
-/// next turn of them ([`Reading`]): no facts for a CLI whose reader states none yet, for a Codex
-/// row whose `auth.json` holds no credential this reads or another account's login.
+/// next turn of them ([`Reading`]): no facts for a Codex, Grok Build, Kimi Code or agy row whose
+/// login file is not there or holds nothing its reader reads (unreadable, larger than it reads,
+/// no JSON object, or no credential Codex signs in with), nor for one that holds another
+/// account's login by its own fields.
 #[must_use]
 pub fn read(
     cli: Cli,
@@ -390,33 +421,44 @@ pub fn read(
             }
         },
         Cli::Codex => codex_login(row, records, store, now),
-        Cli::Grok | Cli::Kimi | Cli::Agy => Reading::default(),
+        Cli::Grok => grok_login(row, records, store, now),
+        Cli::Kimi => kimi_login(row, records, store, now),
+        Cli::Agy => agy_login(row, records, store, now),
     }
 }
 
 /// The files [`read`] reads `row`'s credential from in its store `store`, for a reader that
-/// stamps them to know the facts may read otherwise: Claude Code's credential file names under
-/// the row's login home, Codex's `auth.json`, the refresh journal beside it and the
+/// stamps them to know the facts may read otherwise: under the row's login home, Claude Code's
+/// and agy's credential file names; Codex's `auth.json`, the refresh journal beside it and the
 /// configuration its credential context reads
-/// ([`super::codex_app_login::credential_files_in_home`]); none for a CLI whose reader states
-/// none. The store's own files and Claude Code's token facts ([`SetupTokens::files`]) are not
-/// among them.
+/// ([`super::codex_app_login::credential_files_in_home`]); Grok Build's `auth.json` and its
+/// refusal marker; Kimi Code's credential file of the row's region, with, on Unix, the
+/// configuration and refusal record its refusal is read from, or of a row with none, the file
+/// its connector names and the `credentials` folder the others are written into. The store's
+/// own files and Claude Code's token facts ([`SetupTokens::files`]) are not among them.
 #[must_use]
 pub fn files(cli: Cli, row: &Row, store: &Store) -> Vec<PathBuf> {
     let Some(home) = login_home(row, store) else {
         return Vec::new();
     };
+    let stores = || cli.connector().stores.iter().map(|name| home.join(name));
     match cli {
-        Cli::Claude => cli
-            .connector()
-            .stores
-            .iter()
-            .map(|name| home.join(name))
-            .collect(),
+        Cli::Claude | Cli::Agy => stores().collect(),
         Cli::Codex => store.user_home().map_or_else(Vec::new, |user_home| {
             super::codex_app_login::credential_files_in_home(&home, user_home)
         }),
-        Cli::Grok | Cli::Kimi | Cli::Agy => Vec::new(),
+        Cli::Grok => stores()
+            .flat_map(|file| {
+                let marker = super::grok_signin::refused_marker(&file);
+                [file, marker]
+            })
+            .collect(),
+        Cli::Kimi => match row.vendor.region {
+            Some(region) => std::iter::once(kimi_credential_path(&home, region))
+                .chain(kimi_refusal_files(&home, region))
+                .collect(),
+            None => stores().chain([home.join("credentials")]).collect(),
+        },
     }
 }
 
@@ -586,6 +628,137 @@ fn codex_login(row: &Row, records: &AccountRecords, store: &Store, now: i64) -> 
         }),
         turns: first_after(now, [turns, settles]),
     }
+}
+
+/// The login `row` signs in with in its CLI's own login file, as that file's reader read it
+/// (`stored`; Grok Build's, Kimi Code's and agy's): an OAuth grant in its `login-file`, issued at
+/// the renewal that made it and last used at its last served turn, with no refresh time (no
+/// field their readers read states one), ending at its access token's end only where it holds a
+/// credential and no refresh token; `refused` where this Mac recorded its client's refusal of
+/// that very login (`refused`), else `expired` where the file holds no credential any more or the
+/// row's login is signed out here, else by its end.
+fn file_login(
+    row: &Row,
+    records: &AccountRecords,
+    stored: stored::Stored,
+    refused: bool,
+    now: i64,
+) -> Reading {
+    let end = stored
+        .expires_at
+        .filter(|_| stored.held && !stored.refreshable);
+    let (by_end, turns) = by_end(end, serves(row, records), now);
+    let (issued_at, last_used) = issued_and_used(row, records);
+    Reading {
+        facts: Some(TokenFacts {
+            kind: Kind::OAuth,
+            kept: Some(Kept::LoginFile),
+            issued_at,
+            expires_at: end.and_then(secs),
+            refreshed_at: None,
+            last_used,
+            state: if refused {
+                State::Refused
+            } else if !stored.held || accounts::signed_out_here(row, &records.state) {
+                State::Expired
+            } else {
+                by_end
+            },
+        }),
+        turns,
+    }
+}
+
+/// Grok Build's login of `row`, from the `auth.json` in its login home, where its records name
+/// no other account than the row expects; `refused` where grok's refusal of that very file is
+/// marked beside it ([`super::grok_signin::refused`]).
+fn grok_login(row: &Row, records: &AccountRecords, store: &Store, now: i64) -> Reading {
+    let Some(file) = login_home(row, store)
+        .and_then(|home| crate::ai::connector::stored_login_file(Cli::Grok.connector(), &home))
+    else {
+        return Reading::default();
+    };
+    match stored::grok(&file, row.expected_identity_email()) {
+        Some(stored) => file_login(
+            row,
+            records,
+            stored,
+            super::grok_signin::refused(&file),
+            now,
+        ),
+        None => Reading::default(),
+    }
+}
+
+/// Kimi Code's login of `row`, from the credential file of its region's slot in its login home
+/// (of a row with no region, the file its connector names,
+/// [`crate::ai::connector::stored_login_file`]), where its token names no other account than
+/// the row expects; `refused` where this Mac recorded the issuer's refusal of that very grant
+/// ([`kimi_refused`]).
+fn kimi_login(row: &Row, records: &AccountRecords, store: &Store, now: i64) -> Reading {
+    let Some(home) = login_home(row, store) else {
+        return Reading::default();
+    };
+    let file = match row.vendor.region {
+        Some(region) => Some(kimi_credential_path(&home, region)),
+        None => crate::ai::connector::stored_login_file(Cli::Kimi.connector(), &home),
+    };
+    match file.and_then(|file| stored::kimi(&file, row.expected_identity_email())) {
+        Some(stored) => file_login(row, records, stored, kimi_refused(row, &home), now),
+        None => Reading::default(),
+    }
+}
+
+/// agy's login of `row`, from the grant in its login home (a whole home of its own, else the
+/// person's): never `refused`, since nothing here records Google's refusal of a grant.
+fn agy_login(row: &Row, records: &AccountRecords, store: &Store, now: i64) -> Reading {
+    match login_home(row, store)
+        .and_then(|home| crate::ai::connector::stored_login_file(Cli::Agy.connector(), &home))
+        .and_then(|file| stored::agy(&file))
+    {
+        Some(stored) => file_login(row, records, stored, false, now),
+        None => Reading::default(),
+    }
+}
+
+/// Whether this Mac recorded the issuer's refusal of the very grant `row`'s Kimi Code login in
+/// `home` holds (its region's slot): the record the refresh writes beside it names the account
+/// the row expects, the configuration its route reads, and the credential file's bytes or the
+/// empty tokens the refusal left there (`shared_provider::kimi_rejected_snapshot`). `false`
+/// where the row names no region or address, and where the record does not read.
+#[cfg(unix)]
+fn kimi_refused(row: &Row, home: &Path) -> bool {
+    row.vendor
+        .region
+        .zip(row.expected_identity_email())
+        .is_some_and(|(region, expected)| {
+            matches!(
+                super::cli::shared_provider::kimi_rejected_snapshot(home, region, expected),
+                Ok(Some(_))
+            )
+        })
+}
+
+/// Off Unix no refresh records a refusal: never.
+#[cfg(not(unix))]
+fn kimi_refused(_row: &Row, _home: &Path) -> bool {
+    false
+}
+
+/// The files [`kimi_refused`] reads beside a Kimi Code login in `home` of `region`: its
+/// configuration and the refusal record.
+#[cfg(unix)]
+fn kimi_refusal_files(home: &Path, region: Region) -> [PathBuf; 2] {
+    [
+        home.join("config.toml"),
+        super::cli::shared_provider::kimi_rejection_file(home, region),
+    ]
+}
+
+/// Off Unix [`kimi_refused`] reads none.
+#[cfg(not(unix))]
+fn kimi_refusal_files(_home: &Path, _region: Region) -> [PathBuf; 0] {
+    []
 }
 
 #[cfg(all(test, unix))]

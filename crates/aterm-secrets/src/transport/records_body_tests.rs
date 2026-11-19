@@ -168,6 +168,7 @@ fn selected_reader_refuses_a_total_past_the_wire_bound() {
             salt: [43; 32],
             ciphertext: vec![44; 512 * 1024].into(),
         },
+        statement: None,
     };
     let record = draft.sign(&[45; 32], [46; 16]).unwrap();
     let count = REPLY_CAP / record.bytes().len();

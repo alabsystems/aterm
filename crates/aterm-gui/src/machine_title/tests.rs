@@ -467,8 +467,8 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
         [1, 2, 3, 4],
         "number and nickname edits advance the same local revision"
     );
-    assert_eq!(applied[1].1, "m86 MissBunny");
-    assert_eq!(applied[2].1, "m87 MissBunny");
+    assert_eq!(applied[1].1, "m86 Miss Bunny");
+    assert_eq!(applied[2].1, "m87 Miss Bunny");
     assert_eq!(
         file::read(root.path())
             .expect("reads")

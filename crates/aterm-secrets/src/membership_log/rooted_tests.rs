@@ -131,7 +131,7 @@ impl World {
         audience: &EpochAudience,
     ) -> Option<(RecordId, Zeroizing<[u8; 32]>)> {
         let log = &self.logs[m];
-        let keys = log.unwrap_epochs(&self.macs[m].identity()).ok()?;
+        let keys = log.unwrap_epochs(self.macs[m].identity()).ok()?;
         log.newest_epochs(audience)
             .into_iter()
             .find_map(|e| keys.get(&e).map(|k| (e, k.clone())))
@@ -549,7 +549,7 @@ pub(in crate::membership_log) fn evaluated(log: &Log) -> String {
     );
     for mac in [A, B, C] {
         let exposed: Vec<(Audience, String)> =
-            log.read_after_cutoff(&mac.identity(), &C.id()).unwrap();
+            log.read_after_cutoff(mac.identity(), &C.id()).unwrap();
         out.push_str(&format!(
             "{} undo {:?} exposed to C {exposed:?}\n",
             label(mac),
@@ -557,7 +557,7 @@ pub(in crate::membership_log) fn evaluated(log: &Log) -> String {
         ));
     }
     for mac in [A, B, C] {
-        let opened = log.open_entry_set(&mac.identity()).unwrap();
+        let opened = log.open_entry_set(mac.identity()).unwrap();
         let read = opened.map(|o| {
             let entries: Vec<(String, Audience, Vec<u8>)> = o
                 .entries
@@ -588,7 +588,7 @@ fn evaluated_registers(log: &Log, skip: &BTreeSet<String>) -> String {
         out.push_str(&format!("{} undo {:?}\n", label(mac), log.undo(&mac.id())));
     }
     for mac in [A, B, C] {
-        let Some(o) = log.open_audience_entries(&mac.identity()).unwrap() else {
+        let Some(o) = log.open_audience_entries(mac.identity()).unwrap() else {
             out.push_str(&format!("{}: none\n", label(mac)));
             continue;
         };
@@ -635,32 +635,53 @@ fn evaluated_registers(log: &Log, skip: &BTreeSet<String>) -> String {
     out
 }
 
-/// Whether `rooted` evaluates as `whole`: membership, entries and registers, the heads and their
-/// digest.
+/// What [`assert_evaluates_as`] compares of a log: the heads and their digest, and what it
+/// evaluates to ([`evaluated`], [`evaluated_registers`]). Read once of a whole log, so that each
+/// log a test compares with it evaluates once and the whole log does not again for each.
+pub(in crate::membership_log) struct Evaluation {
+    heads_digest: [u8; 32],
+    heads: Vec<RecordId>,
+    evaluated: String,
+    registers: String,
+}
+
+impl Evaluation {
+    pub(in crate::membership_log) fn of(log: &Log) -> Self {
+        Self {
+            heads_digest: log.heads_digest(),
+            heads: log.heads(),
+            evaluated: evaluated(log),
+            registers: evaluated_registers(log, &BTreeSet::new()),
+        }
+    }
+}
+
+/// Whether `rooted` evaluates as the whole log `whole` was read of ([`Evaluation::of`]):
+/// membership, entries and registers, the heads and their digest.
 pub(in crate::membership_log) fn assert_evaluates_as(
     seed: u64,
     phase: &str,
     rooted: &Log,
-    whole: &Log,
+    whole: &Evaluation,
 ) {
     assert_eq!(
         rooted.heads_digest(),
-        whole.heads_digest(),
+        whole.heads_digest,
         "seed {seed} ({phase}): the heads digest is the whole log's"
     );
     assert_eq!(
         rooted.heads(),
-        whole.heads(),
+        whole.heads,
         "seed {seed} ({phase}): the heads stand"
     );
     assert_eq!(
         evaluated(rooted),
-        evaluated(whole),
+        whole.evaluated,
         "seed {seed} ({phase}): the rooted log evaluates as the whole log"
     );
     assert_eq!(
         evaluated_registers(rooted, &BTreeSet::new()),
-        evaluated_registers(whole, &BTreeSet::new()),
+        whole.registers,
         "seed {seed} ({phase}): the rooted log's registers and keyed epochs read as the whole log's"
     );
 }
@@ -891,7 +912,7 @@ fn vault_checkpoint_pruning_preserves_the_evaluated_state_over_random_dags() {
             expected,
             "seed {seed}: each record's past is its whole past less the dropped records"
         );
-        assert_evaluates_as(seed, "first", &rooted, &whole);
+        assert_evaluates_as(seed, "first", &rooted, &Evaluation::of(&whole));
         let Body::Checkpoint { cut_ms, .. } = plan.body else {
             panic!("a checkpoint");
         };
@@ -909,7 +930,7 @@ fn vault_checkpoint_pruning_preserves_the_evaluated_state_over_random_dags() {
         let whole = world.whole();
         let mut rooted = rooted;
         rooted.merge(&whole).unwrap();
-        assert_evaluates_as(seed, "after the cut", &rooted, &whole);
+        assert_evaluates_as(seed, "after the cut", &rooted, &Evaluation::of(&whole));
         assert!(
             settled(&whole) && settled(&rooted),
             "seed {seed}: both logs hold the root settled"
@@ -962,8 +983,9 @@ fn vault_checkpoint_pruning_preserves_the_evaluated_state_over_random_dags() {
             settled_ids(&whole),
             "seed {seed}: the log pruned twice holds settled what the whole log does"
         );
-        assert_evaluates_as(seed, "pruned twice", &again, &whole);
-        assert_evaluates_as(seed, "pruned once there", &once, &whole);
+        let evaluation = Evaluation::of(&whole);
+        assert_evaluates_as(seed, "pruned twice", &again, &evaluation);
+        assert_evaluates_as(seed, "pruned once there", &once, &evaluation);
         assert_eq!(
             again.rooting().unwrap().roots.len(),
             1,
@@ -1781,7 +1803,7 @@ fn vault_checkpoint_a_remove_whose_cutoff_was_dropped_counts() {
     // settled, checkpoint, where both read none
     // (`vault_checkpoint_a_remove_behind_a_final_cut_revives_nothing`).
     let values = |log: &Log| {
-        log.open_entry_set(&B.identity()).unwrap().map(|opened| {
+        log.open_entry_set(B.identity()).unwrap().map(|opened| {
             opened
                 .entries
                 .iter()
@@ -1869,7 +1891,7 @@ pub(in crate::membership_log) fn carry_of_dropped(
 /// What `mac`'s register reads each held carry among the siblings of `log` as standing for: the
 /// op whose value it carries.
 fn carried(log: &Log, mac: Mac) -> BTreeMap<RecordId, RecordId> {
-    log.open_audience_entries(&mac.identity())
+    log.open_audience_entries(mac.identity())
         .unwrap()
         .map(|opened| opened.carried)
         .unwrap_or_default()
@@ -2518,7 +2540,7 @@ fn final_cut_over_a_superseded_put() -> (Log, Body, RecordId, Log) {
 
 /// The names of the entries `mac` reads in conflict in `log`.
 fn conflicted(log: &Log, mac: Mac) -> BTreeSet<String> {
-    log.open_audience_entries(&mac.identity())
+    log.open_audience_entries(mac.identity())
         .unwrap()
         .map(|opened| {
             opened
@@ -2532,7 +2554,7 @@ fn conflicted(log: &Log, mac: Mac) -> BTreeSet<String> {
 
 /// What `mac` reads of each entry of `log`: its name and value.
 fn values(log: &Log, mac: Mac) -> Option<Vec<(String, Vec<u8>)>> {
-    log.open_entry_set(&mac.identity()).unwrap().map(|opened| {
+    log.open_entry_set(mac.identity()).unwrap().map(|opened| {
         opened
             .entries
             .iter()
@@ -3295,7 +3317,13 @@ struct ChainCoverage {
     caught_up: usize,
 }
 
-/// Over the seeded random vaults of
+/// The seeds [`vault_checkpoint_chains_of_cuts_read_each_stub_as_the_whole_log_over_random_dags`]
+/// runs: half of [`SEEDS`]. Nearly every seed makes a chain in each phase, and each case its
+/// coverage counts arises in about one chain in two or more, so half the seeds meet every floor
+/// many times over; each of its negative controls fails at seed 1 or 2.
+const CHAIN_SEEDS: u64 = SEEDS / 2;
+
+/// Over the first [`CHAIN_SEEDS`] of the seeded random vaults of
 /// [`vault_checkpoint_pruning_preserves_the_evaluated_state_over_random_dags`], a chain of three
 /// cuts: `K` at the first, `E` at a later one before any Mac but A shares `K` (A shares it inside
 /// `E`'s cut in every other seed, a minority), and then, every Mac having shared `K` (and, in
@@ -3352,7 +3380,7 @@ fn vault_checkpoint_chains_of_cuts_read_each_stub_as_the_whole_log_over_random_d
         _ => panic!("a checkpoint"),
     };
     let later = |world: &World| world.clock + MIN_AGE_MS + budgets::WINDOW_SKEW_MS + HOUR;
-    for seed in 1..=SEEDS {
+    for seed in 1..=CHAIN_SEEDS {
         let minority = seed % 2 == 1;
         for early_in_late in [false, true] {
             let phase = if early_in_late {
@@ -3436,16 +3464,22 @@ fn vault_checkpoint_chains_of_cuts_read_each_stub_as_the_whole_log_over_random_d
             let now = later(&world) + DAY_MS;
             let next = propose(&whole, now).map(|plan| checkpoint_id(&plan.body));
             coverage.next_proposals += usize::from(next.is_some());
+            // The whole log's side of every comparison below, read once.
+            let (whole_settled, whole_early, evaluation) = (
+                settled(&whole),
+                checkpoint::judge(&whole, &early.body).unwrap(),
+                Evaluation::of(&whole),
+            );
             let as_whole = |log: &Log, which: &str| {
                 assert_eq!(
                     settled(log),
-                    settled(&whole),
+                    whole_settled,
                     "seed {seed} ({phase}, {which}): the rooted log holds settled what the whole \
                      log does"
                 );
                 assert_eq!(
                     checkpoint::judge(log, &early.body).unwrap(),
-                    checkpoint::judge(&whole, &early.body).unwrap(),
+                    whole_early,
                     "seed {seed} ({phase}, {which}): the rooted log judges `E` as the whole log"
                 );
                 let gone = checkpoint::gone(log).unwrap_or_default();
@@ -3457,7 +3491,7 @@ fn vault_checkpoint_chains_of_cuts_read_each_stub_as_the_whole_log_over_random_d
                         .all(|id| gone.contains(&log.position(id).unwrap())),
                     "seed {seed} ({phase}, {which}): every stub counts nowhere in the rooted log"
                 );
-                assert_evaluates_as(seed, &format!("{phase}, {which}"), log, &whole);
+                assert_evaluates_as(seed, &format!("{phase}, {which}"), log, &evaluation);
                 assert_eq!(
                     propose(log, now).map(|plan| checkpoint_id(&plan.body)),
                     next,
@@ -3522,14 +3556,19 @@ fn vault_checkpoint_chains_of_cuts_read_each_stub_as_the_whole_log_over_random_d
                     holding(peer),
                     "seed {seed} ({phase}): a Mac at `K` holds what its peer {which} holds"
                 );
-                assert_evaluates_as(seed, &format!("{phase}, caught up {which}"), log, &whole);
+                assert_evaluates_as(
+                    seed,
+                    &format!("{phase}, caught up {which}"),
+                    log,
+                    &evaluation,
+                );
                 coverage.caught_up += 1;
             }
         }
     }
     eprintln!("{coverage:?}");
     assert!(
-        coverage.chains * 2 >= usize::try_from(SEEDS).unwrap(),
+        coverage.chains * 2 >= usize::try_from(CHAIN_SEEDS).unwrap(),
         "{coverage:?}"
     );
     assert!(
@@ -3583,7 +3622,7 @@ fn vault_checkpoint_a_version_one_op_beside_a_cut_reads_as_the_whole_log() {
                 "held before the prune"
             };
             let (mut whole, body, first, stale) = final_cut_over_a_superseded_put();
-            let keys = stale.unwrap_epochs(&C.identity()).unwrap();
+            let keys = stale.unwrap_epochs(C.identity()).unwrap();
             let epoch = stale.newest_epochs(&EpochAudience::Everyone)[0];
             let key = &keys[&epoch];
             let at = T + 3 * DAY_MS;
@@ -3640,3 +3679,6 @@ fn vault_checkpoint_a_version_one_op_beside_a_cut_reads_as_the_whole_log() {
         }
     }
 }
+
+#[path = "rooted_readers_tests.rs"]
+mod readers;

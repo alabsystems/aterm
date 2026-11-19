@@ -166,6 +166,83 @@ fn an_expired_local_broker_hello_is_still_refused() {
     ));
 }
 
+/// A stand-in broker at `path` that says its hello, reads the client's hello and request, then
+/// answers with `answer` (none: it closes, as a broker whose wire predates the request does
+/// once it cannot read it). It returns the request it read.
+fn stand_in(path: &Path, answer: Option<Frame>) -> std::thread::JoinHandle<Option<Request>> {
+    let listener = crate::kept_out(|| crate::CtlListener::bind(path)).unwrap();
+    let ours = super::super::protocol();
+    std::thread::spawn(move || {
+        let (stream, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
+        io::Write::write_all(&mut &stream, &hello(ours)).unwrap();
+        let mut reader = Reader::new(0);
+        let deadline = Some(Instant::now() + Duration::from_secs(60));
+        assert!(matches!(
+            reader.frame(&stream, deadline),
+            Ok(Some(Frame::Hello { .. }))
+        ));
+        let request = match reader.frame(&stream, deadline) {
+            Ok(Some(Frame::Request(request))) => Some(request),
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            wire::send(&stream, &answer).unwrap();
+        }
+        request
+    })
+}
+
+/// The Spotlight request goes to the broker alone and reads each of its answers: a broker
+/// that closes after its hello (one whose wire predates the request) is unserved, naming its
+/// build, as no broker at all is; a count is what it excluded; a refusal keeps its words.
+/// NEGATIVE CONTROL: reading a close after the hello as nothing excluded fails the first case.
+#[test]
+fn the_spotlight_request_reads_each_answer_and_an_older_broker_as_unserved() {
+    let dir = aterm_tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    let ours = super::super::protocol();
+    let path = dir.path().join("old.sock");
+    let older = stand_in(&path, None);
+    match scope_home_at(&path, ours) {
+        ScopeAnswer::Unserved(why) => {
+            assert!(
+                why.contains("build kernel-hello") && why.contains("predates"),
+                "{why}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(older.join().unwrap(), Some(Request::ScopeHome));
+
+    let path = dir.path().join("new.sock");
+    let current = stand_in(&path, Some(Frame::Scoped { added: 3 }));
+    assert_eq!(scope_home_at(&path, ours), ScopeAnswer::Excluded(3));
+    assert_eq!(current.join().unwrap(), Some(Request::ScopeHome));
+
+    let path = dir.path().join("refuses.sock");
+    let refuses = stand_in(
+        &path,
+        Some(Frame::Error {
+            code: libc::EPERM,
+            words: "not the console's".into(),
+        }),
+    );
+    assert_eq!(
+        scope_home_at(&path, ours),
+        ScopeAnswer::Refused("not the console's".into())
+    );
+    refuses.join().unwrap();
+
+    match scope_home_at(&dir.path().join("none.sock"), ours) {
+        ScopeAnswer::Unserved(why) => assert!(why.contains("not installed"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// A browse's add of instance `name`, as the broker streams it.
 fn added(name: &str) -> Event {
     Event::Added(wire::Instance {

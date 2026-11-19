@@ -513,6 +513,7 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
             cwd: "/work".into(),
             version: Some("0.165.0".into()),
             run: crate::harness::relaunch::AgentRun::Codex(crate::harness::relaunch::CodexRun {
+                selected_default: false,
                 home: "/Users//me/.codex".into(),
                 home_env: None,
                 self_claimed: None,
@@ -580,6 +581,7 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
             cwd: "/work".into(),
             version: Some("0.165.0".into()),
             run: crate::harness::relaunch::AgentRun::Codex(crate::harness::relaunch::CodexRun {
+                selected_default: false,
                 home: "/Users//me/.codex".into(),
                 home_env: None,
                 self_claimed: None,

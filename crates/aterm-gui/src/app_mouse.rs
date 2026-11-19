@@ -2605,20 +2605,23 @@ impl App {
             let (x, y) = match target {
                 NativePointerTarget::Key(key) => {
                     let compiled = &artifact.compiled;
-                    let Some(shown) = compiled
-                        .paint
-                        .iter()
-                        .find(|node| node.key.as_str() == key)
-                        .map(|node| node.clip)
-                        .filter(|clip| clip.width > 0.0 && clip.height > 0.0)
-                    else {
-                        continue;
-                    };
-                    let rect = compiled
+                    // An inline link paints inside its block and has a hit on each visible line.
+                    let Some(rect) = compiled
                         .hits
                         .iter()
                         .find(|hit| hit.key.as_str() == key)
-                        .map_or(shown, |hit| hit.rect);
+                        .map(|hit| hit.rect)
+                        .or_else(|| {
+                            compiled
+                                .paint
+                                .iter()
+                                .find(|node| node.key.as_str() == key)
+                                .map(|node| node.clip)
+                        })
+                        .filter(|rect| !rect.is_empty())
+                    else {
+                        continue;
+                    };
                     (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
                 }
                 NativePointerTarget::Point(x, y) => (*x, *y),

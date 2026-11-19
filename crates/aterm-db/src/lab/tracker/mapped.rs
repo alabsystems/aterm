@@ -176,12 +176,12 @@ pub fn birth(
     })
 }
 
-/// The columns `collection`'s key is made from (a change's, of `exit` and `outcome`, the one
-/// its `column` names).
+/// The columns `collection`'s key is made from (a change's, of `exit`, `outcome` and `state`,
+/// the one its `column` names).
 #[must_use]
 pub fn made_from(collection: &Collection) -> &'static [&'static str] {
     match collection.name {
-        "change" => &["package", "column", "exit", "outcome"],
+        "change" => &["package", "column", "exit", "outcome", "state"],
         "ruling" => &["date", "quote"],
         "stop" => &["lane", "item"],
         _ => &["id"],

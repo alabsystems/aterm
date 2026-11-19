@@ -380,10 +380,11 @@ impl SessionLog {
         self.tab_opened_by = opened_by;
     }
 
-    /// Who opened the placed tab, to carry (`tab v=1 … by=`).
-    // Read only by `SessionLog::host_lines` (`any(unix, test)`, `session_log_carry.rs`).
-    #[cfg(any(unix, test))]
-    pub(super) const fn tab_opened_by(&self) -> Option<Actor> {
+    /// Who opened the placed tab, as its open mark names them (`by=`): for a spawn, the caller
+    /// aterm placed the request's connection in (`caller_actor_of`, `control_session.rs`), never
+    /// a word of the request. Carried (`tab v=1 … by=`), and read where a worker's run is
+    /// credited to the session that started it (`control_hosted.rs`).
+    pub(crate) const fn tab_opened_by(&self) -> Option<Actor> {
         self.tab_opened_by
     }
 

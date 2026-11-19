@@ -3317,15 +3317,17 @@ fn announcement_has(message: &Value, marker: &str) -> bool {
 }
 
 /// Whether the transcript row `v` is Claude Code's lost-login answer: its main chain's
-/// `authentication_failed` API error, unless its words are Cloudflare's block or challenge page
-/// answering in the API's place, which Claude Code types `authentication_failed` too (2.1.323,
-/// [`aterm_phase::wall::edge_block`]): a network block, never a login wall.
+/// `authentication_failed` API error, unless its words name a blocked path, which Claude Code
+/// types `authentication_failed` too (2.1.323: any 401 or 403): Cloudflare's block or challenge
+/// page answering in the API's place ([`aterm_phase::wall::edge_block`]) or a 403 that names no
+/// credential ([`aterm_phase::wall::StrikeCause::Blocked`], plan package UB-05), never a login
+/// wall.
 pub(crate) fn is_auth_wall_row(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) == Some("assistant")
         && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
         && v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
         && v.get("error").and_then(Value::as_str) == Some("authentication_failed")
-        && !row_texts(v).any(aterm_phase::wall::edge_block)
+        && row_texts(v).all(|text| aterm_phase::wall::strike_cause(text).strikes())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

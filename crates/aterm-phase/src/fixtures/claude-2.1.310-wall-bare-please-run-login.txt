@@ -1,0 +1,15 @@
+# claude-code 2.1.310 · HAND-BUILT 2026-11-17 for plan package UB-05 · the rows of the measured `claude-2.1.310-wall-not-logged-in-no-login.txt` (a private headless aterm, 144x50, running the real Claude Code over a local stub of the API), its gutter row cut to the remedy alone, as Claude Code's synthetic `authentication_failed` answer words it with no cause (`Please run /login`, the message a transcript row of it carries), and the footer's `Not logged in · Run /login` dropped, since a credential is stored · the remedy alone, naming no cause: `  ⎿  Please run /login`
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.WYUY/proj
+
+
+❯ hi
+  ⎿  Please run /login
+
+✻ Brewed for 0s · done 12:55 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

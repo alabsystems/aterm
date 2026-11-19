@@ -1,0 +1,14 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h: a `started` of a new number while the stream's own turn is open ends that turn
+# out=superseded and opens the new one, both in the stream's stamp; an end of the old number
+# then ends nothing, and the new number's end closes the new turn.
+stream started 1 by=person
+expect open t1 turn src=harness hseq=1 turn_by=person @0
+at 1000 stream started 2 by=agent
+expect close t1 turn out=superseded src=harness conf=claim hseq=2 @1000
+expect open t2 turn par=r1 src=harness conf=claim hseq=2 turn_by=agent @1000
+at 2000 stream ended 1 done
+expect turn=t2
+at 3000 stream ended 2 failed
+expect close t2 turn out=error src=harness hseq=4 @3000
+expect turn=none

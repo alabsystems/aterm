@@ -1,5 +1,5 @@
 {
-  "_comment": "aterm FILES-IDLE baseline: exact counts of the shared files' materializer over an idle hour, from aterm-db's ignored drive alab::upkeep::tests::an_idle_hour_reports_its_counts in the test profile: a two-Writer lab whose registry is in its second generation, carrying each Mac's facts row from an old membership epoch, and whose owner declares lab/tracker with no entry; the owner's schedule makes its first pass over the nine shared files (first_*) and then 60 regular passes with nothing changing (idle_*, summed). Counted on the drive's thread: table views read to project (projections), MACHINE's claim projections and claim contexts, durable writes by the recordings (puts), folder modes set by the looks, the recordings and the outbox changes (chmods), carried records handed to authentication, store read batch fences, and kept historical key asks. SMALLER-OR-EQUAL: a count above its value here fails. No time and no ratio is judged; the lane runs at the load it finds and reports it. Re-record with targo --unverified verify perf --record files-idle.",
+  "_comment": "aterm FILES-IDLE baseline: exact counts of the shared files' materializer over an idle hour, from aterm-db's ignored drive alab::upkeep::tests::an_idle_hour_reports_its_counts in the test profile: a two-Writer lab whose registry is in its second generation, carrying each Mac's facts row from an old membership epoch, and whose owner declares lab/tracker with no entry; the owner's schedule makes its first pass over the ten shared files (first_*) and then 60 regular passes with nothing changing (idle_*, summed). Counted on the drive's thread: table views read to project (projections), MACHINE's claim projections and claim contexts, durable writes by the recordings (puts), folder modes set by the looks, the recordings and the outbox changes (chmods), carried records handed to authentication, store read batch fences, and kept historical key asks. SMALLER-OR-EQUAL: a count above its value here fails. No time and no ratio is judged; the lane runs at the load it finds and reports it. Re-record with targo --unverified verify perf --record files-idle.",
   "first_carried_authenticated": 2,
   "first_chmods": 0,
   "first_fences": 12,
@@ -7,7 +7,7 @@
   "first_machine_claim_contexts": 2,
   "first_machine_claim_projects": 1,
   "first_projections": 2,
-  "first_puts": 48,
+  "first_puts": 54,
   "idle_carried_authenticated": 120,
   "idle_chmods": 0,
   "idle_fences": 720,

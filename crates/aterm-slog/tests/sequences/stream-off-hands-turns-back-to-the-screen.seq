@@ -1,0 +1,19 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h (D29): once the stream no longer feeds the turns, a turn it left open stays open; the
+# screen, already reading at rest, arms its settle then and closes it a second later; from then
+# the screen opens and closes its own turns again.
+stream started 1 by=harness
+expect open t1 turn src=harness @0
+see busy
+at 500 see idle
+at 5000 expect turn=t1
+expect wake=none
+stream off
+expect wake=6000
+at 6000 expect turn=none
+expect close t1 turn out=done src=screen @5000
+at 7000 see busy
+expect open t2 turn par=r1 src=screen @7000
+at 7500 see idle
+at 8500 expect turn=none
+expect close t2 turn out=done src=screen @7500

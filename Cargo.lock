@@ -166,7 +166,7 @@ version = "0.2.2"
 
 [[package]]
 name = "aterm"
-version = "0.208.0"
+version = "0.209.0"
 dependencies = [
  "agh",
  "alab-policy",
@@ -746,6 +746,10 @@ dependencies = [
  "aterm-uds",
  "libc",
 ]
+
+[[package]]
+name = "aterm-diskindex"
+version = "0.0.0"
 
 [[package]]
 name = "aterm-diskwalk"
@@ -2229,6 +2233,7 @@ version = "0.0.0"
 dependencies = [
  "aterm-dl",
  "aterm-durable",
+ "aterm-hash",
  "aterm-json",
  "aterm-objc",
  "aterm-path",
@@ -2336,8 +2341,10 @@ dependencies = [
  "aterm-spec",
  "aterm-spec-anchor",
  "aterm-stamp",
+ "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-time",
+ "aterm-toml",
  "aterm-uds",
  "aterm-vitals",
  "trust-resource-controller",

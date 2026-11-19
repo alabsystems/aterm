@@ -1013,12 +1013,135 @@ use super::{
     RELEASE_SYSTEM_PATH, ReleaseEnv, Renderer, SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, SliceArch,
     SliceBuild, Stock, cargo_build_args, current_release_uid, parse_thin_macho_update_pin,
     publish_verified_output, release_build_command, release_env, release_tool_path,
-    resolve_release_rustup_shim_dir, slice_drives_a_session, stock_install_remedy,
+    resolve_release_rustup_shim_dir, slice_drives_a_session, slice_world, stock_install_remedy,
     stock_release_remedy, turn_verdict, validate_app_version_reports, validate_cli_app_version,
     validate_embedded_update_pin, validate_final_slice_records, validate_lipo_architectures,
     validate_named_cli_app_version, validate_slice_update_pin_reports, x86_64_probe_asset_name,
     x86_64_probe_transcript, x86_64_slice_runs,
 };
+use aterm_types::world::{Config, LANES_OFF, Lane, Layout, MARKER};
+
+/// Whether `command` starts in `world` with `shell` as its `SHELL`: its environment cleared, then
+/// [`MARKER`] at the world's state folder, no `USER` or `LOGNAME`, and exactly the world's
+/// variables ([`Layout::live_env`]) with that `SHELL`; the world's HOME its working folder.
+fn in_world(
+    command: &aterm_uds::spawnfd::Command,
+    world: &Layout,
+    shell: &str,
+) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+    let rendered = format!("{command:?}");
+    let after_cd = rendered
+        .split_once(" && ")
+        .map_or(rendered.as_str(), |(_, rest)| rest);
+    if !after_cd.starts_with("env -i ") {
+        return Err(format!("its environment is not cleared: {rendered}"));
+    }
+    let got: BTreeMap<OsString, OsString> = command
+        .get_envs()
+        .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+        .collect();
+    if got.get(OsStr::new(MARKER)) != Some(&world.state().into_os_string()) {
+        return Err(format!(
+            "it carries no {MARKER} at the world's state: {rendered}"
+        ));
+    }
+    if let Some(login) = ["USER", "LOGNAME"]
+        .into_iter()
+        .find(|name| got.contains_key(OsStr::new(name)))
+    {
+        return Err(format!("it carries the login's {login}: {rendered}"));
+    }
+    let mut want: BTreeMap<OsString, OsString> = world
+        .live_env()
+        .map_err(|refusal| refusal.to_string())?
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), value))
+        .collect();
+    want.insert("SHELL".into(), shell.into());
+    if got != want {
+        return Err(format!(
+            "its environment is not the world's:\n got  {got:?}\n want {want:?}"
+        ));
+    }
+    if command.get_current_dir() != Some(world.home.as_path()) {
+        return Err(format!("it does not start in the world's HOME: {rendered}"));
+    }
+    Ok(())
+}
+
+/// Whether `toml` is the `aterm.toml` of a world that drives no lane: [`Config::OFF`] rendered,
+/// every lane's table off.
+fn every_lane_off(toml: &str) -> Result<(), String> {
+    if let Some(lane) = Lane::ALL
+        .into_iter()
+        .find(|lane| !toml.contains(lane.off()))
+    {
+        return Err(format!("[{}] is not off: {toml:?}", lane.table()));
+    }
+    if !toml.ends_with(LANES_OFF) || toml != Config::OFF.render().map_err(|r| r.to_string())? {
+        return Err(format!("not the world's every-lane-off config: {toml:?}"));
+    }
+    Ok(())
+}
+
+/// THE SLICE PROBE'S WORLD IS MADE ONCE, EVERY LANE OFF, AND ITS COMMANDS START IN IT:
+/// [`slice_world`] lays the world out in the empty scratch with every lane's table off, and the
+/// world's own command passes [`in_world`]. A second make in the same scratch is refused, which
+/// is why both probes of a slice share one world. NEGATIVE CONTROLS: the probe's environment
+/// before its world (cleared, then `PATH`, HOME, `SHELL` and the two XDG folders by hand: no
+/// marker, no temporary folder), and the world's environment over the cutter's own (not
+/// cleared), in another working folder (`/`, where `--diagnose` ran before), with `LOGNAME` set,
+/// without the marker or with another `SHELL` are each refused, and so is the two-table config
+/// the probe wrote before.
+#[test]
+fn the_slice_probe_starts_in_one_scratch_world_and_a_hand_made_env_does_not() {
+    let scratch = crate::test_scratch_dir("sliceenv");
+    let world = slice_world(scratch.path()).unwrap();
+    let toml = std::fs::read_to_string(world.config_file()).unwrap();
+    every_lane_off(&toml).unwrap();
+    every_lane_off("[update]\nenabled = false\n[packages]\nenabled = false\n").unwrap_err();
+    let again = slice_world(scratch.path()).unwrap_err();
+    assert!(
+        again.contains("make the slice probe's scratch world"),
+        "{again}"
+    );
+
+    let in_it = || world.command("/usr/bin/arch").unwrap();
+    in_world(&in_it(), &world, "/bin/sh").unwrap();
+
+    let mut hermetic = aterm_uds::spawnfd::command("/usr/bin/arch");
+    hermetic
+        .env_clear()
+        .env("PATH", RELEASE_SYSTEM_PATH)
+        .env("HOME", &world.home)
+        .env("SHELL", "/bin/sh")
+        .env("XDG_CONFIG_HOME", &world.config_home)
+        .env("XDG_RUNTIME_DIR", &world.runtime)
+        .current_dir(&world.home);
+    let refused = in_world(&hermetic, &world, "/bin/sh").unwrap_err();
+    assert!(refused.contains(MARKER), "{refused}");
+    let mut inherited = aterm_uds::spawnfd::command("/usr/bin/arch");
+    inherited
+        .envs(world.live_env().unwrap())
+        .current_dir(&world.home);
+    let refused = in_world(&inherited, &world, "/bin/sh").unwrap_err();
+    assert!(refused.contains("not cleared"), "{refused}");
+    let mut elsewhere = in_it();
+    elsewhere.current_dir("/");
+    let refused = in_world(&elsewhere, &world, "/bin/sh").unwrap_err();
+    assert!(refused.contains("HOME"), "{refused}");
+    let mut login = in_it();
+    login.env("LOGNAME", "someone");
+    let refused = in_world(&login, &world, "/bin/sh").unwrap_err();
+    assert!(refused.contains("LOGNAME"), "{refused}");
+    let mut unmarked = in_it();
+    unmarked.env_remove(MARKER);
+    let refused = in_world(&unmarked, &world, "/bin/sh").unwrap_err();
+    assert!(refused.contains(MARKER), "{refused}");
+    in_world(&in_it(), &world, "/bin/zsh").unwrap_err();
+}
 
 #[test]
 fn the_universal_cut_runs_its_x86_64_slice_under_rosetta() {
@@ -1037,37 +1160,31 @@ fn the_universal_cut_runs_its_x86_64_slice_under_rosetta() {
     };
 
     let scratch = crate::test_scratch_dir("x86diag");
-    let home = scratch.path().join("home");
+    let world = slice_world(scratch.path()).unwrap();
 
-    let err = x86_64_slice_runs(bin, &home, &mut |_| Ok(output(1, ""))).unwrap_err();
+    let err = x86_64_slice_runs(bin, &world, &mut |_| Ok(output(1, ""))).unwrap_err();
     assert_eq!(err, crate::gates::ROSETTA_REFUSAL);
 
     let mut calls = 0;
-    x86_64_slice_runs(bin, &home, &mut |_| {
+    x86_64_slice_runs(bin, &world, &mut |_| {
         calls += 1;
         Ok(output(if calls == 1 { 0 } else { 134 }, ""))
     })
     .unwrap_err();
 
     let mut seen = Vec::new();
-    let mut rendered = Vec::new();
+    let mut placed = Vec::new();
     let mut home_writable = false;
-    let report = x86_64_slice_runs(bin, &home, &mut |command| {
+    let report = x86_64_slice_runs(bin, &world, &mut |command| {
         seen.push(argv(command));
-        rendered.push(format!("{command:?}"));
-        home_writable = std::fs::write(home.join("probe"), b"").is_ok();
+        placed.push(in_world(command, &world, "/bin/zsh"));
+        home_writable = std::fs::write(world.home.join("probe"), b"").is_ok();
         Ok(output(0, "app-version: 0.93.0\n"))
     })
     .unwrap();
-    let home_env = format!("HOME={:?}", home.display().to_string());
-    assert!(
-        rendered[1].starts_with("cd \"/\" && env -i ")
-            && rendered[1].contains(&home_env)
-            && rendered[1].contains("SHELL=\"/bin/zsh\"")
-            && rendered[1].contains("PATH=\"/usr/bin:/bin:/usr/sbin:/sbin\""),
-        "{}",
-        rendered[1]
-    );
+    placed[1]
+        .clone()
+        .expect("--diagnose starts in the world, SHELL=/bin/zsh");
     assert!(home_writable, "the probe HOME must exist and be writable");
     assert_eq!(report, "app-version: 0.93.0\n");
     assert_eq!(
@@ -1093,13 +1210,13 @@ fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
     };
     let settled = "aterm-ctl: turn submitted=1 status=settled seq=4 id=1 dur_ms=188\n";
     let root = crate::test_scratch_dir("x86turn");
-    let scratch_for = |name: &str| {
+    // Each case's world is a short folder of `root`, so its longest socket fits `sun_path`.
+    let world_for = |name: &str| {
         let dir = root.path().join(name);
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        slice_world(&dir).unwrap()
     };
-    let fake_instance = |command: &mut aterm_uds::spawnfd::Command| {
+    let fake_instance = |world: &Layout, command: &mut aterm_uds::spawnfd::Command| {
         let args: Vec<String> = command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1112,33 +1229,38 @@ fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
             args.windows(2).any(|w| w == ["--lifeline-fd", "0"]),
             "the translated instance holds the cutter's lifeline: {args:?}"
         );
-        let rendered = format!("{command:?}");
-        assert!(rendered.contains("env -i "), "{rendered}");
+        in_world(command, world, "/bin/sh").expect("the instance starts in the world");
         let sock = &args[args.iter().position(|a| a == "--control-sock").unwrap() + 1];
+        assert_eq!(std::path::Path::new(sock), world.control_sock());
         aterm_uds::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg(format!("touch '{sock}'; exec sleep 120"))
             .spawn()
     };
 
-    let dir = scratch_for("pass");
+    let world = world_for("ok");
     let mut turn_argv = Vec::new();
+    let mut turn_placed = None;
     slice_drives_a_session(
         bin,
         SliceArch::X86_64,
         Renderer::Cpu,
-        &dir,
-        &mut |c| fake_instance(c),
+        &world,
+        &mut |c| fake_instance(&world, c),
         &mut |command| {
             turn_argv = command
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect();
+            turn_placed = Some(in_world(command, &world, "/bin/sh"));
             Ok(turn_out(0, settled, "sh$ uname -m\nx86_64\n\n"))
         },
         wait,
     )
     .unwrap();
+    turn_placed
+        .expect("a turn ran")
+        .expect("the ctl client starts in the world");
     assert_eq!(
         turn_argv[..4],
         ["-x86_64", "/stage/ship/aterm", "ctl", "--sock"]
@@ -1153,8 +1275,8 @@ fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
             "-m"
         ]
     );
-    let toml = std::fs::read_to_string(dir.join("cfg/aterm/aterm.toml")).unwrap();
-    assert!(toml.contains("[update]\nenabled = false") && toml.contains("[packages]"));
+    assert_eq!(turn_argv[4], world.control_sock().to_string_lossy());
+    every_lane_off(&std::fs::read_to_string(world.config_file()).unwrap()).unwrap();
 
     for (verdict, rows, code) in [
         (settled, "sh$ uname -m\narm64\n", 0),
@@ -1165,13 +1287,13 @@ fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
         ),
         ("aterm-ctl: ERR no session\n", "", 1),
     ] {
-        let dir = scratch_for("refuse");
+        let world = world_for("no");
         let err = slice_drives_a_session(
             bin,
             SliceArch::X86_64,
             Renderer::Cpu,
-            &dir,
-            &mut |c| fake_instance(c),
+            &world,
+            &mut |c| fake_instance(&world, c),
             &mut |_| Ok(turn_out(code, verdict, rows)),
             wait,
         )
@@ -1182,13 +1304,14 @@ fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
     assert!(turn_verdict(&turn_out(0, settled, "arm64\n"), SliceArch::Arm64).is_ok());
     turn_verdict(&turn_out(0, settled, "x86_64\n"), SliceArch::Arm64)
         .expect_err("another slice's answer");
-    let arm64_instance = |command: &mut aterm_uds::spawnfd::Command| {
+    let arm64_instance = |world: &Layout, command: &mut aterm_uds::spawnfd::Command| {
         let args: Vec<String> = command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(&args[..2], ["-arm64", "/stage/ship/aterm"]);
         assert!(!args.iter().any(|a| a == "--cpu"), "{args:?}");
+        in_world(command, world, "/bin/sh").expect("the instance starts in the world");
         let sock = &args[args.iter().position(|a| a == "--control-sock").unwrap() + 1];
         aterm_uds::spawnfd::command("/bin/sh")
             .arg("-c")
@@ -1196,20 +1319,21 @@ fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
             .spawn()
     };
     let gpu_drive = |name: &str, image: i32, metrics: &str| {
-        let dir = scratch_for(name);
+        let world = world_for(name);
         let mut verbs = Vec::new();
         let driven = slice_drives_a_session(
             bin,
             SliceArch::Arm64,
             Renderer::Gpu,
-            &dir,
-            &mut |c| arm64_instance(c),
+            &world,
+            &mut |c| arm64_instance(&world, c),
             &mut |command| {
                 let argv: Vec<String> = command
                     .get_args()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect();
                 assert_eq!(argv[..4], ["-arm64", "/stage/ship/aterm", "ctl", "--sock"]);
+                in_world(command, &world, "/bin/sh").expect("each ctl client starts in the world");
                 verbs.push(argv[5..].join(" "));
                 Ok(match argv[5].as_str() {
                     "turn" => turn_out(0, settled, "sh$ uname -m\narm64\n"),
@@ -1221,7 +1345,7 @@ fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
         );
         (driven, verbs)
     };
-    let (driven, verbs) = gpu_drive("arm64", 0, "backend=gpu frames=3 fx_under_frames=0\n");
+    let (driven, verbs) = gpu_drive("g", 0, "backend=gpu frames=3 fx_under_frames=0\n");
     driven.unwrap();
     assert_eq!(
         verbs,
@@ -1231,32 +1355,32 @@ fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
             "metrics"
         ]
     );
-    let (driven, _) = gpu_drive("arm64-cpu", 0, "backend=cpu frames=3\n");
+    let (driven, _) = gpu_drive("gc", 0, "backend=cpu frames=3\n");
     driven.unwrap_err();
-    let (driven, _) = gpu_drive("arm64-none", 0, "frames=3\n");
+    let (driven, _) = gpu_drive("gn", 0, "frames=3\n");
     driven.unwrap_err();
-    let (driven, verbs) = gpu_drive("arm64-noframe", 1, "backend=gpu\n");
+    let (driven, verbs) = gpu_drive("gf", 1, "backend=gpu\n");
     driven.unwrap_err();
     assert_eq!(verbs.len(), 2, "no metrics read without a frame: {verbs:?}");
 
-    let dir = scratch_for("exit");
+    let world = world_for("ex");
     slice_drives_a_session(
         bin,
         SliceArch::X86_64,
         Renderer::Cpu,
-        &dir,
+        &world,
         &mut |_| aterm_uds::spawnfd::command("/usr/bin/false").spawn(),
         &mut |_| panic!("no turn without a socket"),
         wait,
     )
     .unwrap_err();
 
-    let dir = scratch_for("silent");
+    let world = world_for("si");
     let err = slice_drives_a_session(
         bin,
         SliceArch::X86_64,
         Renderer::Cpu,
-        &dir,
+        &world,
         &mut |_| aterm_uds::spawnfd::command("/bin/sleep").arg("30").spawn(),
         &mut |_| panic!("no turn without a socket"),
         std::time::Duration::ZERO,

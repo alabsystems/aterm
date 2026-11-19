@@ -1092,7 +1092,7 @@ mod unix {
                     .map_or(Value::Null, |migration| text(migration_word(migration))),
             );
             object.insert("name".to_owned(), text(&name.name()));
-            object.insert("nick".to_owned(), text(name.nick.as_str()));
+            object.insert("nick".to_owned(), text(&name.display_nick()));
             object.insert(
                 "nick_class".to_owned(),
                 text(nick_class_word(name.nick_class)),

@@ -646,3 +646,37 @@ fn scaling_prims_scales_lengths_and_keeps_inks() {
         "a power of two round-trips exactly"
     );
 }
+
+/// A test's bake is the bake its art makes at its own device size, whatever was baked before it:
+/// what [`TEST_BAKES`] hands back is keyed by the art and both its width and its height. Each art
+/// is baked fresh beside it, at two widths of one height and two heights of one width.
+/// NEGATIVE CONTROL: keyed by the art alone, the second size answers with the first's pixels.
+#[test]
+fn a_kept_test_bake_is_its_arts_own_at_its_own_size() {
+    use aterm_effects::rainbow_road::{CatArt, CatPose, RoadArt};
+    let road = RoadArt {
+        length: 437,
+        permille: 613,
+        done: false,
+        dark: true,
+    };
+    let cat = CatArt {
+        pose: CatPose::Sit,
+        tilt: 3,
+        dark: false,
+    };
+    for (w, h) in [(37, 11), (41, 11), (37, 13)] {
+        for (art, fresh) in [
+            (ImageArt::Road(road), road.bake(w, h)),
+            (ImageArt::Cat(cat), cat.bake(w, h)),
+        ] {
+            for ask in ["first", "again"] {
+                assert_eq!(
+                    &*art.bake(w, h),
+                    fresh.pixels(),
+                    "{art:?} at {w}×{h}, asked {ask}"
+                );
+            }
+        }
+    }
+}

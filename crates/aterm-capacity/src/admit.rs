@@ -4779,10 +4779,37 @@ pub enum Polled {
     Admitted(Claim),
     /// Still waiting, short of what the shortfall names.
     Waiting(Waiter, Shortfall),
-    /// Its claim file was removed while it waited (the ledger's directory cleaned): it is in no
-    /// other session's queue and can never be admitted, so the wait is over. The error names
-    /// the file.
+    /// The wait is over and the waiter holds nothing, for the error's reason: its claim file was
+    /// removed while it waited (the ledger's directory cleaned), so it is in no other session's
+    /// queue and can never be admitted, and the error names the file; or the ledger failed it as
+    /// its grant was written; or the caller's guard step failed
+    /// ([`Waiter::poll_until_guarded`]), its own error passed through.
     Gone(io::Error),
+}
+
+/// A look its caller's `stopped` ended ([`Waiter::poll_until`], [`Waiter::poll_until_guarded`])
+/// before any grant was written: the waiter has left the queue, holding nothing. A stop is not
+/// a ledger failure, so it has its own type rather than a [`Polled::Gone`] error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PollStopped {
+    /// What the look found the need short of where an ask after its reading saw the stop: its
+    /// reading's shortfall at the ask after it, and at the ask after the guard step that one, or
+    /// the guard's own ([`Short::ExternalLock`]) where the step got none. `None` where the stop
+    /// was seen before the look read anything, or the look found the need fit.
+    pub short: Option<Shortfall>,
+}
+
+impl PollStopped {
+    /// `Err` where `stopped`, naming `short`, what the look had found it short of by then.
+    fn when(stopped: bool, short: Option<&Shortfall>) -> Result<(), PollStopped> {
+        if stopped {
+            Err(PollStopped {
+                short: short.cloned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// A claim in the queue, not yet admitted. It leaves the ledger when dropped. Until it is
@@ -5130,24 +5157,46 @@ impl Waiter {
         )
     )]
     pub fn poll(self, machine: &dyn Machine) -> Polled {
-        self.poll_until(machine, &|| false)
+        self.poll_mode(machine, false)
     }
 
-    /// As [`Self::poll`], a quiet claim's read of the GPU ended early once `stopped` says so
-    /// ([`Machine::gpu_busy`]), so an interrupt ends a quiet wait within a nap, as any other.
-    #[must_use]
-    pub fn poll_until(self, machine: &dyn Machine, stopped: &dyn Fn() -> bool) -> Polled {
-        self.poll_mode(machine, false, stopped)
-    }
-
-    fn poll_mode(
+    /// As [`Self::poll`], ended by `stopped` too, which it asks before its look and twice after
+    /// it, before a grant is written. A quiet claim's read of the GPU asks it as well
+    /// ([`Machine::gpu_busy`]), where a yes only ends that read early, so an interrupt ends a
+    /// quiet wait within a nap as any other: the look goes on to its next ask.
+    ///
+    /// # Errors
+    /// [`PollStopped`] where `stopped` says so at the ask before the look or at either ask after
+    /// it: the waiter has left the queue, holding nothing, and the error names what the look
+    /// found it short of where it had read the ledger by then ([`PollStopped::short`]). A look
+    /// that returns before its asks after it (its claim file removed, the ledger's turn held by
+    /// another waiter or refused, the ledger read refused, a timing that cannot qualify) returns
+    /// `Ok` without asking again.
+    pub fn poll_until(
         self,
         machine: &dyn Machine,
-        forced_now: bool,
         stopped: &dyn Fn() -> bool,
-    ) -> Polled {
-        self.poll_guarded_mode(machine, forced_now, stopped, &mut || Ok(Some(())))
-            .0
+    ) -> Result<Polled, PollStopped> {
+        self.poll_guarded_mode(
+            machine,
+            false,
+            &|short| PollStopped::when(stopped(), short),
+            &mut || Ok(Some(())),
+        )
+        .map(|(polled, _)| polled)
+    }
+
+    /// A look nothing stops: [`Self::poll`], and [`Self::force`]'s on a cohort-aware ledger.
+    fn poll_mode(self, machine: &dyn Machine, forced_now: bool) -> Polled {
+        match self.poll_guarded_mode(
+            machine,
+            forced_now,
+            &|_| Ok::<(), std::convert::Infallible>(()),
+            &mut || Ok(Some(())),
+        ) {
+            Ok((polled, _)) => polled,
+            Err(never) => match never {},
+        }
     }
 
     /// Admit only after the caller also acquires a nonblocking external guard.
@@ -5156,32 +5205,45 @@ impl Waiter {
     /// Only an admitted claim returns its guard; cancellation or any grant error
     /// drops it before releasing the ledger turn. The caller retains the returned
     /// guard through its owning wait or transfers the same lock across exec.
-    #[must_use]
+    ///
+    /// # Errors
+    /// [`PollStopped`], as [`Self::poll_until`]: a guard taken before the stop was seen is
+    /// dropped first. A guard step whose `acquire` errs returns `Ok` ([`Polled::Gone`]) before
+    /// the ask after that step: a stop that came since the ask after the look is not asked for.
     pub fn poll_until_guarded<G>(
         self,
         machine: &dyn Machine,
         stopped: &dyn Fn() -> bool,
         acquire: &mut dyn FnMut() -> io::Result<Option<G>>,
-    ) -> (Polled, Option<G>) {
-        self.poll_guarded_mode(machine, false, stopped, acquire)
+    ) -> Result<(Polled, Option<G>), PollStopped> {
+        self.poll_guarded_mode(
+            machine,
+            false,
+            &|short| PollStopped::when(stopped(), short),
+            acquire,
+        )
     }
 
-    fn poll_guarded_mode<G>(
+    /// One look, `stop` asked before it, after it and after the guard step (which calls
+    /// `acquire` only where the need fits), each time with what the look had found the need
+    /// short of by then (`None` before it read, or where it found the need fit): an error at one
+    /// of those asks ends the look there with that error, the waiter and any guard `acquire` took
+    /// dropped. A quiet claim's GPU read asks `stop` too, with `None`, where an error only ends
+    /// that read early and the look goes on. A look that returns before its asks after it (its
+    /// claim file removed, the turn held or refused, the ledger read refused, a timing that
+    /// cannot qualify) returns `Ok` without asking again, and one whose guard step's own error
+    /// ends it ([`Polled::Gone`]) returns `Ok` before the ask after that step.
+    fn poll_guarded_mode<G, E>(
         mut self,
         machine: &dyn Machine,
         forced_now: bool,
-        stopped: &dyn Fn() -> bool,
+        stop: &dyn Fn(Option<&Shortfall>) -> Result<(), E>,
         acquire: &mut dyn FnMut() -> io::Result<Option<G>>,
-    ) -> (Polled, Option<G>) {
-        if stopped() {
-            return (
-                Polled::Gone(io::Error::from(io::ErrorKind::Interrupted)),
-                None,
-            );
-        }
+    ) -> Result<(Polled, Option<G>), E> {
+        stop(None)?;
         // `try_exists` follows a link: one to nothing is no claim file either.
         if matches!(self.laid.path().try_exists(), Ok(false)) {
-            return (
+            return Ok((
                 Polled::Gone(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
@@ -5190,7 +5252,7 @@ impl Waiter {
                     ),
                 )),
                 None,
-            );
+            ));
         }
         // A quiet claim's GPU is read over a window, before the turn: no other waiter's look
         // waits on it. A forced look waits for nothing, and a measured claim's first look forms
@@ -5202,15 +5264,15 @@ impl Waiter {
             .need
             .quiet
             .filter(|_| !forced_now && !warming)
-            .and_then(|_| machine.gpu_busy(stopped));
+            .and_then(|_| machine.gpu_busy(&|| stop(None).is_err()));
         let turn = match self.ledger.try_turn() {
             Ok(Ok(turn)) => turn,
-            Ok(Err(holder)) => return (self.unread(Short::Turn { holder }), None),
-            Err(e) => return (self.unread(Short::Ledger(e.to_string())), None),
+            Ok(Err(holder)) => return Ok((self.unread(Short::Turn { holder }), None)),
+            Err(e) => return Ok((self.unread(Short::Ledger(e.to_string())), None)),
         };
         let mut found = match self.look(machine, gpu) {
             Ok(found) => found,
-            Err(e) => return (self.unread(Short::Ledger(e.to_string())), None),
+            Err(e) => return Ok((self.unread(Short::Ledger(e.to_string())), None)),
         };
         if let Err(short) = &found.decided
             && let Some(issue) = short.shorts.iter().find_map(|s| match s {
@@ -5218,14 +5280,9 @@ impl Waiter {
                 _ => None,
             })
         {
-            return (Polled::Unqualified(issue), None);
+            return Ok((Polled::Unqualified(issue), None));
         }
-        if stopped() {
-            return (
-                Polled::Gone(io::Error::from(io::ErrorKind::Interrupted)),
-                None,
-            );
-        }
+        stop(found.decided.as_ref().err())?;
         let acquired = if found.decided.is_ok() {
             match acquire() {
                 Ok(Some(guard)) => Some(guard),
@@ -5233,17 +5290,14 @@ impl Waiter {
                     found.decided = Err(Shortfall::only(Short::ExternalLock));
                     None
                 }
-                Err(error) => return (Polled::Gone(error), None),
+                Err(error) => return Ok((Polled::Gone(error), None)),
             }
         } else {
             None
         };
-        if stopped() {
+        if let Err(stopped) = stop(found.decided.as_ref().err()) {
             drop(acquired);
-            return (
-                Polled::Gone(io::Error::from(io::ErrorKind::Interrupted)),
-                None,
-            );
+            return Err(stopped);
         }
         let mut waiter = self;
         // First next for the quiet machine: its patience counts from this look, and every other
@@ -5279,7 +5333,7 @@ impl Waiter {
         drop(turn);
         // Its admission-log row, written with the ledger's lock let go.
         crate::admission_log::looked(before, &mut polled, &found.seen);
-        (polled, acquired)
+        Ok((polled, acquired))
     }
 
     /// Read in `procs` the process tree of each held claim's holder `short` names, with the
@@ -5847,7 +5901,7 @@ impl Waiter {
     /// (room), and [`Error::Timing`], a grant whose timing could not be qualified.
     pub fn force(mut self, machine: &dyn Machine) -> Result<Forced, Error> {
         if self.ledger.cohort_aware().map_err(Error::Ledger)? {
-            return match self.poll_mode(machine, true, &|| false) {
+            return match self.poll_mode(machine, true) {
                 Polled::Admitted(claim) => Ok(Forced::Admitted(claim, None)),
                 // The ledger's lock or a core, a Release's core reservation among them, is never
                 // overridden, on either kind of ledger: a look short of one looks again in its
@@ -6163,7 +6217,8 @@ pub enum Error {
         /// The interrupt ([`aterm_toolchain::interrupt`]); `None` when the caller or the
         /// conservative Background stop ended it.
         signal: Option<i32>,
-        /// What it was short of at its last look; `None` when it never looked.
+        /// What the look the stop came in found it short of, else what the last look before it
+        /// did; `None` when no look found it short.
         short: Option<Shortfall>,
     },
     /// Every claim the wait was behind was held by a holder that had made no progress for the
@@ -6225,7 +6280,7 @@ impl fmt::Display for Error {
                 }
                 match short {
                     Some(short) => write!(f, ": {short}"),
-                    None => f.write_str(", before its first look"),
+                    None => f.write_str(", before any look found it short"),
                 }
             }
             Error::Stuck { stuck, short } => write!(
@@ -6457,9 +6512,11 @@ pub fn admit_relieved(
 }
 
 /// [`admit_with`], its wait ended by `stopped` too (an interrupt its caller caught before the
-/// wait began), which it asks before each look and through each nap (under `now`, through each
-/// nap after a look that met the ledger's lock): the claim then leaves the queue, and
-/// [`Error::Stopped`] names what it was short of.
+/// wait began), which it asks before each look, inside each look (as it begins and twice after
+/// its reading) and through each nap; under `now`, whose looks ask nothing, only once a look met
+/// the ledger's lock, through each nap after such a look and after the look that then admitted
+/// it: the claim then leaves the queue, and [`Error::Stopped`] names what it was short of, at the
+/// look the stop came in where that look found it short.
 ///
 /// # Errors
 /// As [`admit`], and [`Error::Stopped`].
@@ -6530,6 +6587,8 @@ fn admit_deciding(
     say: &mut dyn FnMut(&str),
     stopped: &dyn Fn() -> bool,
 ) -> Result<Claim, Error> {
+    use aterm_toolchain::interrupt::Watch;
+
     let background = mode == Admit::Preemptible && !machine.release_run();
     if background {
         need.rank = crate::Rank::Background;
@@ -6537,7 +6596,7 @@ fn admit_deciding(
     if need.quiet_policy == crate::QuietPolicy::Timing && mode == Admit::Now {
         return Err(Error::Timing(crate::TimingIssue::Now));
     }
-    let watch = (mode != Admit::Now).then(aterm_toolchain::interrupt::Watch::enter);
+    let watch = (mode != Admit::Now).then(Watch::enter);
     // A Background holder starts its group guard only after admission. Observe Release here too,
     // so one already queued cannot be waited out in the uncovered interval before that guard
     // exists. A failed ledger read supplies no authority to start repeatable work beside a
@@ -6551,29 +6610,27 @@ fn admit_deciding(
             false
         }
     };
-    let caller_stopped = stopped;
-    let stopped = || caller_stopped() || release_arrived();
-    let ended = || match watch
-        .as_ref()
-        .and_then(aterm_toolchain::interrupt::Watch::take)
-    {
-        Some(sig) => Some(Some(sig)),
-        None => stopped().then_some(None),
-    };
-    let interrupted = || watch.as_ref().is_some_and(|w| w.caught().is_some()) || stopped();
-    let nap = |d: Duration| match &watch {
-        Some(w) => {
-            w.nap(d, &stopped);
+    // A Release can leave the queue and a caller can report a stop just once. Keep the
+    // first observed reason through a resource poll, nap, relief and final sizing pass.
+    let observed = std::cell::Cell::new(None);
+    let observe = |watch: &Watch| {
+        if observed.get().is_none() {
+            let signal = watch.take();
+            if signal.is_some() || stopped() || release_arrived() {
+                observed.set(Some(signal));
+            }
         }
-        None => std::thread::sleep(d),
+        observed.get()
     };
-    if mode != Admit::Now
-        && let Some(signal) = ended()
-    {
-        return Err(Error::Stopped {
+    let ensure_running = |watch: &Watch, short: Option<&Shortfall>| match observe(watch) {
+        Some(signal) => Err(Error::Stopped {
             signal,
-            short: None,
-        });
+            short: short.cloned(),
+        }),
+        None => Ok(()),
+    };
+    if let Some(watch) = &watch {
+        ensure_running(watch, None)?;
     }
     let at = need.path.clone().or_else(|| std::env::current_dir().ok());
     let reading = machine.read(at.as_deref());
@@ -6591,48 +6648,33 @@ fn admit_deciding(
     // either clock.
     let first = waiter.since;
     let first_ms = waiter.asked_ms;
-    if mode == Admit::Now {
+    let Some(watch) = watch else {
         // It overrides room, never the ledger's lock: one that meets another admission deciding
         // (a verify run admits several stages at once) waits its turn as the wait loop does,
         // saying so by the same rule. That wait holds a watch from the first look that met the
         // lock, so an interrupt or `stopped` ends it as either ends a wait for room, and one that
         // came during the look that then admitted it ends it all the same. A look that had its
         // turn at once holds none: an interrupt during it reaches the process's own handling.
-        let mut turn: Option<(aterm_toolchain::interrupt::Watch, Instant)> = None;
+        let mut turn: Option<(Watch, Instant)> = None;
         let mut said: Option<Instant> = None;
         let mut last: Option<Shortfall> = None;
         let (claim, would) = loop {
             match waiter.force(machine)? {
                 Forced::Admitted(claim, would) => {
                     if let Some((watch, _)) = &turn {
-                        let signal = watch.take();
-                        if signal.is_some() || stopped() {
-                            drop(claim);
-                            return Err(Error::Stopped {
-                                signal,
-                                short: last,
-                            });
-                        }
+                        ensure_running(watch, last.as_ref())?;
                     }
                     break (claim, would);
                 }
                 Forced::Turn(w, short) => {
-                    let (watch, since) = turn.get_or_insert_with(|| {
-                        (aterm_toolchain::interrupt::Watch::enter(), Instant::now())
-                    });
+                    let (watch, since) =
+                        turn.get_or_insert_with(|| (Watch::enter(), Instant::now()));
                     if let Some(line) = w.turn_line(&short, pace, *since, said) {
                         say(&line);
                         said = Some(Instant::now());
                     }
-                    watch.nap(pace.turn_gap(), &stopped);
-                    let signal = watch.take();
-                    if signal.is_some() || stopped() {
-                        drop(w);
-                        return Err(Error::Stopped {
-                            signal,
-                            short: Some(short),
-                        });
-                    }
+                    watch.nap(pace.turn_gap(), &|| observe(watch).is_some());
+                    ensure_running(watch, Some(&short))?;
                     waiter = w;
                     last = Some(short);
                 }
@@ -6651,8 +6693,13 @@ fn admit_deciding(
             }
             (None, None) => {}
         }
+        if let Some((watch, _)) = &turn {
+            ensure_running(watch, last.as_ref())?;
+        }
         return Ok(claim);
-    }
+    };
+    let interrupted = || observe(&watch).is_some();
+    let check_stop = |short: Option<&Shortfall>| ensure_running(&watch, short);
     let mut said: Option<Instant> = None;
     let mut turn_since: Option<Instant> = None;
     let mut last: Option<Shortfall> = None;
@@ -6674,31 +6721,34 @@ fn admit_deciding(
         Ok(again)
     };
     loop {
-        if let Some(signal) = ended() {
-            drop(waiter);
-            return Err(Error::Stopped {
-                signal,
-                short: last,
-            });
-        }
+        check_stop(last.as_ref())?;
         // A claim file removed while it waits (the ledger's directory cleaned) is in no other
-        // session's queue and can never be named a claim: the wait ends, saying so.
-        // A Release or caller stop can arrive inside the poll. Keep the first
-        // observed reason: the low-level poll reports an interrupted I/O result,
-        // and the Release could already have left when the caller sees it.
-        let poll_stop = std::cell::Cell::new(None);
-        let polled = waiter.poll_until(machine, &|| {
-            if poll_stop.get().is_none() {
-                poll_stop.set(ended());
+        // session's queue and can never be named a claim: the wait ends, saying so. The look asks
+        // `interrupted` before it reads the ledger and twice after, before a grant is written,
+        // and a quiet claim's GPU read asks it too, only to end that read early. A stop the check
+        // above had not seen (a Release laid since) that one of those asks saw is kept in
+        // `observed`, and the wait ends as stopped, never as a ledger failure, the waiter
+        // dropped: the look answered `PollStopped`, naming what it found the need short of where
+        // it found it short, else the last look's shortfall is named; or, where only the GPU read
+        // saw it, the look returned early, and the last look's is. A stop that came after the
+        // look's last ask is seen by the checks that follow, unless the look's answer ends the
+        // wait first (stuck, its claim file removed or its grant left unwritten, a timing that
+        // cannot qualify).
+        let polled = match (waiter.poll_until(machine, &interrupted), observed.get()) {
+            (Ok(polled), None) => polled,
+            (Err(PollStopped { short }), signal) => {
+                return Err(Error::Stopped {
+                    signal: signal.flatten(),
+                    short: short.or(last),
+                });
             }
-            poll_stop.get().is_some()
-        });
-        if let Some(signal) = poll_stop.get() {
-            return Err(Error::Stopped {
-                signal,
-                short: last,
-            });
-        }
+            (Ok(_), signal) => {
+                return Err(Error::Stopped {
+                    signal: signal.flatten(),
+                    short: last,
+                });
+            }
+        };
         if let Polled::Waiting(w, short) = &polled
             && entered.stuck_ends.is_some()
             && let Some(stuck) = w.stuck()
@@ -6717,26 +6767,20 @@ fn admit_deciding(
                 claim.short = last
                     .clone()
                     .filter(|s| !matches!(s.shorts[..], [Short::Turn { .. }]));
-                if let Some(signal) = ended() {
-                    drop(claim);
-                    return Err(Error::Stopped {
-                        signal,
-                        short: last,
-                    });
-                }
-                if waited
-                    && let Some(disk) = relief
-                        .resized(say, &interrupted)
-                        .filter(|disk| *disk > entered.disk)
-                {
-                    drop(claim);
-                    entered.disk = disk;
-                    if let Some(why) = never(&entered, &machine.read(at.as_deref())) {
-                        return Err(Error::Never(why));
+                check_stop(last.as_ref())?;
+                if waited {
+                    let resized = relief.resized(say, &interrupted);
+                    check_stop(last.as_ref())?;
+                    if let Some(disk) = resized.filter(|disk| *disk > entered.disk) {
+                        drop(claim);
+                        entered.disk = disk;
+                        if let Some(why) = never(&entered, &machine.read(at.as_deref())) {
+                            return Err(Error::Never(why));
+                        }
+                        rule = rule.grown();
+                        waiter = enter_again(&entered, rule)?;
+                        continue;
                     }
-                    rule = rule.grown();
-                    waiter = enter_again(&entered, rule)?;
-                    continue;
                 }
                 if said.is_some() {
                     let how = claim
@@ -6748,6 +6792,7 @@ fn admit_deciding(
                         "capacity: {what} admitted after {}{how}{alone}",
                         span(claim.waited())
                     ));
+                    check_stop(last.as_ref())?;
                 }
                 return Ok(claim);
             }
@@ -6762,7 +6807,7 @@ fn admit_deciding(
                 if last.is_none() {
                     last = Some(short);
                 }
-                nap(pace.turn_gap());
+                watch.nap(pace.turn_gap(), &interrupted);
             }
             Polled::Waiting(mut w, short)
                 if rule == DiskRule::Reserved && short_of_disk(&short) =>
@@ -6771,7 +6816,10 @@ fn admit_deciding(
                 rule = DiskRule::Room;
                 w.disk_rule = rule;
                 relief.relieve(&short, say, &interrupted);
-                waiter = match relief.resized(say, &interrupted) {
+                check_stop(Some(&short))?;
+                let resized = relief.resized(say, &interrupted);
+                check_stop(Some(&short))?;
+                waiter = match resized {
                     Some(disk) if disk > entered.disk => {
                         entered.disk = disk;
                         if let Some(why) = never(&entered, &machine.read(at.as_deref())) {
@@ -6793,13 +6841,7 @@ fn admit_deciding(
                 }
                 if rule == DiskRule::Room && short_of_disk(&short) {
                     let holders = relief.holders(&short, &interrupted);
-                    if let Some(signal) = ended() {
-                        drop(w);
-                        return Err(Error::Stopped {
-                            signal,
-                            short: Some(short),
-                        });
-                    }
+                    check_stop(Some(&short))?;
                     drop(w);
                     return Err(Error::Unmet {
                         what,
@@ -6819,7 +6861,7 @@ fn admit_deciding(
                 }
                 waiter = w;
                 last = Some(short);
-                nap(pace.poll);
+                watch.nap(pace.poll, &interrupted);
             }
         }
     }

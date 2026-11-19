@@ -1218,7 +1218,7 @@ fn gui_revocation_expiry_and_eof_publish_before_queued_suffix_and_control_ack_wa
                             .as_mut()
                             .unwrap()
                             .expires_us = Some(now);
-                        publish_lapse_supervisor(&h.ctx, now)
+                        publish_lapse_supervisor(&h.ctx, now).map(|lapsed| lapsed.is_some())
                     }
                     _ => {
                         let transition = publish_release_supervisor(

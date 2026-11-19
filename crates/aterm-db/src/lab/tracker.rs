@@ -5,15 +5,22 @@
 //! table family. Its cells tables are what the lab plans and works from ([`tables`]: a goal, a
 //! package, a decision, a request, …), a row keyed by the word it is named by or that word's
 //! mapped form ([`mapped`]) and held to the tracker's own rules ([`checks`]); a package's state
-//! is settled where it is read, from the records that wrote it ([`state`]). Its two log tables
-//! are the append-only ones (TK-05):
+//! is settled where it is read, from the records that wrote it ([`state`]), and so are its exit
+//! and outcome, frozen once it is claimed but by an approved change ([`frozen`]). Its two log tables
+//! of record are the append-only ones (TK-05):
 //!
 //! - [`MEASURE`]: one sample of a goal's metric, as `aterm goals measure` states it;
 //! - [`NOTE`]: one note about any row of the tracker, with its evidence.
 //!
+//! A third log keeps the leases ([`lease::RENEWAL`]): each machine's renewals of the claims its
+//! sessions hold, from which every machine reads alike who holds what (TK-14).
+//!
 //! The schema and its rules are pure and compile on every target; only what reaches the store
-//! is `cfg(unix)` (`att::TRACKER`). No build registers the family for production before the
+//! is `cfg(unix)` (`att::TRACKER`). The lab tracker's TSVs, publication's `goals/data` at a named
+//! commit, are read into its rows and logs by [`import`], which names every cell it cannot hold
+//! as the TSV says (TK-11). No build registers the family for production before the
 //! cutover (TK-32): `att::FAMILIES` and the catalog do not hold it, and only a test declares it.
+//! `aterm goals` (`command`, Unix) writes it, and until that cutover its front door writes nothing.
 //!
 //! A log lives in this catalog table, not in the journal's week ring (`catalog::ring`): the ring
 //! forgets a week's tables, and the tracker's history is what the lab reads its progress from.
@@ -26,11 +33,16 @@
 //! No release holds `lab/tracker` yet, so generation 1 may still change until the cutover.
 
 pub mod checks;
+#[cfg(unix)]
+pub mod command;
+pub mod frozen;
+pub mod import;
+pub mod lease;
 pub mod mapped;
 pub mod state;
 pub mod tables;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::typed::{
     Collection, Column, Derive, Face, Faced, Kind, MAX_OWNED_ROW, Table, Ty, Writer, Writers,
@@ -148,6 +160,7 @@ pub const TRACKER: Table = Table {
         &VIEW,
         &MEASURE,
         &NOTE,
+        &lease::RENEWAL,
     ],
     faces: &[
         // What the owner states: the word a row is named by first, then what a person reads of
@@ -174,6 +187,7 @@ pub const TRACKER: Table = Table {
                 "column",
                 "exit",
                 "outcome",
+                "state",
                 "reason",
                 "approved_by",
             ],
@@ -220,6 +234,14 @@ pub const TRACKER: Table = Table {
             // The row a note is about names it, by its table and key; then what it says, on
             // what evidence, and when.
             order: &["on", "about", "text", "evidence", "at"],
+        },
+        Faced {
+            collection: "renewal",
+            title: "Lease renewals",
+            singular: "Lease renewal",
+            face: Face::Mac,
+            // When the machine renewed its leases, then how long that keeps them.
+            order: &["at", "period"],
         },
     ],
     self_quota: usize::MAX,

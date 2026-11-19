@@ -700,6 +700,67 @@ fn a_clones_publish_rename_holds_the_update_boundary() {
     );
 }
 
+/// A clone published as a top-level folder of the console account's own home has the root LAN
+/// broker asked once, after the rename and past the update boundary, by the one asker beside the
+/// lanes: the lane goes on through its dependencies to its end while the ask still waits on the
+/// broker (whose pace can hold a request a minute), and the broker's answer never fails the
+/// clone.
+/// NEGATIVE CONTROL: the ask made in the lane, at the publish, holds the lane: the broker sees
+/// the clone unfinished through its whole minute.
+#[test]
+fn a_clone_published_in_the_console_home_asks_the_broker_beside_its_lane() {
+    let (sys, who) = fixture();
+    sys.logged_in(&who).stat_of(
+        "/dev/console",
+        Stat {
+            uid: who.uid,
+            gid: 0,
+            mode: 0o600,
+            dir: false,
+            symlink: false,
+            len: 0,
+        },
+    );
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let seen = std::sync::Arc::clone(&seen);
+        sys.on_scope_home(move |sys| {
+            let unbound = sys.boundary.any_held().is_none();
+            // A hang detector: the lane must reach its end while this ask is held.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let ended = loop {
+                let ended = sys
+                    .repository_observations()
+                    .iter()
+                    .any(|progress| progress.name == "new" && progress.phase == Phase::Ready);
+                if ended || std::time::Instant::now() >= until {
+                    break ended;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            seen.lock().unwrap().push((unbound, ended));
+            aterm_uds::lan::ScopeAnswer::Failed("the edit failed".into())
+        });
+    }
+    let (repo, _, _) = script_clone(&sys, &who, false);
+    let cloned = clone_all(&sys, &who, &[repo], &[], &BTreeSet::new(), None, None);
+    assert!(cloned.failed.is_empty(), "{:?}", cloned.failed);
+    assert_eq!(cloned.cloned.len(), 1);
+    let calls = sys.calls();
+    let at = |call: &str| calls.iter().position(|c| c.starts_with(call));
+    assert_eq!(
+        calls.iter().filter(|c| *c == "scope home").count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(at("rename-noreplace ") < at("scope home"), "{calls:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(true, true)],
+        "asked past the update boundary, the lane ended meanwhile"
+    );
+}
+
 /// A guarded clone checks `current` before every step, the publish included. The publish's
 /// guard waits for a pending update handoff (design §6.7), up to minutes, after the last
 /// check; once the handoff is refused it checks `current` again, and publishes nothing when

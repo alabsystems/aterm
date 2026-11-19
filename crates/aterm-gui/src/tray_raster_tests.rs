@@ -2872,6 +2872,384 @@ fn glyph_texels_blend_like_terminal_text() {
     assert_eq!(bare.px, bare_plain.px);
 }
 
+thread_local! {
+    /// While set ([`texel_blends`]), each texel [`Canvas::blend_glyph_texel_as_before`] blends on
+    /// its canvas and inside its clip, as its ink, the pixel under it and its coverage, each
+    /// colour as `u32::from_ne_bytes` reads it ([`GlyphBlends`]' key).
+    static TEXEL_BLENDS: std::cell::RefCell<Option<std::collections::HashSet<(u32, u32, u8)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl Canvas {
+    /// [`Canvas::blend_glyph_texel`] as it was before it kept its pixels ([`GlyphBlends`]), the
+    /// laws' oracle: each texel corrected for contrast and composited anew. Its one memo, of the
+    /// corrected alpha for the last ink and ground by coverage, held a pure function's values,
+    /// so this works each one out.
+    pub(super) fn blend_glyph_texel_as_before(&mut self, x: i32, y: i32, c: [u8; 4], coverage: u8) {
+        if coverage == 0 {
+            return;
+        }
+        let local_x = x.saturating_sub(self.origin_x);
+        let local_y = y.saturating_sub(self.origin_y);
+        if local_x < 0 || local_y < 0 || local_x as u32 >= self.w || local_y as u32 >= self.h {
+            return;
+        }
+        let plain = f32::from(coverage) / 255.0;
+        let i = ((local_y as u32 * self.w + local_x as u32) * 4) as usize;
+        let inside = self
+            .clip
+            .last()
+            .is_none_or(|&(cx0, cy0, cx1, cy1)| x >= cx0 && y >= cy0 && x < cx1 && y < cy1);
+        let key = (u32::from_ne_bytes(c), self.pixel_word(i), coverage);
+        TEXEL_BLENDS.with_borrow_mut(|seen| {
+            if let Some(seen) = seen.as_mut().filter(|_| inside) {
+                seen.insert(key);
+            }
+        });
+        if coverage == u8::MAX || self.px[i + 3] == 0 {
+            self.blend(x, y, c, plain);
+            return;
+        }
+        let pack = |p: &[u8]| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]);
+        let ink = pack(&c[..3]);
+        let ground = pack(&self.px[i..i + 3]);
+        let corrected = aterm_render::correct_alpha(
+            aterm_render::linear_luminance(ink),
+            aterm_render::linear_luminance(ground),
+            plain,
+        );
+        self.blend(x, y, c, corrected);
+    }
+}
+
+/// `draw` with every glyph texel blended by the oracle ([`with_texels_as_before`]), and the ink,
+/// ground and coverage of each texel it blended, each once.
+fn texel_blends<R>(draw: impl FnOnce() -> R) -> (R, std::collections::HashSet<(u32, u32, u8)>) {
+    TEXEL_BLENDS.with_borrow_mut(|seen| *seen = Some(std::collections::HashSet::new()));
+    let drawn = with_texels_as_before(draw);
+    let seen = TEXEL_BLENDS
+        .with_borrow_mut(Option::take)
+        .unwrap_or_default();
+    (drawn, seen)
+}
+
+/// The Deck's words, copied as data from the Full-form Deck cards that
+/// `crate::stats_deck::deck_prims` drew at 1× on 2026-11-18 for its paint tests' calm and
+/// troubled machines (`stats_deck::paint_tests::Scene::Calm` and `Scene::Trouble`): the calm
+/// card's words in its order, each once, then each the troubled card drew that the calm one did
+/// not, in its ink. Each is its string, its size in points, its face (every one of weight Regular) and
+/// the ink it took, an index into a theme's [`DECK_INKS`] (0 dim, 1 value, 2 hot, 3 cool,
+/// 4 stuck, 5 warn). These laws read no Deck code, so a Deck drawn anew leaves them as they are.
+const DECK_WORDS: [(&str, f32, TextFace, usize); 45] = [
+    ("18 cores", 9.5, TextFace::Ui, 0),
+    ("CPU", 10.5, TextFace::UiBold, 1),
+    ("98%", 10.5, TextFace::UiBold, 2),
+    ("17.7 cores", 10.0, TextFace::Ui, 1),
+    ("8 waiting for a core", 9.5, TextFace::Ui, 1),
+    (" · ", 9.5, TextFace::Ui, 0),
+    ("rustc ×9 in Tab 3", 9.5, TextFace::Ui, 1),
+    ("GPU", 10.5, TextFace::UiBold, 1),
+    ("12%", 10.5, TextFace::UiBold, 3),
+    ("Memory", 10.5, TextFace::UiBold, 1),
+    ("33%", 10.5, TextFace::UiBold, 1),
+    ("42.1 GiB used", 10.0, TextFace::Ui, 1),
+    ("Disk", 10.5, TextFace::UiBold, 1),
+    ("56%", 10.5, TextFace::UiBold, 1),
+    ("1.11 TB used", 10.0, TextFace::Ui, 1),
+    ("aterm writes 38 MB/s, 0.2 in Tab 2", 9.5, TextFace::Ui, 1),
+    ("Network", 10.5, TextFace::UiBold, 1),
+    ("18%", 10.5, TextFace::UiBold, 3),
+    ("2.1 MB/s", 10.0, TextFace::Ui, 1),
+    ("0.3 MB/s", 9.5, TextFace::Ui, 1),
+    ("Processes", 10.5, TextFace::UiBold, 1),
+    ("6%", 10.5, TextFace::UiBold, 3),
+    ("897 processes", 10.0, TextFace::Ui, 1),
+    ("1 stuck", 9.5, TextFace::UiBold, 4),
+    ("2 quiet", 9.5, TextFace::UiBold, 4),
+    ("now", 9.5, TextFace::Ui, 0),
+    ("this Mac", 9.5, TextFace::Ui, 0),
+    ("aterm", 9.5, TextFace::Ui, 0),
+    ("Tab 2", 9.5, TextFace::Ui, 0),
+    ("6h ago", 9.5, TextFace::Ui, 0),
+    ("over max", 9.5, TextFace::Ui, 0),
+    ("–10s", 9.5, TextFace::Ui, 0),
+    ("–1m", 9.5, TextFace::Ui, 0),
+    ("–10m", 9.5, TextFace::Ui, 0),
+    ("–1h", 9.5, TextFace::Ui, 0),
+    ("88%", 10.5, TextFace::UiBold, 5),
+    ("112.6 GiB used", 10.0, TextFace::Ui, 1),
+    ("pressure warn", 9.5, TextFace::UiBold, 5),
+    ("swapping 36 MiB/s", 9.5, TextFace::Ui, 1),
+    ("98%", 10.5, TextFace::UiBold, 5),
+    ("1.96 TB used", 10.0, TextFace::Ui, 1),
+    ("full in ~34 min", 9.5, TextFace::UiBold, 5),
+    ("low, 41 GB free", 9.5, TextFace::UiBold, 5),
+    ("2 stuck", 9.5, TextFace::UiBold, 4),
+    ("1 quiet", 9.5, TextFace::UiBold, 4),
+];
+
+/// The inks the Deck's words took in three built-in themes, from the same cards: dim, value,
+/// hot, cool, stuck and warn, as [`DECK_WORDS`] index them.
+const DECK_INKS: [(&str, [[u8; 4]; 6]); 3] = [
+    (
+        "aterm Night",
+        [
+            [153, 161, 172, 255],
+            [207, 216, 227, 255],
+            [255, 225, 72, 255],
+            [138, 163, 176, 255],
+            [180, 231, 252, 255],
+            [233, 196, 106, 255],
+        ],
+    ),
+    (
+        "aterm Day",
+        [
+            [97, 103, 113, 255],
+            [40, 47, 59, 255],
+            [117, 26, 0, 255],
+            [84, 103, 131, 255],
+            [32, 83, 110, 255],
+            [136, 95, 0, 255],
+        ],
+    ),
+    (
+        "Linen",
+        [
+            [112, 96, 84, 255],
+            [68, 49, 38, 255],
+            [117, 26, 0, 255],
+            [83, 100, 128, 255],
+            [32, 83, 110, 255],
+            [132, 91, 0, 255],
+        ],
+    ),
+];
+
+/// Grounds the Deck's cards draw in each theme of [`DECK_INKS`], from the same cards: the card's
+/// fill, which its words sit on, a bar's track and the card's bottom rule.
+const DECK_GROUNDS: [[[u8; 4]; 3]; 3] = [
+    [[50, 55, 65, 255], [64, 69, 80, 255], [79, 81, 87, 255]],
+    [
+        [226, 229, 233, 255],
+        [208, 211, 215, 255],
+        [195, 196, 198, 255],
+    ],
+    [
+        [230, 223, 210, 255],
+        [212, 205, 192, 255],
+        [194, 191, 185, 255],
+    ],
+];
+
+/// The five grounds a card of the Deck's words in `theme` draws them over: the theme's
+/// ([`DECK_GROUNDS`]), and the card's fill again at two part alphas, as chrome over a
+/// translucent window draws it, so three of them hold one colour at three alphas.
+fn deck_word_grounds(theme: usize) -> [[u8; 4]; 5] {
+    let [card, track, rule] = DECK_GROUNDS[theme];
+    let part = |alpha: u8| [card[0], card[1], card[2], alpha];
+    [card, track, rule, part(0xb0), part(0x58)]
+}
+
+/// A card of the Deck's words ([`DECK_WORDS`]) in `theme`'s inks, `scale` device px a point,
+/// 1440 points wide: across it a band of each of [`deck_word_grounds`], and over each band
+/// every word in its own ink, set in rows 16 points apart from the band's left. `apart` sets
+/// each char as its own text an em and a quarter from the next, so no texel lands on a pixel
+/// another glyph blended and every texel's ground is its band's; else each word is one text,
+/// its glyphs' edges over each other's, as the Deck sets it. In device px, with its width and
+/// height.
+fn deck_words_card(theme: usize, scale: f32, apart: bool) -> (Vec<DrawPrim>, u32, u32) {
+    const WIDTH: f32 = 1440.0;
+    const ROW: f32 = 16.0;
+    const PAD: f32 = 12.0;
+    let inks = DECK_INKS[theme].1;
+    let mut texts = Vec::new();
+    let (mut x, mut row) = (PAD, 0_u16);
+    for (word, size, face, ink) in DECK_WORDS {
+        let em = if apart { 1.25 * size } else { 0.62 * size };
+        let wide = em * word.chars().count() as f32 + if apart { 0.0 } else { size };
+        if x + wide > WIDTH - PAD {
+            (x, row) = (PAD, row + 1);
+        }
+        let mut place = |at: f32, s: String| {
+            texts.push((at, f32::from(row) * ROW + 15.0, s, size, face, inks[ink]));
+        };
+        if apart {
+            for (k, ch) in word.chars().enumerate() {
+                place(x + em * k as f32, ch.to_string());
+            }
+        } else {
+            place(x, word.to_string());
+        }
+        x += wide;
+    }
+    let band = f32::from(row + 1) * ROW + 4.0;
+    let mut prims = Vec::new();
+    for (k, fill) in deck_word_grounds(theme).into_iter().enumerate() {
+        let top = band * k as f32;
+        prims.push(DrawPrim::Panel {
+            x: 0.0,
+            y: top * scale,
+            w: WIDTH * scale,
+            h: band * scale,
+            radius: 0.0,
+            fill,
+        });
+        for (at, baseline, s, size, face, color) in &texts {
+            prims.push(DrawPrim::Text {
+                x: at * scale,
+                baseline: (top + baseline) * scale,
+                s: s.clone(),
+                px: size * scale,
+                color: *color,
+                weight: TextWeight::Regular,
+                face: *face,
+            });
+        }
+    }
+    let height = band * deck_word_grounds(theme).len() as f32;
+    (prims, (WIDTH * scale) as u32, (height * scale) as u32)
+}
+
+/// The rasters of the Deck's words the laws draw, each named: in each theme's inks, at 1× and 2×,
+/// set as the Deck sets them and set apart ([`deck_words_card`]), the whole card
+/// ([`rasterize_tray_pixels`], as a new card is drawn) and two strips of it
+/// ([`rasterize_tray_region`], as a reading's live rows are).
+fn deck_word_rasters() -> Vec<(String, Vec<u8>)> {
+    let mut rasters = Vec::new();
+    for (theme, (name, _)) in DECK_INKS.iter().enumerate() {
+        for scale in [1.0, 2.0] {
+            for apart in [false, true] {
+                let (prims, w, h) = deck_words_card(theme, scale, apart);
+                let card = format!("{name} {scale}x{}", if apart { " apart" } else { "" });
+                rasters.push((
+                    format!("{card} card"),
+                    rasterize_tray_pixels(&prims, w, h, 1.0, [0, 0, 0, 0]),
+                ));
+                let strips = [
+                    RasterRect {
+                        x: 0,
+                        y: h / 3,
+                        width: w / 2,
+                        height: h / 3,
+                    },
+                    RasterRect {
+                        x: w / 3,
+                        y: 0,
+                        width: w / 3 + 1,
+                        height: h,
+                    },
+                ];
+                for (k, strip) in strips.into_iter().enumerate() {
+                    let px = rasterize_tray_region(&prims, 1.0, [0, 0, 0, 0], strip);
+                    rasters.push((format!("{card} strip {k}"), px));
+                }
+            }
+        }
+    }
+    rasters
+}
+
+/// Text draws the pixels it drew before its texels' blends were kept ([`GlyphBlends`]): every
+/// raster of [`deck_word_rasters`], from no kept blend and then over the blends the first pass
+/// kept, is byte for byte the raster the oracle ([`Canvas::blend_glyph_texel_as_before`])
+/// draws. Their grounds hold the card's fill opaque and at two part alphas, so a blend kept for
+/// one ground is wrong for the others, and a card set as the Deck sets it meets more inks and
+/// grounds than [`GLYPH_BLEND_GROUNDS`] places (as
+/// [`text_keeps_the_blends_most_texels_take_where_its_inks_and_grounds_outnumber_the_places`]
+/// holds), so places are given up to others as it draws.
+#[test]
+fn text_draws_the_pixels_it_drew_before_its_blends_were_kept() {
+    prepare_ui_fonts_for_direct_view_test();
+    forget_kept_glyphs();
+    let (before, _) = texel_blends(deck_word_rasters);
+    let fresh = deck_word_rasters();
+    let kept = deck_word_rasters();
+    assert_eq!(before.len(), 36);
+    assert!(
+        before[0].1 != before[12].1,
+        "the night and the day theme draw the card apart"
+    );
+    for (pass, now) in [("fresh", &fresh), ("kept", &kept)] {
+        for ((name, was), (_, drawn)) in before.iter().zip(now) {
+            let apart = was.iter().zip(drawn).filter(|(a, b)| a != b).count();
+            assert!(
+                was.len() == drawn.len() && apart == 0,
+                "{name}, {pass}: {apart} bytes apart"
+            );
+        }
+    }
+}
+
+/// What text's blends meet and do on a card of the Deck's words ([`deck_words_card`]): how many
+/// inks and grounds its texels meet, and how many inks, grounds and coverages, as the oracle
+/// counts them ([`texel_blends`]); and, from no kept blend ([`forget_kept_glyphs`]), each of two
+/// rasters' glyph texels and the pixels it worked out ([`glyph_texels`], [`glyph_blends`]).
+fn card_blend_work(theme: usize, scale: f32, apart: bool) -> (usize, usize, [(u64, u64); 2]) {
+    let (prims, w, h) = deck_words_card(theme, scale, apart);
+    let draw = || rasterize_tray_pixels(&prims, w, h, 1.0, [0, 0, 0, 0]);
+    let (_, met) = texel_blends(draw);
+    let places: std::collections::HashSet<_> = met.iter().map(|&(ink, on, _)| (ink, on)).collect();
+    forget_kept_glyphs();
+    let raster = || {
+        let (texels, blends) = (glyph_texels(), glyph_blends());
+        let _ = draw();
+        (glyph_texels() - texels, glyph_blends() - blends)
+    };
+    let first = raster();
+    (places.len(), met.len(), [first, raster()])
+}
+
+/// The work text's blends do ([`GlyphBlends`]): where a card's inks and grounds fit the places
+/// kept, its first raster works out one pixel for each ink, ground and coverage its texels meet
+/// (as the oracle counts them, [`texel_blends`]) and its next raster, which blends the same
+/// texels, works out none. Each card of the Deck's words set apart, in each theme's inks at 1×
+/// and 2×, meets its six inks over its five grounds, which fit.
+#[test]
+fn text_works_out_each_blend_once_where_its_inks_and_grounds_fit_the_places_kept() {
+    prepare_ui_fonts_for_direct_view_test();
+    for (theme, (name, _)) in DECK_INKS.iter().enumerate() {
+        for scale in [1.0, 2.0] {
+            let card = format!("{name} at {scale}x, set apart");
+            let (places, met, [(texels, first), (again, second)]) =
+                card_blend_work(theme, scale, true);
+            assert_eq!(places, 6 * 5, "{card}: its inks over its grounds");
+            assert_eq!(
+                first, met as u64,
+                "{card}: of {texels} texels, the first raster's blends"
+            );
+            assert_eq!(again, texels, "{card}: the next raster's texels");
+            assert_eq!(second, 0, "{card}: the next raster's blends");
+        }
+    }
+}
+
+/// The work text's blends do where a card's inks and grounds outnumber the places kept
+/// ([`GLYPH_BLEND_GROUNDS`]), so that each new one takes the place fewest texels took lately: its
+/// next raster, which blends the same texels over the places its first kept, works out at most
+/// one in a hundred of them, so the inks and grounds most of its texels take stay kept. Each card
+/// of the Deck's words set as the Deck sets them, in each theme's inks at 1× and 2×, meets more
+/// inks and grounds than the places kept, as the oracle counts them ([`texel_blends`]).
+#[test]
+fn text_keeps_the_blends_most_texels_take_where_its_inks_and_grounds_outnumber_the_places() {
+    prepare_ui_fonts_for_direct_view_test();
+    for (theme, (name, _)) in DECK_INKS.iter().enumerate() {
+        for scale in [1.0, 2.0] {
+            let card = format!("{name} at {scale}x, set as the Deck sets it");
+            let (places, _, [(texels, _), (again, second)]) = card_blend_work(theme, scale, false);
+            assert!(
+                places > GLYPH_BLEND_GROUNDS,
+                "{card}: it meets {places} inks and grounds"
+            );
+            assert_eq!(again, texels, "{card}: the next raster's texels");
+            assert!(
+                second * 100 <= again,
+                "{card}: the next raster works out {second} of its {again} texels"
+            );
+        }
+    }
+}
+
 #[test]
 fn mono_text_is_as_heavy_dark_on_light_as_light_on_dark() {
     set_chrome_fonts(None, None, None);
@@ -4699,7 +5077,7 @@ fn an_image_not_kept_draws_nothing_and_bakes_nothing() {
         "and keeps nothing"
     );
     assert!(!art.is_kept(w, h), "and leaves its art unbaked");
-    art.keep(w, h, art.bake(w, h).into());
+    art.keep(w, h, art.bake(w, h));
     assert!(raster(&prims) != blank, "control: kept, it draws");
     crate::widget::retain_images(&[]);
 }

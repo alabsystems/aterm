@@ -2627,7 +2627,8 @@ fn a_checks_stop_outlasts_what_its_attempt_does_not() {
 /// A CHECK WHOSE RUN COULD NOT RECORD IT IS HELD ANYWAY: the account's check is written under no
 /// fence but the account's own, where the run's own record was refused; and where the records
 /// cannot be written at all, this process keeps it and holds the row until a ladder pass has
-/// written it. CONTROL: a check of a row that a login was made for since its run started, or
+/// written it, with the account's path observation beside it (`accounts::Account::unreached`,
+/// plan package UB-05). CONTROL: a check of a row that a login was made for since its run started, or
 /// that names another account now, is no longer the row's to hold.
 #[cfg(unix)]
 #[test]
@@ -2699,6 +2700,18 @@ fn a_check_its_run_could_not_record_is_held_anyway() {
         &store.load_logins(later).unwrap().0
     ));
     assert!(w3_held(&desk, &desk_upkeep(), later), "and held on record");
+    assert_eq!(
+        store
+            .load(later)
+            .unwrap()
+            .0
+            .accounts
+            .get("w3")
+            .and_then(|account| account.unreached.as_ref())
+            .map(|obs| obs.at),
+        Some(NOW),
+        "the account's path observation, written beside its check (plan package UB-05)"
+    );
 
     {
         // A login made for the row after its run started: the check is no longer its to hold.

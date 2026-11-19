@@ -566,6 +566,7 @@ fn snapshot_of(sid: &str, pid: u32, start: &str, cwd: &Path, codex: &Path) -> Sn
         version: None,
         run: aterm_agent::harness::relaunch::AgentRun::Codex(
             aterm_agent::harness::relaunch::CodexRun {
+                selected_default: false,
                 home: codex.to_path_buf(),
                 home_env: None,
                 self_claimed: None,

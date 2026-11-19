@@ -136,7 +136,8 @@ impl Filed {
     }
 }
 
-/// The run a record came from: its id, when it started, and the Mac and session that ran it.
+/// The run a record came from: its id, when it started, the Mac that ran it and, where the
+/// aterm instance hosting it placed it, the session it belongs to ([`Self::hosting`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
@@ -149,15 +150,82 @@ pub struct Run {
     /// Its fleet node id, where it has a node identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// The aterm session the run was started in (`ATERM_SESSION_ID`), as a token.
+    /// READ ONLY, for records made before [`Self::hosted`]: the shell's `ATERM_SESSION_ID`, as a
+    /// token. It names a shell, which any process can set, and never the session a run belongs
+    /// to; no run writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The session the run belongs to, as `aterm ctl @self` addresses it (`t` and 10 base32
+    /// characters, or a legacy `s-` and 20 hex digits): the one whose program is an ancestor of
+    /// the landing's process, as the hosting instance read that process's lineage
+    /// ([`crate::hosting`]); for a landing a program worker runs (`verify land --tab`), the
+    /// session that started the worker. `None`: no hosting session is known (a record from
+    /// before the field, a run no aterm hosts, an instance that did not answer), and the run
+    /// belongs to its computer ([`Self::host`], [`Self::node`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted: Option<String>,
+    /// The worker session the landing runs in, where [`Self::hosted`] names the session that
+    /// asked for it; never without [`Self::hosted`], and never the same session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    /// The checkout the landing runs in: its root, as the run named it at its start (at most
+    /// [`WHY_BYTES`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<String>,
+    /// The branch that checkout's HEAD named at the run's start; `None` for a detached HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// The Mac's physical memory, in MiB, where it was read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u64>,
     /// Its logical cores, where they were read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cores: Option<u32>,
+}
+
+/// The session a run belongs to, as its record names it ([`Run::hosting`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hosting<'a> {
+    /// The session the run is credited to ([`Run::hosted`]).
+    pub hosted: &'a str,
+    /// The worker session it runs in, where another session asked for it ([`Run::worker`]).
+    pub worker: Option<&'a str>,
+}
+
+impl Run {
+    /// The session the run belongs to; `None`: no hosting session is known, and the run belongs
+    /// to its computer. A record from before the join names none, whatever shell id its
+    /// [`Self::session`] holds.
+    #[must_use]
+    pub fn hosting(&self) -> Option<Hosting<'_>> {
+        Some(Hosting {
+            hosted: self.hosted.as_deref()?,
+            worker: self.worker.as_deref(),
+        })
+    }
+
+    /// This run, belonging to the session `placed` names and landing `checkout` on `branch`: a
+    /// checkout or a branch no record can hold ([`place`]) is left out.
+    #[must_use]
+    pub fn placed(
+        mut self,
+        placed: crate::hosting::Hosted,
+        checkout: &str,
+        branch: Option<&str>,
+    ) -> Self {
+        self.hosted = placed.hosted;
+        self.worker = placed.worker;
+        self.checkout = Some(checkout.to_owned()).filter(|path| place(path));
+        self.branch = branch.map(str::to_owned).filter(|name| place(name));
+        self
+    }
+}
+
+/// Whether `text` is a checkout or a branch a record can hold: not empty, at most [`WHY_BYTES`],
+/// and no control character.
+#[must_use]
+pub fn place(text: &str) -> bool {
+    !text.is_empty() && text.len() <= WHY_BYTES && !text.chars().any(char::is_control)
 }
 
 /// What a set of changed paths reached when the record was made ([`crate::land::Reach`]).
@@ -418,7 +486,10 @@ impl Entry {
     /// UTF-8 within [`crate::land_record::MAX_BYTES`] of schema [`SCHEMA`], its signature, where
     /// it has one, this domain's; it names the path's run, ordinal and kind, and was made on the
     /// path's day; each commit it names (head, base, a cause's tip, a landing's commit and onto)
-    /// is an object id and its tree a tree id, where named; and its host and session are tokens.
+    /// is an object id and its tree a tree id, where named; its host and session are tokens; the
+    /// session it belongs to and its worker, where named, are session ids, the worker another
+    /// session than the one it is credited to; and its checkout and branch, where named, are
+    /// ones a record can hold ([`place`]).
     #[must_use]
     pub fn read(path: &str, bytes: &[u8], origin: Origin) -> Self {
         let filed = Filed::parse(path);
@@ -497,6 +568,22 @@ fn read_body(filed: &Filed, bytes: &[u8]) -> Result<Read, String> {
         .is_some_and(|node| !aterm_net::fleet::is_node_id(node))
     {
         return Err("its node is no node id".to_owned());
+    }
+    let run = &record.run;
+    let sessions = [run.hosted.as_deref(), run.worker.as_deref()];
+    if !sessions
+        .into_iter()
+        .flatten()
+        .all(crate::hosting::is_session_id)
+    {
+        return Err("its hosting session or its worker is no session id".to_owned());
+    }
+    if run.worker.is_some() && (run.hosted.is_none() || run.worker == run.hosted) {
+        return Err("its worker names no other session that asked for it".to_owned());
+    }
+    let places = [run.checkout.as_deref(), run.branch.as_deref()];
+    if !places.into_iter().flatten().all(place) {
+        return Err("its checkout or its branch is not one a record holds".to_owned());
     }
     Ok(Read { record, signature })
 }

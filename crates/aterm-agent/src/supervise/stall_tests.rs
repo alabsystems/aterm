@@ -1118,7 +1118,9 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
 /// the explicit restart ends (its crash rule, pid 4242) or not, says whether
 /// the agent's own record names an idle point ([`IdleHost::beside_idle`]),
 /// measures `memory`, counts the idle reads and keeps what it was told for a
-/// person.
+/// person. With `scoped` the tab's claim is instead a contract 4 claim holding
+/// `relaunch` (HX-15m): the memory restart is its own ([`IdleHost::scoped_restart`]),
+/// each ask of it kept and answered with the next of `answers`.
 #[derive(Debug)]
 struct Beside {
     idle: bool,
@@ -1129,6 +1131,9 @@ struct Beside {
     memory: Option<crate::supervise::memory::AgentMemory>,
     asked: std::sync::atomic::AtomicUsize,
     informed: Mutex<Vec<String>>,
+    scoped: bool,
+    answers: Mutex<VecDeque<&'static str>>,
+    restarts: Mutex<Vec<String>>,
 }
 
 impl Beside {
@@ -1140,7 +1145,31 @@ impl Beside {
             memory,
             asked: std::sync::atomic::AtomicUsize::new(0),
             informed: Mutex::new(Vec::new()),
+            scoped: false,
+            answers: Mutex::new(VecDeque::new()),
+            restarts: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Beside a contract 4 claim holding `relaunch`, no self-claim record reading idle,
+    /// answering its memory restart's asks with `answers` in turn.
+    fn scoped(
+        memory: Option<crate::supervise::memory::AgentMemory>,
+        answers: &[&'static str],
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            scoped: true,
+            answers: Mutex::new(answers.iter().copied().collect()),
+            ..Arc::into_inner(Self::new(false, memory)).expect("one owner")
+        })
+    }
+
+    /// The restarts asked of this host, by their word.
+    fn restarts(&self) -> Vec<String> {
+        self.restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn idle_reads(&self) -> usize {
@@ -1176,6 +1205,34 @@ impl IdleHost for Beside {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(text.to_string());
+    }
+    fn scoped_restart(&self, why: &crate::supervise::policy::turn_end::Restart) -> bool {
+        self.scoped && matches!(why, crate::supervise::policy::turn_end::Restart::Memory)
+    }
+    fn can_restart(&self) -> bool {
+        self.scoped
+    }
+    fn restart(
+        &self,
+        why: &crate::supervise::policy::turn_end::Restart,
+        _: &crate::supervise::policy::turn_end::RestartAsk,
+    ) -> Option<crate::supervise::policy::turn_end::RestartAnswer> {
+        if !self.scoped {
+            return None;
+        }
+        self.restarts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(why.word().to_string());
+        let step = self
+            .answers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or("relaunched:scoped-memory");
+        Some(crate::supervise::policy::turn_end::RestartAnswer::unread(
+            step,
+        ))
     }
 }
 
@@ -1515,6 +1572,119 @@ fn actionable_memory() -> Option<crate::supervise::memory::MemoryOver> {
         strain: Some(crate::supervise::memory::Strain::Critical),
         dominant: true,
     })
+}
+
+/// What a loop says and notes, kept ([`Review`]), unattended.
+struct MemorySaid(Vec<String>);
+
+impl Review for MemorySaid {
+    fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        crate::supervise::ledger::assert_marked(line);
+        self.0.push(line.to_string());
+        Ok(())
+    }
+    fn note(&mut self, line: &str) {
+        crate::supervise::ledger::assert_marked(line);
+        self.0.push(line.to_string());
+    }
+    fn unattended(&self) -> bool {
+        true
+    }
+}
+
+/// REVIEW OF HX-15m: BESIDE A CONTRACT 4 CLAIM HOLDING `relaunch` THE MEMORY CEILING IS THE
+/// HOST'S RESTART (D19: the watchdog serves every contract 4 claim, a Codex tab's too). The loop
+/// only watches, as a Codex tab's worker does; the host says the tab's claimant takes its memory
+/// restart (`scoped_restart(Memory)`) and no self-claim record reads idle. Over the ceiling, at
+/// the screen's idle point, the host is asked `restart:memory` (its harness is told `restart
+/// cause=memory`); its deferral (`wait:person`) is noted and asked again only past the restart
+/// back-off's first step; the made restart is said once, and no server `restart` verb is sent.
+/// NEGATIVE HALF: a busy screen asks nothing; before the fix the watch-only loop's memory edge
+/// went to the self-claim's remedy alone, whose idle point is a record no contract 4 claim
+/// writes, so the host was never asked and the ceiling only warned.
+#[test]
+fn beside_a_relaunch_claimant_the_memory_ceiling_is_the_hosts_restart() {
+    let mut m = Mock::new(vec![vec!["idle".to_string()]]);
+    m.verb_replies.insert("text", memory_text_at(7));
+    let mut s = session(&mut m, None);
+    s.set_beside(Some("codex-alab".to_string()));
+    let host = Beside::scoped(Some(memory_in_trouble()), &["wait:person"]);
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..auto(30)
+    };
+    s.stall_host = opts.idle_host.clone();
+    let mut said = MemorySaid(Vec::new());
+    let screen = s.screen().expect("the screen");
+    let at = |phase| Turn {
+        phase,
+        screen: screen.clone(),
+        timed_out: false,
+    };
+    assert!(
+        !s.memory_edge(&at(Phase::Busy), &opts, &mut said)
+            .expect("busy")
+    );
+    assert!(host.restarts().is_empty(), "busy: nothing asked");
+
+    let asked = Instant::now();
+    assert!(
+        !s.memory_edge(&at(Phase::Idle), &opts, &mut said)
+            .expect("idle")
+    );
+    assert_eq!(
+        host.restarts(),
+        ["memory"],
+        "at the idle point: {:?}",
+        said.0
+    );
+    assert!(
+        said.0
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.ends_with("restart:memory waits: wait:person")),
+        "{:?}",
+        said.0
+    );
+    let (_, again) = s.beside_memory_retry.expect("the deferral's back-off");
+    assert!(
+        again >= asked + Duration::from_secs(10),
+        "the restart back-off's first step"
+    );
+    let idle = at(Phase::Idle);
+    let before = again - Duration::from_millis(1);
+    s.beside_scoped_memory_at(actionable_memory(), &idle, before, &opts, &mut said)
+        .expect("within the back-off");
+    assert_eq!(
+        host.restarts().len(),
+        1,
+        "not asked again within the back-off"
+    );
+    s.beside_scoped_memory_at(actionable_memory(), &idle, again, &opts, &mut said)
+        .expect("past the back-off");
+    assert_eq!(host.restarts().len(), 2, "asked again at its end");
+    assert!(
+        said.0.iter().any(|l| l.starts_with("RESTARTED ")
+            && l.contains(" memory ")
+            && l.ends_with("reply=relaunched:scoped-memory")),
+        "{:?}",
+        said.0
+    );
+    s.beside_scoped_memory_at(
+        actionable_memory(),
+        &idle,
+        again + Duration::from_secs(600),
+        &opts,
+        &mut said,
+    )
+    .expect("made");
+    assert_eq!(host.restarts().len(), 2, "once per agent process");
+    assert_eq!(count(s.ctl, "restart"), 0, "no server restart verb");
 }
 
 #[test]

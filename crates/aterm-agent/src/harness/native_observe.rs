@@ -118,7 +118,7 @@ pub enum Reply {
 }
 
 fn fields(text: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
-    if text.len() > MAX_REQUEST || text.contains(['\n', '\r', '\0']) {
+    if text.len() > MAX_REQUEST || super::native_act::holds_a_terminator(text) {
         return None;
     }
     let mut words = text.split_ascii_whitespace();

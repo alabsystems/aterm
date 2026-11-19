@@ -43,6 +43,9 @@ pub const HISTORY: usize = 4_096;
 /// snapshot and the baseline, which hold every row, take [`MAX_BYTES`].
 pub const SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
 
+#[path = "file_baseline.rs"]
+mod baseline;
+
 /// One shared file under one root.
 #[derive(Clone, Debug)]
 pub struct File {
@@ -662,6 +665,19 @@ impl File {
             .flatten()
     }
 
+    /// Digest of the edit baseline, including the operations behind the cells. Two replicas
+    /// can use the same local revision number for different projections.
+    #[must_use]
+    pub fn baseline_digest(&self, rev: u64, bytes: &[u8]) -> String {
+        let mut sha = Sha256::new();
+        sha.update(b"aterm/file/export/1\0");
+        sha.update(self.name.to_string().as_bytes());
+        sha.update([0]);
+        sha.update(rev.to_be_bytes());
+        sha.update(bytes);
+        aterm_codec::hex::encode_lower(&sha.finalize())
+    }
+
     /// The extension the face is written with: the last pass's, else the snapshot's, else a
     /// table's.
     #[must_use]
@@ -896,8 +912,8 @@ pub fn test_chmods() -> usize {
 #[cfg(any(unix, windows))]
 mod write {
     use super::{
-        BASELINES, File, HISTORY, MAX_BYTES, Opened, Pass, Projected, Projection, Recorded,
-        Restored, SIDECAR_BYTES, memo, read_bounded, sha_hex,
+        File, HISTORY, MAX_BYTES, Opened, Pass, Projected, Projection, Recorded, Restored,
+        SIDECAR_BYTES, memo, read_bounded, sha_hex,
     };
     use crate::{Frontier, Kept, Rendered, Snapshot, State, Why, Word};
     use aterm_uds::file_lock::LockFile;
@@ -935,7 +951,7 @@ mod write {
     /// follows the link, as `metadata` does). With a trace scope armed it records a write
     /// (`aterm_uds::trace::effect`) where it makes a folder or sets a mode, each of which moves
     /// what a look at the folder shows; a folder already there and private records nothing.
-    fn private_dir(dir: &Path) -> io::Result<()> {
+    pub(super) fn private_dir(dir: &Path) -> io::Result<()> {
         use aterm_uds::trace::{Effect, effect};
         #[cfg(unix)]
         {
@@ -966,7 +982,7 @@ mod write {
         Ok(())
     }
 
-    fn put(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    pub(super) fn put(path: &Path, bytes: &[u8]) -> io::Result<()> {
         #[cfg(test)]
         if super::cut::stops() {
             return Err(io::Error::other(
@@ -1024,37 +1040,6 @@ mod write {
             })
         }
 
-        /// Write the baseline of revision `rev` where the one there holds other bytes, and then
-        /// drop the ones older than the newest [`BASELINES`]; whether it wrote.
-        fn write_baseline(&self, rev: u64, bytes: &[u8]) -> io::Result<bool> {
-            let dir = self.root.baselines(&self.name);
-            private_dir(&dir)?;
-            let path = self.root.baseline(&self.name, rev);
-            let there = read_bounded(&path, MAX_BYTES).ok().flatten();
-            if !put_new(&path, bytes, there.as_deref())? {
-                return Ok(false);
-            }
-            let mut revs: Vec<u64> = std::fs::read_dir(&dir)?
-                .flatten()
-                .filter_map(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()?
-                        .strip_suffix(".json")?
-                        .parse()
-                        .ok()
-                })
-                .collect();
-            revs.sort_unstable();
-            for old in revs.iter().rev().skip(BASELINES) {
-                match std::fs::remove_file(self.root.baseline(&self.name, *old)) {
-                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-                    _ => {}
-                }
-            }
-            Ok(true)
-        }
-
         /// Record one pass, which took `look` ([`File::look`]) before it opened custody.
         ///
         /// Under the file's lock: a pass whose look's count is no longer the recorded count
@@ -1103,6 +1088,13 @@ mod write {
         /// # Errors
         /// A local file or folder cannot be written, or another pass held the lock too long.
         pub fn record(&self, look: Look, pass: Pass, now_ms: u64) -> io::Result<Recorded> {
+            let recorded = self.record_pass(look, pass, now_ms)?;
+            // Even a settled pass repairs a mirror whose writer exited before refreshing it.
+            self.refresh_local_if_requested();
+            Ok(recorded)
+        }
+
+        fn record_pass(&self, look: Look, pass: Pass, now_ms: u64) -> io::Result<Recorded> {
             let (root, name) = (&self.root, &self.name);
             self.make_dirs()?;
             let _lock = LockFile::take(
@@ -1215,7 +1207,11 @@ mod write {
                         } = *projected;
                         wrote |= put_new(&root.frontier(name), &sidecar, sidecar_there.as_deref())?;
                         if let Some(baseline) = baseline {
-                            wrote |= self.write_baseline(snapshot.snapshot().rev, &baseline)?;
+                            wrote |= self.write_baseline(
+                                snapshot.snapshot().rev,
+                                &baseline,
+                                held.as_deref(),
+                            )?;
                         }
                         // The content here already, at its revision, its columns stated as
                         // this pass states them: the file and the time it was written stay. A

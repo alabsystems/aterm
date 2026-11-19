@@ -566,6 +566,10 @@ pub struct Authoring {
     /// The least wire bytes of this Mac's `[everyone]` writes that wait for a key beside this
     /// batch ([`Self::beside_waiting`]), which a vault pass signs later with no ask.
     waiting: usize,
+    /// How many of its records are keyed ([`Kind::weighed`] is not) and no checkpoint share,
+    /// which a log at format 2 weighs against its keyed budget ([`Self::keyed_refusal`]): a
+    /// share is what that stop keeps room for.
+    pub keyed: usize,
 }
 
 impl Authoring {
@@ -586,6 +590,10 @@ impl Authoring {
             let bytes = record.wire_len();
             let class = class_of(record);
             batch.bytes = batch.bytes.saturating_add(bytes);
+            // A checkpoint share takes the room the keyed stop keeps for it.
+            if !record.kind().weighed() && record.kind() != Kind::Checkpoint {
+                batch.keyed = batch.keyed.saturating_add(1);
+            }
             if record.kind() == Kind::Put {
                 batch.put_bytes = batch.put_bytes.saturating_add(bytes);
                 if class.is_some() {
@@ -605,6 +613,7 @@ impl Authoring {
     #[must_use]
     pub fn with_put(mut self, bytes: usize, class: Class) -> Self {
         self.bytes = self.bytes.saturating_add(bytes);
+        self.keyed = self.keyed.saturating_add(1);
         self.put_bytes = self.put_bytes.saturating_add(bytes);
         self.largest_put = self.largest_put.max(bytes);
         self.least = Some(self.least.map_or(class, |least| least.min(class)));
@@ -647,6 +656,24 @@ impl Authoring {
     pub const fn beside_waiting(mut self, bytes: usize) -> Self {
         self.waiting = bytes;
         self
+    }
+
+    /// Why a log at format 2 that holds `held` keyed records of its keyed `budget`, and seats
+    /// `seats` Macs, does not take this batch: one checkpoint share of each seat is kept room
+    /// for, since a prune drops records only at a final checkpoint, which a majority of the
+    /// seats' shares makes final, and a log with no room for them could never prune. `None`
+    /// where the batch holds no keyed record or fits below that room. A log at format 1 is not
+    /// asked (`Log::author_ask`): no checkpoint prunes it, and its stops are its bytes'.
+    #[must_use]
+    pub fn keyed_refusal(&self, held: usize, budget: usize, seats: usize) -> Option<String> {
+        let stop = budget.saturating_sub(seats);
+        (self.keyed > 0 && held.saturating_add(self.keyed) > stop).then(|| {
+            format!(
+                "this write was not signed: the vault log holds {held} keyed records of {budget}, \
+                 and the last {seats} are kept for each seat's checkpoint share; a final \
+                 checkpoint's prune makes room"
+            )
+        })
     }
 
     /// Why a log that holds `held` bytes, whose signer's seat signed `signed` bytes of `Put`s in

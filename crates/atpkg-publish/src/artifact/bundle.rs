@@ -19,6 +19,8 @@ use crate::error::{Error, Result};
 use crate::programs::{self, BundleDef, Hello, Shape};
 use crate::triple::{Arch, Os, Triple};
 
+mod runtime;
+
 /// The sysroot-bundle packer.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PackBundle;
@@ -161,6 +163,9 @@ struct Bundle<'a> {
     switch: Switch,
     /// Whether the bundle ships (and so is admitted by) its own bin/trustc.
     own_compiler: bool,
+    runtime: runtime::DarwinRuntime,
+    /// Whether the admitted Trust bundle provides the public Miri runner and interpreter.
+    miri: bool,
     proven: bool,
     hello: HelloPlan,
     base: Option<Vec<u8>>,
@@ -373,6 +378,8 @@ pub fn admit<'a>(
         admitting.content.version.commit,
         if proven { "proven" } else { "unproven" }
     );
+    let runtime = runtime::DarwinRuntime::capture(program, triple, &admitting.content)?;
+    let miri = program == "trust" && runtime::has_miri_pair(&sysroot)?;
     Ok(Admitted(Bundle {
         ctx,
         req,
@@ -385,6 +392,8 @@ pub fn admit<'a>(
         version,
         switch,
         own_compiler,
+        runtime,
+        miri,
         proven,
         hello,
         base,
@@ -966,6 +975,14 @@ fn alias_pair_gate(root: &Path, canonical: &str, alias: &str) -> Result<OneCompi
 /// # Errors
 /// The first strip or re-sign failure.
 pub fn strip_symbols(tools: &dyn Tools, root: &Path) -> Result<(usize, usize)> {
+    strip_unbound_symbols(tools, root, &runtime::DarwinRuntime::default())
+}
+
+fn strip_unbound_symbols(
+    tools: &dyn Tools,
+    root: &Path,
+    runtime: &runtime::DarwinRuntime,
+) -> Result<(usize, usize)> {
     let mut groups: BTreeMap<(u64, u64), Vec<PathBuf>> = BTreeMap::new();
     let mut solo = 0u64;
     for rel in crate::artifact::relocate::walk_files(root).map_err(Error::cannot_run)? {
@@ -973,10 +990,10 @@ pub fn strip_symbols(tools: &dyn Tools, root: &Path) -> Result<(usize, usize)> {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| matches!(e, "rlib" | "rmeta" | "a" | "o"));
-        if skip {
+        let path = root.join(&rel);
+        if skip && !runtime.contains(root, &path) {
             continue;
         }
-        let path = root.join(&rel);
         let Some((obj, meta)) = arch::read_with_meta(&path) else {
             continue;
         };
@@ -991,6 +1008,9 @@ pub fn strip_symbols(tools: &dyn Tools, root: &Path) -> Result<(usize, usize)> {
     }
     let (mut stripped, mut relinked) = (0, 0);
     for members in groups.values() {
+        if members.iter().any(|p| runtime.contains(root, p)) {
+            continue;
+        }
         let first = &members[0];
         tools
             .strip(first, true)
@@ -1058,7 +1078,7 @@ impl<'a> Staged<'a> {
             eprintln!("atpkg-publish: one compiler — {one:?}");
         }
         if b.req.strip {
-            let (s, l) = strip_symbols(b.tools, &root)?;
+            let (s, l) = strip_unbound_symbols(b.tools, &root, &b.runtime)?;
             eprintln!(
                 "atpkg-publish: strip pass — {s} Mach-O(s) stripped, {l} hard-link member(s) re-linked"
             );
@@ -1351,7 +1371,13 @@ fn gates(
 ) -> std::result::Result<atpkg::manifest::Provenance, (Error, Started)> {
     let read = |e: Error| (e, Started::Nothing);
     let ran = |e: Error| (e, Started::Staged);
+    b.runtime.check(root).map_err(read)?;
     if b.req.program == "trust" {
+        if runtime::has_miri_pair(root).map_err(read)? != b.miri {
+            return Err(read(Error::refused(
+                "packaging changed the presence of the admitted Trust Miri pair",
+            )));
+        }
         trust_alias_gate(root).map_err(read)?;
     } else {
         compiler_gate(root).map_err(read)?;

@@ -303,6 +303,12 @@ pub(crate) fn output_within(
 /// A could-not-run when git cannot be started, does not end in time or prints more than a whole
 /// stdout can hold, or a refusal when git fails.
 pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&run_bytes(dir, args)?)
+        .trim()
+        .to_string())
+}
+
+pub(crate) fn run_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
     cmd.arg("-C")
         .arg(dir)
@@ -317,7 +323,7 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
         )),
     })?;
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        Ok(out.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
         Err(Error::refused(format!(

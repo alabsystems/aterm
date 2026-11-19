@@ -50,6 +50,7 @@ fn change_field(snap: &mut Snapshot, field: i64) {
         17 => {
             snap.run = aterm_agent::harness::relaunch::AgentRun::Codex(
                 aterm_agent::harness::relaunch::CodexRun {
+                    selected_default: false,
                     home: "/example/codex".into(),
                     home_env: None,
                     self_claimed: None,

@@ -1067,9 +1067,19 @@ pub fn dialable(ip: IpAddr) -> bool {
 
 /// What this Mac's vault holds of the membership log: every record its store holds
 /// (`aterm_secrets::client::load_records`, what a Mac states it holds, not the acknowledged view
-/// an authority decision reads); `None` where the store does not read.
+/// an authority decision reads); `None` where the store does not read, and where its records
+/// ride no members lane (`aterm_secrets::client::members_lane_open`: its format mark names a
+/// later format than 1, ATERM-KI-1116-1471). Such a Mac's row states no membership digest, so
+/// the digest trigger asks no repair round for the membership store of it, on its side or a
+/// neighbour's (`aterm_mesh_core::relay_digest::Trigger` asks only where both digests are
+/// known): a round would move no membership record, which the lane carries for neither side,
+/// and would reconcile every table both hold for nothing. Its tables' digest still asks one.
+/// A Mac with no mark states what it did.
 #[must_use]
 pub fn membership_of_vault(paths: &aterm_secrets::client::Paths) -> Option<Held> {
+    if !aterm_secrets::client::members_lane_open(paths).ok()? {
+        return None;
+    }
     let store = aterm_secrets::client::load_records(paths).ok()?;
     Some(Held::membership(&store.inventory()))
 }

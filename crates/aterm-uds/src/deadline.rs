@@ -3,8 +3,6 @@
 
 //! Deadlines for blocking in-process calls and child processes.
 
-#[cfg(any(unix, windows))]
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Output;
@@ -1158,7 +1156,8 @@ fn deadline_now() -> Instant {
 
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 /// The m16 descendant-progress detector's cadence: frequent enough inside a one-minute evidence
-/// window without turning a network operation into a continuous process-table sweep. A
+/// window without turning a network operation into a continuous process-tree reading (a whole
+/// process-table sweep off macOS, [`aterm_sysprobe::procs::process_tree`]). A
 /// [`ProgressWindow`] reads the tree once per tick however often its collector wakes (one that
 /// holds a stop wakes every [`STOP_TICK`]), and between ticks only to judge a window that would
 /// close before the next reading.
@@ -1180,46 +1179,25 @@ struct ProcessProgressMember {
     io_bytes: Option<u64>,
 }
 
-/// Select `root` and every current descendant from one complete process-table sweep. Missing
-/// identity, CPU, reaped-child CPU, truncation or ambiguous pids prove no lack of progress.
+/// Select `root` and every current descendant ([`aterm_sysprobe::procs::process_tree`], which on
+/// macOS reads the tree's own processes and no others). Missing identity, CPU, reaped-child CPU,
+/// truncation or ambiguous pids prove no lack of progress.
 #[cfg(any(unix, windows))]
 fn process_progress_tree(root: u32) -> Option<Vec<ProcessProgressMember>> {
-    let sweep = aterm_sysprobe::processes()?;
-    if sweep.truncated {
-        return None;
-    }
-    let mut by_pid = BTreeMap::new();
-    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for process in &sweep.procs {
-        if by_pid.insert(process.pid, process).is_some() {
-            return None;
-        }
-        children.entry(process.ppid).or_default().push(process.pid);
-    }
-    if !by_pid.contains_key(&root) {
-        return None;
-    }
-    let mut open = VecDeque::from([root]);
-    let mut seen = BTreeSet::new();
-    let mut members = Vec::new();
-    while let Some(pid) = open.pop_front() {
-        if !seen.insert(pid) || members.len() >= PROCESS_PROGRESS_TREE_CAP {
-            return None;
-        }
-        let process = by_pid.get(&pid)?;
-        members.push(ProcessProgressMember {
-            pid,
-            start: process.start?,
-            cpu_ns: process.cpu_ns?.saturating_add(process.child_cpu_ns?),
-            io_bytes: process
-                .disk_read
-                .zip(process.disk_written)
-                .map(|(read, written)| read.saturating_add(written)),
-        });
-        if let Some(next) = children.get(&pid) {
-            open.extend(next.iter().copied());
-        }
-    }
+    let mut members = aterm_sysprobe::procs::process_tree(root, PROCESS_PROGRESS_TREE_CAP)?
+        .into_iter()
+        .map(|process| {
+            Some(ProcessProgressMember {
+                pid: process.pid,
+                start: process.start?,
+                cpu_ns: process.cpu_ns?.saturating_add(process.child_cpu_ns?),
+                io_bytes: process
+                    .disk_read
+                    .zip(process.disk_written)
+                    .map(|(read, written)| read.saturating_add(written)),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
     members.sort_unstable();
     Some(members)
 }
@@ -1304,7 +1282,7 @@ impl ProcessProgressProbe {
 /// A progress reading for [`output_while_progressing`] that counts what this process's
 /// descendants do: it advances whenever their CPU time or I/O did since the last reading
 /// ([`ProcessProgressProbe::read_descendants`]), and at a reading that does not compare, which
-/// is no evidence of a stall. The process table is read at most once every
+/// is no evidence of a stall. The tree is read at most once every
 /// [`PROCESS_PROGRESS_TICK`]. A caller adds it to its own count of progress, so that a child
 /// a loaded machine starves is not named stalled while it works: a step of its own may take
 /// any wall-clock time there, and its CPU time still advances.

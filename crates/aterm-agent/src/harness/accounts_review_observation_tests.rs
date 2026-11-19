@@ -517,3 +517,173 @@ fn an_unlisted_logins_check_is_noted_under_the_account_its_files_name() {
         "CONTROL: no reader"
     );
 }
+
+/// A BLOCKED SIGN-IN RECORDS ITS PATH AND NEVER STRIKES THE LOGIN (plan package UB-05): a sign-in
+/// or a review whose run met a blocked path (Cloudflare's bot check, a 403 named by its status
+/// alone under Claude Code's remedy, no answer) ends `Ended::Unreached`. The AI store keeps it as
+/// a path observation ([`crate::ai::store::Record::unreached_at`]), never the login's end; the
+/// account's record keeps the path ([`accounts::Account::unreached`]) while its login ledger
+/// stays as its evidence reads it: no strike, the verdict still the turn it served, no event,
+/// and nothing staged on a Codex login.
+/// CONTROL: the same runs ended on words that name a refused credential (`Ended::ReviewAuth`, a
+/// status that names nobody signed in) strike the login and read it ended.
+/// NEGATIVE CONTROLS (2026-11-18, each restored with cp from a backup plus touch, confirmed with
+/// cmp): with `record_review_login`'s blocked-path return disabled, the ledger holds a
+/// `login-end` strike; with `Record::apply` taking `Unreached` as an end, the AI store reads it
+/// ended.
+#[test]
+fn a_blocked_sign_in_records_its_path_and_never_strikes_the_login() {
+    use crate::ai::store::{How, Record, Records};
+    for said in [
+        "Please run /login · API Error: 403 Forbidden",
+        "Please run /login · API Error: 403 Attention Required! | Cloudflare",
+    ] {
+        assert!(!aterm_phase::wall::strike_cause(said).strikes(), "{said}");
+    }
+    assert!(
+        aterm_phase::wall::strike_cause("Login expired · Please run /login").strikes(),
+        "CONTROL: a refused credential's words"
+    );
+
+    let mut record = Record::default();
+    record.apply(How::Login, Outcome::Worked, NOW - 20);
+    record.apply(How::Login, Outcome::Ended(Ended::Unreached), NOW);
+    assert_eq!(
+        (record.ended_at, record.ended_why, record.unreached_at),
+        (None, None, Some(NOW)),
+        "the AI store keeps the path"
+    );
+    assert!(!record.ended(), "a blocked path is no login's end");
+    let kept = Records {
+        by_id: [("claude".to_owned(), record.clone())]
+            .into_iter()
+            .collect(),
+        ..Records::default()
+    };
+    assert_eq!(
+        Records::parse(&kept.render()).unwrap().of("claude"),
+        record,
+        "it is written and read back"
+    );
+    record.apply(How::Login, Outcome::Ended(Ended::StatusSignedOut), NOW + 1);
+    assert!(
+        record.ended(),
+        "CONTROL: a status that names nobody signed in"
+    );
+
+    for (why, strikes) in [(Ended::Unreached, false), (Ended::ReviewAuth, true)] {
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        let cli = Cli::Claude;
+        let home = root.path().join(cli.accounts().default_home);
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            root.path().join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"00000000-0000-4000-8000-000000000001","emailAddress":"blocked@example.com"}}"#,
+        )
+        .unwrap();
+        let store = accounts::Store::at_for(root.path(), cli, root.path());
+        let path = root.path().join(cli.accounts().roster_file);
+        let row = Row {
+            label: "account".into(),
+            ..Row::default()
+        };
+        fs::write(
+            &path,
+            accounts::append_rows_for(cli, "", std::slice::from_ref(&row)).unwrap(),
+        )
+        .unwrap();
+        store
+            .transact_logins(NOW, &mut None, |state, logins| {
+                Ok(accounts::observe_served(state, logins, "account", NOW - 20))
+            })
+            .unwrap();
+        let login = accounts::login_env_for(cli, &row);
+        let witness =
+            capture_review_login(&store, cli, &path, "account", &login, NOW).expect("a witness");
+        let events = record_review_login(
+            &store,
+            cli,
+            &path,
+            &witness,
+            &home,
+            Outcome::Ended(why),
+            NOW,
+        )
+        .expect("the outcome");
+        let state = store.load(NOW).unwrap().0;
+        let account = state.accounts.get("account").expect("the account's record");
+        let verdict = account.evidence_verdict().expect("a verdict");
+        assert_eq!(
+            (
+                verdict.login == accounts::Login::Struck,
+                account.login.struck.is_some()
+            ),
+            (strikes, strikes),
+            "{why:?}: {:?}",
+            account.login
+        );
+        assert_eq!(
+            account.auth == accounts::Auth::SignedOut,
+            strikes,
+            "{why:?}"
+        );
+        if strikes {
+            assert!(account.unreached.is_none(), "CONTROL: {why:?} is no path");
+        } else {
+            assert_eq!(verdict.said, accounts::Said::Served, "the turn it served");
+            assert!(events.is_empty(), "{events:?}");
+            assert_eq!(
+                account.unreached.as_ref().map(|obs| obs.at),
+                Some(NOW),
+                "its path is recorded"
+            );
+        }
+    }
+
+    // A Codex review's outcome stages its login's end where it is one; a blocked path stages none.
+    for (why, ends) in [(Ended::Unreached, false), (Ended::ReviewAuth, true)] {
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        let cli = Cli::Codex;
+        let home = root.path().join(cli.accounts().default_home);
+        write_codex_login(&home, "fixture@example.test");
+        let store = accounts::Store::at_for(root.path(), cli, root.path());
+        let path = root.path().join(cli.accounts().roster_file);
+        let row = Row {
+            label: "account".into(),
+            ..Row::default()
+        };
+        fs::write(
+            &path,
+            accounts::append_rows_for(cli, "", std::slice::from_ref(&row)).unwrap(),
+        )
+        .unwrap();
+        let login = accounts::login_env_for(cli, &row);
+        let witness =
+            capture_review_login(&store, cli, &path, "account", &login, NOW).expect("a witness");
+        record_review_login(
+            &store,
+            cli,
+            &path,
+            &witness,
+            &home,
+            Outcome::Ended(why),
+            NOW,
+        )
+        .expect("the outcome");
+        let account = store.load(NOW).unwrap().0.accounts.remove("account");
+        assert_eq!(
+            account
+                .as_ref()
+                .is_some_and(|account| account.auth == accounts::Auth::SignedOut),
+            ends,
+            "Codex, {why:?}"
+        );
+        assert_eq!(
+            account
+                .and_then(|account| account.unreached)
+                .map(|obs| obs.at),
+            (!ends).then_some(NOW),
+            "Codex, {why:?}: its path"
+        );
+    }
+}

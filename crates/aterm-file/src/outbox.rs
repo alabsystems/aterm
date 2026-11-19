@@ -1190,21 +1190,27 @@ mod write {
             put(
                 &self.root().outbox(self.name()),
                 &body(&queued.raw, queued.read.iter().map(intent_line)),
-            )
+            )?;
+            self.refresh_local_if_requested();
+            Ok(())
         }
 
         fn put_held(&self, held: &Lines<Held>) -> io::Result<()> {
             put(
                 &self.root().held(self.name()),
                 &body(&held.raw, held.read.iter().map(held_line)),
-            )
+            )?;
+            self.refresh_local_if_requested();
+            Ok(())
         }
 
         fn put_done(&self, done: &Lines<Done>) -> io::Result<()> {
             put(
                 &self.root().done(self.name()),
                 &body(&done.raw, done.read.iter().map(done_line)),
-            )
+            )?;
+            self.refresh_local_if_requested();
+            Ok(())
         }
 
         fn intent(
@@ -1241,6 +1247,7 @@ mod write {
             queued.read.push(intent.clone());
             let text = within_bounds(queued, held)?;
             let landed = put_landed(&self.root().outbox(self.name()), &text)?;
+            self.refresh_local_if_requested();
             Ok(Accepted {
                 intent,
                 unflushed: landed.err().map(|error| error.to_string()),

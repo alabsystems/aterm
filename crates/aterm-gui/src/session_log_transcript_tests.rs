@@ -918,6 +918,141 @@ fn a_turn_that_ends_under_its_own_background_work_closes_and_so_does_its_wake() 
     );
 }
 
+/// A turn's rows up to its tool's result, then Claude Code's own `authentication_failed` notice
+/// `text` and the turn's end, as 2.1.323 writes a 401 or a 403 it is answered with
+/// (`claude-2.1.323-transcript-cloudflare-403.jsonl`'s shape), each row of the newest build the
+/// lab measured (`MEASURED_BUILDS`), so the log takes its steps `state=on`.
+fn walled_turn(ms: u64, text: &str) -> (Vec<String>, Vec<String>) {
+    let build = aterm_agent::harness::steps::MEASURED_BUILDS
+        .last()
+        .expect("a measured build");
+    let v = &format!(r#""version":"{build}""#);
+    let old = r#""version":"2.1.300""#;
+    (
+        vec![
+            prompt("v1", ms, "fix it").replace(old, v),
+            calls("m1", ms + 100, &[("toolu_a", "Bash")]).replace(old, v),
+            results(ms + 200, &[("toolu_a", false)]),
+        ],
+        vec![
+            notice(ms + 300, text).replace(
+                r#""error":"rate_limit""#,
+                r#""error":"authentication_failed""#,
+            ),
+            format!(
+                r#"{{"parentUuid":"p","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":400,"messageCount":9,"timestamp":"{}","uuid":"d-{ms}","isMeta":false,{v}}}"#,
+                at(ms + 400)
+            ),
+        ],
+    )
+}
+
+/// A Claude tab whose screen `capture` ends a turn on a login wall, its transcript's notice of
+/// that wall reading `text`: the word the tab publishes at the wall and the log's lines once the
+/// transcript's notice and the turn's end are read, with the screen's settle of the turn on its
+/// wall before that read (`settled`: the wall step left on the run after its turn) or after it
+/// (the wall step under its turn).
+fn walled_turn_lines(
+    name: &str,
+    capture: &str,
+    text: &str,
+    settled: bool,
+) -> (&'static str, Vec<String>) {
+    use crate::presence::{Cursor, agent_verdict};
+    let word = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &aterm_phase::prompt::fixtures::screen(capture),
+        Cursor::Unknown,
+        "",
+        std::time::Instant::now(),
+    )
+    .word();
+    let (work, end) = walled_turn(1_100, text);
+    let mut r = Rig::new(name);
+    r.touch();
+    let _ = r.read(&LogWake::default());
+    r.publish(1_000, "busy", 5);
+    r.append(&work);
+    let _ = r.read(&LogWake::default());
+    r.publish(2_000, word, 6);
+    if settled {
+        r.hand.set(3_100);
+        let _ = r.tl.lock().unwrap().slog_tick();
+    }
+    r.append(&end);
+    let _ = r.read(&LogWake::default());
+    r.hand.set(4_100);
+    let _ = r.tl.lock().unwrap().slog_tick();
+    (word, r.lines())
+}
+
+/// A BLOCKED PATH'S TURN IS LOGGED AS THE API'S OUTAGE THE TAB PUBLISHED (plan package UB-05):
+/// Claude Code puts its sign-in remedy before a 403 named by its status alone, on the screen
+/// (`⏺ Please run /login · API Error: 403 Forbidden`) and in its transcript's
+/// `authentication_failed` notice, and the tab publishes the outage its harness waits out
+/// (`wall:api-error`). The log's transcript projection answers the notice by the same rule: the
+/// transcript confirms the screen's wall step (never retracts it) and the turn's out stays
+/// `wall:api-error`, whether the transcript's end is read while the wall step stands under its
+/// turn or after the screen settled the turn on it, so the log and the briefs built on it name no
+/// lost login at a blocked path and no normal finish either.
+/// CONTROL: `Login expired · Please run /login` publishes `wall:auth`, its notice confirms it, and
+/// the turn's out is `wall:auth`.
+/// NEGATIVE CONTROL (2026-11-18, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `steps::notice_of_value` keeping the transcript's raw wall, the 403's wall step is closed
+/// `retracted` under its turn, and after the settle its turn's out is amended to `wall:auth`.
+#[test]
+fn a_blocked_paths_turn_is_logged_as_the_api_outage_the_tab_published() {
+    const STATUS_ALONE_403: &str =
+        include_str!("../../aterm-phase/src/fixtures/claude-2.1.310-wall-403-status-alone.txt");
+    for (name, capture, text, out) in [
+        (
+            "slog-tx-wall-403",
+            STATUS_ALONE_403,
+            "Please run /login · API Error: 403 Forbidden",
+            "wall:api-error",
+        ),
+        (
+            "slog-tx-wall-expired",
+            aterm_phase::prompt::fixtures::LOGIN_EXPIRED_2_1_310,
+            "Login expired · Please run /login",
+            "wall:auth",
+        ),
+    ] {
+        for settled in [true, false] {
+            let name = &format!("{name}-{settled}");
+            let (word, got) = walled_turn_lines(name, capture, text, settled);
+            assert_eq!(word, out, "PRECONDITION: the tab publishes the wall {out}");
+            assert!(
+                having(&got, " out=retracted ").is_empty(),
+                "{text} (settled {settled}): the transcript retracts no wall: {got:#?}"
+            );
+            assert_eq!(
+                having(&got, " confirmed=1 ").len(),
+                1,
+                "{text} (settled {settled}): the transcript confirms the wall step: {got:#?}"
+            );
+            let other = if out == "wall:auth" {
+                "wall:api-error"
+            } else {
+                "wall:auth"
+            };
+            assert!(
+                having(&got, &format!(" out={other} ")).is_empty()
+                    && having(&got, " out=done ").is_empty(),
+                "{text} (settled {settled}): no out but {out}: {got:#?}"
+            );
+            let closed = having(&got, " close t1 turn ");
+            assert!(
+                closed.len() == 1 && closed[0].contains(&format!(" out={out} ")),
+                "{text} (settled {settled}): the turn's out is {out}: {got:#?}"
+            );
+            time_order_holds(&got).unwrap();
+        }
+    }
+}
+
 const THREAD: &str = "019a0000-0000-7000-8000-00000000000a";
 
 fn rollout_rows(build: &str) -> String {

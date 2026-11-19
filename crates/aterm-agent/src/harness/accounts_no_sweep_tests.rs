@@ -242,9 +242,11 @@ impl Mac {
     }
 }
 
-/// Every minute for the first hour, then every quarter hour to the week's end.
+/// Every minute for the first hour, where the two used logins start ten minutes apart, then every
+/// hour to the week's end: nothing but the upkeep writes the records here, so a door a due time
+/// opens for a row stays open until the row starts, and the first pass after it starts it.
 fn week_step(since: i64) -> i64 {
-    if since < HOUR { MINUTE } else { 15 * MINUTE }
+    if since < HOUR { MINUTE } else { HOUR }
 }
 
 #[test]

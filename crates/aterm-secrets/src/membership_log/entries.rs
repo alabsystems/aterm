@@ -1655,7 +1655,7 @@ impl Log {
             },
             plain,
         )?;
-        Ok(self.draft(
+        let mut draft = self.draft(
             actor,
             authored_ms,
             Body::Put {
@@ -1664,7 +1664,15 @@ impl Log {
                 salt,
                 ciphertext: ciphertext.into(),
             },
-        ))
+        );
+        let key = (entry.audience.clone(), entry.name.clone());
+        let writes = super::writer::writes_of(entry);
+        draft.statement = self.statement_for(
+            actor,
+            &draft,
+            super::writer::Target::Entry(&key, Some(writes)),
+        )?;
+        Ok(draft)
     }
 
     /// Draft a [`Body::Put`] sealing the `aterm-commons-control-v1` descriptor (`ACD1`) under an
@@ -1702,7 +1710,7 @@ impl Log {
             },
             plain,
         )?;
-        Ok(self.draft(
+        let mut draft = self.draft(
             actor,
             authored_ms,
             Body::Put {
@@ -1711,7 +1719,9 @@ impl Log {
                 salt,
                 ciphertext: ciphertext.into(),
             },
-        ))
+        );
+        draft.statement = self.statement_for(actor, &draft, super::writer::Target::Commons)?;
+        Ok(draft)
     }
 
     /// Draft a [`Body::Delete`] tombstoning `name` in `epoch`'s audience under `epoch_key`.
@@ -1734,6 +1744,10 @@ impl Log {
             ));
         }
         let plain = encode_delete_plaintext(name)?;
+        let key = audience
+            .as_text_audience()
+            .map(|text| (text, name.to_owned()))
+            .ok_or_else(|| Error::new("a Delete's audience names no entry"))?;
         let sequence = self.next_sequence_for(actor);
         let (salt, ciphertext) = seal_aead(
             epoch_key,
@@ -1747,7 +1761,7 @@ impl Log {
             },
             plain,
         )?;
-        Ok(self.draft(
+        let mut draft = self.draft(
             actor,
             authored_ms,
             Body::Delete {
@@ -1756,7 +1770,10 @@ impl Log {
                 salt,
                 ciphertext: ciphertext.into(),
             },
-        ))
+        );
+        draft.statement =
+            self.statement_for(actor, &draft, super::writer::Target::Entry(&key, None))?;
+        Ok(draft)
     }
 
     /// Age recipients belonging to Macs that were removed and not restored in this log.
@@ -1963,7 +1980,10 @@ impl Log {
     /// The key that opens the counting `Put` or `Delete` at `index`, sealed under `epoch`: a
     /// counting epoch's from `unwrapped`, or, when `index` is one of the keyed `epoch`'s
     /// dependents (F21 rule 1), that epoch's from `keyed`. A counting write under a keyed epoch
-    /// that is no dependent (one signed once its signer held the removal) opens for nobody.
+    /// that is no dependent (one signed once its signer held the removal) opens for nobody, and
+    /// neither does a version-2 op whose ciphertext was shed ([`Record::is_shed`],
+    /// [`super::pass`]): it reads as an op this reader did not open, which a version-2
+    /// statement that names it reads as such.
     fn op_key<'k>(
         &self,
         index: usize,
@@ -1972,6 +1992,9 @@ impl Log {
         keyed: &'k BTreeMap<RecordId, Zeroizing<[u8; 32]>>,
         effective: &eval::Effective,
     ) -> Option<&'k Zeroizing<[u8; 32]>> {
+        if self.order.get(index).is_some_and(Record::is_shed) {
+            return None;
+        }
         if let Some(key) = unwrapped.get(epoch) {
             return Some(key);
         }
@@ -2337,7 +2360,7 @@ impl Log {
         &self,
         identity: &Identity,
     ) -> Result<Option<OpenedAudienceEntries>> {
-        self.resolve_audience_entries(identity, value_digest)?
+        self.resolve_audience_entries(identity, value_digest, None)?
             .map(|resolved| resolved.into_full(self))
             .transpose()
     }
@@ -2354,7 +2377,7 @@ impl Log {
         audience: &Audience,
         names: &[&str],
     ) -> Result<Option<Vec<Entry>>> {
-        self.resolve_audience_entries(identity, value_digest)?
+        self.resolve_audience_entries(identity, value_digest, None)?
             .map(|resolved| resolved.into_audience_named(self, audience, names))
             .transpose()
     }
@@ -2384,7 +2407,7 @@ impl Log {
         if !has_active_seat && !has_unproved_seat {
             return Ok(false);
         }
-        let Some(resolved) = self.resolve_audience_entries(identity, value_digest)? else {
+        let Some(resolved) = self.resolve_audience_entries(identity, value_digest, None)? else {
             return Ok(false);
         };
         if has_active_seat {
@@ -2416,7 +2439,7 @@ impl Log {
         identity: &Identity,
         names: Option<&[&str]>,
     ) -> Result<Option<SelectedEntries>> {
-        let Some(resolved) = self.resolve_audience_entries(identity, value_digest)? else {
+        let Some(resolved) = self.resolve_audience_entries(identity, value_digest, None)? else {
             return Ok(None);
         };
         if resolved.summary.unwrapped_keys.is_empty()
@@ -2434,7 +2457,7 @@ impl Log {
         names: &[&str],
         digest: fn(&[u8]) -> [u8; 32],
     ) -> Result<Option<Vec<Entry>>> {
-        let Some(resolved) = self.resolve_audience_entries(identity, digest)? else {
+        let Some(resolved) = self.resolve_audience_entries(identity, digest, None)? else {
             return Ok(None);
         };
         if resolved.summary.unwrapped_keys.is_empty()
@@ -2461,10 +2484,28 @@ impl Log {
             project = "aterm_secrets::membership_log::entries::tests::host_carry_transition"
         )
     )]
+    /// What a writer of format 2 reads of this log's registers as `identity` resolves them
+    /// ([`super::writer`]): each register's ops, its winner and what that writes, and the
+    /// siblings that write otherwise; and the Commons control `Put`s. `None` where `identity`
+    /// was removed.
+    ///
+    /// # Errors
+    /// As [`Log::open_audience_entries`].
+    pub(super) fn register_facts(
+        &self,
+        identity: &Identity,
+    ) -> Result<Option<super::writer::Facts>> {
+        let mut facts = super::writer::Facts::default();
+        Ok(self
+            .resolve_audience_entries(identity, value_digest, Some(&mut facts))?
+            .map(|_| facts))
+    }
+
     fn resolve_audience_entries(
         &self,
         identity: &Identity,
         digest: fn(&[u8]) -> [u8; 32],
+        mut facts: Option<&mut super::writer::Facts>,
     ) -> Result<Option<ResolvedEntries>> {
         #[cfg(test)]
         AUDIENCE_RESOLVES.with(|resolves| resolves.set(resolves.get() + 1));
@@ -2736,6 +2777,32 @@ impl Log {
                     siblings.iter().map(|&i| candidates[i].record_id).collect(),
                 );
             }
+            if let Some(facts) = facts.as_deref_mut() {
+                let w = register.winner(&siblings);
+                let winner = match w.map(|w| (w, &candidates[w].op)) {
+                    Some((w, DecodedOp::Put(_))) => Some(super::writer::Winner::Put {
+                        rep: register.rep_id(w),
+                        writes: super::writer::writes_of(&opening.text_put(candidates[w].index)?),
+                    }),
+                    Some((_, DecodedOp::Delete)) => Some(super::writer::Winner::Delete),
+                    None => None,
+                };
+                let standing = w.map_or_else(Vec::new, |w| {
+                    siblings
+                        .iter()
+                        .filter(|&&i| register.class_of(i) != register.class_of(w))
+                        .map(|&i| candidates[i].record_id)
+                        .collect()
+                });
+                facts.registers.insert(
+                    (audience.clone(), name.clone()),
+                    super::writer::Register {
+                        ops: candidates.iter().map(|op| op.record_id).collect(),
+                        standing,
+                        winner,
+                    },
+                );
+            }
             let Some(w) = register.winner(&siblings) else {
                 continue;
             };
@@ -2802,6 +2869,12 @@ impl Log {
             }
         }
 
+        if let Some(facts) = facts {
+            facts.commons = commons_candidates
+                .iter()
+                .map(|control| control.record_id)
+                .collect();
+        }
         let mut commons_control = None;
         if !commons_candidates.is_empty() {
             let siblings = effective.newest(&commons_candidates, |c| c.index);

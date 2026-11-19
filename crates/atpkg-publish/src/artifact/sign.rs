@@ -192,7 +192,7 @@ fn sign_with_reference(
     authority: &Authority,
     reference: Option<&super::bottle::reference::qualification::Permit>,
 ) -> Result<(Vec<u8>, atpkg::PkgManifest)> {
-    if super::bottle::reference::qualification::is_reference(bytes)?
+    if super::bottle::reference::qualification::requires_native_receipts(bytes)?
         && !reference.is_some_and(|permit| permit.matches(bytes))
     {
         return Err(Error::refused(

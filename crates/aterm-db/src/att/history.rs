@@ -38,7 +38,7 @@ use super::{Handle, Usage, View};
 use crate::said::Said;
 use crate::{
     Error, Result,
-    alab::registry::{self, MACHINE, MACHINE_FACTS},
+    alab::registry::{MACHINE, MACHINE_FACTS},
     catalog::Sighted,
     database::{Change, Command, decode_hex},
     documents::{application, log::Log},
@@ -179,7 +179,7 @@ impl Entry {
 /// facts bind, never a row found by its label.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Mac {
-    /// The `machine` row the writer's `machine-facts` row binds ([`registry::bound_machine`]:
+    /// The `machine` row the writer's `machine-facts` row binds ([`crate::alab::registry::bound_machine`]:
     /// its `merged_into`, else its `mac`).
     Row {
         key: String,
@@ -268,42 +268,10 @@ impl Macs {
     }
 
     /// The join `facts` (each Mac's own statement, keyed by its Commons machine) and `machines`
-    /// (the registry's machine rows) hold. A facts row's `predecessor` is the same Mac before
-    /// writer succession: a predecessor whose own facts row binds no machine row, or that has
-    /// none, binds what its successor binds, however far back the chain runs.
+    /// (the registry's machine rows) hold: each writer's machine row as its facts bind it, a
+    /// predecessor's through its successor ([`crate::alab::link::bound`]).
     pub fn from_rows(machines: &Projection, facts: &OwnedRead) -> Self {
-        let mut bound: BTreeMap<[u8; 16], String> = facts
-            .rows
-            .values()
-            .filter_map(|row| {
-                let key = registry::bound_machine(&row.value).filter(|key| !key.is_empty())?;
-                Some((row.machine, key.to_owned()))
-            })
-            .collect();
-        // Each pass carries a binding one predecessor back; a chain is no longer than the rows.
-        for _ in 0..facts.rows.len() {
-            let mut carried = false;
-            for row in facts.rows.values() {
-                let Some(before) = row
-                    .value
-                    .get("predecessor")
-                    .and_then(aterm_json::Value::as_str)
-                    .and_then(keys::parse_uuid32)
-                else {
-                    continue;
-                };
-                if bound.contains_key(&before) {
-                    continue;
-                }
-                if let Some(key) = bound.get(&row.machine).cloned() {
-                    bound.insert(before, key);
-                    carried = true;
-                }
-            }
-            if !carried {
-                break;
-            }
-        }
+        let bound = crate::alab::link::bound(facts);
         let labels: BTreeMap<String, String> = machines
             .rows
             .iter()

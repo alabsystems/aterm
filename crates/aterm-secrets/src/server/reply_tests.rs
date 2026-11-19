@@ -64,6 +64,7 @@ fn chain(count: usize) -> Vec<Record> {
                 body: RecordBody::Name {
                     name: format!("sender-{i}"),
                 },
+                statement: None,
             }
             .sign(&seed, incarnation)
             .unwrap(),

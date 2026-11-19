@@ -5,7 +5,7 @@ use super::*;
 use crate::engine::{self, NoJournal};
 use crate::items::defaults::tests::{ctx, export, user};
 use crate::model::{Mode, Outcome};
-use crate::port::{Fake, FileId, Ran, Stat};
+use crate::port::{Fake, FileId, LetsGo, Ran, Stat};
 
 const ENV: &str = "alice$ CARGO_HOME=/Users//alice/.cargo RUSTUP_HOME=/Users//alice/.rustup /Users//alice/.cargo/bin/rustup";
 const STABLE: &str =
@@ -72,6 +72,13 @@ fn folder() -> Stat {
 const VOLUME: u64 = 16_777_229;
 const AUTOFS: u64 = 889_192_451;
 
+/// A folder of alice's made at `path` on the data volume, its inode `ino`: one the scope and the
+/// root LAN broker read alike, as macOS answers `lstat` for it.
+pub(crate) fn made_on_volume(sys: &Fake, path: &str, ino: u64) {
+    sys.file(path, b"");
+    on_volume(sys, path, ino);
+}
+
 /// A folder on the data volume with inode `ino`.
 fn on_volume(sys: &Fake, path: &str, ino: u64) {
     sys.stat_of(path, folder()).file_id_of(
@@ -85,9 +92,9 @@ fn on_volume(sys: &Fake, path: &str, ino: u64) {
 }
 
 /// A Mac's folders as the scope lists them.
-/// - Alice's home: the folders Spotlight keeps, three it should leave out (one with a space in
-///   its name), and what is never a candidate (a dot-folder, a `.noindex` folder, a file, a
-///   link).
+/// - Alice's home, on the data volume: the folders Spotlight keeps, three it should leave out
+///   (one with a space in its name), and what is never a candidate (a dot-folder, a `.noindex`
+///   folder, a file, a link).
 /// - Her Library: Caches and Mail, which it should leave out, and the synced drives'
 ///   CloudStorage and Mobile Documents, which it keeps.
 /// - The data volume's top level: Applications, Users and Volumes, which it keeps; Library and
@@ -95,7 +102,15 @@ fn on_volume(sys: &Fake, path: &str, ino: u64) {
 ///   show; and the automounter's `home` on another device.
 /// - /Users//Shared.
 pub(crate) fn home(sys: &Fake) {
-    for name in [
+    sys.file_id_of(
+        Path::new(ALICE),
+        FileId {
+            dev: VOLUME,
+            ino: 1000,
+            born_ns: None,
+        },
+    );
+    for (ino, name) in (3000..).zip([
         "Documents",
         "Desktop",
         "Library",
@@ -109,9 +124,8 @@ pub(crate) fn home(sys: &Fake) {
         "Library/Mail",
         "Library/CloudStorage",
         "Library/Mobile Documents",
-    ] {
-        let path = format!("{ALICE}/{name}");
-        sys.file(&path, b"").stat_of(&path, folder());
+    ]) {
+        made_on_volume(sys, &format!("{ALICE}/{name}"), ino);
     }
     sys.file(&format!("{ALICE}/notes.txt"), b"x")
         .link(&format!("{ALICE}/Linked"), "/Volumes/Work");
@@ -152,9 +166,17 @@ pub(crate) enum Config {
     Writes,
     /// It exits 0 and adds nothing.
     Deaf,
-    /// It adds the path, and `mds` rewrites the configuration before the edit lands.
+    /// It adds the path, and `mds` rewrites the configuration before each edit lands, adding
+    /// an entry of its own each time ([`MDS_ADDED`] and its count), so no two rewrites are the
+    /// same bytes.
     Rewritten,
+    /// As [`Self::Rewritten`], at the first edit only.
+    RewrittenOnce,
 }
+
+/// The entry `mds` adds to the configuration as it rewrites it under an edit ([`Config`]),
+/// numbered from 1.
+const MDS_ADDED: &str = "/Volumes/Added By mds";
 
 /// What the fake configuration file holds where the key is absent, and where it is no array.
 const NO_LIST: &[u8] = b"\0absent";
@@ -243,10 +265,16 @@ pub(crate) fn spotlight(sys: &Fake, excluded: Option<&[&str]>, config: Config) {
                 Some(Ran::ok(""))
             }
             (PLUTIL, ["-lint", _]) => {
-                if config == Config::Rewritten {
+                if matches!(config, Config::Rewritten | Config::RewrittenOnce) {
                     let mut live = config_list(sys)?;
-                    live.push("/Volumes/Added By mds".to_owned());
-                    put(sys, VOLUME_CONFIG, &live);
+                    let rewrites = live
+                        .iter()
+                        .filter(|entry| entry.starts_with(MDS_ADDED))
+                        .count();
+                    if config == Config::Rewritten || rewrites == 0 {
+                        live.push(format!("{MDS_ADDED} {}", rewrites + 1));
+                        put(sys, VOLUME_CONFIG, &live);
+                    }
                 }
                 Some(Ran::ok(""))
             }
@@ -289,6 +317,20 @@ pub(crate) const FULL: &[u8] = b"/Library\n\
     /Users//alice/Library/Mail\n\
     /Users//alice/My Projects\n\
     /opt\n";
+
+/// [`FULL`]'s folders beyond alice's home's top level: a receipt under which every folder owed
+/// is one the root LAN broker takes.
+pub(crate) const BEYOND_THE_HOME: &[u8] = b"/Library\n\
+    /System/Volumes/Data/MobileSoftwareUpdate\n\
+    /Users//Shared\n\
+    /Users//alice/Library/Caches\n\
+    /Users//alice/Library/Mail\n\
+    /opt\n";
+
+/// The receipt lines of alice's own top-level folders [`home`] holds for the root LAN broker to
+/// exclude, the only folders of [`FULL`] it takes.
+const AT_HOME: &[u8] =
+    b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/My Projects\n";
 
 /// [`FULL`]'s folders, one a line.
 pub(crate) fn full() -> Vec<String> {
@@ -525,8 +567,8 @@ fn a_lost_receipt_is_rewritten_without_restarting_the_indexer() {
 /// A configuration with no list yet gets one. An edit that cannot be made leaves the live
 /// configuration byte for byte as it was, mds running and no receipt, and records the
 /// folders it could not exclude: a copy whose inserts did not take, a key that holds no
-/// array, a configuration that is not there, and one mds rewrote while the copy was edited.
-/// A later apply that succeeds removes that record.
+/// array, and a configuration that is not there. A later apply that succeeds removes that
+/// record.
 /// NEGATIVE CONTROL: the same world with a `plutil` that writes ends changed, with no record.
 #[test]
 fn setup_makes_a_missing_list_and_a_failed_edit_leaves_the_configuration_alone() {
@@ -561,17 +603,490 @@ fn setup_makes_a_missing_list_and_a_failed_edit_leaves_the_configuration_alone()
         sys.remove(Path::new(VOLUME_CONFIG)).unwrap();
     });
     assert!(absent.written(VOLUME_CONFIG).is_none());
-    let (raced, _) = failed(&|sys| spotlight(sys, Some(&["/Volumes/Backup"]), Config::Rewritten));
-    assert_eq!(
-        config_list(&raced).unwrap(),
-        ["/Volumes/Backup", "/Volumes/Added By mds"]
-    );
 
     // The same Mac once its configuration takes the edit.
     spotlight(&deaf, Some(&["/Volumes/Backup"]), Config::Writes);
     assert_eq!(scope_rows(&deaf, Mode::Apply)[0].outcome, Outcome::Changed);
     assert!(deaf.written(SCOPE_REFUSED).is_none());
     assert_eq!(deaf.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+}
+
+/// A configuration `mds` rewrote while the copy was edited is edited again from a fresh copy,
+/// [`EDIT_TRIES`] times in all; one `mds` rewrote under each is left as `mds` left it, with mds
+/// running and no receipt, and is no refusal: no record names the folders, so the next run
+/// excludes them, and the home is still owed its scope.
+/// NEGATIVE CONTROLS: an exclusion with no retry lints once; a rewrite recorded as a refusal
+/// names every folder in `spotlight-scope.refused`, which takes them off the automatic ask.
+#[test]
+fn a_configuration_mds_rewrote_under_the_edit_is_no_refusal() {
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&["/Volumes/Backup"]), Config::Rewritten);
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+    assert!(
+        rows[0]
+            .why
+            .as_deref()
+            .is_some_and(|why| why.contains("changed while it was being edited")),
+        "{rows:?}"
+    );
+    let lints = sys
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("/usr/bin/plutil -lint "))
+        .count();
+    assert_eq!(lints, EDIT_TRIES, "{:?}", sys.calls());
+    assert_eq!(
+        config_list(&sys).unwrap(),
+        [
+            "/Volumes/Backup",
+            "/Volumes/Added By mds 1",
+            "/Volumes/Added By mds 2",
+            "/Volumes/Added By mds 3"
+        ]
+    );
+    assert_eq!(count(&sys, KILL), 0);
+    assert!(sys.written(SCOPE_RECEIPT).is_none());
+    assert!(sys.written(SCOPE_REFUSED).is_none(), "{:?}", sys.calls());
+
+    spotlight(&sys, None, Config::Writes);
+    sys.file(VOLUME_CONFIG, b"/Volumes/Backup\n/Volumes/Added By mds\n");
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+}
+
+/// A configuration `mds` rewrote once under the password route's edit is edited again within
+/// the run from a fresh copy, which keeps `mds`'s entry: the step that asked the person's
+/// password excludes every folder, restarts `mds` once and writes its receipt, with no refusal.
+/// NEGATIVE CONTROL: an exclusion with one try (`EDIT_TRIES` 1) fails the step on the rewrite.
+#[test]
+fn a_configuration_mds_rewrote_once_is_edited_again_within_the_run() {
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&["/Volumes/Backup"]), Config::RewrittenOnce);
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+    let mut expected = full();
+    expected.push("/Volumes/Backup".to_owned());
+    expected.push("/Volumes/Added By mds 1".to_owned());
+    expected.sort();
+    assert_eq!(sorted(&sys), expected);
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+    assert_eq!(count(&sys, KILL), 1);
+    assert!(sys.written(SCOPE_REFUSED).is_none());
+}
+
+/// Every change `sys` made to Spotlight's configuration or a file (all but the configuration's
+/// reads) lies inside a hold of root's lock ([`SCOPE_LOCK`]), and there was one.
+fn changed_under_the_lock(sys: &Fake) {
+    let calls = sys.calls();
+    let (hold, go) = (format!("hold {SCOPE_LOCK}"), format!("let go {SCOPE_LOCK}"));
+    let mut held = false;
+    let mut changes = 0;
+    for call in &calls {
+        if *call == hold {
+            held = true;
+        } else if *call == go {
+            held = false;
+        } else if edits_one(call) && !call.starts_with("/usr/bin/plutil -extract ") {
+            assert!(held, "{call} outside root's lock: {calls:?}");
+            changes += 1;
+        }
+    }
+    assert!(changes > 0, "{calls:?}");
+}
+
+/// Every root writer of Spotlight's configuration and of the files beside it holds root's one
+/// lock ([`SCOPE_LOCK`]) from before its first change to after its last: while another holder
+/// has it, the password route's step fails, naming nothing refused, the page's Keep a folder
+/// out… fails, and the LAN broker answers busy, each editing nothing; once it is let go, each
+/// goes ahead, every change it makes under its own hold.
+/// NEGATIVE CONTROLS: the step's, the keep-out's and the broker's hold each taken out edits
+/// Spotlight under another's lock; the broker's let go as soon as it is taken edits outside it.
+#[test]
+fn every_root_writer_of_spotlight_holds_its_one_lock() {
+    use crate::port::System as _;
+    const ARCHIVE: &str = "/Users//alice/Documents/Archive";
+    let hold = |sys: &Fake| {
+        sys.hold_root_lock(
+            Path::new(SCOPE_LOCK),
+            std::time::Duration::ZERO,
+            "the other writer holds it",
+        )
+        .expect("the other writer's hold")
+    };
+    let mac = || {
+        let sys = Fake::root();
+        home(&sys);
+        spotlight(&sys, Some(&[]), Config::Writes);
+        sys
+    };
+
+    let sys = mac();
+    let other = hold(&sys);
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+    assert!(edits(&sys).is_empty(), "{:?}", sys.calls());
+    assert!(sys.written(SCOPE_REFUSED).is_none(), "nothing was refused");
+    drop(other);
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    changed_under_the_lock(&sys);
+
+    let sys = mac();
+    let other = hold(&sys);
+    let rows = keep_out_rows(&sys, ARCHIVE);
+    assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+    // Its probe reads the configuration, which is no edit.
+    assert!(
+        edits(&sys)
+            .iter()
+            .all(|call| call.starts_with("/usr/bin/plutil -extract ")),
+        "{:?}",
+        sys.calls()
+    );
+    assert_eq!(config_list(&sys).unwrap(), Vec::<String>::new());
+    drop(other);
+    assert_eq!(keep_out_rows(&sys, ARCHIVE)[0].outcome, Outcome::Changed);
+    changed_under_the_lock(&sys);
+
+    let sys = Arc::new(broker_mac());
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    let other = hold(&sys);
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Busy);
+    assert!(edits(&sys).is_empty(), "{:?}", sys.calls());
+    drop(other);
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Excluded(3));
+    changed_under_the_lock(&sys);
+}
+
+/// The LAN broker reads the receipt under root's lock as it applies, and adds no folder the
+/// receipt names since its plan: the password route's run in between excluded it, and the
+/// person then took it back, which the broker leaves as they chose. The receipt keeps the
+/// password route's line beside the broker's.
+/// NEGATIVE CONTROL: an apply of the whole plan excludes the folder the person took back.
+#[test]
+fn the_broker_adds_no_folder_the_receipt_names_since_its_plan() {
+    let sys = Arc::new(broker_mac());
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    assert_eq!(
+        plan.folders,
+        owed_paths(&["Developer", "Downloads", "My Projects"])
+    );
+    sys.file(SCOPE_RECEIPT, b"/Users//alice/Developer\n");
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Excluded(2));
+    assert!(
+        !config_list(&sys)
+            .unwrap()
+            .iter()
+            .any(|path| path == "/Users//alice/Developer"),
+        "{:?}",
+        config_list(&sys)
+    );
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(AT_HOME));
+}
+
+/// The password route's step and the page's Keep a folder out… wait for another holder of root's
+/// lock, and go ahead once it lets go while they wait; the LAN broker only tries it, so it
+/// answers busy and edits nothing while the same holder has it.
+/// NEGATIVE CONTROLS: `hold_scope(sys, Duration::ZERO)` in `Scope::apply` or in `KeepOut::apply`
+/// fails that step; the broker's hold taken with `LOCK_WAIT` excludes the plan.
+#[test]
+fn the_password_route_and_keep_out_wait_for_another_holder_and_the_broker_does_not() {
+    const ARCHIVE: &str = "/Users//alice/Documents/Archive";
+    let lock = Path::new(SCOPE_LOCK);
+    let waited = format!("waited {SCOPE_LOCK}");
+    let mac = || {
+        let sys = Fake::root();
+        home(&sys);
+        spotlight(&sys, Some(&[]), Config::Writes);
+        sys.held_elsewhere(lock, LetsGo::WhileWaited, |_| {});
+        sys
+    };
+
+    let sys = mac();
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+    assert!(sys.calls().contains(&waited), "{:?}", sys.calls());
+    changed_under_the_lock(&sys);
+
+    let sys = mac();
+    let rows = keep_out_rows(&sys, ARCHIVE);
+    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+    assert!(sys.calls().contains(&waited), "{:?}", sys.calls());
+    assert_eq!(config_list(&sys).unwrap(), [ARCHIVE]);
+
+    let sys = Arc::new(broker_mac());
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    sys.held_elsewhere(lock, LetsGo::WhileWaited, |_| {});
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Busy);
+    assert!(edits(&sys).is_empty(), "{:?}", sys.calls());
+    assert!(!sys.calls().contains(&waited), "{:?}", sys.calls());
+}
+
+/// Each root writer reads root's receipt under its own hold of root's lock, after the last
+/// write of the holder before it: a folder that holder noted (the person may have taken it back
+/// since) is added again by neither the password route's step, which waited for it, nor the
+/// broker's apply, which took the lock as it was let go; and the receipt keeps that line.
+/// NEGATIVE CONTROLS: the receipt read above `hold_scope` in `Scope::apply`
+/// (`listed_as_root`) or in the broker's apply (`broker_lines`) excludes Developer.
+#[test]
+fn each_writer_reads_the_receipt_under_its_hold() {
+    let developer = "/Users//alice/Developer";
+    let noted_developer = |sys: &Fake| {
+        sys.file(SCOPE_RECEIPT, b"/Users//alice/Developer\n");
+    };
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&[]), Config::Writes);
+    sys.held_elsewhere(Path::new(SCOPE_LOCK), LetsGo::WhileWaited, noted_developer);
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert!(
+        !config_list(&sys)
+            .unwrap()
+            .iter()
+            .any(|path| path == developer),
+        "{:?}",
+        config_list(&sys)
+    );
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+
+    let sys = Arc::new(broker_mac());
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    sys.held_elsewhere(
+        Path::new(SCOPE_LOCK),
+        LetsGo::AtTheNextTake,
+        noted_developer,
+    );
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Excluded(2));
+    assert!(
+        !config_list(&sys)
+            .unwrap()
+            .iter()
+            .any(|path| path == developer),
+        "{:?}",
+        config_list(&sys)
+    );
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(AT_HOME));
+}
+
+/// The broker's half of the receipt and a home's share are judged again over the receipt read
+/// under root's lock: where alice's share had room for Developer's line alone at the plan, a
+/// password route's run between the plan and the apply that noted one more line of hers leaves
+/// Spotlight as it is, with no edit.
+/// NEGATIVE CONTROL: an apply that takes the plan less what the receipt names, unjudged,
+/// excludes the planned folder past the home's share.
+#[test]
+fn the_brokers_bounds_hold_over_the_receipt_read_under_its_lock() {
+    let sys = Arc::new(broker_mac());
+    let developer = "/Users//alice/Developer\n".len();
+    let share = spotlight_scope::HOME_BYTES - developer;
+    let mut lines = String::new();
+    let mut at = 0;
+    while share - lines.len() > 300 {
+        lines.push_str(&format!("{ALICE}/gone-{at:02}-{}\n", "g".repeat(200)));
+        at += 1;
+    }
+    let room = share - lines.len();
+    lines.push_str(&format!("{ALICE}/{}\n", "f".repeat(room - ALICE.len() - 2)));
+    assert_eq!(lines.len(), share);
+    sys.file(SCOPE_RECEIPT, lines.as_bytes());
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    assert_eq!(
+        plan.folders,
+        owed_paths(&["Developer"]),
+        "room for one line of the share"
+    );
+    sys.held_elsewhere(
+        Path::new(SCOPE_LOCK),
+        LetsGo::AtTheNextTake,
+        move |sys: &Fake| {
+            sys.file(
+                SCOPE_RECEIPT,
+                format!("{lines}{ALICE}/gone-last\n").as_bytes(),
+            );
+        },
+    );
+    let answer = duty.apply(&plan);
+    assert!(
+        matches!(&answer, ScopeAnswer::Unchanged(why) if why.contains("full")),
+        "{answer:?}"
+    );
+    assert!(edits(&sys).is_empty(), "{:?}", sys.calls());
+}
+
+/// The broker records its own lines of the receipt beside it, and only it: after its apply the
+/// record names the folders it added, and a password route's run after it, which writes the
+/// rest of the scope to the receipt, leaves the record as it was.
+/// NEGATIVE CONTROL: the password route writing the record as its receipt names the whole
+/// scope as the broker's.
+#[test]
+fn the_broker_records_its_own_lines_and_the_password_route_never_does() {
+    let sys = Arc::new(broker_mac());
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Excluded(3));
+    assert_eq!(sys.written(SCOPE_BROKERED).as_deref(), Some(AT_HOME));
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+    assert_eq!(sys.written(SCOPE_BROKERED).as_deref(), Some(AT_HOME));
+}
+
+/// The broker's record keeps only its lines the receipt still names: a line the receipt lacks (a
+/// run that stopped before its receipt, the folder since removed) is dropped as it next applies,
+/// so a line the password route later notes there is never counted as the broker's. Its line
+/// the receipt names, of another home, is kept.
+/// NEGATIVE CONTROL: the record written as all it named and the folders added keeps the lines
+/// the receipt lacks.
+#[test]
+fn the_brokers_record_drops_lines_the_receipt_no_longer_names() {
+    let sys = Arc::new(broker_mac());
+    sys.file(SCOPE_RECEIPT, b"/Users//bob/Kept\n").file(
+        SCOPE_BROKERED,
+        b"/Users//alice/Gone\n/Users//bob/Gone\n/Users//bob/Kept\n",
+    );
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Excluded(3));
+    let text = |path: &str| {
+        sys.written(path)
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+    };
+    let ours = format!("{}/Users//bob/Kept\n", String::from_utf8_lossy(AT_HOME));
+    assert_eq!(text(SCOPE_BROKERED).as_deref(), Some(ours.as_str()));
+    assert_eq!(text(SCOPE_RECEIPT).as_deref(), Some(ours.as_str()));
+}
+
+/// The broker writes its record before the receipt, so a run that stops between them leaves no
+/// receipt line its record lacks, which every reader would count as the password route's and so
+/// let the broker's own lines pass their half: a record that cannot be written leaves the
+/// receipt as it was, and the apply fails; a receipt that cannot be written after it leaves the
+/// record naming lines the receipt lacks, which no reader counts.
+/// NEGATIVE CONTROL: the receipt written before the record names the broker's folders where the
+/// record failed, and leaves the record unwritten where the receipt failed.
+#[test]
+fn the_brokers_record_is_written_before_the_receipt() {
+    let sys = Arc::new(broker_mac());
+    sys.write_fails(SCOPE_BROKERED, io::ErrorKind::StorageFull);
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    let answer = duty.apply(&plan);
+    assert!(matches!(answer, ScopeAnswer::Failed(_)), "{answer:?}");
+    assert!(sys.written(SCOPE_RECEIPT).is_none(), "{:?}", sys.calls());
+
+    let sys = Arc::new(broker_mac());
+    sys.write_fails(SCOPE_RECEIPT, io::ErrorKind::StorageFull);
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    let answer = duty.apply(&plan);
+    assert!(matches!(answer, ScopeAnswer::Failed(_)), "{answer:?}");
+    assert_eq!(sys.written(SCOPE_BROKERED).as_deref(), Some(AT_HOME));
+    assert!(sys.written(SCOPE_RECEIPT).is_none(), "{:?}", sys.calls());
+}
+
+/// A lock the broker could not take for a cause that passes (a full disk making its folder, no
+/// file descriptor free in the broker or in the system) is busy, which the client asks again on
+/// the clock; one it could not take for a cause that stands (a file there not root's) leaves
+/// Spotlight as it is. Neither edits anything or is remembered.
+/// NEGATIVE CONTROLS: every lock error but `WouldBlock` read as a cause that stands answers the
+/// full disk Unchanged; `passing` without its `EMFILE | ENFILE` arm answers no descriptor free
+/// Unchanged.
+#[test]
+fn a_lock_not_taken_for_a_passing_cause_is_busy_and_not_remembered() {
+    let lock = Path::new(SCOPE_LOCK);
+    for (why, fails, passes) in [
+        (
+            "a full disk",
+            &(|sys: &Fake| {
+                sys.exclusive_fails(lock, io::ErrorKind::StorageFull);
+            }) as &dyn Fn(&Fake),
+            true,
+        ),
+        (
+            "no descriptor free in the broker",
+            &|sys: &Fake| {
+                sys.exclusive_fails_os(lock, libc::EMFILE);
+            },
+            true,
+        ),
+        (
+            "no descriptor free in the system",
+            &|sys: &Fake| {
+                sys.exclusive_fails_os(lock, libc::ENFILE);
+            },
+            true,
+        ),
+        (
+            "a file there not root's",
+            &|sys: &Fake| {
+                sys.exclusive_fails(lock, io::ErrorKind::PermissionDenied);
+            },
+            false,
+        ),
+    ] {
+        let sys = Arc::new(broker_mac());
+        let duty = duty_over(&sys);
+        let plan = duty.plan(501).unwrap();
+        fails(&sys);
+        let answer = duty.apply(&plan);
+        if passes {
+            assert_eq!(answer, ScopeAnswer::Busy, "{why}");
+        } else {
+            assert!(
+                matches!(answer, ScopeAnswer::Unchanged(_)),
+                "{why}: {answer:?}"
+            );
+        }
+        assert!(edits(&sys).is_empty(), "{why}: {:?}", sys.calls());
+        assert_eq!(duty.plan(501), Ok(plan), "{why}");
+    }
+}
+
+/// The password route's reading of the home holds no lock: every look into alice's home, the
+/// step's probe and its apply alike, finds root's lock free, so a reading that hangs holds no
+/// other root writer.
+/// NEGATIVE CONTROL: `hold_scope` taken above `wanted` in `Scope::apply` finds it held.
+#[test]
+fn the_password_routes_reading_of_the_home_holds_no_lock() {
+    use crate::port::System as _;
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&[]), Config::Writes);
+    let free = Arc::new(Mutex::new(Vec::new()));
+    {
+        let free = Arc::clone(&free);
+        sys.on_stat_read(move |sys, path| {
+            if path.starts_with(ALICE) {
+                let held =
+                    sys.hold_root_lock(Path::new(SCOPE_LOCK), Duration::ZERO, "the reading's");
+                free.lock().unwrap().push(held.is_ok());
+            }
+        });
+    }
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    let free = free.lock().unwrap();
+    assert!(!free.is_empty(), "the home was read");
+    assert!(free.iter().all(|free| *free), "{free:?}");
+}
+
+/// A reading of a home ends before its result is handed on: a request that hears it finds no
+/// reading held, so the next request reads the home rather than answer busy.
+/// NEGATIVE CONTROL: a result handed on before the reading's end is heard with it still held.
+#[test]
+fn a_reading_of_a_home_ends_before_its_result_is_heard() {
+    let reading = Arc::new(AtomicBool::new(true));
+    let mut heard = None;
+    read_then_end(
+        Arc::clone(&reading),
+        || "the home's folders",
+        |read| heard = Some((read, reading.load(Ordering::Acquire))),
+    );
+    assert_eq!(heard, Some(("the home's folders", false)));
 }
 
 /// A volume whose indexing is already off is left off, and nothing is excluded or restarted;
@@ -1614,6 +2129,728 @@ fn check_again_searches_spotlight_anew() {
             2
         )
     );
+}
+
+/// A folder of root's that neither group nor others may write: `/` and `/Users` as macOS lays
+/// them.
+fn roots(mode: u32) -> Stat {
+    Stat {
+        uid: 0,
+        gid: 0,
+        mode,
+        dir: true,
+        symlink: false,
+        len: 0,
+    }
+}
+
+/// The console's device, owned by `uid` (the account logged in at it).
+fn console_of(uid: u32) -> Stat {
+    Stat {
+        uid,
+        gid: 0,
+        mode: 0o600,
+        dir: false,
+        symlink: false,
+        len: 0,
+    }
+}
+
+/// Alice's home folder as `uid` owns it with `mode`.
+fn home_folder(uid: u32, mode: u32) -> Stat {
+    Stat {
+        uid,
+        gid: 20,
+        mode,
+        dir: true,
+        symlink: false,
+        len: 0,
+    }
+}
+
+/// The Mac the root LAN broker serves alice (501) on, as root reads it: alice at the console,
+/// her home under root's `/Users` as directory services name it, holding [`home`]'s folders,
+/// and Spotlight indexing the data volume with nothing excluded yet.
+fn broker_mac() -> Fake {
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&[]), Config::Writes);
+    sys.stat_of("/", roots(0o755))
+        .stat_of("/Users", roots(0o755))
+        .stat_of(ALICE, home_folder(501, 0o750))
+        .stat_of("/dev/console", console_of(501))
+        .home_of_uid(501, ALICE);
+    sys
+}
+
+/// The duty over `sys`, as `aterm lan serve` makes it.
+fn duty_over(sys: &Arc<Fake>) -> Arc<dyn aterm_uds::lan::ScopeDuty> {
+    broker_duty(Arc::clone(sys) as Arc<dyn System + Send + Sync>)
+}
+
+/// What [`home`]'s folders hold for the broker to exclude.
+fn owed_paths(names: &[&str]) -> BTreeSet<PathBuf> {
+    names
+        .iter()
+        .map(|name| PathBuf::from(format!("{ALICE}/{name}")))
+        .collect()
+}
+
+/// Every call that edits Spotlight's configuration, restarts `mds` or writes a file.
+fn edits(sys: &Fake) -> Vec<String> {
+    sys.calls()
+        .into_iter()
+        .filter(|call| edits_one(call))
+        .collect()
+}
+
+/// Whether `call` is one [`edits`] keeps.
+fn edits_one(call: &str) -> bool {
+    call.contains("plutil")
+        || call.contains("killall")
+        || call.starts_with("write ")
+        || call.starts_with("rename ")
+        || call.starts_with("remove ")
+}
+
+/// The broker plans for the console account alone and only over a home that account cannot
+/// steer root away from: each row is refused before anything is read past the home, and edits
+/// nothing. The account's own top-level folders the scope leaves out are planned, a link among
+/// them never, and nothing of the rest of the scope ([`FULL`]: ~/Library's folders, the data
+/// volume's top level, /Users//Shared), which is the password route's.
+/// NEGATIVE CONTROLS: the console comparison, the sticky check, the ancestors' write-bit check
+/// and the plain-path check each removed lets the row they guard plan; the home read for the
+/// scope's whole `wanted` and the plan's top-level filter dropped plans ~/Library's folders and
+/// the data volume's top level.
+#[test]
+fn the_broker_scopes_only_the_console_accounts_own_plain_home() {
+    let refused = |why: &str, uid: u32, seed: &dyn Fn(&Fake)| {
+        let sys = Arc::new(broker_mac());
+        seed(&sys);
+        let planned = duty_over(&sys).plan(uid);
+        assert!(
+            matches!(&planned, Err(ScopeAnswer::Refused(words)) if !words.contains('/')),
+            "{why}: {planned:?}"
+        );
+        assert!(edits(&sys).is_empty(), "{why}: {:?}", sys.calls());
+    };
+    refused("root", 0, &|sys| {
+        sys.stat_of("/dev/console", console_of(0))
+            .home_of_uid(0, "/var/root");
+    });
+    // Bob's own home holds to every other rule, so only the console's owner keeps him out.
+    refused("an account not at the console", 502, &|sys| {
+        sys.stat_of("/Users//bob", home_folder(502, 0o750))
+            .home_of_uid(502, "/Users//bob");
+    });
+    refused("no home from directory services", 503, &|sys| {
+        sys.stat_of("/dev/console", console_of(503));
+    });
+    refused("a home that is a link", 501, &|sys| {
+        sys.stat_of(
+            ALICE,
+            Stat {
+                symlink: true,
+                dir: false,
+                ..home_folder(501, 0o755)
+            },
+        );
+    });
+    refused("a home another account owns", 501, &|sys| {
+        sys.stat_of(ALICE, home_folder(502, 0o750));
+    });
+    refused("a home with the sticky bit", 501, &|sys| {
+        sys.stat_of(ALICE, home_folder(501, 0o1750));
+    });
+    refused("a group-writable /Users", 501, &|sys| {
+        sys.stat_of("/Users", roots(0o775));
+    });
+    refused("a /Users that is not root's", 501, &|sys| {
+        sys.stat_of("/Users", home_folder(501, 0o755));
+    });
+    // Every folder its spelling names is in place, so only the spelling refuses it.
+    refused("a home spelled through ..", 501, &|sys| {
+        sys.stat_of("/Users/..", roots(0o755))
+            .stat_of("/Users/../tmp", roots(0o755))
+            .stat_of("/Users/../tmp/x", home_folder(501, 0o750))
+            .home_of_uid(501, "/Users/../tmp/x");
+    });
+    refused("a doubled /", 501, &|sys| {
+        sys.home_of_uid(501, "/Users//alice");
+    });
+    refused("a trailing /", 501, &|sys| {
+        sys.home_of_uid(501, "/Users//alice/");
+    });
+    refused("a relative home", 501, &|sys| {
+        sys.home_of_uid(501, "Users/alice");
+    });
+
+    let sys = Arc::new(broker_mac());
+    let plan = duty_over(&sys).plan(501).unwrap();
+    assert_eq!(
+        plan,
+        aterm_uds::lan::ScopePlan {
+            uid: 501,
+            folders: owed_paths(&["Developer", "Downloads", "My Projects"]),
+        },
+        "a link, a file, a dot-folder and a .noindex folder are never planned"
+    );
+    assert!(edits(&sys).is_empty(), "{:?}", sys.calls());
+}
+
+/// An apply excludes the plan's folders and adds them to root's receipt; a broker that finds
+/// the receipt, or its record of its own lines, is not root's own regular file, or the receipt
+/// past its bound, leaves Spotlight as it is, and the broker neither writes nor removes the
+/// password route's record of what it failed to exclude.
+/// NEGATIVE CONTROLS: a receipt or record read leniently (`unwrap_or_default`) plans over the
+/// foreign file; the password route's record kept (`Route::Password`) removes it on success and
+/// writes it on failure.
+#[test]
+fn the_broker_reads_the_receipt_strictly_and_never_touches_the_refusal() {
+    let theirs = Stat {
+        uid: 501,
+        gid: 20,
+        mode: 0o644,
+        dir: false,
+        symlink: false,
+        len: 0,
+    };
+    for (why, seed) in [
+        (
+            "a receipt of the account's",
+            &(|sys: &Fake| {
+                sys.file(SCOPE_RECEIPT, b"").stat_of(SCOPE_RECEIPT, theirs);
+            }) as &dyn Fn(&Fake),
+        ),
+        ("a receipt past its bound", &|sys: &Fake| {
+            sys.file(SCOPE_RECEIPT, &vec![b'x'; spotlight_scope::RECEIPT_MAX + 1]);
+        }),
+        (
+            "a record of the broker's lines of the account's",
+            &|sys: &Fake| {
+                sys.file(SCOPE_BROKERED, b"")
+                    .stat_of(SCOPE_BROKERED, theirs);
+            },
+        ),
+    ] {
+        let sys = Arc::new(broker_mac());
+        seed(&sys);
+        assert!(
+            matches!(duty_over(&sys).plan(501), Err(ScopeAnswer::Unchanged(_))),
+            "{why}"
+        );
+        assert!(edits(&sys).is_empty(), "{why}: {:?}", sys.calls());
+    }
+
+    let sys = Arc::new(broker_mac());
+    sys.file(SCOPE_REFUSED, b"/Users//alice/Developer\n");
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Excluded(3));
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(AT_HOME));
+    assert_eq!(count(&sys, KILL), 1);
+    assert_eq!(
+        sys.written(SCOPE_REFUSED).as_deref(),
+        Some(&b"/Users//alice/Developer\n"[..]),
+        "the broker leaves the password route's record as it is"
+    );
+    assert!(
+        duty.plan(501).unwrap().folders.is_empty(),
+        "nothing is owed"
+    );
+
+    let deaf = Arc::new(broker_mac());
+    spotlight(&deaf, Some(&[]), Config::Deaf);
+    let duty = duty_over(&deaf);
+    let plan = duty.plan(501).unwrap();
+    assert!(matches!(duty.apply(&plan), ScopeAnswer::Failed(words) if !words.contains('/')));
+    assert!(deaf.written(SCOPE_REFUSED).is_none(), "{:?}", deaf.calls());
+    assert!(deaf.written(SCOPE_RECEIPT).is_none());
+}
+
+/// A configuration `mds` rewrote under each of the broker's tries is busy, never a failure: the
+/// plan is not remembered, so the client's next ask plans the same folders and edits again, and
+/// no folder is written to the receipt or to the password route's record. One `mds` rewrote
+/// once is edited again within the apply, and excluded.
+/// NEGATIVE CONTROLS: the broker's `Changed` arm setting `failed` as `Failed` does answers
+/// `Failed`, and the next plan is refused; an exclusion with one try answers the rewrite once
+/// busy.
+#[test]
+fn a_configuration_mds_rewrote_under_the_brokers_edit_is_busy_and_tried_again() {
+    let sys = Arc::new(broker_mac());
+    spotlight(&sys, Some(&[]), Config::Rewritten);
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Busy, "{:?}", sys.calls());
+    assert!(sys.written(SCOPE_RECEIPT).is_none());
+    assert!(sys.written(SCOPE_REFUSED).is_none());
+    assert_eq!(count(&sys, KILL), 0, "mds was not restarted");
+    let tried = sys.calls().len();
+    assert_eq!(
+        duty.plan(501).unwrap(),
+        plan,
+        "the same folders are planned again"
+    );
+    assert_eq!(duty.apply(&plan), ScopeAnswer::Busy);
+    assert!(
+        sys.calls()[tried..]
+            .iter()
+            .any(|call| call.contains("plutil")),
+        "the next apply edits again: {:?}",
+        &sys.calls()[tried..]
+    );
+
+    let once = Arc::new(broker_mac());
+    spotlight(&once, Some(&[]), Config::RewrittenOnce);
+    let duty = duty_over(&once);
+    let plan = duty.plan(501).unwrap();
+    assert_eq!(
+        duty.apply(&plan),
+        ScopeAnswer::Excluded(3),
+        "{:?}",
+        once.calls()
+    );
+    assert_eq!(count(&once, KILL), 1);
+    assert_eq!(once.written(SCOPE_RECEIPT).as_deref(), Some(AT_HOME));
+}
+
+/// The same account's same folders whose apply failed are not tried again for a day: the next
+/// plan of them answers that Spotlight stays as it is, and runs no edit. New folders are a new
+/// plan; a day on, by the duty's clock, the same folders are planned again.
+/// NEGATIVE CONTROLS: a broker that forgets the failure plans the same folders again; one that
+/// remembers it with no age refuses them a day on.
+#[test]
+fn a_failed_plan_is_not_tried_again() {
+    let sys = Arc::new(broker_mac());
+    spotlight(&sys, Some(&[]), Config::Deaf);
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    assert!(matches!(duty.apply(&plan), ScopeAnswer::Failed(_)));
+    let tried = sys.calls().len();
+    assert!(
+        matches!(duty.plan(501), Err(ScopeAnswer::Unchanged(words)) if words.contains("failed")),
+        "{:?}",
+        sys.calls()
+    );
+    assert!(
+        sys.calls()[tried..]
+            .iter()
+            .all(|call| !call.contains("plutil") && !call.contains("killall")),
+        "{:?}",
+        &sys.calls()[tried..]
+    );
+    sys.advance(spotlight_scope::LEFT_KEPT.as_secs() - 1);
+    assert!(matches!(duty.plan(501), Err(ScopeAnswer::Unchanged(_))));
+    sys.advance(1);
+    assert_eq!(
+        duty.plan(501),
+        Ok(plan),
+        "a day on, the same folders are tried again"
+    );
+    made_on_volume(&sys, &format!("{ALICE}/Scratch"), 4000);
+    assert_eq!(
+        duty.plan(501).unwrap().folders,
+        owed_paths(&["Developer", "Downloads", "My Projects", "Scratch"])
+    );
+}
+
+/// A failed plan dated after the duty's clock (the clock set back since it failed) counts for
+/// nothing: the same folders are planned again at once rather than kept out by a failure whose
+/// age cannot be read.
+/// NEGATIVE CONTROLS: the memory without its `*at <= now` guard overflows; one that reads the
+/// failure's age as `now.saturating_sub(*at)` with no guard refuses the plan.
+#[test]
+fn a_failed_plan_dated_after_the_clock_is_tried_again() {
+    let sys = Arc::new(broker_mac());
+    spotlight(&sys, Some(&[]), Config::Deaf);
+    let duty = duty_over(&sys);
+    let plan = duty.plan(501).unwrap();
+    assert!(matches!(duty.apply(&plan), ScopeAnswer::Failed(_)));
+    assert!(matches!(duty.plan(501), Err(ScopeAnswer::Unchanged(_))));
+    sys.set_back(1);
+    assert_eq!(duty.plan(501), Ok(plan));
+}
+
+/// One request excludes at most [`spotlight_scope::SCOPE_BATCH`] folders, in path order, and the
+/// next takes the rest; a home whose receipt lines are at [`spotlight_scope::HOME_LINES`], or
+/// past it, gains none; a folder whose line would take the receipt past its bound is left out, so of a receipt
+/// 40 bytes short of it only Developer's 23-byte line is planned, and of one 20 bytes short none
+/// is; a volume Spotlight does not index plans nothing.
+/// NEGATIVE CONTROLS: a plan with no batch bound takes all 70 at once; a line bound met only
+/// at its count (`==`) plans Developer past it; a plan that leaves Spotlight as it is where any
+/// owed folder would pass a bound plans nothing 40 bytes short.
+#[test]
+fn a_plan_is_bounded_by_its_batch_the_homes_lines_and_the_receipt() {
+    let sys = Arc::new(broker_mac());
+    for at in 0..67 {
+        made_on_volume(&sys, &format!("{ALICE}/made-{at:02}"), 4000 + at);
+    }
+    let duty = duty_over(&sys);
+    let first = duty.plan(501).unwrap();
+    assert_eq!(first.folders.len(), spotlight_scope::SCOPE_BATCH);
+    assert!(first.folders.contains(Path::new("/Users//alice/Developer")));
+    assert_eq!(duty.apply(&first), ScopeAnswer::Excluded(64));
+    let rest = duty.plan(501).unwrap();
+    assert_eq!(rest.folders.len(), 6, "{:?}", rest.folders);
+    assert!(rest.folders.is_disjoint(&first.folders));
+
+    // Lines of alice's top level with names of one or two characters, so the home's byte share
+    // has room for Developer's line and only the line bound stops it, at it and past it (lines
+    // the password route wrote).
+    const NAMES: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for count in [spotlight_scope::HOME_LINES, spotlight_scope::HOME_LINES + 1] {
+        let full = Arc::new(broker_mac());
+        let lines: String = (0..count)
+            .map(|at| {
+                let name: String = if at < NAMES.len() {
+                    char::from(NAMES[at]).into()
+                } else {
+                    let at = at - NAMES.len();
+                    [NAMES[at / NAMES.len()], NAMES[at % NAMES.len()]]
+                        .map(char::from)
+                        .iter()
+                        .collect()
+                };
+                format!("{ALICE}/{name}\n")
+            })
+            .collect();
+        assert!(lines.len() + "/Users//alice/Developer\n".len() <= spotlight_scope::HOME_BYTES);
+        full.file(SCOPE_RECEIPT, lines.as_bytes());
+        assert!(
+            matches!(
+                duty_over(&full).plan(501),
+                Err(ScopeAnswer::Unchanged(words)) if words.contains("full")
+            ),
+            "{count} lines"
+        );
+    }
+
+    // A receipt `short` bytes short of its bound, of lines none of them alice's.
+    let near = |short: usize| {
+        let near = Arc::new(broker_mac());
+        let mut lines = String::new();
+        while lines.len() + 1100 < spotlight_scope::RECEIPT_MAX - short {
+            lines.push_str(&format!(
+                "/Volumes/{:04}-{}\n",
+                lines.len(),
+                "v".repeat(1000)
+            ));
+        }
+        let room = spotlight_scope::RECEIPT_MAX - short - lines.len();
+        lines.push_str(&format!("/{}\n", "p".repeat(room - 2)));
+        assert_eq!(lines.len(), spotlight_scope::RECEIPT_MAX - short);
+        near.file(SCOPE_RECEIPT, lines.as_bytes());
+        near
+    };
+    assert_eq!(
+        duty_over(&near(40)).plan(501).map(|plan| plan.folders),
+        Ok(owed_paths(&["Developer"]))
+    );
+    assert!(matches!(
+        duty_over(&near(20)).plan(501),
+        Err(ScopeAnswer::Unchanged(words)) if words.contains("bound")
+    ));
+
+    let off = Arc::new(broker_mac());
+    off.simulate(|_, cmd| {
+        (cmd.program.to_str()? == MDUTIL)
+            .then(|| Ran::ok("/System/Volumes/Data:\n\tIndexing disabled.\n"))
+    });
+    assert!(duty_over(&off).plan(501).unwrap().folders.is_empty());
+}
+
+/// A home whose listing passes [`spotlight_scope::LISTING_MAX`] names is left as it is: root
+/// reads no listing without bound for an account.
+/// NEGATIVE CONTROL: a listing read without its bound plans the home's folders.
+#[test]
+fn a_home_past_its_listing_bound_is_left_as_it_is() {
+    let sys = Arc::new(broker_mac());
+    for at in 0..spotlight_scope::LISTING_MAX {
+        sys.file(&format!("{ALICE}/.dot-{at}"), b"");
+    }
+    assert!(matches!(
+        duty_over(&sys).plan(501),
+        Err(ScopeAnswer::Unchanged(words)) if words.contains("names")
+    ));
+}
+
+/// The asker waits while a maker is at work and nothing is noted, asks for what was noted
+/// (taking the note, so a folder noted during the ask is the next ask's), and ends only once
+/// every maker has ended with nothing noted left, a folder noted as the last maker ended among
+/// what it asks for.
+/// NEGATIVE CONTROL: an asker that ends whenever nothing is noted ends while a maker works.
+#[test]
+fn the_asker_waits_while_a_maker_works_and_ends_once_none_does() {
+    let mut made = Made {
+        noted: false,
+        makers: 1,
+    };
+    assert_eq!(next(&mut made), Next::Wait);
+    made.noted = true;
+    assert_eq!(next(&mut made), Next::Ask);
+    assert!(!made.noted, "the ask took the note");
+    assert_eq!(next(&mut made), Next::Wait);
+    made.makers = 0;
+    made.noted = true;
+    assert_eq!(next(&mut made), Next::Ask);
+    assert_eq!(next(&mut made), Next::End);
+}
+
+/// A folder published as a top-level folder of the console account's own home is noted for
+/// the asker, which asks the broker once for every folder noted since its last ask began and
+/// ends once every maker has; one published elsewhere, or by an account away from the console,
+/// is noted for no ask.
+/// NEGATIVE CONTROL: an asker that ends with its makers before asking leaves the noted folders
+/// unasked.
+#[test]
+fn a_folder_made_in_the_console_home_is_asked_for_once_its_makers_end() {
+    let account = || {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.logged_in(&user("alice", 501))
+            .stat_of("/dev/console", console_of(501));
+        sys
+    };
+    let asks = |sys: &Fake| sys.calls().iter().filter(|c| *c == "scope home").count();
+    // Every folder is noted, and its maker ended, before the asker starts, so one ask is
+    // all a correct asker makes.
+    let asked_for = |sys: &Fake, made: &[&str]| {
+        let folders = MadeFolders::new();
+        let maker = folders.maker();
+        for made in made {
+            folders.made(sys, Path::new(made));
+        }
+        drop(maker);
+        std::thread::scope(|scope| {
+            scope.spawn(|| folders.ask_while_made(sys));
+        });
+        asks(sys)
+    };
+    let sys = account();
+    assert_eq!(
+        asked_for(&sys, &["/Users//alice/new", "/Users//alice/other"]),
+        1,
+        "{:?}",
+        sys.calls()
+    );
+    let deeper = account();
+    assert_eq!(asked_for(&deeper, &["/Users//alice/Developer/new"]), 0);
+    let away = account();
+    away.stat_of("/dev/console", console_of(502));
+    assert_eq!(asked_for(&away, &["/Users//alice/new"]), 0);
+}
+
+/// The password route never takes root's receipt past its bound: where the folders it would
+/// add pass it, it fails before Spotlight is edited, leaving the configuration and the receipt
+/// as they were; and root's own receipt past its bound is no empty one, so the root step fails
+/// rather than writes a receipt of this home alone over the other homes' lines.
+/// NEGATIVE CONTROLS: an exclusion that writes the receipt whatever its size edits Spotlight and
+/// writes a receipt no reader reads; root reading its own over-bound receipt as none rewrites
+/// it with this home's folders alone.
+#[test]
+fn the_password_route_keeps_the_receipt_within_its_bound() {
+    let near = Fake::root();
+    home(&near);
+    spotlight(&near, Some(&[]), Config::Writes);
+    let mut lines = String::new();
+    while lines.len() + 1100 < spotlight_scope::RECEIPT_MAX - 40 {
+        lines.push_str(&format!(
+            "/Volumes/{:04}-{}\n",
+            lines.len(),
+            "v".repeat(1000)
+        ));
+    }
+    let room = spotlight_scope::RECEIPT_MAX - 40 - lines.len();
+    lines.push_str(&format!("/{}\n", "p".repeat(room - 2)));
+    near.file(SCOPE_RECEIPT, lines.as_bytes());
+    let rows = scope_rows(&near, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+    assert!(
+        rows[0].why.as_deref().unwrap_or("").contains("bound"),
+        "{rows:?}"
+    );
+    assert_eq!(
+        config_list(&near).as_deref(),
+        Some(&[][..]),
+        "{:?}",
+        near.calls()
+    );
+    assert_eq!(
+        near.written(SCOPE_RECEIPT).as_deref(),
+        Some(lines.as_bytes())
+    );
+    assert_eq!(count(&near, KILL), 0);
+
+    let over = Fake::root();
+    home(&over);
+    spotlight(&over, Some(&[]), Config::Writes);
+    let past = vec![b'/'; spotlight_scope::RECEIPT_MAX + 1];
+    over.file(SCOPE_RECEIPT, &past);
+    let rows = scope_rows(&over, Mode::Apply);
+    assert!(rows[0].outcome.is_failure(), "{rows:?}");
+    assert_eq!(over.written(SCOPE_RECEIPT).as_deref(), Some(&past[..]));
+    assert_eq!(config_list(&over).as_deref(), Some(&[][..]));
+}
+
+/// The broker's reading of a home runs on a thread of its own that a request waits
+/// [`READ_DEADLINE`] for: a read the home's filesystem holds (a mount made after the table was
+/// read) answers busy within the deadline, which the client asks again on the clock, and while
+/// that reading still runs no other starts, so the next request answers busy at once; once it
+/// ends, a request reads the home again.
+/// NEGATIVE CONTROL: a request that waits for its reading with no deadline answers only once the
+/// filesystem does, past the test's minute.
+#[test]
+fn a_home_reading_the_filesystem_holds_ends_at_its_deadline() {
+    let sys = Arc::new(broker_mac());
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    let blocked = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let blocked = Arc::clone(&blocked);
+        sys.on_stat_read(move |_, path| {
+            if path == Path::new("/Users//alice/Developer")
+                && blocked.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Held until the test releases it, or for the hang detector's minute.
+                let _ = held
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(60));
+            }
+        });
+    }
+    let duty = broker_duty_within(
+        Arc::clone(&sys) as Arc<dyn System + Send + Sync>,
+        std::time::Duration::from_millis(200),
+    );
+    let began = std::time::Instant::now();
+    assert_eq!(
+        duty.plan(501),
+        Err(ScopeAnswer::Busy),
+        "a held reading ends at its deadline"
+    );
+    assert!(began.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(
+        duty.plan(501),
+        Err(ScopeAnswer::Busy),
+        "no second reading starts beside the held one"
+    );
+    assert!(edits(&sys).is_empty(), "{:?}", sys.calls());
+    release.send(()).unwrap();
+    // A hang detector: the released reading must end, and the next request read the home.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let planned = loop {
+        match duty.plan(501) {
+            Err(ScopeAnswer::Busy) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            planned => break planned,
+        }
+    };
+    assert_eq!(
+        planned.map(|plan| plan.folders),
+        Ok(owed_paths(&["Developer", "Downloads", "My Projects"]))
+    );
+}
+
+/// `sync.spotlight`'s ask keeps the folders the broker left as they are, or failed to exclude,
+/// in this account's state folder with the time, so its readings for a day ask nothing for them
+/// (not applicable), and the automatic ask owes the password the home they leave never scoped
+/// whatever the record's age; a day on, the broker is asked for them again, as it is where the
+/// record's time is after the clock's. An ask that excluded every folder owed removes the
+/// record. A transient answer keeps nothing.
+/// NEGATIVE CONTROLS: an ask that keeps no record leaves the next reading asking the broker for
+/// the same folders; a record honoured at any age asks nothing a day on, or with the clock set
+/// back.
+#[test]
+fn the_folders_the_broker_left_are_kept_for_the_next_reading() {
+    let state = "/Users//alice/Library/Application Support/aterm/state";
+    let account = |answer: ScopeAnswer| {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.account_state = Some(PathBuf::from(state));
+        home(&sys);
+        spotlight(&sys, Some(&[]), Config::Writes);
+        sys.logged_in(&user("alice", 501))
+            .stat_of("/", roots(0o755))
+            .stat_of("/Users", roots(0o755))
+            .stat_of(ALICE, home_folder(501, 0o750))
+            .stat_of("/dev/console", console_of(501))
+            .on_scope_home(move |_| answer.clone());
+        sys
+    };
+    let record = PathBuf::from(state).join(spotlight_scope::BROKER_LEFT);
+    let record = record.to_string_lossy();
+    let day = spotlight_scope::LEFT_KEPT.as_secs();
+    let left = |pass: &spotlight_scope::Pass| {
+        matches!(
+            pass,
+            spotlight_scope::Pass::Left(_) | spotlight_scope::Pass::Failed(_)
+        )
+    };
+    for answer in [
+        ScopeAnswer::Unchanged("its last edit of these folders failed".into()),
+        ScopeAnswer::Failed("TCC denied the edit".into()),
+    ] {
+        let sys = account(answer.clone());
+        let pass = exclude_by_broker(&sys);
+        assert!(left(&pass), "{answer:?}: {pass:?}");
+        let text = format!("at {}\n{}", sys.now, String::from_utf8_lossy(AT_HOME));
+        assert_eq!(
+            sys.written(&record).as_deref(),
+            Some(text.as_bytes()),
+            "{answer:?}"
+        );
+        assert_eq!(
+            spotlight_scope::broker_would_take(&Port(&sys)),
+            Some(Err(Leave::Stands(spotlight_scope::LEFT.to_owned()))),
+            "{answer:?}"
+        );
+        let asks = count(&sys, "scope home");
+        assert_eq!(exclude_by_broker(&sys), spotlight_scope::Pass::Nothing);
+        sys.advance(day - 1);
+        assert_eq!(exclude_by_broker(&sys), spotlight_scope::Pass::Nothing);
+        assert_eq!(
+            count(&sys, "scope home"),
+            asks,
+            "{answer:?}: the left folders ask nothing for a day"
+        );
+        sys.advance(1);
+        assert_eq!(
+            spotlight_scope::broker_would_take(&Port(&sys)),
+            Some(Err(Leave::Stands(spotlight_scope::LEFT.to_owned()))),
+            "{answer:?}: the automatic ask reads them left still"
+        );
+        assert!(left(&exclude_by_broker(&sys)), "{answer:?}");
+        assert_eq!(
+            count(&sys, "scope home"),
+            asks + 1,
+            "{answer:?}: a day on, the broker is asked again"
+        );
+    }
+    let ahead = account(ScopeAnswer::Unchanged("still full".into()));
+    let owed = owed_paths(&["Developer", "Downloads", "My Projects"]);
+    let text = spotlight_scope::broker_left_text(&owed, ahead.now + 60);
+    ahead.file(&record, text.as_bytes());
+    assert!(left(&exclude_by_broker(&ahead)));
+    assert_eq!(
+        count(&ahead, "scope home"),
+        1,
+        "a record dated after the clock's time is asked again"
+    );
+
+    let busy = account(ScopeAnswer::Busy);
+    assert_eq!(exclude_by_broker(&busy), spotlight_scope::Pass::Busy);
+    assert!(busy.written(&record).is_none());
+
+    let done = account(ScopeAnswer::Excluded(3));
+    done.file(&record, b"/Users//alice/Gone\n");
+    done.on_scope_home(|sys| {
+        sys.file(SCOPE_RECEIPT, FULL);
+        ScopeAnswer::Excluded(3)
+    });
+    assert_eq!(exclude_by_broker(&done), spotlight_scope::Pass::Done(3));
+    assert!(done.written(&record).is_none(), "{:?}", done.calls());
 }
 
 /// The person's keep-out of `folder`, as `--only spotlight-keep-out --keep-out <folder>` runs it.

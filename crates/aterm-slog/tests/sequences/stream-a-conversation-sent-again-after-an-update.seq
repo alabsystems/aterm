@@ -1,0 +1,34 @@
+seq v=1 rig=stream program=claude build=2.1.322
+# HX-15h review: the stream's hold crosses a carried update with its turn. The successor's Out
+# ring is empty, so it sends `want`, and the harness sends its conversation again: its turns 1
+# to 3 and its running turn 4. None of it writes: the numbers it named are history, and turn 4
+# repeats the turn it holds. Its next end closes that turn.
+stream started 1 by=person
+expect open t1 turn par=r1 src=harness hseq=1 @0
+at 100 stream ended 1 done
+expect close t1 turn out=done src=harness hseq=2 @100
+at 200 stream started 2 by=person
+expect open t2 turn par=r1 src=harness hseq=3 @200
+at 300 stream ended 2 done
+expect close t2 turn out=done src=harness hseq=4 @300
+at 400 stream started 3 by=person
+expect open t3 turn par=r1 src=harness hseq=5 @400
+at 500 stream ended 3 done
+expect close t3 turn out=done src=harness hseq=6 @500
+at 600 stream started 4 by=person
+expect open t4 turn par=r1 src=harness hseq=7 @600
+handoff carried
+expect turn=t4
+stream started 1 by=person
+expect turn=t4
+stream ended 1 done
+expect turn=t4
+stream started 2 by=person
+stream ended 2 done
+stream started 3 by=person
+stream ended 3 done
+stream started 4 by=person
+expect turn=t4
+at 2000 stream ended 4 done
+expect close t4 turn out=done src=harness @2000
+expect turn=none

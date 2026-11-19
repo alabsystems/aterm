@@ -7,11 +7,11 @@
 
 use super::command::{print, print_schema, sources_line};
 use super::fixture;
-use super::fold::{AGENTS_KEEP_MS, FleetTables, Inputs, REACH_KEEP_MS, Source, fold};
+use super::fold::{FleetTables, Inputs, REACH_KEEP_MS, Source, SourceState, fold};
 use super::read::{
-    AccountWord, AgentSeen, Answer, Answered, At, Harness, Latest, Limits, Load, Look, MachineSeen,
-    OUTPUT_KEEP_MS, OWN_ID, OutSrc, Rate, Read, SIGHTED_KEEP_MS, State, Tally, TurnFacts, Work,
-    word,
+    AccountWord, AgentSeen, Answer, Answered, At, Harness, LOOK_KEEP_MS, Latest, Limits, Load,
+    Look, MachineSeen, OUTPUT_KEEP_MS, OWN_ID, OutSrc, Rate, Read, SIGHTED_KEEP_MS, State, Tally,
+    TurnFacts, Work, word,
 };
 use super::rows::{
     self, AccountRef, EvidenceHow, ObservedState, Reach, UNREGISTERED, Via, WindowState,
@@ -1184,9 +1184,10 @@ fn the_rows_change_by_themselves_only_at_the_instant_the_fold_names() {
     assert_eq!(fold(&inputs, next - 1).tables, now.tables);
     assert_ne!(fold(&inputs, next).tables, now.tables);
 
-    // Two hours after a machine's last answer, it no longer speaks for its agents: they are
-    // unknown, not gone and not idle.
-    let later = fold(&inputs, NOW + AGENTS_KEEP_MS).tables;
+    // Once the read is too old to say a machine answers, its answer no longer speaks for its
+    // agents: they are not read, not gone and not idle.
+    let read_at = NOW - 20_000;
+    let later = fold(&inputs, read_at + REACH_KEEP_MS + 1).tables;
     assert!(later.agents.is_empty());
     let me = now
         .tables
@@ -1205,8 +1206,8 @@ fn the_rows_change_by_themselves_only_at_the_instant_the_fold_names() {
         assert_eq!(shown_of(own, column), "?", "{column}");
     }
     assert!(own.last_seen_ms.is_some() && own.build.is_some());
-    // Control: one millisecond inside the two hours they are all still rows.
-    let inside = fold(&inputs, NOW - 20_000 + AGENTS_KEEP_MS).tables;
+    // Control: at the read's last instant they are all still rows.
+    let inside = fold(&inputs, read_at + REACH_KEEP_MS).tables;
     assert_eq!(inside.agents.len(), fixture::AGENTS);
 }
 
@@ -1256,11 +1257,15 @@ fn a_silent_machine_keeps_its_last_answer_and_an_unnamed_one_is_dropped_in_time(
         .expect("m3 is a row");
     assert_eq!(row.reach, Reach::Silent);
     assert_eq!(row.reach_why.as_deref(), Some("nothing-listens"));
+    // It does not answer now: what it said of its sessions is not read, while its build and
+    // when it was last seen stand.
     assert_eq!(
-        row.sessions.map(|at| at.v),
-        Some(2),
-        "what it last said stands, dated"
+        row.sessions, None,
+        "a silent machine's sessions are not read"
     );
+    assert_eq!(row.agents_listed, None);
+    assert_eq!(row.last_seen_ms, Some(NOW));
+    assert_eq!(row.build, Some(At::new("0.141.0".to_owned(), NOW)));
     // m5, which the second read did not name, says nothing of now.
     let m5 = tables
         .machines
@@ -1334,7 +1339,7 @@ fn a_folder_publishes_only_what_changed_and_a_fixture_holds_against_later_offers
     assert_eq!(held.value.sources.read.why(), Some(HELD_READ_FAILED));
     assert_eq!(
         sources_line(&held.value.sources),
-        "registry=never journal=never network=never fleet_read=held(read-failed)"
+        "registry=never journal=never network=never fleet_read=held(read-failed) own=never"
     );
 
     // A fixture stands: a reader's later offer does not replace it.
@@ -1533,7 +1538,9 @@ fn the_fold_thread_folds_on_an_offer_or_at_the_instant_the_last_fold_named() {
     assert_eq!(lapsed.revision, 2);
     assert_eq!(lapsed.value.machines[0].reach, Reach::Unread);
     assert_eq!(lapsed.value.sources.read.why(), Some(HELD_STALE));
-    assert!(after.is_some_and(|next| next > NOW + 51));
+    // Its agents and counts went with its reach, in the same fold: nothing more changes by itself.
+    assert_eq!(after, None);
+    assert_eq!(lapsed.value.machines[0].sessions, None);
 
     // With nothing offered and no instant ahead, a turn waits for an offer, however long.
     let (done, turned) = std::sync::mpsc::channel();
@@ -1621,11 +1628,13 @@ fn a_read_says_which_machines_answer_for_five_minutes_and_no_longer() {
     }
     assert_eq!(
         sources_line(&fold(&inputs, read_at + 6 * 3_600_000).tables.sources),
-        "registry=live journal=never network=never fleet_read=held(stale)"
+        "registry=live journal=never network=never fleet_read=held(stale) own=never"
     );
-    // What it said of its sessions stands for two hours, dated, as before.
+    // What it said of its sessions is not read once the read is too old to say it answers.
     let old = fold(&inputs, read_at + REACH_KEEP_MS + 1).tables;
-    assert_eq!(old.machines[1].sessions, Some(At::new(2, read_at)));
+    assert_eq!(old.machines[1].sessions, None);
+    let fresh = fold(&inputs, read_at + REACH_KEEP_MS).tables;
+    assert_eq!(fresh.machines[1].sessions, Some(At::new(2, read_at)));
 }
 
 /// A read whose question of the fleet was refused still heard this Mac's own windows: its row
@@ -1682,7 +1691,7 @@ fn a_refused_fleet_read_gives_this_mac_its_own_answer_and_holds_the_peers() {
     assert_eq!((me.reach, me.sessions), (Reach::Up, Some(At::new(3, end))));
     assert_eq!((m7.reach, m7.how), (Reach::Unread, Via::None));
     assert_eq!(m7.last_seen_ms, Some(NOW), "it is still held");
-    assert_eq!(m7.sessions, None, "its two hours have passed");
+    assert_eq!(m7.sessions, None, "it no longer answers now");
 
     // Control: a read that did ask the fleet and no longer names it drops it.
     folder.offer_read(whole(end + 60_000, Vec::new()));
@@ -1779,7 +1788,7 @@ fn a_network_observation_nobody_is_making_is_held() {
     );
     assert_eq!(
         sources_line(&folder.tables().value.sources),
-        "registry=never journal=never network=held(no-history) fleet_read=never"
+        "registry=never journal=never network=held(no-history) fleet_read=never own=never"
     );
 }
 
@@ -1981,8 +1990,9 @@ fn an_accounts_sessions_are_unread_once_no_answer_speaks_for_agents() {
         (Some(0), "0".into())
     );
 
-    // Two hours on with no newer read: the agents are unknown, and so is the account's count.
-    let late = NOW + AGENTS_KEEP_MS;
+    // Past the read's five minutes with no newer read: the agents are not read, and so is the
+    // account's count.
+    let late = NOW + REACH_KEEP_MS;
     let old = fold(&inputs, late).tables;
     assert!(old.agents.is_empty());
     let row = &old.accounts[0];
@@ -2210,7 +2220,7 @@ fn a_table_prints_by_its_schema_and_a_relation_nobody_read_says_so() {
     assert!(!print(&unread, "accounts", &[], true).expect("print").read);
     assert_eq!(
         sources_line(&unread.sources),
-        "registry=never journal=never network=never fleet_read=never"
+        "registry=never journal=never network=never fleet_read=never own=never"
     );
 }
 
@@ -4221,4 +4231,391 @@ fn an_agents_row_carries_its_output_age_its_open_turn_its_job_and_its_word_and_a
     for column in ["tok_in_per_min", "tok_out_per_min", "rate_over_ms"] {
         assert_eq!(cell_of(s1, column), Cell::Unread, "one read: {column}");
     }
+}
+
+/// A light look this Mac's deck reads: 12 cores 2.4 busy, 20000 of 65536 MiB in use, 5% of 38
+/// GPU cores busy, a 953000 MiB home volume, its dial at 20 and within capacity.
+fn deck_look() -> Look {
+    Look {
+        cpu_busy_x100: Some(240),
+        mem_used_mb: Some(20_000),
+        gpu_busy_pct: Some(5),
+        limits: Limits {
+            cpu: Some(false),
+            mem: Some(false),
+            disk: Some(false),
+            gpu: Some(false),
+        },
+        load: Some(Load {
+            level_x100: 20,
+            over_x100: Some(0),
+        }),
+        ..whole_look()
+    }
+}
+
+/// This Mac's own reading from its vitals at `at`.
+fn own_at(look: Look, home_free_mb: Option<u64>, at: u64) -> Source<Arc<super::read::Own>> {
+    live(super::read::Own { look, home_free_mb }, at)
+}
+
+/// FP-10 (1): THIS MACHINE'S OWN COLUMN, PAIRS AND LOAD ARE ITS DECK'S OWN VITALS, never its
+/// survey answer. Its answer says a busy look (the dial at 97, its GPU at its limit); its deck
+/// reads a light one. CONTROLS: the answer's figures drawn for this Mac, its column unread
+/// while its dial shows a load (no read made, a Mac in no fleet), and a reading past its three
+/// minutes drawn as now, or replaced by the answer's.
+#[test]
+fn this_machines_own_load_is_its_vitals_and_never_its_survey_answer() {
+    let mut lab = lab_of(&["m1", "m3"]);
+    lab.me = Some(keys::machine_pk("m1"));
+    let own_seen = NOW - 2_000;
+    let busy = || {
+        read_of(vec![
+            MachineSeen::own(Some("m1"), answered_with("0.208.0", None, whole_look())),
+            peer("m3", answered_with("0.208.0", None, whole_look())),
+        ])
+    };
+    let inputs = Inputs {
+        lab: live(lab.clone(), NOW),
+        read: busy(),
+        own: own_at(deck_look(), Some(700_000), own_seen),
+        ..Inputs::default()
+    };
+    let folded = tables(&inputs);
+    let me = machine_row(&folded, "m1");
+    assert_eq!((me.reach, me.how), (Reach::Up, Via::Own));
+    let deck = |v: u64| Some(At::new(v, own_seen));
+    assert_eq!(
+        me.load,
+        Some(At::new(
+            Load {
+                level_x100: 20,
+                over_x100: Some(0)
+            },
+            own_seen
+        )),
+        "the deck's dial, never the answer's 97"
+    );
+    assert_eq!((me.cpu.used, me.cpu.capacity), (deck(240), deck(12)));
+    assert_eq!((me.mem.used, me.mem.capacity), (deck(20_000), deck(65_536)));
+    assert_eq!(me.gpu.used, deck(5 * 38));
+    assert_eq!(me.disk.used, deck(953_000 - 700_000), "its own free space");
+    assert_eq!(me.disk_free_mb, deck(700_000), "never its answer's 50000");
+    assert_eq!(
+        shown_of(me, "facts_at"),
+        own_seen.to_string(),
+        "its free space's read, older than its build's (NOW - 1000): never the newer"
+    );
+    assert_eq!(me.limits.map(|at| at.v.gpu), Some(Some(false)));
+    assert_eq!(
+        me.sessions.map(|at| at.v),
+        Some(0),
+        "its agents are its answer's"
+    );
+    // A peer's column is its own answer's.
+    let m3 = machine_row(&folded, "m3");
+    assert_eq!(m3.load.map(|at| at.v.level_x100), Some(97));
+    assert_eq!(folded.sources.own, SourceState::Live { at_ms: own_seen });
+
+    // No read made at all (a Mac in no fleet, a glance not yet asked): its column is up, its
+    // figures its deck's.
+    let alone = tables(&Inputs {
+        read: Source::Never,
+        ..inputs.clone()
+    });
+    let me = machine_row(&alone, "m1");
+    assert_eq!((me.reach, me.how), (Reach::Up, Via::Own));
+    assert_eq!(me.load.map(|at| at.v.level_x100), Some(20));
+    assert_eq!(me.sessions, None, "no answer listed its agents");
+
+    // Its reading three minutes old is drawn; a millisecond older it is unread, never the
+    // answer's figures, and the fold named that instant.
+    let at = |own_at_ms: u64| {
+        fold(
+            &Inputs {
+                own: own_at(deck_look(), Some(700_000), own_at_ms),
+                ..inputs.clone()
+            },
+            NOW,
+        )
+    };
+    let edge = at(NOW - LOOK_KEEP_MS);
+    assert_eq!(
+        machine_row(&edge.tables, "m1")
+            .load
+            .map(|at| at.v.level_x100),
+        Some(20)
+    );
+    assert_eq!(edge.next_change_ms.map(|next| next <= NOW + 1), Some(true));
+    let old = at(NOW - LOOK_KEEP_MS - 1).tables;
+    let me = machine_row(&old, "m1");
+    assert_eq!((me.load, me.cpu.used, me.limits), (None, None, None));
+    assert_eq!(me.disk_free_mb, None, "never its answer's free space");
+    assert_eq!(me.reach, Reach::Up, "its own answer still says it answers");
+    assert_eq!(
+        (old.sources.own.word(), old.sources.own.why()),
+        ("held", Some(HELD_STALE))
+    );
+    // A reading with no row to draw it on (no registry read, no answer yet) still goes stale at
+    // the instant the fold names.
+    let alone = Inputs {
+        own: own_at(deck_look(), Some(700_000), own_seen),
+        ..Inputs::default()
+    };
+    let now = fold(&alone, NOW);
+    assert!(now.tables.machines.is_empty());
+    assert_eq!(now.next_change_ms, Some(own_seen + LOOK_KEEP_MS + 1));
+    assert_eq!(
+        fold(&alone, own_seen + LOOK_KEEP_MS + 1)
+            .tables
+            .sources
+            .own
+            .word(),
+        "held"
+    );
+    // With no reading offered, its answer's look is not drawn either.
+    let unoffered = tables(&Inputs {
+        own: Source::Never,
+        ..inputs
+    });
+    let me = machine_row(&unoffered, "m1");
+    assert_eq!((me.load, me.cpu.used, me.mem.used), (None, None, None));
+    assert_eq!(me.disk_free_mb, None);
+}
+
+/// FP-10 (2): ANOTHER MACHINE'S LOAD, CORES BUSY AND VERDICTS ARE KEPT THREE MINUTES, THEN
+/// UNREAD. m3's first answer carries its whole look, its CPU at its limit; its next, a minute
+/// on, is the answer after a gap, which has no rate: no load, no cores busy and no CPU verdict,
+/// while it still judges memory, disk and GPU. CONTROLS: the second answer blanking them (the
+/// CPU verdict with the other three included), a figure kept past its 180 s, a kept figure
+/// dated as the newer read, and a claim's figures kept under a proven row.
+#[test]
+fn another_machines_load_is_kept_three_minutes_then_unread() {
+    let first = NOW - 100_000;
+    let second = first + 60_000;
+    let pegged = Look {
+        limits: Limits {
+            cpu: Some(true),
+            ..whole_look().limits
+        },
+        ..whole_look()
+    };
+    let unrated = Look {
+        cpu_busy_x100: None,
+        limits: Limits {
+            cpu: None,
+            mem: Some(false),
+            disk: Some(false),
+            gpu: Some(false),
+        },
+        load: None,
+        ..whole_look()
+    };
+    let latest = Latest::default()
+        .with(whole(
+            first,
+            vec![peer("m3", answered_with("0.208.0", None, pegged.clone()))],
+        ))
+        .with(whole(
+            second,
+            vec![peer("m3", answered_with("0.208.0", None, unrated.clone()))],
+        ));
+    let inputs = Inputs {
+        lab: live(lab_of(&["m3"]), NOW),
+        read: live(latest.clone(), second),
+        ..Inputs::default()
+    };
+    let now = fold(&inputs, NOW);
+    let m3 = machine_row(&now.tables, "m3");
+    assert_eq!(m3.reach, Reach::Up);
+    assert_eq!(
+        m3.load,
+        Some(At::new(
+            Load {
+                level_x100: 97,
+                over_x100: Some(0)
+            },
+            first
+        )),
+        "the first answer's load, dated by it"
+    );
+    assert_eq!(m3.cpu.used, Some(At::new(1_140, first)));
+    assert_eq!(
+        m3.cpu.capacity,
+        Some(At::new(12, second)),
+        "the newer cores"
+    );
+    assert_eq!(
+        m3.limits,
+        Some(At::new(
+            Limits {
+                cpu: Some(true),
+                mem: Some(false),
+                disk: Some(false),
+                gpu: Some(false),
+            },
+            first
+        )),
+        "the kept CPU verdict beside the newer three, dated by the older"
+    );
+    assert_eq!(m3.mem.used, Some(At::new(40_000, second)));
+    assert_eq!(
+        shown_of(m3, "cpu_at"),
+        first.to_string(),
+        "the older side's time"
+    );
+    assert_eq!(shown_of(m3, "look_at"), first.to_string());
+    let lapses = first + LOOK_KEEP_MS + 1;
+    assert_eq!(now.next_change_ms, Some(lapses));
+    assert_eq!(fold(&inputs, lapses - 1).tables, now.tables);
+    let after = fold(&inputs, lapses).tables;
+    let m3 = machine_row(&after, "m3");
+    assert_eq!((m3.load, m3.cpu.used), (None, None));
+    assert_eq!(
+        m3.limits.map(|at| (at.v.cpu, at.v.gpu, at.at_ms)),
+        Some((None, Some(false), second)),
+        "the CPU verdict lapsed; the newer three stand"
+    );
+    assert_eq!(m3.cpu.capacity, Some(At::new(12, second)));
+    assert_eq!(m3.reach, Reach::Up, "it still answers; its load is unread");
+
+    // A newer answer that says them replaces them.
+    let third = second + 60_000;
+    let renewed = latest.with(whole(
+        third,
+        vec![peer("m3", answered_with("0.208.0", None, deck_look()))],
+    ));
+    let renewed = fold(
+        &Inputs {
+            read: live(renewed.clone(), third),
+            ..inputs.clone()
+        },
+        lapses,
+    )
+    .tables;
+    assert_eq!(
+        machine_row(&renewed, "m3")
+            .load
+            .map(|at| (at.v.level_x100, at.at_ms)),
+        Some((20, third))
+    );
+
+    // A claim of the same book entry starts what is kept afresh: nothing proven stands under
+    // it, and nothing it says stands under the proven answer after it.
+    let claimed = Latest::default()
+        .with(whole(
+            first,
+            vec![peer("m3", answered_with("0.208.0", None, pegged))],
+        ))
+        .with(whole(
+            second,
+            vec![peer("m3", answered_with("0.208.0", None, unrated.clone())).unproven()],
+        ));
+    let sighted = claimed.machines.values().next().expect("m3 is held");
+    assert!(sighted.unproven);
+    assert_eq!(
+        (
+            sighted.kept.load,
+            sighted.kept.cpu.used,
+            sighted.kept.cpu_limit
+        ),
+        (None, None, None)
+    );
+    assert_eq!(sighted.kept.gpu_limit, Some(At::new(false, second)));
+    assert_eq!(sighted.kept.cpu.capacity, Some(At::new(12, second)));
+}
+
+/// FP-10 (3): A MACHINE THAT STOPS ANSWERING MOVES ITS AGENTS TO NOT READ IN THE SAME FOLD.
+/// m3 answered with one busy agent and its whole look; the next read finds it silent. Its
+/// agents, sessions, tallies, pairs, verdicts and load are not read from that fold on; its
+/// build, when it was last seen and the account placed on it survive. CONTROLS: a silent
+/// machine's agents still counted running, and its build or its placed account dropped.
+#[test]
+fn a_machine_that_stops_answering_moves_its_agents_to_not_read_in_the_same_fold() {
+    let row = account("claude", "one@lab.example", "claude-one");
+    let pk = row.pk.clone();
+    let mut lab = lab_of(&["m3"]);
+    lab.accounts.insert(pk.clone(), row);
+    lab.bound.insert(UUID.to_owned(), keys::machine_pk("m3"));
+    let now_s = NOW / 1_000;
+    let mut seen = Seen::of_events(&[], now_s);
+    seen.places.rows.push(Placed {
+        uuid: UUID.to_owned(),
+        account: pk,
+        why: Why::Fill,
+        since: now_s - 600,
+        until: now_s + 3_600,
+    });
+    let answered_at_ms = NOW - 61_000;
+    let mut answer = answered_with("0.208.0", None, whole_look());
+    if let Answer::Answered(answered) = &mut answer {
+        answered.sessions = Some(1);
+        answered.agents = vec![agent(
+            "s1",
+            Harness::Claude,
+            State::Busy,
+            Some("one@lab.example"),
+        )];
+        let mut tally = Tally::default();
+        tally.add(State::Busy);
+        answered.tally = Some(tally);
+    }
+    let heard = Latest::default().with(whole(answered_at_ms, vec![peer("m3", answer)]));
+    let inputs = |latest: Latest, read_at: u64| Inputs {
+        lab: live(lab.clone(), NOW),
+        journal: live(seen.clone(), NOW),
+        read: live(latest, read_at),
+        ..Inputs::default()
+    };
+
+    // Control: while it answers, its agent is a row and its counts are read.
+    let answering = tables(&inputs(heard.clone(), answered_at_ms));
+    let m3 = machine_row(&answering, "m3");
+    assert_eq!(answering.agents.len(), 1);
+    assert_eq!((m3.reach, m3.sessions.map(|at| at.v)), (Reach::Up, Some(1)));
+    assert_eq!(shown_of(m3, "busy"), "1");
+    assert!(m3.load.is_some());
+
+    let silent_at = NOW - 1_000;
+    let silent = heard.with(whole(
+        silent_at,
+        vec![peer(
+            "m3",
+            Answer::Silent {
+                why: Some("nothing-listens".to_owned()),
+            },
+        )],
+    ));
+    let folded = tables(&inputs(silent, silent_at));
+    let m3 = machine_row(&folded, "m3");
+    assert_eq!(m3.reach, Reach::Silent);
+    assert!(
+        folded.agents.is_empty(),
+        "no agent of a silent machine is a row"
+    );
+    for column in [
+        "sessions",
+        "agents",
+        "busy",
+        "agents_listed",
+        "cpu_used_x100",
+        "load_x100",
+    ] {
+        assert_eq!(cell_of(m3, column), Cell::Unread, "{column}");
+    }
+    assert_eq!(m3.limits, None);
+    // What it said of itself survives, dated by the answer that said it.
+    assert_eq!(
+        m3.build,
+        Some(At::new("0.208.0".to_owned(), answered_at_ms))
+    );
+    assert_eq!(m3.last_seen_ms, Some(answered_at_ms));
+    assert_eq!(m3.accounts_active, Some(1), "the account placed on it");
+    let how: Vec<EvidenceHow> = folded.accounts[0]
+        .active
+        .iter()
+        .flatten()
+        .map(|e| e.how)
+        .collect();
+    assert_eq!(how, vec![EvidenceHow::Place]);
 }

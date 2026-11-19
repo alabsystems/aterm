@@ -336,10 +336,52 @@ fn contents_role(directory: BorrowedFd<'_>) -> io::Result<()> {
 }
 
 fn before(deadline: Instant) -> io::Result<()> {
-    if Instant::now() >= deadline {
+    if now() >= deadline {
         Err(io::ErrorKind::TimedOut.into())
     } else {
         Ok(())
+    }
+}
+
+/// The instant an endpoint is judged at: the monotonic clock, which a test moves on past an
+/// endpoint ([`Elapsed`]) instead of waiting the endpoint out.
+fn now() -> Instant {
+    #[cfg(test)]
+    let ahead = ELAPSED.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let ahead = std::time::Duration::ZERO;
+    Instant::now() + ahead
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How far this test thread's endpoint clock runs ahead of the monotonic clock.
+    static ELAPSED: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// This test thread's endpoint clock moved on to an endpoint, as if the time up to it had
+/// passed, until the value drops.
+#[cfg(test)]
+#[must_use = "the clock goes back when this drops"]
+pub(super) struct Elapsed(std::time::Duration);
+
+#[cfg(test)]
+impl Elapsed {
+    /// Move this thread's endpoint clock on to `endpoint`: every endpoint at or before it has
+    /// passed.
+    pub(super) fn to(endpoint: Instant) -> Self {
+        let was = ELAPSED.with(std::cell::Cell::get);
+        let ahead = endpoint.saturating_duration_since(Instant::now());
+        ELAPSED.with(|elapsed| elapsed.set(was.max(ahead)));
+        Self(was)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Elapsed {
+    fn drop(&mut self) {
+        ELAPSED.with(|elapsed| elapsed.set(self.0));
     }
 }
 

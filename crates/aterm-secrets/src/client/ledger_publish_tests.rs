@@ -4242,6 +4242,7 @@ fn a_records_file_past_the_stream_cap_keeps_what_it_holds_and_records_go_on() {
                     ciphertext: vec![0x5a; crate::membership_log::entries::MAX_PUT_CIPHERTEXT]
                         .into(),
                 },
+                statement: None,
             }
             .sign(&w9, inc9)
             .unwrap()

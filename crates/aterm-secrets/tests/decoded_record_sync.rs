@@ -284,6 +284,7 @@ impl Fixture {
             body: Body::Name {
                 name: name.to_owned(),
             },
+            statement: None,
         }
         .sign(&WRITER, INCARNATION)
         .unwrap()

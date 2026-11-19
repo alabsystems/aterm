@@ -1016,9 +1016,12 @@ fn the_hearing_ledger_keeps_a_version_at_its_round_and_the_contact_that_came_aft
 #[test]
 fn relayed_reports_reach_the_ledger_at_the_hearing_tick_without_counting_as_contact() {
     use aterm_secrets::commons::{
-        hearing::{CHECKPOINTS, Entry, Hold, RELAYS, Reports, Version},
+        hearing::{Entry, Floor, Hold, RELAYS, Reports, Version, in_place},
         roster::Role,
     };
+    // The floor a member that reports `RELAYS` clears: the test judges the relay, not where
+    // a deployed fence such as `CHECKPOINTS` stands.
+    const RELAYED: Floor = in_place(Some(RELAYS));
     let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
     // Mac 2 runs the tick; Mac 1 is the member it has no round with.
     let (signer, local) = (lab.bootstrap(0), lab.bootstrap(1));
@@ -1045,7 +1048,7 @@ fn relayed_reports_reach_the_ledger_at_the_hearing_tick_without_counting_as_cont
         (own.actor(), Version::own())
     );
     assert_eq!(
-        hearing.ledger.holding_below([&member], now_ms, CHECKPOINTS),
+        hearing.ledger.holding_below([&member], now_ms, RELAYED),
         unheard
     );
 
@@ -1071,7 +1074,7 @@ fn relayed_reports_reach_the_ledger_at_the_hearing_tick_without_counting_as_cont
     assert!(
         hearing
             .ledger
-            .holding_below([&member], now_ms, CHECKPOINTS)
+            .holding_below([&member], now_ms, RELAYED)
             .is_empty()
     );
     let read = Ledger::read(&local);
@@ -1200,7 +1203,10 @@ impl Listening {
 /// is dropped: `` left: Some(Version(0, 207, 0)) right: Some(Version(0, 202, 0)) ``.
 #[test]
 fn a_round_with_a_member_stands_against_its_relayed_report_in_the_same_tick() {
-    use hearing::{CHECKPOINTS, Hold, RELAYS, Version};
+    use hearing::{Floor, Hold, RELAYS, Version, in_place};
+    // The floor a member that reports `RELAYS` clears: the test judges the relay, not where
+    // a deployed fence such as `CHECKPOINTS` stands.
+    const RELAYED: Floor = in_place(Some(RELAYS));
     let lab = Listening::new();
     let mut hearing = lab.hearing();
     lab.tick(&mut hearing, &[], Instant::now());
@@ -1216,9 +1222,7 @@ fn a_round_with_a_member_stands_against_its_relayed_report_in_the_same_tick() {
     assert_eq!(hearing.ledger.entry(&actor).unwrap().version, Some(older));
     let now_ms = aterm_time::unix_millis().unwrap();
     assert_eq!(
-        hearing
-            .ledger
-            .holding_below([&lab.member], now_ms, CHECKPOINTS),
+        hearing.ledger.holding_below([&lab.member], now_ms, RELAYED),
         vec![(actor, Hold::Older(Some(older)))]
     );
     assert!(!hearing.ledger.writes_no_secret_file(&lab.member, now_ms));

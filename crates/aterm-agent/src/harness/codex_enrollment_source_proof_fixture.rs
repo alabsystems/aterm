@@ -75,6 +75,7 @@ enum Purpose {
     Retained,
     RetainedDistinct,
     RetainedResources,
+    RetainedTransport,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -221,12 +222,20 @@ impl SourceProofLaunch {
     pub fn retained_frontend(&self) -> bool {
         matches!(
             self.body.purpose,
-            Purpose::Retained | Purpose::RetainedDistinct | Purpose::RetainedResources
+            Purpose::Retained
+                | Purpose::RetainedDistinct
+                | Purpose::RetainedResources
+                | Purpose::RetainedTransport
         )
     }
 
     pub fn resources_frontend(&self) -> bool {
         matches!(self.body.purpose, Purpose::RetainedResources)
+    }
+    /// Immutable authenticated Native-only transport purpose. This supplies no
+    /// whole-App/clipboard capability and cannot be changed by request fields.
+    pub fn native_transport_only(&self) -> bool {
+        matches!(self.body.purpose, Purpose::RetainedTransport)
     }
 
     pub fn advance(&self, env: &Env) -> SourceProofAdvance {
@@ -285,7 +294,7 @@ impl SourceProofLaunch {
         }
         let body = envelope.body;
         if body.schema != 3
-            || body.replacement.is_some() && !matches!(body.purpose, Purpose::Retained)
+            || body.replacement.is_some() != matches!(body.purpose, Purpose::RetainedTransport)
             || body.nonce.len() != 32
             || !body
                 .nonce
@@ -374,7 +383,13 @@ impl SourceProofLaunch {
     /// Exact process-image multiplicity selected by the authenticated driver,
     /// independently of frontend checkpoint data or child-reported processes.
     pub fn retained_backend_images(&self) -> Result<Vec<Image>, String> {
-        let mut images = self.retained_images()?;
+        self.current()?;
+        if !self.retained_frontend() {
+            return Err("retained image policy requires its authenticated purpose".into());
+        }
+        // UI replacement keeps the SAME original backend. B is admitted for
+        // the new frontend, never as a request to create a second backend.
+        let mut images = vec![self.candidate.image.clone()];
         if matches!(
             self.body.purpose,
             Purpose::RetainedDistinct | Purpose::RetainedResources
@@ -537,7 +552,7 @@ impl NativeSourceProofWorld {
         candidate: &Path,
         replacement: &Path,
     ) -> Result<String, String> {
-        self.task(candidate, Purpose::Retained, Some(replacement))
+        self.task(candidate, Purpose::RetainedTransport, Some(replacement))
     }
     fn task(
         &self,

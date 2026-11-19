@@ -537,18 +537,24 @@ pub const SEAL_DRIVER: &str = "librustc_driver-fixture.so";
 /// A promoter-shaped seal and its sibling rustc-private closure, as trust's
 /// `scripts/promote-toolchain.sh` lays them out: `(seal, private)`.
 pub fn seal_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    seal_fixture_for(root, SEAL_TRIPLE)
+}
+
+/// The same seal layout with native images and a driver for the selected host.
+pub fn seal_fixture_for(root: &Path, triple: &str) -> (PathBuf, PathBuf) {
     let source = root.join("seal");
     let private = root.join("rustc-private-sysroots/exact-fixture");
-    let native = |body: &str| {
-        let mut b = elf(EM_AARCH64, 2, 1);
-        b.extend(body.as_bytes());
-        b
+    let native = |body: &str| seal_image(triple, body);
+    let driver_name = if triple == SEAL_TRIPLE {
+        SEAL_DRIVER
+    } else {
+        "librustc_driver-fixture.dylib"
     };
     put_exe(&source.join("bin/trustc"), &native("fixture trustc"));
     put_exe(&source.join("bin/targo"), &native("fixture targo"));
     let driver = native("exact compiler driver\n");
-    put(&source.join("lib").join(SEAL_DRIVER), &driver);
-    let target = source.join(format!("lib/rustlib/{SEAL_TRIPLE}/lib"));
+    put(&source.join("lib").join(driver_name), &driver);
+    let target = source.join(format!("lib/rustlib/{triple}/lib"));
     for name in ["std", "core"] {
         put(
             &target.join(format!("lib{name}-fixture.rlib")),
@@ -572,31 +578,37 @@ pub fn seal_fixture(root: &Path) -> (PathBuf, PathBuf) {
         &private.join(".rustc-commit-hash"),
         format!("{SEAL_COMMIT}\n").as_bytes(),
     );
-    put(&private.join(SEAL_TRIPLE).join(SEAL_DRIVER), &driver);
+    put(&private.join(triple).join(driver_name), &driver);
     put(
-        &private
-            .join(SEAL_TRIPLE)
-            .join("librustc_middle-fixture.rmeta"),
+        &private.join(triple).join("librustc_middle-fixture.rmeta"),
         b"matching private metadata\n",
     );
     put(
         &private.join("host/libproc_macro-fixture.rmeta"),
         b"matching host metadata\n",
     );
-    copy_tree(
-        &target,
-        &private.join(format!("lib/rustlib/{SEAL_TRIPLE}/lib")),
-    );
-    let fingerprint = atpkg::sha256_file(&source.join("lib").join(SEAL_DRIVER)).expect("hash");
+    copy_tree(&target, &private.join(format!("lib/rustlib/{triple}/lib")));
+    let fingerprint = atpkg::sha256_file(&source.join("lib").join(driver_name)).expect("hash");
     put(
         &source.join("PROVENANCE"),
         format!(
             "reported_commit={SEAL_COMMIT}\nprivate_sysroot=exact-fixture\n\
-             artifact_driver_name={SEAL_DRIVER}\nartifact_driver_sha256={fingerprint}\n"
+             artifact_driver_name={driver_name}\nartifact_driver_sha256={fingerprint}\n"
         )
         .as_bytes(),
     );
     (source, private)
+}
+
+/// A fixture object of the selected seal’s native format with a recognizable payload.
+pub fn seal_image(triple: &str, body: &str) -> Vec<u8> {
+    let mut image = if triple == SEAL_TRIPLE {
+        elf(EM_AARCH64, 2, 1)
+    } else {
+        macho(CPU_ARM64)
+    };
+    image.extend_from_slice(body.as_bytes());
+    image
 }
 
 /// The seal compiler's `-vV`, as the closure reads it.

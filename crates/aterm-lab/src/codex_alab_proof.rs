@@ -633,6 +633,20 @@ impl RepoAction {
             Self::Push => 1,
         }
     }
+
+    fn reported_by(self, request: &str) -> bool {
+        let finding = model::repo_finding(request);
+        match self {
+            Self::Commit => finding == Some("1 untracked (notes.txt)"),
+            Self::Push => matches!(
+                finding,
+                Some(
+                    "1 unpushed commit, 1 commit not on origin/main"
+                        | "1 unpushed commit, 1 commit not on cached origin/main"
+                )
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -848,8 +862,10 @@ impl RepoFixture {
         request: &str,
         committed: Option<&str>,
     ) -> Result<RepoChange, String> {
-        if !request.contains(model::REPO_SUFFIX_HEAD) {
-            return Err("repository request carries no native repository facts".into());
+        if !action.reported_by(request) {
+            return Err(format!(
+                "repository request does not report the Git facts for {action:?}"
+            ));
         }
         let git = |args: &[&str]| fixture_git(&self.env, &self.root, args);
         let named_origin = self
@@ -892,18 +908,14 @@ impl RepoFixture {
         let remote_before = remote()?;
         match action {
             RepoAction::Commit => {
-                if !request.contains(NOTES)
-                    || dirty.trim() != format!("?? {NOTES}")
-                    || old_head != remote_before
-                {
+                if dirty.trim() != format!("?? {NOTES}") || old_head != remote_before {
                     return Err("commit request did not observe exactly the untracked notes".into());
                 }
                 git(&["add", NOTES])?;
                 git(&["commit", "-q", "-m", "lab: the release notes"])?;
             }
             RepoAction::Push => {
-                if !request.contains("not on cached origin/main")
-                    || !dirty.is_empty()
+                if !dirty.is_empty()
                     || committed != Some(old_head.as_str())
                     || old_head == remote_before
                     || git(&["rev-parse", "--verify", "HEAD^"])?.trim() != remote_before
@@ -3178,7 +3190,7 @@ impl Proof {
                 ends_said(&ended), tail(&text, 180)
             ),
             nudged && ended.as_ref().is_ok_and(Vec::is_empty)
-                && tag.ends_with("+repo") && text.contains(NOTES)
+                && tag.ends_with("+repo") && RepoAction::Commit.reported_by(&text)
                 && receipt.as_ref().is_ok_and(|receipt| receipt.request == text),
         );
         let committed = receipt.and_then(|receipt| receipt.result);
@@ -3213,7 +3225,7 @@ impl Proof {
                 ends_said(&ended), tail(&text, 180)
             ),
             nudged && ended.as_ref().is_ok_and(Vec::is_empty)
-                && tag.ends_with("+repo") && text.contains("not on cached origin/main")
+                && tag.ends_with("+repo") && RepoAction::Push.reported_by(&text)
                 && receipt.as_ref().is_ok_and(|receipt| receipt.request == text),
         );
         let pushed = receipt.and_then(|receipt| receipt.result);
@@ -4507,6 +4519,10 @@ enum Lane {
     Window,
     /// `--capacity-only`: the capacity lane alone ([`capacity_proof`]), with no aterm.
     Capacity,
+    /// A signed ordinary CLI turn against a provider whose session credential is withheld.
+    WithheldSource,
+    /// The same provider challenge from the packaged interactive terminal.
+    WithheldTui,
 }
 
 impl Lane {
@@ -4528,13 +4544,15 @@ impl Lane {
             | Self::Upgrade
             | Self::RawUpgrade
             | Self::Restart
-            | Self::Window => false,
+            | Self::Window
+            | Self::WithheldSource
+            | Self::WithheldTui => false,
         }
     }
 }
 
 /// Each `--*-only` flag and the lane it narrows a run to.
-const ONLY: [(&str, Lane); 8] = [
+const ONLY: [(&str, Lane); 10] = [
     ("--policy-only", Lane::Policy),
     ("--terminals-only", Lane::Terminals),
     ("--facts-only", Lane::Facts),
@@ -4543,6 +4561,8 @@ const ONLY: [(&str, Lane); 8] = [
     ("--restart-only", Lane::Restart),
     ("--window-only", Lane::Window),
     ("--capacity-only", Lane::Capacity),
+    ("--withheld-source-only", Lane::WithheldSource),
+    ("--withheld-source-tui-only", Lane::WithheldTui),
 ];
 
 /// What one `codex-alab-proof` command line asks for.
@@ -4560,7 +4580,7 @@ struct Asked {
 
 /// Read a `codex-alab-proof` command line: at most one `--*-only` flag ([`ONLY`]),
 /// `--upgrade-package` only where the run hands off ([`Lane::hands_off`]), and no `--aterm` or
-/// `--expect-rollout` beside `--capacity-only`, which runs no aterm and no rollout leg.
+/// `--expect-rollout` for a standalone exec lane, which starts no aterm or rollout leg.
 /// # Errors
 /// Usage: two lanes, an option its lane does not take, a value missing, or an unknown word.
 fn asked(args: &[String]) -> Result<Asked, Fail> {
@@ -4605,9 +4625,16 @@ fn asked(args: &[String]) -> Result<Asked, Fail> {
             "codex-alab-proof: --lose-settle-ack requires --signed-original and an explicit debug --aterm",
         ));
     }
-    if lane == Lane::Capacity && (aterm.is_some() || expect.is_some()) {
+    if matches!(lane, Lane::Capacity | Lane::WithheldSource)
+        && (aterm.is_some() || expect.is_some())
+    {
         return Err(Fail::usage(
-            "codex-alab-proof: --capacity-only runs no aterm and no rollout leg",
+            "codex-alab-proof: this standalone codex exec lane runs no aterm and no rollout leg",
+        ));
+    }
+    if lane == Lane::WithheldTui && expect.is_some() {
+        return Err(Fail::usage(
+            "codex-alab-proof: the signed TUI control observes its own original thread",
         ));
     }
     if let Some(extra) = a.first() {
@@ -4627,7 +4654,9 @@ fn asked(args: &[String]) -> Result<Asked, Fail> {
     })
 }
 
-/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--restart-only|--window-only|--capacity-only]`
+/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--restart-only|--window-only|--capacity-only|--withheld-source-only|--withheld-source-tui-only]`
+/// `--withheld-source-only` checks a signed noninteractive CLI turn denied its provider credential.
+/// `--withheld-source-tui-only` checks the signed TUI with the same provider in a private headless aterm.
 /// `--upgrade-only --signed-original --package A --upgrade-package B` starts from two distinct
 /// installed signed builds in one private store. Use a debug or dev-seams aterm for its registry.
 /// `--lose-settle-ack` adds the private guardian proof to that signed lane with explicit `--aterm`.
@@ -4648,10 +4677,20 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         expect,
     } = asked(args)?;
     let not_run = |why: String| Fail::exit(3, format!("NOT RUN: {why}"));
-    if lane == Lane::Capacity {
+    if matches!(
+        lane,
+        Lane::Capacity | Lane::WithheldSource | Lane::WithheldTui
+    ) {
         let home = crate::paths::paths().need_store_home().map_err(not_run)?;
         let pkg = package(given.as_deref(), home).map_err(not_run)?;
-        return capacity_alone(&pkg);
+        return match lane {
+            Lane::WithheldSource => capacity_proof::withheld_source::run(&pkg, keep, None),
+            Lane::WithheldTui => {
+                let terminal = instance::resolve_aterm(aterm).map_err(not_run)?;
+                capacity_proof::withheld_source::run(&pkg, keep, Some(&terminal))
+            }
+            _ => capacity_alone(&pkg),
+        };
     }
     let aterm = instance::resolve_aterm(aterm).map_err(not_run)?;
     let home = crate::paths::paths().need_store_home().map_err(not_run)?;
@@ -4719,7 +4758,9 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         Lane::Facts => facts_proof::legs(&mut proof, &pkg_a),
         Lane::Window => window_proof::legs(&mut proof, &pkg_a),
         Lane::Full => legs(&mut proof, &pkg_a, &pkg_b),
-        Lane::Capacity => unreachable!("--capacity-only returned before any instance started"),
+        Lane::Capacity | Lane::WithheldSource | Lane::WithheldTui => {
+            unreachable!("the standalone qualification already ran")
+        }
     };
     proof.end_all();
     // The last leg, where the lane runs it ([`Lane::runs_capacity`]) and once the instance is

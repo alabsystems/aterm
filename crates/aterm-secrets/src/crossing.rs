@@ -422,6 +422,19 @@ mod mark {
             if faults(&self.path).follows {
                 return true;
             }
+            // The same of a test of another crate ([`reads_format_two`]): a build without
+            // debug assertions holds no such set. The set's lock is taken only once a test named
+            // a node: the first lock of a `std` mutex on macOS allocates its `pthread` mutex for
+            // the life of the process, which a process no test named does not owe.
+            #[cfg(any(test, debug_assertions))]
+            if READS_TWO_NAMED.load(std::sync::atomic::Ordering::Acquire)
+                && READS_TWO
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&self.path)
+            {
+                return true;
+            }
             crate::commons::hearing::READS_FORMAT.is_some()
         }
 
@@ -506,6 +519,30 @@ mod mark {
         }
     }
 
+    /// The format marks whose node's build reads format 2 as a test of another crate said
+    /// ([`reads_format_two`]), by path, so no other node of the process does.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    static READS_TWO: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+    /// Whether [`READS_TWO`] names any node: set by the first [`reads_format_two`], never
+    /// cleared.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    static READS_TWO_NAMED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Seam (tests of other crates, through `client::test_reads_format_two`): from now on the
+    /// node whose format mark is at `path` runs a build that reads format 2
+    /// ([`FormatMark::follows`]), as [`Faults::follows`] says of a node in this crate's tests.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    pub(crate) fn reads_format_two(path: &std::path::Path) {
+        READS_TWO
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf());
+        READS_TWO_NAMED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// An exclusive `flock` on [`FormatMark::lock_path`], released by `LOCK_UN` when dropped.
     #[cfg(unix)]
     struct StoreLock(std::fs::File);
@@ -588,6 +625,19 @@ mod mark {
         /// format mark names, so a format-2 Mac hands a format-1 Mac its records over the
         /// mesh, and takes that Mac's (ATERM-KI-1116-1471).
         pub(crate) lane_past_mark: bool,
+        /// Not a fault: the wall clock (Unix milliseconds) the node judges its format fence by
+        /// (`crate::client::format_two`), in place of the system's.
+        pub(crate) now_ms: Option<u64>,
+        /// MUTANT: the node's first format-2 write waits on no fence
+        /// (`crate::client::format_two::writer`): a node whose build reads format 2 signs one
+        /// at its first write.
+        pub(crate) first_write_unfenced: bool,
+        /// MUTANT: a fence the node cannot judge fails its write
+        /// (`crate::client::format_two::writer`), where it signs version 1.
+        pub(crate) fence_error_fails_write: bool,
+        /// MUTANT: the node reads its log pass's journal record whatever its build reads and
+        /// its mark names (`crate::client::log_pass::last`).
+        pub(crate) log_pass_ungated: bool,
     }
 
     #[cfg(test)]
@@ -616,6 +666,8 @@ mod mark {
     }
 }
 
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(crate) use mark::reads_format_two;
 #[cfg(all(any(unix, windows), test))]
 pub(crate) use mark::{Faults, faults, inject};
 

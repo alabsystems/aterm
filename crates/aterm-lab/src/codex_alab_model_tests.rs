@@ -423,7 +423,7 @@ fn the_repository_leg_defends_clean_words_over_a_dirty_repository() {
     );
     let nudge = acted(
         LAND_NUDGE,
-        "Your repository's local Git state still shows work (1 untracked (notes.txt)): \
+        "Your repository's local Git state still shows work (fixture: 1 untracked (notes.txt)): \
          commit, merge and push it to the remote main first.",
     );
     let committed = answer(&body(&[p, LAND, &nudge], None));
@@ -439,7 +439,7 @@ fn the_repository_leg_defends_clean_words_over_a_dirty_repository() {
     );
     let unpushed = acted(
         LAND_NUDGE,
-        "Your repository's local Git state still shows work (1 unpushed commit, 1 commit \
+        "Your repository's local Git state still shows work (fixture: 1 unpushed commit, 1 commit \
          not on cached origin/main): commit, merge and push it to the remote main first.",
     );
     let pushed = answer(&body(&[p, LAND, &nudge, &unpushed], None));

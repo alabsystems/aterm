@@ -201,9 +201,9 @@ pub struct Counters {
     pub peak_footprint: Option<u64>,
 }
 
-/// `pid`'s children, sorted (macOS `proc_listchildpids`): read at a shell's prompt, the jobs it
-/// left running. One kernel call; `None` where refused, past 255 children (the list may be
-/// cut), and off macOS.
+/// `pid`'s children, zombies among them, sorted (macOS `proc_listchildpids`): read at a shell's
+/// prompt, the jobs it left running. One kernel call up to 63 children, two past that; `None`
+/// where refused, past 255 children, and off macOS.
 #[must_use]
 pub fn child_pids(pid: u32) -> Option<Vec<u32>> {
     #[cfg(target_os = "macos")]

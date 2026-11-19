@@ -113,6 +113,7 @@ fn trial_program(case: i64, carried: i64, custom_home: bool, supported: bool) ->
         cause: None,
         tab: None,
         run: Some(RunRestore::Codex(CodexRestore {
+            selected_default: false,
             home: default.to_str().unwrap().into(),
             home_env: None,
             embedded: true,

@@ -296,6 +296,225 @@ fn a_face_is_the_export_tsv_with_the_revisioned_key_last() {
 }
 
 #[test]
+fn a_sparse_snapshot_can_exceed_the_complete_tsv_byte_limit_on_separators_alone() {
+    let columns = 8_192;
+    let rows = usize::try_from(crate::snapshot::MAX_BYTES).unwrap() / columns;
+    let mut snapshot = accounts((0..rows).map(|i| row(&format!("row{i}"), &[])).collect());
+    snapshot.columns = (1..columns)
+        .map(|i| column(&format!("field{i}"), Source::Schema, None))
+        .chain([column("pk", Source::Pk, None)])
+        .collect();
+    assert!(snapshot.full_tsv().is_err());
+}
+
+#[test]
+fn the_offline_command_reads_only_recorded_files_and_cannot_submit_or_drop_an_edit() {
+    let scratch = scratch();
+    let root = &scratch.root;
+    let read = |args: &[&str]| {
+        let words: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let Run::Answer(answer) = cli::entry::retained(root, &words) else {
+            panic!("expected an immediate answer");
+        };
+        answer
+    };
+    assert!(read(&["ls"]).out.is_empty());
+    assert_eq!(read(&["cat", "ai/accounts"]).code, exit::USAGE);
+
+    let file = File::at(root, &name("ai/accounts"));
+    file.record(
+        file.look().unwrap(),
+        opened_with(
+            true,
+            frontier(0, &[1]),
+            Some(accounts(vec![ada()])),
+            Some(b"baseline".to_vec()),
+        ),
+        1,
+    )
+    .unwrap();
+    let queued = file
+        .write(
+            &person(),
+            draft(vec![edit(&ada().pk, "note", "offline", &[])]),
+            2,
+        )
+        .unwrap();
+    for args in [
+        &["cat", "ai/accounts"][..],
+        &["cat", "ai/accounts", "--published"],
+        &["search", "ai/accounts", "ADA", "--json"],
+        &["path", "ai/accounts"],
+        &["path", "ai/accounts", "--local"],
+        &["export", "ai/accounts"],
+    ] {
+        let result = read(args);
+        assert_eq!(result.code, exit::OK, "{}", result.err);
+        assert_eq!(result, answer(root, args));
+    }
+    assert_eq!(
+        read(&["--json", "outbox", "drop", &queued.id]).code,
+        exit::USAGE
+    );
+    assert_eq!(
+        read(&["import", "ai/accounts", "edits.tsv", "--apply"]).code,
+        exit::USAGE
+    );
+    assert_eq!(read(&["refresh", "ai/accounts"]).code, exit::USAGE);
+    assert!(read(&["outbox"]).out.contains(&queued.id));
+}
+
+#[test]
+fn a_local_tsv_and_export_can_exceed_the_editors_byte_limit() {
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    let note = "n".repeat(usize::try_from(crate::MAX_FACE_BYTES).unwrap());
+    let snapshot = accounts(vec![row("key", &[("note", &note)])]);
+    file.record(
+        file.look().expect("a look"),
+        opened_with(
+            true,
+            frontier(0, &[1]),
+            Some(snapshot),
+            Some(b"baseline".to_vec()),
+        ),
+        1,
+    )
+    .expect("recorded");
+    let expected_size = note.len() + "realm\tnote\t=slug\t=email\t=pk@1\n\t\t\t\tkey\n".len();
+    let (local, _) = file
+        .local_tsv()
+        .expect("complete local TSV above the editor limit");
+    assert_eq!(
+        std::fs::metadata(local).unwrap().len(),
+        expected_size as u64
+    );
+    let exported = answer(&scratch.root, &["export", "ai/accounts"]);
+    assert_eq!(exported.code, exit::OK, "{}", exported.err);
+    assert!(exported.out.split_once('\n').unwrap().1.split('\t').nth(1) == Some(note.as_str()));
+}
+
+#[test]
+fn exact_baselines_age_out_with_their_revisions_and_same_revision_copies_are_bounded() {
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    let save = |snapshot, bytes: Vec<u8>| {
+        file.record(
+            file.look().unwrap(),
+            opened_with(true, frontier(0, &[1]), Some(snapshot), Some(bytes)),
+            1,
+        )
+        .unwrap();
+    };
+    let retained = crate::file::BASELINES;
+    for n in 0..retained + 3 {
+        save(accounts(vec![ada()]), n.to_string().into_bytes());
+    }
+    let known =
+        |n: usize| file.baseline_for_export(1, &file.baseline_digest(1, n.to_string().as_bytes()));
+    assert_eq!(
+        (0..retained + 3).filter(|n| known(*n).is_some()).count(),
+        retained + 1
+    );
+    assert!(known(retained + 1).is_some(), "the newly replaced baseline");
+    // A crash after the snapshot, before the status, leaves no committed export of that pair.
+    let state_path = scratch.root.state(file.name());
+    let before = std::fs::read(&state_path).unwrap();
+    for n in 0..retained {
+        save(
+            accounts(vec![row("other", &[("note", &n.to_string())])]),
+            vec![0],
+        );
+        if n == 0 {
+            let recorded = std::fs::read(&state_path).unwrap();
+            std::fs::write(&state_path, &before).unwrap();
+            assert!(file.editable_snapshot().unwrap().is_none());
+            std::fs::write(&state_path, recorded).unwrap();
+            assert!(file.editable_snapshot().unwrap().is_some());
+        }
+    }
+    assert!((0..retained + 3).all(|n| known(n).is_none()));
+}
+
+#[test]
+fn wide_table_cat_export_and_local_tsv_include_the_column_the_grid_omits() {
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    let key = ada().pk;
+    let note = "published\t\"quoted\"";
+    let mut snapshot = accounts(vec![row(&key, &[("note", note)])]);
+    let extra = crate::MAX_FACE_COLUMNS + 1 - snapshot.columns.len();
+    let names: Vec<_> = (0..extra).map(|i| format!("field{i}")).collect();
+    snapshot.columns.splice(
+        0..0,
+        names.iter().map(|name| column(name, Source::Schema, None)),
+    );
+    let content = aterm_codec::hex::encode_lower(&snapshot.content());
+    let baseline = b"recorded grid baseline";
+    file.record(
+        file.look().expect("a look"),
+        opened_with(
+            true,
+            frontier(0, &[1]),
+            Some(snapshot),
+            Some(baseline.to_vec()),
+        ),
+        1,
+    )
+    .expect("recorded");
+
+    let headers = names.join("\t");
+    let grid = std::fs::read_to_string(file.face_path()).expect("the editable grid");
+    assert_eq!(
+        grid.lines().next().unwrap(),
+        format!("{headers}\trealm\t=slug\t=email\t=pk@1")
+    );
+    assert!(!grid.contains("published"));
+    let row_prefix = "\t".repeat(extra + 1);
+    let header = format!("{headers}\trealm\tnote\t=slug\t=email\t=pk@1");
+    let cells = format!("{row_prefix}\"published\t\"\"quoted\"\"\"\t\t\t{key}\n");
+    let published = format!("{header}\n{cells}");
+    let stored = file.published().snapshot.expect("published snapshot");
+    assert_eq!(stored.full_tsv().unwrap(), published);
+    assert_eq!(
+        answer(&scratch.root, &["cat", "ai/accounts", "--published"]).out,
+        published
+    );
+    let exported = answer(&scratch.root, &["export", "ai/accounts"]);
+    assert_eq!(exported.code, exit::OK, "{}", exported.err);
+    let digest = file.baseline_digest(1, baseline);
+    assert_eq!(
+        exported.out,
+        format!("{header}.{digest}+{content}\n{cells}")
+    );
+
+    let (local, _) = file.local_tsv().expect("maintained local TSV");
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), published);
+    file.write(&person(), draft(vec![edit(&key, "note", "local", &[])]), 2)
+        .expect("queued edit to the omitted column");
+    let overlay = format!("{header}\n{row_prefix}local\t\t\t{key}\n");
+    assert_eq!(answer(&scratch.root, &["cat", "ai/accounts"]).out, overlay);
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), overlay);
+    assert_eq!(std::fs::read_to_string(file.face_path()).unwrap(), grid);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&local).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            std::fs::metadata(file.face_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
 fn a_snapshot_is_replaced_only_by_a_frontier_that_contains_it_or_a_later_home() {
     let old = frontier(0, &[1, 2]);
     assert!(frontier(0, &[1, 2]).admits_over(&old));
@@ -1006,6 +1225,17 @@ fn the_read_verbs_answer_in_every_state() {
     );
 
     let rows = answer(root, &["rows", "ai/accounts", "--where", "realm=codex"]);
+    let found = answer(
+        root,
+        &["search", "ai/accounts", "AI-Fb", "--where", "realm=codex"],
+    );
+    assert_eq!(found.out, rows.out);
+    assert_eq!(found.code, exit::OK);
+    assert!(
+        !answer(root, &["search", "ai/accounts", "absent"])
+            .out
+            .contains("ac-fedcba")
+    );
     assert_eq!(rows.code, exit::OK);
     assert_eq!(
         rows.out,
@@ -1123,6 +1353,9 @@ fn rows_joins_a_column_to_the_file_it_names() {
         .expect("records");
 
     let joined = answer(root, &["rows", "ai/links", "--join", "account"]);
+    let found = answer(root, &["search", "ai/links", "CLAUDE", "--join", "account"]);
+    assert!(found.out.contains("pf-1"), "{}", found.out);
+    assert!(!found.out.contains("pf-2"));
     assert_eq!(joined.code, exit::OK);
     assert_eq!(
         joined.out,
@@ -1904,6 +2137,97 @@ fn mark(op: Option<String>) -> crate::Mark {
         generation: 2,
         left: std::collections::BTreeMap::new(),
     }
+}
+
+#[test]
+fn a_requested_local_tsv_tracks_queued_and_held_writes_and_recovers_on_a_quiet_pass() {
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    let project = || opened(true, frontier(0, &[1]), Some(accounts(vec![ada()])));
+    file.record(file.look().expect("a look"), project(), 1)
+        .expect("recorded");
+    let local = scratch.root.local_tsv(file.name());
+    let face = file.face_path();
+    let published = std::fs::read(&face).expect("the editable face");
+    assert!(!local.exists(), "a pass only makes a requested local TSV");
+
+    let path = answer(&scratch.root, &["path", "ai/accounts", "--local"]);
+    assert_eq!(path.code, exit::OK, "{}", path.err);
+    assert_eq!(path.out.trim(), local.to_str().expect("a path"));
+    assert!(
+        scratch.root.name_of(&local).is_none(),
+        "the local TSV cannot commit edits"
+    );
+    let contents = || std::fs::read_to_string(&local).expect("the local TSV");
+    let cat = || answer(&scratch.root, &["cat", "ai/accounts"]).out;
+    assert_eq!(contents(), cat());
+    let queued = file
+        .write(
+            &person(),
+            draft(vec![edit(&ada().pk, "note", "from here", &[])]),
+            2,
+        )
+        .expect("queued");
+    assert!(contents().contains("from here"));
+    assert_eq!(contents(), cat());
+    assert_eq!(std::fs::read(&face).expect("still editable"), published);
+    assert!(hold(&file, &queued.id, "a competing edit", 3));
+    assert!(contents().contains("⚠"));
+    assert_eq!(contents(), cat());
+
+    // The prior refresh never finished. The lock file keeps the subscription.
+    std::fs::remove_file(&local).expect("simulate interruption");
+    file.record(file.look().expect("a look"), project(), 4)
+        .expect("recorded");
+    assert_eq!(contents(), cat());
+    let modified = std::fs::metadata(&local)
+        .expect("local TSV")
+        .modified()
+        .expect("mtime");
+    file.record(file.look().expect("a look"), project(), 5)
+        .expect("recorded");
+    assert_eq!(
+        std::fs::metadata(&local)
+            .expect("local TSV")
+            .modified()
+            .expect("mtime"),
+        modified
+    );
+    assert!(!scratch.root.local_tsv(&name("ai/links")).exists());
+    let path = answer(&scratch.root, &["path", "ai/accounts", "--local", "--json"]);
+    assert_eq!(path.code, exit::OK);
+    let status: Value = aterm_json::from_str(&path.out).expect("status");
+    assert_eq!(status.get("view").and_then(Value::as_str), Some("local"));
+    assert_eq!(status.get("held_back").and_then(Value::as_u64), Some(1));
+    aterm_uds::trace::read_as_if_later(std::time::Duration::from_secs(10), || {
+        file.local_tsv().expect("witness a settled, unchanged TSV");
+        let renders = crate::local::RENDERS.get();
+        file.refresh_local_if_requested();
+        assert_eq!(
+            crate::local::RENDERS.get(),
+            renders,
+            "a quiet refresh consumes no TSV bytes"
+        );
+        file.batch_local_updates(|| {
+            for key in ["other-a", "other-b"] {
+                file.write(&person(), draft(vec![edit(key, "note", "new", &[])]), 6)
+                    .expect("queued");
+            }
+            assert_eq!(crate::local::RENDERS.get(), renders);
+        });
+        assert_eq!(
+            crate::local::RENDERS.get(),
+            renders + 1,
+            "one refresh across the queued rows"
+        );
+        assert_eq!(contents(), cat());
+
+        // An external removal invalidates a clean cache even with all sources unchanged.
+        file.local_tsv().expect("witness the new overlay");
+        std::fs::remove_file(&local).expect("remove working TSV");
+        file.refresh_local_if_requested();
+        assert_eq!(contents(), cat());
+    });
 }
 
 /// An accepted write is one durable line of the outbox, read back whole; a read lays it over

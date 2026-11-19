@@ -103,6 +103,296 @@ impl Drop for RestartReservation {
     }
 }
 
+/// A UI-only exec constructor in the original launch table. Its nonce may
+/// select independent controller entry, but can never open a credential member.
+/// The Native owner independently retains and validates its admitted image.
+#[cfg(unix)]
+pub struct FrontendExecReservation {
+    launch: LaunchReservation,
+    native: Arc<NativeRestart>,
+    source: Process,
+    source_identity: aterm_uds::process::Identity,
+    target: Image,
+}
+#[cfg(unix)]
+impl FrontendExecReservation {
+    /// Correlation DATA for the exact raw command's environment, not a grant.
+    pub fn token_data(&self) -> &str {
+        self.launch.token()
+    }
+    /// Called by the original Native owner after H1/capture/image validation
+    /// and durable possible-execution recording. A retry grants the same token.
+    ///
+    /// # Errors
+    /// The original kernel generation, frontend or retired Source custody changed.
+    pub fn grant(
+        &self,
+        frontend: &ServiceFrontend,
+        foreground: &FrontendMember<'_>,
+    ) -> Result<(), Error> {
+        frontend.check_foreground(foreground)?;
+        if frontend.process() != &self.source
+            || aterm_uds::process::read_identity(self.source_identity.pid)
+                != Some(self.source_identity)
+            || Process::observe(self.source.pid).as_ref() != Some(&self.source)
+        {
+            return Err(Error::Stale);
+        }
+        let state = self.launch.state.upgrade().ok_or(Error::Stale)?;
+        let state = lock(&state)?;
+        if !frontend.in_namespace(&self.launch.state) {
+            return Err(Error::Denied);
+        }
+        if state.actors.contains_key(&actor_key(foreground.caller())) {
+            retired_actor(&state, foreground.caller())?;
+        }
+        let launch = state
+            .launches
+            .get(self.launch.token())
+            .ok_or(Error::Stale)?;
+        if !matches!(&launch.binding, LaunchBinding::Frontend)
+            || launch
+                .native_restart
+                .as_ref()
+                .is_none_or(|native| !Arc::ptr_eq(native, &self.native))
+            || launch.image != self.target
+        {
+            return Err(Error::Stale);
+        }
+        self.native.grant_frontend(&self.source)
+    }
+    /// Verify actual entry through this same token and a different exec image
+    /// generation before any E1 bytes are released. No actor/Ready is required.
+    ///
+    /// # Errors
+    /// The actual issued frontend/foreground/constructor or generation is foreign/stale.
+    pub fn entered(
+        &self,
+        frontend: &ServiceFrontend,
+        foreground: &FrontendMember<'_>,
+    ) -> Result<(), Error> {
+        frontend.check_foreground(foreground)?;
+        let process = frontend.process();
+        if process.image != self.target
+            || !self.native.admits(process)
+            || !frontend.in_namespace(&self.launch.state)
+        {
+            return Err(Error::Denied);
+        }
+        let identity = aterm_uds::process::read_identity(
+            i32::try_from(process.pid).map_err(|_| Error::Unavailable)?,
+        )
+        .ok_or(Error::Unavailable)?;
+        if (identity.idversion.is_some() && identity == self.source_identity)
+            || Process::observe(process.pid).as_ref() != Some(process)
+        {
+            return Err(Error::Stale);
+        }
+        let state = self.launch.state.upgrade().ok_or(Error::Stale)?;
+        let state = lock(&state)?;
+        let launch = state
+            .launches
+            .get(self.launch.token())
+            .ok_or(Error::Stale)?;
+        if !matches!(&launch.binding, LaunchBinding::Frontend)
+            || launch.process.as_ref() != Some(process)
+            || launch
+                .native_restart
+                .as_ref()
+                .is_none_or(|native| !Arc::ptr_eq(native, &self.native))
+        {
+            return Err(Error::Denied);
+        }
+        self.native.bind_generation(process)
+    }
+}
+#[cfg(unix)]
+impl NativeRestart {
+    fn grant_frontend(&self, original: &Process) -> Result<(), Error> {
+        if self.child != *original || self.cancelled() {
+            return Err(Error::Stale);
+        }
+        self.granted.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+#[cfg(unix)]
+impl Drop for FrontendExecReservation {
+    fn drop(&mut self) {
+        if !self.native.granted.load(Ordering::Acquire) {
+            self.native.revoked.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Registry {
+    /// Reserve only UI/controller entry for the actual current foreground.
+    /// The Native caller must retain its independently admitted target image;
+    /// raw argv/environment remain with that owner, never shell-reparsed here.
+    ///
+    /// # Errors
+    /// Foreign/ended frontend, a live old credential reader, invalid/raw auth
+    /// selectors, changed image/process, closed App, or exhausted launch capacity.
+    pub fn reserve_frontend_exec(
+        &self,
+        frontend: &ServiceFrontend,
+        foreground: &FrontendMember<'_>,
+        target: &Image,
+        environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    ) -> Result<FrontendExecReservation, Error> {
+        use std::os::unix::ffi::OsStrExt;
+        frontend.check_foreground(foreground)?;
+        let namespace = Arc::downgrade(&self.state);
+        if !frontend.in_namespace(&namespace) {
+            return Err(Error::Denied);
+        }
+        let source = frontend.process().clone();
+        let source_identity = aterm_uds::process::read_identity(
+            i32::try_from(source.pid).map_err(|_| Error::Unavailable)?,
+        )
+        .ok_or(Error::Unavailable)?;
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&target.path));
+        if source.image == *target || Image::at(path).as_ref() != Some(target) {
+            return Err(Error::Stale);
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut expected_env = Vec::new();
+        let mut session = None;
+        for (name, value) in environment {
+            if name.is_empty()
+                || name.as_bytes().contains(&b'=')
+                || name.as_bytes().contains(&0)
+                || value.as_bytes().contains(&0)
+                || !names.insert(name)
+            {
+                return Err(Error::Denied);
+            }
+            if name == "ATERM_SESSION_ID" {
+                session = value.to_str();
+            }
+            if matches!(
+                name.to_str(),
+                Some("CODEX_HOME" | "CODEX_AUTH_PATH" | "CODEX_AUTH_SLOT")
+            ) {
+                expected_env.push((
+                    name.to_str().ok_or(Error::Unsupported)?.into(),
+                    value.to_str().ok_or(Error::Unsupported)?.into(),
+                ));
+            }
+        }
+        if session != Some(foreground.caller().sid.as_str()) {
+            return Err(Error::Denied);
+        }
+        let token = aterm_uds::rand::hex_token::<16>().map_err(|_| Error::Unavailable)?;
+        let current_token = atpkg::caller_shell::process_args(source.pid)
+            .and_then(|args| args.env_var(LAUNCH_ENV).map(str::to_owned));
+        let mut state = lock(&self.state)?;
+        if state.actors.contains_key(&actor_key(foreground.caller())) {
+            retired_actor(&state, foreground.caller())?;
+        }
+        let scope = state
+            .app_lifetime
+            .as_ref()
+            .ok_or(Error::Denied)?
+            .enter()
+            .ok_or(Error::Denied)?;
+        // An already entered current UI constructor positively supersedes its
+        // older generations in this SAME launch table. Do not accumulate one
+        // permanent row per successful same-birth upgrade. Ungranted, uncertain
+        // and unrelated constructors are never evicted for capacity.
+        let current_is_frontend = current_token.as_ref().is_some_and(|token| {
+            state.launches.get(token).is_some_and(|launch| {
+                matches!(launch.binding, LaunchBinding::Frontend)
+                    && launch.process.as_ref() == Some(&source)
+                    && launch
+                        .native_restart
+                        .as_ref()
+                        .is_some_and(|native| native.admits(&source))
+            })
+        });
+        let old_tokens: Vec<_> = if current_is_frontend {
+            state
+                .launches
+                .iter()
+                .filter(|(key, launch)| {
+                    current_token.as_ref() != Some(*key)
+                        && matches!(launch.binding, LaunchBinding::Frontend)
+                        && launch.process.as_ref().is_some_and(|old| {
+                            old.pid == source.pid
+                                && old.birth == source.birth
+                                && old.image != source.image
+                        })
+                        && launch
+                            .native_restart
+                            .as_ref()
+                            .is_some_and(|native| native.granted.load(Ordering::Acquire))
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut retired = Vec::new();
+        for key in old_tokens {
+            if let Some(old) = state.launches.remove(&key) {
+                if let Some(native) = &old.native_restart {
+                    native.revoked.store(true, Ordering::Release);
+                }
+                retired.push(old);
+            }
+        }
+        if state.launches.len() >= MAX_LAUNCHES || state.launches.contains_key(&token) {
+            drop(state);
+            drop(retired);
+            return Err(Error::Busy);
+        }
+        let native = Arc::new(NativeRestart {
+            child: source.clone(),
+            granted: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            entry_generation: std::sync::OnceLock::new(),
+        });
+        state.launches.insert(
+            token.clone(),
+            Launch {
+                sid: foreground.caller().sid.clone(),
+                image: target.clone(),
+                expected_env,
+                expected_unset: ["CODEX_HOME", "CODEX_AUTH_PATH", "CODEX_AUTH_SLOT"]
+                    .into_iter()
+                    .filter(|name| {
+                        !names
+                            .iter()
+                            .any(|actual| *actual == std::ffi::OsStr::new(name))
+                    })
+                    .collect(),
+                process: None,
+                binding: LaunchBinding::Frontend,
+                typed: true,
+                gate: None,
+                _scope: Some(scope),
+                initial: None,
+                native_restart: Some(native.clone()),
+            },
+        );
+        drop(state);
+        drop(retired);
+        Ok(FrontendExecReservation {
+            launch: LaunchReservation {
+                token,
+                executable: path.to_path_buf(),
+                state: namespace,
+            },
+            native,
+            source,
+            source_identity,
+            target: target.clone(),
+        })
+    }
+}
+
 /// A fresh constructor reserved for the existing SDK owner itself. The native
 /// host still owns signed-image admission, policy, input custody and its Go
 /// record; this reservation cannot grant entry while old SDK custody remains.
