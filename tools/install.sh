@@ -780,7 +780,7 @@ valid_slug() {
 
 # One `key = "value"` string out of one `[table]` of a TOML file, on stdout (empty
 # when absent): the line-oriented shape the release cutter's `table_string`
-# (crates/aterm-release/src/channel.rs) reads, line for line — the exact
+# (crates/aterm-cutter/src/channel.rs) reads, line for line — the exact
 # header, then `key = "value"` with the value the first double-quoted run (a
 # trailing `# comment` falls outside it), whitespace trimmed.
 manifest_table_string() { # <file> <table> <key>
@@ -1535,6 +1535,18 @@ passwd_homes() { # <uid>
 	awk -F: -v u="$1" '$3 == u { print $6 }'
 }
 
+# The home of every account the account database lists, one per line, from the
+# listings account_homes reads (a test replaces it).
+every_account_home() {
+	if [[ -x /usr/bin/dscacheutil ]]; then
+		/usr/bin/dscacheutil -q user 2>/dev/null | awk '/^dir: / { print substr($0, 6) }' || true
+	elif command -v getent >/dev/null 2>&1; then
+		getent passwd 2>/dev/null | awk -F: '{ print $6 }' || true
+	else
+		awk -F: '{ print $6 }' </etc/passwd 2>/dev/null || true
+	fi
+}
+
 # Whether folder <a> (a physical path) is folder <b> or inside it, by identity
 # (-ef) at each level up, so another spelling of the same folder (a case variant
 # on APFS, a leading //, a firmlink's /System/Volumes/Data path) is the same.
@@ -2129,8 +2141,8 @@ gate_pinned_channel() { # <root>
 # has the same body); on macOS atpkg's `targo` and `targo-tippy` shims first run
 # a block of shell builtins that may put `--config build.build-dir=…` in front
 # of "$@", or export CARGO_BUILD_BUILD_DIR for `targo trust`
-# (crates/atpkg/src/build_cache.rs), so their exec is the last of about three
-# hundred lines, some 17 KB (the bound is aterm's own shim reader's, 64 KiB).
+# (crates/atpkg/src/build_cache.rs), so their exec is the last of about five
+# hundred lines, some 26 KB (the bound is aterm's own shim reader's, 64 KiB).
 # Following such a shim is sound: it is read here, never run, only to LOCATE
 # the store file, which gate_store_targo must then prove and every
 # build runs by its physical path; a prelude runs only when the shim itself is
@@ -3893,9 +3905,265 @@ unpack_container() { # <asset> <mnt>
 	fi
 }
 
+# --- the state-format floor ---------------------------------------------------
+#
+# aterm records the state formats this account's state may be written in
+# (aterm_update_core::state_formats), and the record ends in `floor <build>`:
+# over the formats recorded, the highest of the lowest build number known
+# to read each, which each level line keeps and dropping a reader line never
+# raises (state_formats::Ledger::floor). Only builds a release lane stamped
+# record (and a debug build a test names one), so a floor above 0 is the
+# number of such a build: perhaps a canonical cut run on the account before it
+# is published (`ship stage-local --stage` on the release host), or one later
+# abandoned, so until a release numbered at or above it is published, the
+# latest public release is below it. No build numbered below it is known to
+# read that state (a broker log a newer astream pin cut), so no lane installs
+# one (the bundle, the released Linux binary, a source build), the aterm
+# already installed stays, and the refusal names build <floor> or newer
+# instead. A build numbered at or above it is installed, though it too need
+# not read every format: build numbers do not order builds. The record is
+# `state-formats` in the folder
+# aterm_types::dirs::account_state_dir names: as root, under uid 0's account
+# home, whatever HOME and XDG_STATE_HOME say; otherwise, off macOS, in an
+# absolute XDG_STATE_HOME's `aterm`, whatever the home; else under HOME when it
+# is absolute, else under the home the account database gives the uid (aterm
+# reads /etc/passwd's, which on macOS lists no person's account, so there this
+# names a record where aterm names none); on macOS in its
+# `Library/Application Support/aterm`, elsewhere in its `.local/state/aterm`.
+
+# The record's path, or status 1 when it names none: no absolute
+# XDG_STATE_HOME that counts, and no absolute home.
+state_formats_path() {
+	local uid os home="" homes
+	uid="$(installer_uid)"
+	os="$(uname -s)"
+	if [[ "$uid" != 0 && "$os" != Darwin && "${XDG_STATE_HOME:-}" == /* ]]; then
+		printf '%s\n' "$XDG_STATE_HOME/aterm/state-formats"
+		return 0
+	fi
+	if [[ "$uid" != 0 && "${HOME:-}" == /* ]]; then
+		home="$HOME"
+	else
+		homes="$(account_homes "$uid")"
+		home="${homes%%$'\n'*}"
+	fi
+	[[ "$home" == /* ]] || return 1
+	if [[ "$os" == Darwin ]]; then
+		printf '%s\n' "$home/Library/Application Support/aterm/state-formats"
+	else
+		printf '%s\n' "$home/.local/state/aterm/state-formats"
+	fi
+}
+
+# The records an install into the folders <folder>... is held to, one path per
+# line: this account's (state_formats_path); and when the run is root's and
+# one of those folders is outside root's home (root_places_shared: the app's
+# /Applications, or a store or bin folder an ATERM_STORE_DIR or ATERM_BIN_DIR
+# names elsewhere), where other accounts' aterm may then run what it places
+# over their own state, also the one aterm keeps under the home of each
+# account the account database lists whose home is a folder: in its
+# `Library/Application Support/aterm` on macOS, elsewhere in its
+# `.local/state/aterm` (a root run does not know another account's
+# XDG_STATE_HOME). A home on a mount remote_home_mounts lists (a network
+# share, a FUSE daemon's, an automounter's) is passed over without a look,
+# its record unread: a look there can mount a share or wait on a server that
+# stopped answering, and a share that maps root to nobody refuses it. A root
+# run that places only into root's home reads root's own record alone.
+# Status 1, with no other account's record named, when the mount table
+# cannot be read.
+state_formats_paths() { # [<folder>...]
+	local home os mounts
+	state_formats_path || true
+	[[ "$(installer_uid)" == 0 ]] || return 0
+	root_places_shared "$@" || return 0
+	mounts="$(remote_home_mounts)" || return 1
+	os="$(uname -s)"
+	while IFS= read -r home; do
+		[[ "$home" == /* ]] || continue
+		if home_on_mount "$home" "$mounts"; then
+			continue
+		fi
+		[[ -d "$home" ]] || continue
+		if [[ "$os" == Darwin ]]; then
+			printf '%s\n' "$home/Library/Application Support/aterm/state-formats"
+		else
+			printf '%s\n' "$home/.local/state/aterm/state-formats"
+		fi
+	done <<<"$(every_account_home)"
+}
+
+# Whether a root run that places into the folders <folder>... places into one
+# that is neither root's home nor in it (dir_within, by identity; a folder
+# still to be made, by where mkdir -p would make it), so another account may
+# reach what it places there. Root's home is uid 0's account home
+# (account_homes' first); with none, every folder counts. An empty <folder>
+# names nothing.
+root_places_shared() { # <folder>...
+	local homes home f
+	homes="$(account_homes 0)"
+	home="${homes%%$'\n'*}"
+	for f in "$@"; do
+		[[ -n "$f" ]] || continue
+		[[ "$home" == /* ]] && dir_within "$f" "$home" || return 0
+	done
+	return 1
+}
+
+# The folders a root run does not look in for an account's home
+# (state_formats_paths), one per line, as the mount table spells them: on
+# macOS each foreign_mount_points lists (a volume not local, an automounter's
+# map among them, or one an account mounted), and each of those on the Data
+# volume also as its firmlinks and synthetic links spell it at /, without
+# /System/Volumes/Data (macOS's automounted /home is
+# /System/Volumes/Data/home); on Linux each foreign_mount_points lists (one not
+# on the device / is on, whose type is no disk's, memory's or the kernel's
+# own: a network or FUSE one) and each folder an automounter watches
+# (linux_automounts). Status 1 when the mount table cannot be read (a test
+# replaces it).
+remote_home_mounts() {
+	local list m
+	list="$(foreign_mount_points)" || return 1
+	if [[ "$(uname -s)" == Darwin ]]; then
+		while IFS= read -r m; do
+			[[ -n "$m" ]] || continue
+			printf '%s\n' "$m"
+			[[ "$m" != /System/Volumes/Data/* ]] || printf '%s\n' "${m#/System/Volumes/Data}"
+		done <<<"$list"
+	else
+		printf '%s\n' "$list"
+		linux_automounts 2>/dev/null || return 1
+	fi
+}
+
+# Whether <home>, as the account database spells it, is one of the folders
+# <mounts> lists (one per line) or below one, by text alone (text_in_folder):
+# nothing is looked at, so no automounter mounts it and no server holds the
+# run. A home spelled through a link onto such a mount is not seen as on it.
+home_on_mount() { # <home> <mounts>
+	local m
+	while IFS= read -r m; do
+		[[ "$m" == /?* ]] || continue
+		text_in_folder "$1" "$m" && return 0
+	done <<<"$2"
+	return 1
+}
+
+# The floor the record at <path> sets, in STATE_FLOOR; empty when there is no
+# record, which is exactly when aterm's own open of <path> finds no file there
+# (ENOENT: a link to nothing included). Any other failure of that open (a
+# folder on the way this account may not search, a link loop, a name too long,
+# a file where a folder should be) is a record that cannot be read. A record is
+# read for its first line, which must be `aterm-state-formats 1`, and for its
+# one `floor` line, `floor <a canonical u64>`; every other line must start with
+# a word the record holds (level, reader, fence), and it must end in a newline,
+# within 65536 bytes. aterm_update_core holds the rest of each line to its
+# grammar. Status 1, STATE_FLOOR_WHY saying why, for a record this cannot read:
+# it may record a format, so a person's install is refused over it, as aterm
+# refuses their rollback (state_formats::Why::Chosen).
+state_format_floor() { # <path>
+	local path="$1" opened size="" header="" cut="" line floor="" floors=0 bad="" version
+	local LC_ALL=C
+	STATE_FLOOR=""
+	STATE_FLOOR_WHY=""
+	if [[ ! -e "$path" ]]; then
+		# The open aterm makes (open(2) for reading, following links), asked of
+		# the system: only its "No such file or directory" is no record.
+		if opened="$({ true <"$path"; } 2>&1)"; then
+			:
+		elif [[ "$opened" == *": No such file or directory" ]]; then
+			return 0
+		else
+			STATE_FLOOR_WHY="it cannot be opened (${opened##*: })"
+			return 1
+		fi
+	fi
+	if [[ -f "$path" && -r "$path" ]]; then
+		size="$(wc -c <"$path" 2>/dev/null)" || size=""
+		size="${size//[!0-9]/}"
+	fi
+	if [[ -z "$size" ]]; then
+		STATE_FLOOR_WHY="it is not a file this installer can read"
+		return 1
+	fi
+	if ! decimal_in_closed_range "$size" 0 65536; then
+		STATE_FLOOR_WHY="it is larger than any record aterm writes"
+		return 1
+	fi
+	{
+		IFS= read -r header || cut=1
+		while IFS= read -r line; do
+			case "$line" in
+			"level "* | "reader "* | "fence "*) ;;
+			floor | "floor "*)
+				floors=$((floors + 1))
+				floor="${line#floor }"
+				[[ "$line" == "floor $floor" ]] || floor=""
+				;;
+			*) bad="it holds a line no record holds" ;;
+			esac
+		done
+	} <"$path"
+	version="${header#aterm-state-formats }"
+	if [[ "$header" != "aterm-state-formats $version" || "$version" == 0 ]] ||
+		! numeric_component_in_u64 "$version"; then
+		STATE_FLOOR_WHY="its first line is not a state-format record's"
+		return 1
+	fi
+	if [[ "$version" != 1 ]]; then
+		STATE_FLOOR_WHY="a newer aterm wrote it (version $version)"
+		return 1
+	fi
+	[[ -z "$cut" && -z "${line:-}" ]] || bad="it does not end in a newline"
+	if [[ -z "$bad" ]] && { [[ "$floors" != 1 ]] || ! numeric_component_in_u64 "$floor"; }; then
+		bad="it has not one floor line naming a build"
+	fi
+	if [[ -n "$bad" ]]; then
+		STATE_FLOOR_WHY="$bad"
+		return 1
+	fi
+	STATE_FLOOR="$floor"
+}
+
+# Whether build <build> (a decimal; empty when the release names none) may be
+# installed into the folders <folder>... (where the lane places it) over the
+# state the records state_formats_paths names for them describe: when each
+# can be read and the highest floor among them is 0 (as with no record), or
+# <build> is a canonical u64 no lower than it
+# (state_formats::Ledger::installs). Otherwise it says why on stderr, naming
+# <what> and the record, or the mount table a root run could not read, and
+# fails, and the caller ends before it changes anything.
+admit_state_floor() { # <build> <what> [<folder>...]
+	local build="$1" what="$2" paths path highest="" at=""
+	shift 2
+	if ! paths="$(state_formats_paths "$@")"; then
+		echo "install.sh: not installing $what: the mount table cannot be read, so this root run cannot tell which accounts' homes are on this machine's own disks, whose state-format records it is held to — nothing was installed" >&2
+		return 1
+	fi
+	while IFS= read -r path; do
+		[[ -n "$path" ]] || continue
+		if ! state_format_floor "$path"; then
+			echo "install.sh: not installing $what: the state-format record $path cannot be read: $STATE_FLOOR_WHY; it may record a state format that build does not read — nothing was installed" >&2
+			return 1
+		fi
+		[[ -n "$STATE_FLOOR" ]] || continue
+		if [[ -z "$highest" ]] || ! decimal_in_closed_range "$STATE_FLOOR" 0 "$highest"; then
+			highest="$STATE_FLOOR"
+			at="$path"
+		fi
+	done <<<"$paths"
+	[[ -n "$highest" && "$highest" != 0 ]] || return 0
+	decimal_in_closed_range "$build" "$highest" 18446744073709551615 && return 0
+	echo "install.sh: not installing $what (build ${build:-unnamed}): the aterm state the record $at describes may be written in a format no aterm numbered below build $highest is known to read — nothing was installed; install build $highest or newer" >&2
+	return 1
+}
+
 # Stage <bundle> next to <dest> and swap it in, TERM and HUP held (taken
-# again here, for a caller that unpacked nothing) and then dropped.
+# again here, for a caller that unpacked nothing) and then dropped. First the
+# bundle's sealed build (its Info.plist's CFBundleVersion) is held to the
+# state-format floor (admit_state_floor, for an install into <dest>): below
+# it, nothing is staged and <dest> stays as it was.
 place_bundle() { # <bundle> <dest>
+	admit_state_floor "$(plist_raw "$1/Contents/Info.plist" CFBundleVersion)" "${TAG:-the aterm.app at $1}" "$2" || exit 1
 	hold_kills
 	stage_bundle "$1" "$2" || {
 		echo "install.sh: could not stage aterm.app in $2 — nothing was installed" >&2
@@ -4462,6 +4730,22 @@ linux_mounts() { # [<mountinfo>]
 	}' "${1:-/proc/self/mountinfo}"
 }
 
+# The folders Linux's automounter (autofs) watches, one per line, from the
+# kernel's table (<mountinfo>, by default this process's), which linux_mounts
+# leaves out: a look at a name in one mounts what the automounter's map names
+# there, a network share's included, before the look is answered.
+linux_automounts() { # [<mountinfo>]
+	awk '{
+		for (i = 7; i <= NF && $i != "-"; i++) continue
+		if ($(i + 1) != "autofs") next
+		p = $5
+		gsub(/\\040/, " ", p)
+		gsub(/\\011/, "\t", p)
+		gsub(/\\134/, "\\", p)
+		print p
+	}' "${1:-/proc/self/mountinfo}"
+}
+
 # Whether statfs type <hex> (stat -f -c %t's) is a network or FUSE
 # filesystem's: NFS, SMB/CIFS (two), Ceph, AFS (two), 9P, Lustre, GPFS and
 # FUSE, the types crates/aterm-uds/src/shared_write.rs REMOTE_FILESYSTEMS
@@ -4757,13 +5041,24 @@ root_entry() { # <path>
 # with the run's traps reset, so it sets them again (end_on_ctrl_c): a Ctrl-C
 # then removes its file there, which the run's own shell never named.
 first_line_bounded() {
-	local out s=0
+	first_line_or_timeout "" "$@"
+}
+
+# A probe needs an empty answer on timeout. A join can instead name the local
+# status command. Neither trusts a partial line from a command that timed out.
+first_line_or_timeout() { # <line on timeout> <exe> [args…]
+	local on_timeout="$1" out s=0
+	shift
 	may_run "$1" || return 0
 	end_on_ctrl_c
 	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
 	probe_temp out aterm-probe || return 0
 	BOUNDED_OUT="$out" BOUNDED_ERR=/dev/null ask_bounded "$@" || s=$?
-	[[ "$s" -eq 124 ]] || head -n 1 "$out"
+	if [[ "$s" -eq 124 ]]; then
+		[[ -z "$on_timeout" ]] || printf '%s\n' "$on_timeout"
+	else
+		head -n 1 "$out"
+	fi
 	rm -f "$out"
 }
 
@@ -5244,8 +5539,8 @@ secrets_aterm() { # <bin-dir> <store-dir> <app-dir>...
 # minute after the first ask, then after 1, 2, 4 and 8 minutes, then every
 # 15), so a member away when this ran shows the request too. An aterm older than the members verb, or an
 # ATERM_INSTALL_VAULT_URL, runs `aterm secrets join --no-wait` instead
-# (docs/DESIGN-alab-swarm-2026-10-27.md §5.3, C6). Best effort and silent when
-# neither an ALab member nor the vault answers.
+# (docs/DESIGN-alab-swarm-2026-10-27.md §5.3, C6). A timeout names the status
+# command for that join. A join that returns quietly adds no installer output.
 join_secrets_headless() {
 	local aterm said dirs=(/Applications "$HOME/Applications")
 	secrets_join_runs_here "${APP_OPENED:-0}" "$(installer_uid)" "${HOME:-}" || return 0
@@ -5259,7 +5554,8 @@ join_secrets_headless() {
 	elif first_line_bounded "$aterm" members --help | grep -q '^aterm members:'; then
 		args=(members join --no-wait)
 	fi
-	said="$(first_line_bounded "$aterm" "${args[@]}")"
+	local timed_out="The installer stopped waiting for enrollment. Check with 'aterm ${args[0]} status'."
+	said="$(first_line_or_timeout "$timed_out" "$aterm" "${args[@]}")"
 	if [[ -n "$said" ]]; then
 		printf 'install.sh: %s: %s\n' "${args[0]}" "$said"
 	fi
@@ -5798,6 +6094,22 @@ place_store_binary() {
 	expose_store_binary
 }
 
+# The build number crates/aterm/build.rs stamps on the source build of <root>
+# (ATERM_STAMP=commit, which cargo_build_pinned sets, and SOURCE_DATE_EPOCH,
+# which it leaves as the environment has it): SOURCE_DATE_EPOCH when it is
+# digits, else HEAD's committer time, else 0 (a build that names no number);
+# its leading zeros dropped, as a number reads it.
+source_build_number() { # <root>
+	local n="${SOURCE_DATE_EPOCH:-}"
+	local LC_ALL=C
+	if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+		n="$(checkout_git -C "$1" show -s --format=%ct HEAD 2>/dev/null)" || n=""
+		[[ "$n" =~ ^[0-9]+$ ]] || n=0
+	fi
+	n="${n#"${n%%[!0]*}"}"
+	printf '%s\n' "${n:-0}"
+}
+
 install_cli_from_source() {
 	echo "install.sh: building aterm from $ROOT at $(checkout_git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')"
 	# Pin the target dir (a global CARGO_TARGET_DIR / build.target-dir redirect
@@ -5818,6 +6130,10 @@ install_cli_from_source() {
 	# The rename at the end replaces the store's aterm: asked here first, so one
 	# that stays costs no build; place_store_binary asks again before the rename.
 	may_replace "$STORE_DIR/aterm" || exit 1
+	# The build's number against the state-format floor (admit_state_floor,
+	# for an install into the store and the bin folder), before anything is
+	# built: the binary placed opens the same state a released aterm does.
+	admit_state_floor "$(source_build_number "$ROOT")" "the source build of $ROOT" "$STORE_DIR" "${BIN_DIR:-}" || exit 1
 	# Existence-after-build IS the freshness proof: cargo always re-links a
 	# deleted output, so a redirected build can never leave a previous build's
 	# binary here to be silently installed.
@@ -7291,6 +7607,11 @@ install_linux_app() {
 	verified="$(linux_release_verify "$TMP" "$TAG" "$REPO_SLUG" "$LINUX_ARCH" "$STORE_DIR")" || exit 1
 	IFS=$'\t' read -r name digest size build roster_seq <<<"$verified"
 	[[ "$name" == "$LINUX_ASSET" ]] || { echo "install.sh: Linux asset identity changed" >&2; exit 1; }
+	# The signed build against the state-format floor (admit_state_floor,
+	# for an install into the store and the bin folder), before the binary is
+	# fetched or run: a candidate's own `update install` may predate any check
+	# of the record.
+	admit_state_floor "$build" "$TAG" "$STORE_DIR" "${BIN_DIR:-}" || exit 1
 	host_size="$(release_asset_size "$TAG" "$name" 536870912)" || exit 1
 	[[ "$host_size" == "$size" ]] || { echo "install.sh: the download host's size for $name disagrees with the signed Linux size" >&2; exit 1; }
 	echo "install.sh: downloading authenticated $name ($((size / 1000000)) MB)"
