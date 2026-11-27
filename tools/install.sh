@@ -3196,10 +3196,14 @@ def access_acl(path):
     return False
 
 
-# statfs f_type of the network and FUSE filesystems, where a server or daemon
-# decides access: NFS, SMB/CIFS (two), Ceph, AFS (two), 9P, Lustre, GPFS, FUSE.
+# statfs f_type of every network, FUSE, VM-share, and shared-disk/cluster
+# filesystem, where another node, host, or daemon may write: NFS, SMB 1/2/3,
+# Ceph, AFS (two), 9P, Lustre, GPFS, FUSE, vboxsf, prl_fs, vmhgfs, OCFS2,
+# GFS2, Coda, OrangeFS, BeeGFS.
 REMOTE_FILESYSTEMS = frozenset((0x6969, 0xFF534D42, 0xFE534D42, 0x00C36400, 0x6B414653,
-                                0x5346414F, 0x01021997, 0x0BD00BD0, 0x47504653, 0x65735546))
+                                0x5346414F, 0x01021997, 0x0BD00BD0, 0x47504653, 0x65735546,
+                                0x517B, 0x786F4256, 0x7C7C6673, 0xBACBACBC, 0x7461636F,
+                                0x01161970, 0x73757245, 0x20030528, 0x19830326))
 
 
 def remote_filesystem_type(magic):
@@ -4746,15 +4750,16 @@ linux_automounts() { # [<mountinfo>]
 	}' "${1:-/proc/self/mountinfo}"
 }
 
-# Whether statfs type <hex> (stat -f -c %t's) is a network or FUSE
-# filesystem's: NFS, SMB/CIFS (two), Ceph, AFS (two), 9P, Lustre, GPFS and
-# FUSE, the types crates/aterm-uds/src/shared_write.rs REMOTE_FILESYSTEMS
+# Whether statfs type <hex> (stat -f -c %t's) is a network, FUSE, VM-share,
+# or shared-disk/cluster filesystem's: NFS, SMB 1/2/3, Ceph, AFS (two), 9P,
+# Lustre, GPFS, FUSE, vboxsf, prl_fs, vmhgfs, OCFS2, GFS2, Coda, OrangeFS and
+# BeeGFS, the types crates/aterm-uds/src/shared_write.rs REMOTE_FILESYSTEMS
 # lists (on one of them the updater and the Linux verifier take a folder its
 # group can write for one any account in that group may change); one stat
 # could not read counts as such.
 remote_filesystem_type() { # <hex>
 	case "$1" in
-	6969 | ff534d42 | fe534d42 | c36400 | 6b414653 | 5346414f | 1021997 | bd00bd0 | 47504653 | 65735546) return 0 ;;
+	6969 | ff534d42 | fe534d42 | c36400 | 6b414653 | 5346414f | 1021997 | bd00bd0 | 47504653 | 65735546 | 517b | 786f4256 | 7c7c6673 | bacbacbc | 7461636f | 1161970 | 73757245 | 20030528 | 19830326) return 0 ;;
 	"" | *[!0-9a-f]*) return 0 ;;
 	esac
 	return 1
