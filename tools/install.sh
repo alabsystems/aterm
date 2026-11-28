@@ -5493,23 +5493,33 @@ setup_aterm() { # <verb> <bin-dir> <store-dir> <app-dir>...
 # Whether `<exe> pkg help <verb>`, asked as setup_aterm asks it (ask_bounded),
 # ends 0 and names <word>: a run cut off answered nothing.
 help_names() { # <exe> <verb> <word>
-	local out s=0
+	help_mentions "$1" "$3" pkg help "$2"
+}
+
+help_mentions() { # <exe> <word> <help-args…>
+	local exe="$1" word="$2" out s=0
+	shift 2
 	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
 	probe_temp out aterm-probe || return 1
-	BOUNDED_OUT="$out" BOUNDED_ERR=/dev/null ask_bounded "$1" pkg help "$2" || s=$?
-	if [[ "$s" -ne 0 ]] || ! grep -qF -- "$3" "$out"; then
+	BOUNDED_OUT="$out" BOUNDED_ERR=/dev/null ask_bounded "$exe" "$@" || s=$?
+	if [[ "$s" -ne 0 ]] || ! grep -qF -- "$word" "$out"; then
 		s=1
 	fi
 	rm -f "$out"
 	return "$s"
 }
 
-# The aterm that runs `aterm members join --no-wait` (or, for an older one or
-# an ATERM_INSTALL_VAULT_URL, `aterm secrets join --no-wait`) on lanes with no
+# The aterm that runs `aterm members auto-join` (or, for an explicit
+# ATERM_INSTALL_VAULT_URL, `aterm secrets join --no-wait`) on lanes with no
 # window (join_secrets_headless): the one this run placed, else this account's
 # own link, bundle or store binary, proved to answer --version as aterm and
 # `secrets --help` as aterm secrets (bounded, on /dev/null, under may_run).
-secrets_aterm() { # <bin-dir> <store-dir> <app-dir>...
+secrets_aterm() { # [--automatic] <bin-dir> <store-dir> <app-dir>...
+	local automatic=0 unsupported=0
+	if [[ "$1" == --automatic ]]; then
+		automatic=1
+		shift
+	fi
 	local bin="$1" store="$2" c d a asked=()
 	shift 2
 	local cands=(${PLACED_ATERM:+"$PLACED_ATERM"})
@@ -5526,14 +5536,21 @@ secrets_aterm() { # <bin-dir> <store-dir> <app-dir>...
 		asked+=("$c")
 		first_line_bounded "$c" --version | grep -q '^aterm ' || continue
 		first_line_bounded "$c" secrets --help | grep -q '^aterm secrets:' || continue
+		if [[ "$automatic" -eq 1 ]] && ! help_mentions "$c" '  auto-join ' members --help; then
+			unsupported=1
+			continue
+		fi
 		echo "$c"
 		return 0
 	done
+	if [[ "$unsupported" -eq 1 ]]; then
+		echo "install.sh: automatic enrollment needs an aterm with 'members auto-join'." >&2
+	fi
 	return 0
 }
 
 # Lanes with no window (--no-open, SSH, piped stdout, --no-app, Linux, or an
-# `open` that failed) run `aterm members join --no-wait`: it proves this Mac
+# `open` that failed) run `aterm members auto-join`: it proves this Mac
 # to the ALab members on this network first, and a member on the home ALab LAN
 # lets it in at once (docs/DESIGN-automatic-lan-admission-2026-11-02.md).
 # Where none did, it asks every member and returns, leaving a request a person
@@ -5542,8 +5559,8 @@ secrets_aterm() { # <bin-dir> <store-dir> <app-dir>...
 # also joins the ALab vault without waiting and starts this Mac's vault
 # subscriber, which proves and asks again while the Mac waits (about half a
 # minute after the first ask, then after 1, 2, 4 and 8 minutes, then every
-# 15), so a member away when this ran shows the request too. An aterm older than the members verb, or an
-# ATERM_INSTALL_VAULT_URL, runs `aterm secrets join --no-wait` instead
+# 15), so a member away when this ran shows the request too. An explicit
+# ATERM_INSTALL_VAULT_URL runs `aterm secrets join --no-wait` instead
 # (docs/DESIGN-alab-swarm-2026-10-27.md §5.3, C6). A timeout names the status
 # command for that join. A join that returns quietly adds no installer output.
 join_secrets_headless() {
@@ -5551,14 +5568,14 @@ join_secrets_headless() {
 	secrets_join_runs_here "${APP_OPENED:-0}" "$(installer_uid)" "${HOME:-}" || return 0
 	[[ -n "${ATERM_INSTALL_DIR:-}" ]] && dirs=("$ATERM_INSTALL_DIR")
 	[[ -n "${DEST:-}" ]] && dirs=("$DEST" "${dirs[@]}")
-	aterm="$(secrets_aterm "$BIN_DIR" "$STORE_DIR" "${dirs[@]}")"
-	[[ -n "$aterm" ]] || return 0
-	local args=(secrets join --no-wait)
+	local search=("$BIN_DIR" "$STORE_DIR" "${dirs[@]}") args=(members auto-join)
 	if [[ -n "${ATERM_INSTALL_VAULT_URL:-}" ]]; then
 		args=(secrets join "$ATERM_INSTALL_VAULT_URL" --no-wait)
-	elif first_line_bounded "$aterm" members --help | grep -q '^aterm members:'; then
-		args=(members join --no-wait)
+	else
+		search=(--automatic "${search[@]}")
 	fi
+	aterm="$(secrets_aterm "${search[@]}")"
+	[[ -n "$aterm" ]] || return 0
 	local timed_out="The installer stopped waiting for enrollment. Check with 'aterm ${args[0]} status'."
 	said="$(first_line_or_timeout "$timed_out" "$aterm" "${args[@]}")"
 	if [[ -n "$said" ]]; then
